@@ -1,0 +1,20 @@
+[package]
+name = "graphreact-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WebAssembly bindings for GraphReact (M18 stub). Targets server-WASM deployments — edge compute, embedded host runtimes, sandboxed plugins. NOT a browser-frontend runtime; see graphreactRust/docs/decisions/0002-graphreact-is-backend-only.md for the architectural framing."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+graphreact-core = { path = "../graphreact-core" }
+wasm-bindgen.workspace = true
+
+[lints]
+workspace = true

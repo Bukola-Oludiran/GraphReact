@@ -1,0 +1,51 @@
+[package]
+name = "graphreact-dist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "GraphReact distribution layer — M14. Erlang-cluster-equivalent multi-host clustering for the Backend product: location-transparent message addressing, distributed monitors and links, distributed pg group registry, net-tick partition detection. Wire protocol = length-prefixed postcard over TLS (rustls); OTP-style challenge-response handshake using HMAC-SHA256(cookie). Sits as a peer to the engine layer — depends on graphreact-core (Scheduler, Message, MonitorRef, GroupRegistry) but NOT on any specific engine, so the same dist crate routes JSC and CPython component bodies."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+graphreact-core = { path = "../graphreact-core" }
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+rustls.workspace = true
+bytes.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+arc-swap.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "test-util"] }
+criterion.workspace = true
+
+[[bench]]
+name = "cross_node_throughput"
+harness = false
+
+[[bench]]
+name = "cross_node_throughput_rtt"
+harness = false
+
+[lints]
+workspace = true

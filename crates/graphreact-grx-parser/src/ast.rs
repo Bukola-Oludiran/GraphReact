@@ -1,0 +1,159 @@
+//! AST node types for `.grx` files.
+//!
+//! Mirrors the TypeScript reference at [`graphreact/src/core/parser/ast.ts`].
+//! Values produced by the parser are owned (no string interning) — `.grx`
+//! files are typically tens of kilobytes; the win from interning isn't
+//! worth the API friction.
+
+use serde_json::Value as JsonValue;
+
+use crate::error::SourceLoc;
+
+/// A whole `.grx` file (Phase-7 multi-file format). Either contains
+/// graph markup, definition blocks (component bodies), or both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrxFile {
+    pub imports: Vec<ImportDirective>,
+    pub graph: Option<GraphDecl>,
+    pub definitions: Vec<NodeDefinitionBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphDecl {
+    pub id: String,
+    pub children: Vec<GrxNode>,
+    pub loc: SourceLoc,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GrxNode {
+    Node(NodeDecl),
+    Edge(EdgeDecl),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeDecl {
+    /// Component tag name (e.g. `Counter`, `Logger`).
+    pub component: String,
+    /// `id` attribute value (separated out from `attrs`).
+    pub id: String,
+    /// All other attributes.
+    pub attrs: AttrMap,
+    /// Nested children.
+    pub children: Vec<GrxNode>,
+    /// `<Foo />` vs `<Foo></Foo>`.
+    pub self_closing: bool,
+    pub loc: SourceLoc,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeDecl {
+    pub source: String,
+    pub target: String,
+    /// All attributes other than `source`/`target`.
+    pub attrs: AttrMap,
+    pub loc: SourceLoc,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDirective {
+    pub src: String,
+    pub loc: SourceLoc,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeDefinitionBlock {
+    /// Tag name = component name.
+    pub component: String,
+    /// Raw component-body code. Language-specific; see [`Self::lang`].
+    pub code: String,
+    /// Body language. Default is [`ComponentLang::Js`] when no `lang`
+    /// attribute is present (preserves backward compatibility with
+    /// pre-M13-phase3 fixtures). [`ComponentLang::Python`] routes
+    /// through the CPython engine + PyRuntime composition layer.
+    pub lang: ComponentLang,
+    pub loc: SourceLoc,
+}
+
+/// Body language for a [`NodeDefinitionBlock`]. M13-phase3a introduces
+/// Python; future engines (V8 native at M17, JVM at M17+, etc.) extend
+/// this enum. Selecting a `lang` other than what the active runtime
+/// supports surfaces as a runtime error at mount time, not parse time
+/// (the parser is engine-agnostic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+pub enum ComponentLang {
+    /// JavaScript / TypeScript body. Routed to the JSC engine.
+    #[default]
+    Js,
+    /// Python body. Routed to the CPython engine via the PyRuntime
+    /// composition layer (M13-phase3+).
+    Python,
+}
+
+impl ComponentLang {
+    /// Lower-case, single-token name suitable for `lang="…"`
+    /// attribute values + `IrDefinition` JSON serialisation.
+    #[must_use]
+    pub const fn as_attr_str(self) -> &'static str {
+        match self {
+            Self::Js => "js",
+            Self::Python => "python",
+        }
+    }
+
+    /// Parse a `lang="…"` attribute value. Returns `None` for
+    /// unrecognised values; the parser turns that into a `Parse`
+    /// error pointing at the definition block's source loc.
+    #[must_use]
+    pub fn from_attr_str(value: &str) -> Option<Self> {
+        match value {
+            "js" | "javascript" | "ts" | "typescript" => Some(Self::Js),
+            "python" | "py" => Some(Self::Python),
+            _ => None,
+        }
+    }
+}
+
+/// Ordered map of attribute key → JSON value (string / bool / number /
+/// array / object / null). `serde_json::Map` preserves insertion order
+/// (matches TS `Record<string, unknown>` iteration order).
+pub type AttrMap = serde_json::Map<String, JsonValue>;
+
+impl GraphDecl {
+    /// Walk the graph's children depth-first, yielding each `NodeDecl`
+    /// with its parent path (insertion order). Useful when downstream
+    /// IR builders need a flat traversal.
+    pub fn walk_nodes<'a>(&'a self) -> impl Iterator<Item = WalkedNode<'a>> + 'a {
+        let mut stack: Vec<(usize, Vec<&'a str>, &'a [GrxNode])> = vec![(0, Vec::new(), &self.children)];
+        std::iter::from_fn(move || loop {
+            let (depth, path, slice) = stack.last_mut()?;
+            if let Some((first, rest)) = slice.split_first() {
+                *slice = rest;
+                if let GrxNode::Node(n) = first {
+                    let full_path: Vec<&'a str> = {
+                        let mut p = path.clone();
+                        p.push(n.id.as_str());
+                        p
+                    };
+                    let walked = WalkedNode {
+                        node: n,
+                        depth: *depth,
+                        parent_path: full_path.clone(),
+                    };
+                    let new_depth = *depth + 1;
+                    stack.push((new_depth, full_path, &n.children));
+                    return Some(walked);
+                }
+            } else {
+                stack.pop();
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WalkedNode<'a> {
+    pub node: &'a NodeDecl,
+    pub depth: usize,
+    pub parent_path: Vec<&'a str>,
+}

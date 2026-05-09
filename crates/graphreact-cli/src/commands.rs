@@ -1,0 +1,1724 @@
+//! Subcommand handlers. Take parsed CLI args, return either output
+//! text or an exit code.
+
+use std::fmt::Write;
+use std::path::Path;
+
+use thiserror::Error;
+
+use graphreact_grx_parser::{
+    ir::{build_ir, ir_to_json, parse_to_ir},
+    multi_file::resolve_multi_file,
+    Parser,
+};
+
+use graphreact_engine_zig::Engine;
+
+use crate::cli::{Cli, InitTemplate, RuntimeArg};
+use crate::engine_select::{select, EngineKind};
+use crate::fmt::format_file;
+use crate::runtime::{dry_mount, RuntimeError};
+
+#[derive(Debug, Error)]
+pub enum CommandError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("parser error: {0}")]
+    Parser(#[from] graphreact_grx_parser::GrxParseError),
+    #[error("engine error: {0}")]
+    Engine(#[from] graphreact_engine_zig::EngineError),
+    #[error("runtime error: {0}")]
+    Runtime(#[from] RuntimeError),
+    #[error("engine selection error: {0}")]
+    EngineSelect(#[from] crate::engine_select::EngineSelectError),
+    #[error("serde_json error: {0}")]
+    Json(#[from] serde_json::Error),
+    /// `grx cluster …` error path. Surfaces handshake / cookie / TLS
+    /// / dial / configuration failures from `graphreact_dist`.
+    #[error("cluster error: {0}")]
+    Cluster(#[from] graphreact_dist::DistError),
+    /// User-supplied CLI argument that didn't validate (peer string
+    /// without `@`, malformed addr, etc.).
+    #[error("cluster argument error: {0}")]
+    ClusterArg(String),
+}
+
+pub type CommandResult<T> = Result<T, CommandError>;
+
+/// `grx parse` — print the AST or IR.
+pub fn run_parse(path: &Path, json: bool, ast: bool) -> CommandResult<String> {
+    let source = std::fs::read_to_string(path)?;
+    if ast {
+        let file = Parser::parse_file(&source)?;
+        if json {
+            let value = serde_json::to_value(serde_json::json!({
+                "imports": file.imports.iter().map(|i| serde_json::json!({
+                    "src": i.src,
+                    "loc": { "line": i.loc.line, "column": i.loc.column },
+                })).collect::<Vec<_>>(),
+                "graph": file.graph.as_ref().map(|g| serde_json::json!({
+                    "id": g.id,
+                    "loc": { "line": g.loc.line, "column": g.loc.column },
+                    "n_children": g.children.len(),
+                })),
+                "definitions": file.definitions.iter().map(|d| serde_json::json!({
+                    "component": d.component,
+                    "loc": { "line": d.loc.line, "column": d.loc.column },
+                    "code_len": d.code.len(),
+                })).collect::<Vec<_>>(),
+            }))?;
+            Ok(serde_json::to_string_pretty(&value)?)
+        } else {
+            Ok(summarise_ast(&file))
+        }
+    } else {
+        let ir = parse_to_ir(&source)?;
+        if json {
+            Ok(serde_json::to_string_pretty(&ir_to_json(&ir))?)
+        } else {
+            Ok(summarise_ir(&ir))
+        }
+    }
+}
+
+/// `grx check` — parse + import-resolve, error if any step fails.
+pub fn run_check(path: &Path) -> CommandResult<String> {
+    // resolve_multi_file does parser + import walk in one shot.
+    let resolved = resolve_multi_file(path)?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "✓ {} parsed cleanly",
+        resolved.root_path.display()
+    );
+    if !resolved.imports.is_empty() {
+        let _ = writeln!(out, "  resolved {} imports:", resolved.imports.len());
+        for imp in &resolved.imports {
+            let _ = writeln!(out, "    • {}", imp.path.display());
+        }
+    }
+    if let Some(g) = &resolved.root.graph {
+        let n_children = g.children.len();
+        let _ = writeln!(
+            out,
+            "  graph `{}` declared at line {} with {n_children} top-level children",
+            g.id, g.loc.line
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  no <Graph> block (definition-only file — fine for libraries)"
+        );
+    }
+    Ok(out)
+}
+
+/// `grx fmt` — pretty-print canonically.
+pub fn run_fmt(path: &Path, check_only: bool) -> CommandResult<FmtOutcome> {
+    let source = std::fs::read_to_string(path)?;
+    let file = Parser::parse_file(&source)?;
+    let formatted = format_file(&file);
+    if formatted == source {
+        return Ok(FmtOutcome::AlreadyFormatted);
+    }
+    if check_only {
+        Ok(FmtOutcome::WouldChange { formatted })
+    } else {
+        std::fs::write(path, &formatted)?;
+        Ok(FmtOutcome::Wrote { formatted })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum FmtOutcome {
+    AlreadyFormatted,
+    WouldChange { formatted: String },
+    Wrote { formatted: String },
+}
+
+/// `grx completions <shell>` — print shell completion script to stdout.
+pub fn run_completions(shell: clap_complete::Shell) -> CommandResult<String> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let mut buf: Vec<u8> = Vec::new();
+    clap_complete::generate(shell, &mut cmd, "grx", &mut buf);
+    Ok(String::from_utf8(buf).expect("clap_complete writes valid UTF-8"))
+}
+
+/// `grx init <path>` — scaffold a new `.grx` project from a template.
+pub fn run_init(path: &Path, template: InitTemplate) -> CommandResult<String> {
+    if path.exists() {
+        return Err(CommandError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("path `{}` already exists; refusing to overwrite", path.display()),
+        )));
+    }
+    std::fs::create_dir_all(path)?;
+    let (filename, contents) = render_template(template);
+    std::fs::write(path.join(filename), contents)?;
+    std::fs::write(path.join("README.md"), render_readme(template, path))?;
+    let mut out = String::new();
+    let _ = writeln!(out, "scaffolded `{}` from `{template:?}` template", path.display());
+    let _ = writeln!(out, "  • {}", filename);
+    let _ = writeln!(out, "  • README.md");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "next steps:");
+    let _ = writeln!(out, "  cd {}", path.display());
+    let _ = writeln!(out, "  grx check {}", filename);
+    let _ = writeln!(out, "  grx run {}                   # null engine (topology dry-run)", filename);
+    let _ = writeln!(out, "  grx run {} --runtime jsc     # once M12.3 lands", filename);
+    Ok(out)
+}
+
+const HELLO_TEMPLATE: &str = r#"<Graph id="hello">
+  <NodeType id="Greeter" component="Greeter" />
+</Graph>
+
+<Greeter>
+  // Component body. Real engine (JSC, M12.3) will execute this.
+  return {
+    accepts: ["*"],
+    emits: ["*"],
+    init: () => { /* TODO */ },
+  };
+</Greeter>
+"#;
+
+const PINGPONG_TEMPLATE: &str = r#"<Graph id="ping-pong">
+  <NodeType id="A" component="Pinger" />
+  <NodeType id="B" component="Ponger" />
+  <edge source="A" target="B" />
+  <edge source="B" target="A" />
+</Graph>
+
+<Pinger>
+  return {
+    accepts: ["pong"],
+    emits: ["ping"],
+    init: () => { /* TODO: send first ping on mount */ },
+  };
+</Pinger>
+
+<Ponger>
+  return {
+    accepts: ["ping"],
+    emits: ["pong"],
+    init: () => { /* TODO */ },
+  };
+</Ponger>
+"#;
+
+fn render_template(template: InitTemplate) -> (&'static str, &'static str) {
+    match template {
+        InitTemplate::Hello => ("hello.grx", HELLO_TEMPLATE),
+        InitTemplate::PingPong => ("ping-pong.grx", PINGPONG_TEMPLATE),
+    }
+}
+
+fn render_readme(template: InitTemplate, path: &Path) -> String {
+    let (filename, _) = render_template(template);
+    let project = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project");
+    format!(
+        "# {project}\n\n\
+         A GraphReact `.grx` project scaffolded from the `{template:?}` template.\n\n\
+         ## Run\n\n\
+         ```\n\
+         grx check {filename}\n\
+         grx run {filename}\n\
+         ```\n\n\
+         The null engine mounts the topology without executing component bodies. \
+         Once M12.3 (JSC engine) ships, run `grx run {filename} --runtime jsc` for end-to-end execution.\n"
+    )
+}
+
+/// Render a parser error with an inline source-snippet pointing at the
+/// failing line/column. Used by the binary's top-level error handler.
+/// Falls back to the plain error message when the error has no source
+/// location, or when reading the source fails.
+#[must_use]
+pub fn format_parse_error(err: &graphreact_grx_parser::GrxParseError, path: &Path) -> String {
+    let header = format!("error: {}\n  --> {}", err, path.display());
+    let Some(loc) = err.source_loc() else {
+        return header;
+    };
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return header;
+    };
+    let Some(line_text) = source.lines().nth(loc.line.saturating_sub(1)) else {
+        return header;
+    };
+    let line_num = loc.line.to_string();
+    let gutter_width = line_num.len();
+    let caret_offset = loc.column.saturating_sub(1);
+    let caret_indent = " ".repeat(caret_offset);
+    format!(
+        "{header}\n   {empty_gutter} |\n   {line_num} | {line_text}\n   {empty_gutter} | {caret_indent}^",
+        empty_gutter = " ".repeat(gutter_width),
+    )
+}
+
+/// `grx version` — engine + parser + CLI.
+pub fn run_version() -> CommandResult<String> {
+    let null_engine = graphreact_engine_null::NullEngine::new();
+    let echo_engine = graphreact_engine_echo::EchoEngine::new();
+    let jsc_line = jsc_version_line();
+    let cpython_line = cpython_version_line();
+    Ok(format!(
+        "grx {cli}\n\
+         parser  {parser}\n\
+         engine-trait  {engine_trait}\n\
+         engine-null   {engine_null}\n\
+         engine-echo   {engine_echo}\n\
+         {jsc_line}\n\
+         {cpython_line}\n",
+        cli = env!("CARGO_PKG_VERSION"),
+        parser = env!("CARGO_PKG_VERSION"),
+        engine_trait = env!("CARGO_PKG_VERSION"),
+        engine_null = null_engine.engine_version(),
+        engine_echo = echo_engine.engine_version(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn cpython_version_line() -> String {
+    // Hard-code the version string for the same reason as
+    // `jsc_version_line`: Python is process-singleton and we don't
+    // want `grx version` to drag the main interpreter up.
+    "engine-cpython cpython-0.1.0-m13-phase3h (Python is resolved at build time \
+     via pkg-config — `python-3.X-embed` or `python-3.Xt-embed`, newest wins; \
+     GRAPHREACT_PYTHON_VERSION / GRAPHREACT_PYTHON_PKGCONFIG env-var overrides \
+     supported; build floor is Python 3.12 (PEP 684 per-interpreter GIL). \
+     M13-phase3h: PEP 703 free-threaded build linkage. When the \
+     resolved Python is a free-threaded build (`python3.Xt` — detected via the \
+     trailing `t` in pkg-config name or libname) the build script emits \
+     --cfg python_free_threaded + cargo:python-free-threaded=1, xtask zig-build \
+     passes -Dpython_free_threaded=true to `zig build`, and the engine version \
+     string gains a ` free-threaded` annotation at init time. **No runtime \
+     path changes** — PEP 703 removes the GIL but doesn't change any C-API \
+     entry point we use; concurrent isolate execution requires Zig-side state \
+     locking which is a separable refactor. The cfg flag flows through to the \
+     Rust runtime layer so future code paths that DO want per-isolate \
+     parallelism can branch on it. New #[cfg(python_free_threaded)] runtime \
+     probe verifies sys._is_gil_enabled() == False (catches distribution bugs \
+     where pkg-config auto-resolved a regular Python). 3h footgun: PEP 703 \
+     builds inline _Py_atomic_* helpers into Py_DECREF / PyList_Check / \
+     PyList_Size macros; Zig translate-c can't inline them and the symbols \
+     aren't exported. All c.Py_DECREF swapped to c.Py_DecRef (function form); \
+     PyList_Check / PyList_Size elided (PyList_AsTuple errors cleanly on \
+     non-lists). M13-phase3f unchanged: PEP 684 per-interpreter GIL on Python \
+     3.12+. M13-phase3g unchanged: useEffectAsync via asyncio bridge. \
+     M13-followon-D analogue unchanged: per-node __hostCallbacks token GC. \
+     CPython is per-minor-version-and-ABI ABI-locked, so distribution is \
+     per-minor + per-ABI slices (grx-py-3.12 / 3.13 / 3.14 / 3.14t — same shape \
+     as numpy wheels). **M13 phase 3 series CLOSED — every M13 sub-phase \
+     shipped (10/10 phase 3 + 4/4 outstanding-work plan).**)"
+        .to_string()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cpython_version_line() -> String {
+    "engine-cpython not-linked (M13-phase3f's build.rs supports Linux + Windows \
+     via pkg-config python-3.X-embed; per-OS artifact production is a parallel \
+     CI track, not blocked on M13-phase3h).".to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn jsc_version_line() -> String {
+    // Hard-code the version string. Querying the Zig side requires
+    // initialising JSC, which is process-global and serialises poorly
+    // when `grx version` runs alongside other JSC-touching code paths
+    // (notably the integration tests). Keep version reporting cheap
+    // and stateless.
+    "engine-jsc    jsc-0.1.0 (M12.3b-phase1.5: drain_microtasks REAL on macOS via extern-C C++ shim against the system framework's exported _ZN3JSC2VM15drainMicrotasksEv symbol; JSContextRef→JSC::VM* via JSContextGetGroup + APICast.h-style reinterpret_cast. drain wired into JsRuntime::process_batch_async (post-batch defensive drain) + host_effect_async's await loop (select! periodic drain). 3 acceptance tests added: callable-without-panic, multi-microtask-chain, deferred-host-resolve genuine-async. Validates variant-(b) symbol-shim approach BEFORE phase2-5 commit multi-session effort to vendored WebKit. Phase1's JS Promise → Rust Future bridge carries forward unchanged. M12.3a-followon series previously closed (A+B+C+D+E+F all shipped 2026-05-02). Outstanding M12.3b: phase2 (xtask webkit-clone/build), phase3 (linux/windows binaries), phase4 (vendored-WebKit drainMicrotasks shim — Linux/Windows path), phase5 (CI matrix).)"
+        .to_string()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn jsc_version_line() -> String {
+    "engine-jsc    not-linked (M12.3b: vendored WebKit for non-macOS)".to_string()
+}
+
+#[cfg(test)]
+mod debug_validation_tests {
+    use super::*;
+    use crate::debug::{DebugEngine, DebugFlag};
+
+    #[test]
+    fn none_passes_through() {
+        let r = validate_debug_against_runtime(None, RuntimeArg::Null).unwrap();
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn cpython_match_accepts() {
+        let d = DebugFlag {
+            engine: DebugEngine::Cpython,
+            port: 5678,
+        };
+        let r = validate_debug_against_runtime(Some(d), RuntimeArg::Cpython).unwrap();
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn cpython_with_null_runtime_rejected() {
+        let d = DebugFlag {
+            engine: DebugEngine::Cpython,
+            port: 5678,
+        };
+        let err = validate_debug_against_runtime(Some(d), RuntimeArg::Null).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--debug requires"),
+            "expected runtime-required error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn cpython_with_jsc_runtime_rejected() {
+        let d = DebugFlag {
+            engine: DebugEngine::Cpython,
+            port: 5678,
+        };
+        let err = validate_debug_against_runtime(Some(d), RuntimeArg::Jsc).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--runtime cpython"),
+            "expected mismatch error, got: {msg}"
+        );
+    }
+
+    /// **M16-Backend P9 SHIPPED 2026-05-08.** JSC + `--debug=jsc:<port>`
+    /// validates clean — install path is the JSC RemoteInspector via
+    /// the Zig bridge, lockdownd-discovered by Safari Web Inspector.
+    /// Replaces the P8-era `jsc_request_rejected_until_p9` test.
+    #[test]
+    fn jsc_match_accepts() {
+        let d = DebugFlag {
+            engine: DebugEngine::Jsc,
+            port: 9229,
+        };
+        let r = validate_debug_against_runtime(Some(d), RuntimeArg::Jsc).unwrap();
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn jsc_with_cpython_runtime_rejected() {
+        let d = DebugFlag {
+            engine: DebugEngine::Jsc,
+            port: 9229,
+        };
+        let err = validate_debug_against_runtime(Some(d), RuntimeArg::Cpython).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--runtime jsc"),
+            "expected mismatch error naming jsc, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn jsc_with_null_runtime_rejected() {
+        let d = DebugFlag {
+            engine: DebugEngine::Jsc,
+            port: 9229,
+        };
+        let err = validate_debug_against_runtime(Some(d), RuntimeArg::Null).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--debug requires"),
+            "expected runtime-required error, got: {msg}"
+        );
+    }
+}
+
+/// **M16-Backend P8.** Reject `--debug=<engine>` that doesn't match
+/// `--runtime`. Surfacing the mismatch at dispatch time means the
+/// engine isn't initialised twice and the operator sees the error
+/// immediately instead of finding it in the body's traceback. Also
+/// rejects JSC requests until P9 lands.
+pub fn validate_debug_against_runtime(
+    debug: Option<crate::debug::DebugFlag>,
+    runtime: RuntimeArg,
+) -> Result<Option<crate::debug::DebugFlag>, CommandError> {
+    use crate::debug::DebugEngine;
+
+    let Some(d) = debug else {
+        return Ok(None);
+    };
+    let want_engine = match d.engine {
+        DebugEngine::Cpython => "cpython",
+        DebugEngine::Jsc => "jsc",
+    };
+    let runtime_str = match runtime {
+        RuntimeArg::Cpython => "cpython",
+        RuntimeArg::Jsc => "jsc",
+        other => {
+            return Err(CommandError::ClusterArg(format!(
+                "--debug requires `--runtime cpython` or `--runtime jsc`; got `{other}`"
+            )));
+        }
+    };
+    if want_engine != runtime_str {
+        return Err(CommandError::ClusterArg(format!(
+            "--debug=<{want_engine}> requires `--runtime {want_engine}`; got `--runtime {runtime_str}`"
+        )));
+    }
+    Ok(Some(d))
+}
+
+/// `grx run --watch` — drives the M15 hot-reload pipeline. Returns
+/// only on SIGINT or fatal error; this is the long-running variant of
+/// `grx run`. Engine-restricted to JSC plus CPython (the null plus
+/// echo engines have no body to swap).
+///
+/// **M16-Backend P8.** `debug` (when `Some`) carries a per-body
+/// source-debug listener spec; `debug_wait` toggles the
+/// `wait_for_client` block. The watch loop installs the debug
+/// listener after the first mount; subsequent reload cycles preserve
+/// the same listener (it lives on the same Python process).
+pub fn run_run_watch(
+    path: &Path,
+    runtime: RuntimeArg,
+    debug: Option<crate::debug::DebugFlag>,
+    debug_wait: bool,
+) -> CommandResult<()> {
+    crate::watch_mode::run_watch_blocking(path.to_path_buf(), runtime, debug, debug_wait)
+}
+
+/// **M15 Phase 9.** `grx reload <path>` — stub. Remote-daemon reload
+/// requires M16-Backend's management API. Today this prints a
+/// redirect message and returns an error so scripts fail loudly
+/// rather than silently no-op.
+pub fn run_reload(path: &Path) -> CommandResult<String> {
+    Err(CommandError::Io(std::io::Error::other(format!(
+        "`grx reload {}` requires a running daemon plus the management API \
+         (M16-Backend) which has not shipped yet. For in-process auto-reload \
+         use `grx run --watch {}` — same hot-reload pipeline, runs against \
+         the daemon you start in the same process.",
+        path.display(),
+        path.display(),
+    ))))
+}
+
+/// `grx run` — parse + mount onto the selected engine.
+///
+/// **M16-Backend P8.** `debug` (when `Some`) installs a per-body
+/// source-debug listener after the engine mounts. `debug_wait`
+/// toggles `debugpy.wait_for_client()` (default: block until the
+/// IDE attaches so breakpoints in `def init(ctx)` actually fire).
+pub fn run_run(
+    path: &Path,
+    runtime: RuntimeArg,
+    debug: Option<crate::debug::DebugFlag>,
+    debug_wait: bool,
+) -> CommandResult<String> {
+    let kind = EngineKind::from(runtime);
+    let report = match kind {
+        // Phase 3b: JSC uses `mount_with_scheduler` — each component
+        // body is a re-callable function attached to a graphreact-core
+        // Scheduler; one process_batch round runs all initial mounts
+        // (state preservation working via the signal registry).
+        #[cfg(target_os = "macos")]
+        EngineKind::Jsc => {
+            // **M14.8.x-followon (Phase G).** Drive the JSC mount
+            // + first batch via `process_batch_async` so
+            // `useEffectAsync` effects fire under `grx run`.
+            // `JsRuntime` is `!Send` (Rc<RefCell<JscEngine>>) so
+            // it must run on a `tokio::task::LocalSet`. The
+            // binary's outer multi-thread runtime forbids
+            // nested `block_on`, so we hop to an OS thread,
+            // build a current_thread runtime + LocalSet there,
+            // and block on it. This is the same shape used by
+            // the existing async tests in jsruntime.rs.
+            //
+            // **M16-Backend P9.** When `--debug=jsc:<port>` is
+            // set, install the JSC RemoteInspector listener
+            // BEFORE the first batch so Safari Web Inspector
+            // can attach + breakpoints inside `def init` bodies
+            // hit on first render. JSC has no wait-for-client
+            // semantic (lockdownd discovery is silent), so
+            // `--debug-no-wait` is a no-op for JSC; documented in
+            // m16-debug-jsc.md.
+            let path_buf = path.to_path_buf();
+            let debug_install = debug;
+            let _ = debug_wait; // no wait-for-client on JSC lockdownd
+            let report =
+                std::thread::spawn(move || -> Result<crate::runtime::DryMountReport, CommandError> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| {
+                            CommandError::Io(std::io::Error::other(format!(
+                                "build current_thread runtime: {e}"
+                            )))
+                        })?;
+                    let local = tokio::task::LocalSet::new();
+                    local.block_on(&rt, async move {
+                        let mut runtime = crate::jsruntime::mount_with_scheduler(&path_buf)?;
+                        if let Some(d) = debug_install {
+                            let mut engine = runtime.engine.borrow_mut();
+                            crate::debug::jsc_inspector::install_jsc_inspector(
+                                &mut engine,
+                                runtime.iso,
+                                d.port,
+                            )
+                            .map_err(|e| {
+                                CommandError::ClusterArg(format!(
+                                    "debug install failed: {e}"
+                                ))
+                            })?;
+                        }
+                        runtime
+                            .process_batch_async()
+                            .await
+                            .map_err(crate::runtime::RuntimeError::from)?;
+                        let report = crate::runtime::DryMountReport {
+                            engine_name: "jsc".to_string(),
+                            engine_version: runtime.engine.borrow().engine_version(),
+                            graph_id: runtime.graph_id.clone(),
+                            n_nodes: runtime.n_nodes,
+                            n_edges: runtime.n_edges,
+                            n_definitions: runtime.n_definitions,
+                            mounted_components: runtime.mounted.clone(),
+                        };
+                        let _ = runtime.shutdown();
+                        Ok::<_, CommandError>(report)
+                    })
+                })
+                .join()
+                .map_err(|_| {
+                    CommandError::Io(std::io::Error::other(
+                        "jsc localset thread panicked",
+                    ))
+                })??;
+            report
+        }
+        // CPython arm. Files with `lang="python"` definitions route
+        // through `pyruntime::mount_python_definitions` (which now
+        // routes through `mount_with_scheduler` under the hood —
+        // M13-phase3b+ shipped real hooks + scheduler integration;
+        // M13-phase3c shipped use_emit + use_message). Files with no
+        // Python definitions fall back to the predecessor smoke-module
+        // path so existing JSC-only fixtures continue to print a
+        // trailer (no regression on `grx run --runtime=cpython
+        // <jsc-fixture.grx>`).
+        #[cfg(target_os = "macos")]
+        EngineKind::Cpython => {
+            // M13-phase3a: route .grx files with `lang="python"`
+            // definitions through `pyruntime::mount_python_definitions`
+            // — first time grx --runtime=cpython actually mounts an
+            // author-written Python body. Files with no Python
+            // definitions fall back to the predecessor smoke-module
+            // path so existing JSC-only fixtures still produce the
+            // engine trailer (no `--runtime=cpython` regression).
+            let resolved = graphreact_grx_parser::multi_file::resolve_multi_file(path)?;
+            let has_python_def = resolved
+                .root
+                .definitions
+                .iter()
+                .chain(resolved.imports.iter().flat_map(|i| i.file.definitions.iter()))
+                .any(|d| d.lang == graphreact_grx_parser::ast::ComponentLang::Python);
+
+            if has_python_def {
+                // **M14.8.x-followon (Phase G).** Same shape as
+                // the JSC arm: drive `process_batch_async` on a
+                // current_thread runtime + LocalSet hosted on
+                // an OS thread (PyRuntime is `!Send` for the
+                // same reasons JsRuntime is). `useEffectAsync`
+                // / Python asyncio coroutines now fire under
+                // `grx run --runtime cpython`.
+                let path_buf = path.to_path_buf();
+                let debug_install = debug;
+                std::thread::spawn(
+                    move || -> Result<crate::runtime::DryMountReport, CommandError> {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| {
+                                CommandError::Io(std::io::Error::other(format!(
+                                    "build current_thread runtime: {e}"
+                                )))
+                            })?;
+                        let local = tokio::task::LocalSet::new();
+                        local.block_on(&rt, async move {
+                            // **M16-Backend P8.** When `--debug` is
+                            // set we use `mount_with_scheduler`
+                            // (which doesn't run any body) so
+                            // debugpy lands BEFORE the first batch
+                            // — required for `def init(ctx)`
+                            // breakpoints to hit on first mount.
+                            // Without `--debug` the historical
+                            // `mount_python_definitions` path
+                            // (mount + sync first batch) stays.
+                            let mut runtime = if debug_install.is_some() {
+                                crate::pyruntime::mount_with_scheduler(&path_buf)?
+                            } else {
+                                crate::pyruntime::mount_python_definitions(&path_buf)?
+                            };
+                            if let Some(d) = debug_install {
+                                {
+                                    let mut engine = runtime.engine.borrow_mut();
+                                    crate::debug::cpython_debugpy::install_debugpy(
+                                        &mut engine,
+                                        runtime.iso,
+                                        d.port,
+                                        debug_wait,
+                                    )
+                                    .map_err(|e| {
+                                        CommandError::ClusterArg(format!(
+                                            "debug install failed: {e}"
+                                        ))
+                                    })?;
+                                }
+                            }
+                            runtime
+                                .process_batch_async()
+                                .await
+                                .map_err(crate::runtime::RuntimeError::from)?;
+                            let report = crate::runtime::DryMountReport {
+                                engine_name: "cpython".to_string(),
+                                engine_version: runtime.engine.borrow().engine_version(),
+                                graph_id: runtime.graph_id.clone(),
+                                n_nodes: runtime.n_nodes,
+                                n_edges: runtime.n_edges,
+                                n_definitions: runtime.n_definitions,
+                                mounted_components: runtime.mounted.clone(),
+                            };
+                            let _ = runtime.shutdown();
+                            Ok::<_, CommandError>(report)
+                        })
+                    },
+                )
+                .join()
+                .map_err(|_| {
+                    CommandError::Io(std::io::Error::other(
+                        "cpython localset thread panicked",
+                    ))
+                })??
+            } else {
+                // Pre-phase-3a smoke fallback. Lets `grx run --runtime=cpython
+                // <jsc-fixture.grx>` continue to print the engine
+                // trailer without erroring; useful for ops to verify
+                // the Python framework is linked + the engine spins up
+                // even when the fixture has no Python bodies.
+                let mut engine = select(kind)?;
+                let graph_block_opt = resolved.root.graph.clone();
+                let graph_id = graph_block_opt
+                    .as_ref()
+                    .map(|g| g.id.clone())
+                    .unwrap_or_else(|| "<no graph>".to_string());
+                let (n_nodes, n_edges) = if let Some(g) = graph_block_opt {
+                    let ir = graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
+                        imports: resolved.root.imports.clone(),
+                        graph: Some(g),
+                        definitions: resolved.root.definitions.clone(),
+                    });
+                    (ir.nodes.len(), ir.edges.len())
+                } else {
+                    (0, 0)
+                };
+                let n_definitions = resolved.root.definitions.len()
+                    + resolved
+                        .imports
+                        .iter()
+                        .map(|i| i.file.definitions.len())
+                        .sum::<usize>();
+
+                engine.initialize().map_err(crate::runtime::RuntimeError::from)?;
+                let iso = engine
+                    .create_isolate(graphreact_engine_zig::IsolateOptions::default())
+                    .map_err(crate::runtime::RuntimeError::from)?;
+                let module = engine
+                    .eval_module(
+                        iso,
+                        "grx_run_smoke",
+                        "def smoke():\n    return {'name': 'cpython-online', 'graph': '__GRAPH__'}\n",
+                    )
+                    .map_err(crate::runtime::RuntimeError::from)?;
+                let smoke = engine
+                    .resolve_function(iso, module, "smoke")
+                    .map_err(crate::runtime::RuntimeError::from)?;
+                let result = engine
+                    .call_function(iso, smoke, &[])
+                    .map_err(crate::runtime::RuntimeError::from)?;
+                let smoke_repr = format!("{result:?}");
+                let report = crate::runtime::DryMountReport {
+                    engine_name: "cpython".to_string(),
+                    engine_version: engine.engine_version(),
+                    graph_id,
+                    n_nodes,
+                    n_edges,
+                    n_definitions,
+                    mounted_components: vec![format!("[smoke] {smoke_repr}")],
+                };
+                let _ = engine.dispose_isolate(iso);
+                let _ = engine.shutdown();
+                report
+            }
+        }
+        // Null + echo continue using the legacy IIFE-based
+        // `eval_module` path. They do no real evaluation anyway —
+        // their value is exercising the trait surface, not running
+        // hooks. Phase 3 hook semantics live exclusively on JSC.
+        _ => {
+            let mut engine = select(kind)?;
+            dry_mount(path, engine.as_mut())?
+        }
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "running `{}` on engine `{}` ({})",
+        path.display(),
+        report.engine_name,
+        report.engine_version,
+    );
+    let _ = writeln!(
+        out,
+        "  graph `{}`: {} nodes, {} edges, {} definitions",
+        report.graph_id, report.n_nodes, report.n_edges, report.n_definitions
+    );
+    if !report.mounted_components.is_empty() {
+        let _ = writeln!(
+            out,
+            "  mounted {} components: {}",
+            report.mounted_components.len(),
+            report.mounted_components.join(", ")
+        );
+    }
+    if report.engine_name == "null" {
+        let _ = writeln!(
+            out,
+            "\n(null engine: components were not actually executed. \
+             Use --runtime=jsc on macOS for the M12.3a JSC engine — \
+             real eval/resolve/call + bidirectional callbacks ship in M12.3a-phase2.5; \
+             real hook semantics land in M12.3a-phase3.)"
+        );
+    } else if report.engine_name == "cpython" {
+        let _ = writeln!(
+            out,
+            "\n(cpython engine, M13-phase3h: PEP 703 free-threaded build linkage. \
+             Build-time selector probes pkg-config for `python-3.X-embed` or \
+             `python-3.Xt-embed` (newest wins; GRAPHREACT_PYTHON_VERSION / \
+             GRAPHREACT_PYTHON_PKGCONFIG env-var overrides). Build floor is \
+             Python 3.12 (PEP 684 per-interpreter GIL). When a free- \
+             threaded build is detected (trailing `t` in pkg-config name or \
+             libname `python3.Xt`) the build script emits --cfg \
+             python_free_threaded + cargo:python-free-threaded=1, xtask \
+             zig-build passes -Dpython_free_threaded=true to `zig build`, and \
+             the engine version string gains a ` free-threaded` annotation at \
+             init time. **No runtime path changes for 3h** — PEP 703 removes \
+             the GIL but doesn't change any C-API entry point we use \
+             (Py_InitializeEx, PyThreadState_Swap, Py_NewInterpreterFromConfig, \
+             PyRun_String, PyObject_*). Concurrent isolate execution requires \
+             Zig-side state locking around state.* mutations + per-isolate \
+             modules/functions list mutations — separable refactor, out of \
+             scope for 3h's build-flag framing. The python_free_threaded cfg \
+             flag flows through to the Rust runtime layer so future code paths \
+             that DO want per-isolate parallelism can branch on it without \
+             another build-system pass. New #[cfg(python_free_threaded)] \
+             runtime probe verifies sys._is_gil_enabled() == False — catches \
+             distribution bugs where pkg-config auto-resolved a regular Python \
+             despite operator intent. 3h footgun: PEP 703 builds inline \
+             _Py_atomic_* helpers into Py_DECREF (split-refcount) AND the \
+             PyList_Check / PyList_Size macros (atomic type-cache reads); Zig's \
+             translate-c can't inline them and the helpers aren't exported \
+             symbols. All c.Py_DECREF swapped to c.Py_DecRef (function form, \
+             exported symbol since 3.0); PyList_Check / PyList_Size elided \
+             (defensive checks — PyList_AsTuple errors cleanly on non-lists). \
+             Same fix shape as M13-phase3f's Py_INCREF → Py_IncRef swap. \
+             M13-phase3f unchanged: PEP 684 per-interpreter GIL on Python 3.12+ \
+             (Py_NewInterpreterFromConfig with gil = OWN_GIL; real Py_FinalizeEx \
+             on shutdown). M13-phase3g unchanged: useEffectAsync via asyncio \
+             bridge (manual coroutine trampoline). M13-followon-D analogue \
+             unchanged: per-node __hostCallbacks token GC on unmount. M13 phase \
+             3 closed at 3e-γ. PyRuntime::mount_with_scheduler binds Python \
+             bodies to a graphreact-core Scheduler. Author convention: \
+             `body(ctx)` (preferred) or `init(ctx)` (phase 3a back-compat). \
+             Distribution = per-minor + per-ABI slices (grx-py-3.12 / 3.13 / \
+             3.14 / 3.14t), same shape as numpy wheels. **M13 closes here — \
+             every M13 sub-phase shipped.**)"
+        );
+    } else if report.engine_name == "jsc" {
+        let _ = writeln!(
+            out,
+            "\n(jsc engine, M12.3b-phase1.5: drain_microtasks REAL on macOS \
+             via extern-C C++ shim that resolves the system framework's \
+             exported _ZN3JSC2VM15drainMicrotasksEv symbol \
+             (JSC::VM::drainMicrotasks). JSContextRef → JSC::VM* derived \
+             via JSContextGetGroup + an APICast.h-style reinterpret_cast \
+             (no vendored headers). drain wired into \
+             JsRuntime::process_batch_async (defensive post-batch drain) \
+             + host_effect_async's await loop (select! periodic drain — \
+             genuine-async I/O via deferred host resolution settles \
+             without phase4). Validates variant-(b) symbol-shim approach \
+             before phase2-5 commit to vendored WebKit. Phase1's \
+             useEffectAsync JS Promise → Rust Future bridge carries \
+             forward; phase1.5 makes the manual-drain capability real. \
+             `grx run` still on sync path (CLI activation deferred — \
+             same as phase1). All previous surface carries forward: \
+             Tier 1 (live wiring) + Tier 2 (followon-E policy-derived \
+             reachability) + Tier 3 (followon-F negotiation-aware \
+             planning) + 20 hooks real on JSC + all 4 source kinds + \
+             edge-accept-predicate-vetoed AcceptEdge. M12.3a-followon \
+             series previously CLOSED. Outstanding M12.3b: phase2-5 \
+             (vendored WebKit + cross-platform binaries + Linux/Windows \
+             drainMicrotasks shim + CI matrix).)"
+        );
+    }
+    Ok(out)
+}
+
+fn summarise_ir(ir: &graphreact_grx_parser::GrxIr) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "graph: {}", ir.graph_id);
+    if !ir.imports.is_empty() {
+        let _ = writeln!(out, "imports ({}):", ir.imports.len());
+        for i in &ir.imports {
+            let _ = writeln!(out, "  • {i}");
+        }
+    }
+    let _ = writeln!(out, "nodes ({}):", ir.nodes.len());
+    for n in &ir.nodes {
+        let _ = writeln!(
+            out,
+            "  - {} <{}> at {}:{}, depth={}, parent={}",
+            n.id,
+            n.component,
+            n.source_loc.line,
+            n.source_loc.column,
+            n.depth,
+            if n.parent_path.len() > 1 {
+                n.parent_path[n.parent_path.len() - 2].as_str()
+            } else {
+                "<root>"
+            }
+        );
+    }
+    let _ = writeln!(out, "edges ({}):", ir.edges.len());
+    for e in &ir.edges {
+        let _ = writeln!(
+            out,
+            "  - {} → {} ({:?}) at {}:{}",
+            e.source, e.target, e.kind, e.source_loc.line, e.source_loc.column
+        );
+    }
+    if !ir.definitions.is_empty() {
+        let _ = writeln!(out, "definitions ({}):", ir.definitions.len());
+        for d in &ir.definitions {
+            let _ = writeln!(out, "  • {} ({} bytes)", d.component, d.code.len());
+        }
+    }
+    out
+}
+
+fn summarise_ast(file: &graphreact_grx_parser::GrxFile) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "ast:");
+    let _ = writeln!(out, "  imports: {}", file.imports.len());
+    let _ = writeln!(out, "  definitions: {}", file.definitions.len());
+    if let Some(g) = &file.graph {
+        let _ = writeln!(out, "  graph `{}`: {} children", g.id, g.children.len());
+    } else {
+        let _ = writeln!(out, "  graph: <none>");
+    }
+    out
+}
+
+/// Build an [`IR`] from any path. Public so integration tests can
+/// reuse the conversion without going through the CLI.
+pub fn build_ir_for_path(
+    path: &Path,
+) -> Result<graphreact_grx_parser::GrxIr, CommandError> {
+    let source = std::fs::read_to_string(path)?;
+    let file = Parser::parse_file(&source)?;
+    Ok(build_ir(&file))
+}
+
+// =====================================================================
+// M14.8 — `grx cluster …` handlers.
+// =====================================================================
+//
+// Two entry shapes per subcommand:
+//
+//  - `start_*` returns a live `Cluster` + scheduler so tests (and
+//    future ops surfaces) can drive the runtime + introspect the
+//    state without blocking the test thread.
+//  - `run_*_blocking` builds via `start_*` and then drives the
+//    daemon loop (process_batch + sleep, or wait for SIGINT).
+//
+// M14.8 shipped the engine-free shape; M14.8.x lifts the deferral
+// for JSC by mounting via `mount_with_scheduler` and then handing
+// the resulting `JsRuntime`'s scheduler to `Cluster::start`. The
+// load-bearing detail is the M14.8.x retrofit on
+// `Scheduler::install_remote_group_sink`: when sinks are installed
+// AFTER mount-time bodies have already called `useGroupJoin`, the
+// install method synthesises Join events for every existing
+// membership so `DistGroups` populates correctly. Without that
+// retrofit, mount-then-cluster would silently drop the local
+// memberships from the dist crate's view.
+//
+// CPython is structurally identical; wiring it under
+// `grx cluster daemon` is a follow-on slice — same shape as the
+// JSC path, just routes through `pyruntime::mount_python_definitions`.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use graphreact_core::Scheduler;
+use graphreact_dist::{
+    Cluster, ClusterConfig, Creation, NetSplitPolicy, NetTickConfig, NodeId, SecretCookie,
+    TlsConfig, RELOAD_V1_CAPABILITY,
+};
+use rustls::pki_types::{
+    pem::PemObject, CertificateDer, PrivateKeyDer,
+};
+
+/// Daemon CLI knobs translated into structured form. Constructed
+/// from the [`crate::cli::ClusterOp::Daemon`] variant; consumed by
+/// [`start_daemon`].
+pub struct DaemonOptions {
+    pub path: Option<std::path::PathBuf>,
+    pub node_id: NodeId,
+    pub listen: SocketAddr,
+    pub cookie: SecretCookie,
+    pub tls: TlsConfig,
+    pub peers: Vec<(NodeId, SocketAddr)>,
+    pub runtime: RuntimeArg,
+    pub net_tick: NetTickConfig,
+    pub net_split_policy: NetSplitPolicy,
+    pub duration_secs: Option<u64>,
+    /// **M16-Backend P2.** Resolved observer-server bind. `None`
+    /// means no observer port bound (zero-overhead default).
+    /// `Some(_)` means construct + spawn the HTTP server alongside
+    /// the cluster, install [`PrometheusSink`] on the scheduler +
+    /// cluster, and join the server's lifetime to the daemon's.
+    ///
+    /// Constructed by the bin/grx translation layer via
+    /// [`graphreact_observer::BindConfig::from_flags`] before
+    /// `start_daemon` is called, so any flag-validation error
+    /// surfaces at process start (NOT during the first scrape).
+    pub observer_bind: Option<graphreact_observer::BindConfig>,
+    /// **M16-Backend P8.** Per-body source-debug listener spec.
+    /// `Some(_)` installs debugpy (P8) / JSC inspector (P9) on
+    /// the engine matching `runtime` after first mount. `None`
+    /// runs without a debug listener.
+    pub debug: Option<crate::debug::DebugFlag>,
+    /// **M16-Backend P8.** When `debug` is set, blocks on
+    /// `debugpy.wait_for_client()` (or the JSC analogue in P9)
+    /// before running the first batch. Default `true` so
+    /// breakpoints in `def init(ctx)` hit on first mount; the
+    /// `--debug-no-wait` CLI flag flips it.
+    pub debug_wait: bool,
+    /// **M16-Backend P10.** OTLP/gRPC endpoint for OpenTelemetry
+    /// trace export. `Some(url)` constructs a
+    /// [`graphreact_observer::OtelSink`] (under `--features otel`),
+    /// installs it as both a `TelemetrySink` (via the daemon's
+    /// `MultiplexSink`) AND a `WireTracingHook` (via
+    /// [`graphreact_dist::Cluster::install_wire_tracing_hook`]) so
+    /// outbound remote messages carry the current OTel span context
+    /// in their wire packet's `trace_context` field, and receiver-
+    /// side spans render cross-cluster traces with `Link`
+    /// attributes. The daemon advertises the
+    /// `observer-otel-v1` capability when this field is set; peers
+    /// without the capability still receive trace_context bytes
+    /// correctly (wire format is mandatorily v3) but their own
+    /// outbound emissions don't carry it. `None` (default) skips
+    /// OTel entirely; non-OTel deployments don't pay the SDK dep
+    /// cost. Without `--features otel`, setting this returns
+    /// `CommandError::ClusterArg` at start_daemon.
+    pub observer_otel_endpoint: Option<String>,
+    /// **M16-Backend P10.** OTel resource attribute `service.name`
+    /// for spans emitted via `observer_otel_endpoint`. Defaults to
+    /// `"graphreact"`. Per OTel SDK convention, can also be set via
+    /// the `OTEL_SERVICE_NAME` environment variable.
+    pub observer_otel_service_name: Option<String>,
+}
+
+/// `grx cluster connect` knobs. Mirrors [`DaemonOptions`] minus
+/// `path`/`peers`/`runtime` — `connect` is a one-shot dial and
+/// doesn't host a `.grx` mount.
+pub struct ConnectOptions {
+    pub peer: NodeId,
+    pub peer_addr: SocketAddr,
+    pub node_id: NodeId,
+    pub listen: SocketAddr,
+    pub cookie: SecretCookie,
+    pub tls: TlsConfig,
+    pub net_tick: NetTickConfig,
+    pub net_split_policy: NetSplitPolicy,
+    /// Run-duration cap. `None` runs indefinitely until SIGINT —
+    /// symmetric with `DaemonOptions::duration_secs`. `Some(n)`
+    /// exits after `n` seconds, useful in tests + scripted
+    /// shutdowns.
+    pub duration_secs: Option<u64>,
+}
+
+/// What kind of scheduler-driver the daemon is hosting. Engine-free
+/// is a bare [`Scheduler`]; engine-hosted variants own the engine
+/// runtime (`JsRuntime` for JSC; `PyRuntime` follows the same
+/// shape under M14.8.x-cpython once wired) and route
+/// `process_batch` through that runtime's TLS-installing entry
+/// so component bodies fire correctly.
+pub enum SchedulerHost {
+    /// No `.grx` mount — the daemon acts as a relay for cross-node
+    /// traffic. Useful for `grx cluster connect` and for tests that
+    /// don't need engine hooks.
+    Empty(Box<Scheduler>),
+    /// JSC engine-hosted runtime. Owns the engine + isolate; calls
+    /// to [`Self::process_batch`] route through
+    /// [`crate::jsruntime::JsRuntime::process_batch`] so the engine
+    /// TLS guards (`EngineGuard::with_directory`) are installed for
+    /// the duration of body evaluation. M14.8.x.
+    #[cfg(target_os = "macos")]
+    Jsc(Box<crate::jsruntime::JsRuntime>),
+    /// CPython engine-hosted runtime. Mirrors the JSC variant —
+    /// owns the engine + isolate; routes `process_batch` through
+    /// [`crate::pyruntime::PyRuntime::process_batch`] so the
+    /// equivalent CPython TLS guards are installed for the
+    /// duration of body evaluation. M14.8.x.
+    #[cfg(target_os = "macos")]
+    Cpython(Box<crate::pyruntime::PyRuntime>),
+}
+
+impl SchedulerHost {
+    /// Mutable reference to the underlying [`Scheduler`]. Used by
+    /// `Cluster::start` (to install dist sinks) and by tests that
+    /// drive `group_broadcast` / inspect monitor state directly.
+    pub fn scheduler_mut(&mut self) -> &mut Scheduler {
+        match self {
+            SchedulerHost::Empty(s) => s,
+            #[cfg(target_os = "macos")]
+            SchedulerHost::Jsc(r) => &mut r.scheduler,
+            #[cfg(target_os = "macos")]
+            SchedulerHost::Cpython(r) => &mut r.scheduler,
+        }
+    }
+
+    /// Drive one `process_batch` round. For JSC / CPython this
+    /// installs the engine TLS guards via the runtime's own
+    /// `process_batch` entry point.
+    pub fn process_batch(&mut self) -> Result<(), graphreact_core::RuntimeError> {
+        match self {
+            SchedulerHost::Empty(s) => s.process_batch(),
+            #[cfg(target_os = "macos")]
+            SchedulerHost::Jsc(r) => r.process_batch(),
+            #[cfg(target_os = "macos")]
+            SchedulerHost::Cpython(r) => r.process_batch(),
+        }
+    }
+}
+
+/// Live daemon. Exposed so tests can introspect [`Cluster::registry`]
+/// without going through subprocess. Owns the [`SchedulerHost`] (boxed
+/// — `!Send` + held across `await`s by the binary's blocking driver).
+pub struct DaemonHandle {
+    cluster: Cluster,
+    host: SchedulerHost,
+    /// **M16-Backend P2+P4.** Observer management-API handle when
+    /// `--observer-bind` was passed. `None` means no observer port
+    /// bound. [`Self::shutdown`] joins the server's task before
+    /// dropping the cluster. Owns the snapshot-bridge receiver,
+    /// drained by [`drive_handle_until`] after each `process_batch`
+    /// round.
+    observer: Option<graphreact_observer::ApiServerHandle>,
+    /// **M16-Backend P10.** OTel `SdkTracerProvider` parked here so
+    /// the daemon's shutdown can flush buffered spans via
+    /// `provider.shutdown()` BEFORE the cluster tears down.
+    /// `None` for non-OTel deployments. Only present under
+    /// `--features otel` AND when `--observer-otel-endpoint` was
+    /// passed.
+    #[cfg(feature = "otel")]
+    otel_provider: Option<graphreact_observer::SdkTracerProvider>,
+}
+
+impl DaemonHandle {
+    #[must_use]
+    pub fn cluster(&self) -> &Cluster {
+        &self.cluster
+    }
+
+    /// Read the live [`Scheduler`] — for tests that want to drive
+    /// `group_broadcast` manually or inspect monitor / link state.
+    pub fn scheduler(&mut self) -> &mut Scheduler {
+        self.host.scheduler_mut()
+    }
+
+    /// Drive one `process_batch` round through whichever
+    /// [`SchedulerHost`] flavor this daemon was constructed with.
+    /// Engine-free hosts go through the bare scheduler; JSC hosts
+    /// route through `JsRuntime::process_batch` so engine TLS guards
+    /// are installed for the duration of body evaluation.
+    pub fn process_batch(&mut self) -> Result<(), graphreact_core::RuntimeError> {
+        self.host.process_batch()
+    }
+
+    /// Drop the cluster and tear down the engine (if any).
+    /// **M16-Backend P2:** also signals + joins the observer HTTP
+    /// server (if one was spawned). **M16-Backend P10:** flushes
+    /// any buffered OTel spans via `provider.shutdown()` BEFORE the
+    /// cluster tears down so the collector receives the final batch.
+    /// Async because the observer shutdown + OTel provider flush
+    /// both await background tasks.
+    pub async fn shutdown(self) {
+        // **M16-Backend P10.** Flush the OTel span batch processor
+        // FIRST so any buffered spans hit the collector before the
+        // scheduler/cluster teardown drops in-flight context. The
+        // SDK's `shutdown()` is synchronous (blocking on the export
+        // task's join); we call it via spawn_blocking to keep the
+        // async runtime cooperative.
+        #[cfg(feature = "otel")]
+        if let Some(provider) = self.otel_provider {
+            // SdkTracerProvider::shutdown() is sync + blocking; the
+            // batch processor's export task is already a tokio
+            // task on the runtime, so the join doesn't deadlock.
+            // Wrap in spawn_blocking to keep the caller's runtime
+            // cooperative.
+            tokio::task::spawn_blocking(move || {
+                let _ = provider.shutdown();
+            })
+            .await
+            .ok();
+        }
+        // Stop the observer server FIRST so any in-flight scrape
+        // serializes a final consistent view of the metrics
+        // before the scheduler tears down.
+        if let Some(observer) = self.observer {
+            observer.shutdown().await;
+        }
+        self.cluster.shutdown();
+        // Engine teardown — `shutdown` disposes the isolate + the
+        // engine on JSC / CPython; engine-free path has nothing
+        // to release.
+        match self.host {
+            SchedulerHost::Empty(_) => {}
+            #[cfg(target_os = "macos")]
+            SchedulerHost::Jsc(mut runtime) => {
+                let _ = runtime.shutdown();
+            }
+            #[cfg(target_os = "macos")]
+            SchedulerHost::Cpython(mut runtime) => {
+                let _ = runtime.shutdown();
+            }
+        }
+    }
+
+    /// **M16-Backend P2.** Local socket address the observer HTTP
+    /// server is bound to, or `None` if no observer was configured.
+    /// Lets tests scrape `/metrics` without parsing CLI output.
+    #[must_use]
+    pub fn observer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.observer.as_ref().map(|h| h.local_addr)
+    }
+}
+
+/// Construct a daemon, install all dist sinks on the scheduler,
+/// open the TLS listener, optionally dial peers. Returns a live
+/// [`DaemonHandle`]. Async because `Cluster::start` + `Cluster::connect`
+/// are async.
+pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandError> {
+    let mut host = build_scheduler_host(opts.path.as_deref(), opts.runtime, opts.debug)?;
+    // **M16-Backend P8.** Install debugpy on the freshly-mounted
+    // CPython isolate (if `--debug=cpython:<port>` was passed).
+    // build_scheduler_host (above) already mounted via the
+    // body-deferring `mount_with_scheduler` path so the first batch
+    // hasn't fired yet. With `wait=true` (default), `debugpy.listen`
+    // blocks until the operator's IDE attaches; subsequent
+    // `process_batch` calls then run with breakpoints active.
+    #[cfg(target_os = "macos")]
+    if let Some(d) = opts.debug {
+        if let SchedulerHost::Cpython(runtime) = &mut host {
+            let mut engine = runtime.engine.borrow_mut();
+            crate::debug::cpython_debugpy::install_debugpy(
+                &mut engine,
+                runtime.iso,
+                d.port,
+                opts.debug_wait,
+            )
+            .map_err(|e| CommandError::ClusterArg(format!("debug install failed: {e}")))?;
+        }
+    }
+    // **M16-Backend P10.** Build the cluster capability list, adding
+    // the `observer-otel-v1` capability when this daemon advertises
+    // OTel-aware outbound trace propagation. Peers with the matching
+    // capability participate in cross-cluster traces; peers without
+    // still receive trace_context bytes correctly (wire format is
+    // mandatorily v3) but their own outbound emissions don't carry
+    // it. Without `--features otel` setting `observer_otel_endpoint`
+    // returns `CommandError::ClusterArg` below before we get here,
+    // so the capability is only advertised when OTel is actually
+    // wired.
+    #[allow(unused_mut)] // mut only needed under `--features otel`
+    let mut capabilities: Vec<String> =
+        vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()];
+    #[cfg(feature = "otel")]
+    if opts.observer_otel_endpoint.is_some() {
+        capabilities.push(graphreact_dist::OBSERVER_OTEL_V1_CAPABILITY.into());
+    }
+    #[cfg(not(feature = "otel"))]
+    if opts.observer_otel_endpoint.is_some() {
+        return Err(CommandError::ClusterArg(
+            "--observer-otel-endpoint requires `--features otel` on graphreact-cli".into(),
+        ));
+    }
+    let config = ClusterConfig {
+        node_id: opts.node_id.clone(),
+        creation: Creation(default_creation()),
+        listen_addr: opts.listen,
+        cookie: opts.cookie,
+        tls: opts.tls,
+        capabilities,
+        net_tick: opts.net_tick,
+        net_split_policy: opts.net_split_policy,
+    };
+    // Cluster::start installs the dist sinks on `&mut Scheduler`.
+    let cluster = Cluster::start(config, host.scheduler_mut()).await?;
+
+    // **M16-Backend P10.** Construct the OtelSink + install it on
+    // BOTH the cluster's TelemetrySink slot (joined into the
+    // MultiplexSink below) AND the cluster's WireTracingHook slot
+    // (so outbound remote messages carry trace_context). The
+    // SdkTracerProvider is parked on the DaemonHandle so
+    // `shutdown()` can flush buffered spans before tearing down.
+    #[cfg(feature = "otel")]
+    let (otel_sink_dyn, otel_provider): (
+        Option<std::sync::Arc<dyn graphreact_core::TelemetrySink>>,
+        Option<graphreact_observer::SdkTracerProvider>,
+    ) = if let Some(endpoint) = opts.observer_otel_endpoint.as_deref() {
+        let (sink, provider) = graphreact_observer::build_otel_sink(
+            endpoint,
+            opts.observer_otel_service_name.as_deref(),
+        )
+        .map_err(|e| CommandError::ClusterArg(format!("otel exporter build: {e}")))?;
+        // Install as the wire-tracing hook so route_outbound
+        // populates wire::Message::trace_context.
+        cluster.install_wire_tracing_hook(
+            sink.clone() as std::sync::Arc<dyn graphreact_dist::WireTracingHook>,
+        );
+        let sink_dyn = sink as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
+        (Some(sink_dyn), Some(provider))
+    } else {
+        (None, None)
+    };
+    #[cfg(not(feature = "otel"))]
+    let otel_sink_dyn: Option<std::sync::Arc<dyn graphreact_core::TelemetrySink>> = None;
+
+    // M16-Backend P2+P4 — install PrometheusSink on scheduler +
+    // cluster, then spawn the management API HTTP server (axum
+    // 0.7 with /v1/healthz, /v1/identity, /v1/metrics, /v1/nodes,
+    // /v1/nodes/{id}, /v1/supervisor/tree). The same
+    // `Arc<MetricsInner>` is shared between the sink (writer) and
+    // the server's `/v1/metrics` handler (reader). The snapshot
+    // bridge receiver lives on the scheduler thread (drained by
+    // `drive_handle_until` after each `process_batch`); axum
+    // handlers send `SnapshotRequest` on the bridge sender. When
+    // `opts.observer_bind` is `None`, none of this runs.
+    let observer = if let Some(bind_cfg) = opts.observer_bind {
+        let metrics = std::sync::Arc::new(graphreact_observer::MetricsInner::new());
+        let prom_sink = std::sync::Arc::new(graphreact_observer::PrometheusSink::from_arc(
+            metrics.clone(),
+        ));
+        // Random process-start id for crash detection by ops
+        // tooling (see Identity::process_start_id docs).
+        let process_start_id = {
+            use rand::RngCore;
+            rand::thread_rng().next_u64()
+        };
+        let server = graphreact_observer::spawn_management_api(
+            bind_cfg,
+            metrics,
+            process_start_id,
+        )
+        .await
+        .map_err(|e| CommandError::ClusterArg(format!("observer bind: {e}")))?;
+        // M16-Backend P5 — fan PrometheusSink + the API server's
+        // RingBufferTelemetry through one MultiplexSink so both
+        // see every event without two install_telemetry_sink calls
+        // (which would overwrite). The ring's Arc is shared with
+        // the API handler that serves /v1/nodes/:id/messages/recent.
+        // M16-Backend P7 — adds the WebSocketSink as a third
+        // consumer; per-event cost is one owned-event allocation +
+        // one broadcast send (atomic on the ring; no blocking even
+        // if subscribers are slow).
+        let ring_sink = server.ring.clone() as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
+        let prom_dyn = prom_sink as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
+        let mut mux_builder = graphreact_observer::MultiplexSink::builder()
+            .push(prom_dyn.clone())
+            .push(ring_sink.clone());
+        if let Some(ws_sink) = server.websocket.as_ref() {
+            let ws_dyn = std::sync::Arc::new(ws_sink.clone())
+                as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
+            mux_builder = mux_builder.push(ws_dyn);
+        }
+        // **M16-Backend P10.** Add OtelSink as a fourth multiplex
+        // consumer (after Prom + Ring + WS). Only installed when
+        // `--observer-otel-endpoint` is set; non-OTel deployments
+        // skip this branch.
+        if let Some(ref otel_sink) = otel_sink_dyn {
+            mux_builder = mux_builder.push(otel_sink.clone());
+        }
+        let mux = std::sync::Arc::new(mux_builder.build())
+            as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
+        host.scheduler_mut().install_telemetry_sink(mux.clone());
+        cluster.install_telemetry_sink(mux);
+        Some(server)
+    } else if let Some(otel_sink) = otel_sink_dyn.clone() {
+        // **M16-Backend P10.** OTel sink installed without
+        // `--observer-bind` — install directly on scheduler +
+        // cluster via single-sink path. Supports the "OTel-only"
+        // deployment shape (no Prometheus, no management API).
+        host.scheduler_mut().install_telemetry_sink(otel_sink.clone());
+        cluster.install_telemetry_sink(otel_sink);
+        None
+    } else {
+        None
+    };
+
+    // M14.8.x: run one initial `process_batch` so the engine-
+    // hosted bodies actually evaluate at boot — `mount_with_scheduler`
+    // / `mount_python_definitions` register nodes but do NOT run
+    // their bodies. Running batch HERE (after `Cluster::start`,
+    // BEFORE peer dial) makes sure every body's mount-time
+    // `useGroupJoin` / `useMonitor` / `useLink` call fires through
+    // the dist sinks BEFORE any peer's `PgDiscover` arrives, so
+    // our `PgSync` reply includes local memberships and the
+    // cluster converges on the first round.
+    //
+    // For the engine-free path this is a no-op (no nodes registered
+    // → process_batch settles immediately).
+    host.process_batch().map_err(|e| {
+        CommandError::Runtime(crate::runtime::RuntimeError::from(e))
+    })?;
+
+    // Dial each peer. `connect` waits for handshake completion;
+    // any failure short-circuits the daemon boot (substrate-
+    // not-MVP: ops would rather see the error early than have a
+    // half-converged cluster).
+    for (peer_id, peer_addr) in opts.peers {
+        cluster.connect(peer_addr, peer_id).await?;
+    }
+
+    Ok(DaemonHandle {
+        cluster,
+        host,
+        observer,
+        #[cfg(feature = "otel")]
+        otel_provider,
+    })
+}
+
+/// Mount the engine for the daemon. Engine-free for `path: None`
+/// or `runtime: Null`; engine-hosted variants own a `JsRuntime` /
+/// `PyRuntime` per chosen runtime. The M14.8.x retrofit on
+/// `Scheduler::install_remote_group_sink` makes the
+/// mount-then-cluster ordering safe: `Cluster::start` is called
+/// AFTER the mount has already evaluated bodies once, but the
+/// retrofit synthesises `Join` events for every membership the
+/// bodies registered, so `DistGroups` populates correctly.
+fn build_scheduler_host(
+    path: Option<&Path>,
+    runtime: RuntimeArg,
+    debug: Option<crate::debug::DebugFlag>,
+) -> Result<SchedulerHost, CommandError> {
+    match (path, runtime) {
+        (None, _) => Ok(SchedulerHost::Empty(Box::default())),
+        #[cfg(target_os = "macos")]
+        (Some(path), RuntimeArg::Jsc) => {
+            // **M16-Backend P9.** JSC mount via `mount_with_scheduler`
+            // registers definitions but does NOT run any body
+            // (bodies fire on the first `process_batch`, scheduled
+            // by `start_daemon` AFTER `Cluster::start`). Installing
+            // the JSC RemoteInspector listener here makes the
+            // JSContext appear in `Safari → Develop → [Hostname]
+            // → JSContext` BEFORE the first body executes — operator
+            // can attach Web Inspector and set breakpoints; first
+            // render hits them.
+            //
+            // Lockdownd discovery is async/silent: there's no
+            // wait-for-client semantic in JSC's RemoteInspector
+            // (unlike debugpy.wait_for_client), so the install
+            // returns immediately. If the operator attaches mid-
+            // render the breakpoints take effect on the next
+            // body invocation.
+            let runtime = crate::jsruntime::mount_with_scheduler(path)?;
+            if let Some(d) = debug {
+                let mut engine = runtime.engine.borrow_mut();
+                crate::debug::jsc_inspector::install_jsc_inspector(
+                    &mut engine,
+                    runtime.iso,
+                    d.port,
+                )
+                .map_err(|e| {
+                    CommandError::ClusterArg(format!("debug install failed: {e}"))
+                })?;
+            }
+            Ok(SchedulerHost::Jsc(Box::new(runtime)))
+        }
+        #[cfg(target_os = "macos")]
+        (Some(path), RuntimeArg::Cpython) => {
+            // **M16-Backend P8.** When `--debug=cpython:<port>` is
+            // set we mount via `mount_with_scheduler` (registers
+            // definitions WITHOUT running any body) so debugpy
+            // lands BEFORE the first batch — required for `def
+            // init(ctx)` breakpoints to hit on first mount. The
+            // first `process_batch` happens inside
+            // `drive_handle_until` after Cluster::start, by which
+            // time debugpy is listening + (if `wait=true`) the
+            // operator has attached.
+            let runtime = if debug.is_some() {
+                crate::pyruntime::mount_with_scheduler(path)?
+            } else {
+                crate::pyruntime::mount_python_definitions(path)?
+            };
+            Ok(SchedulerHost::Cpython(Box::new(runtime)))
+        }
+        (Some(_), RuntimeArg::Null) => Err(CommandError::ClusterArg(
+            "`--runtime null` requires no `--path`; remove the path or pick a real runtime"
+                .into(),
+        )),
+        (Some(_), other) => Err(CommandError::ClusterArg(format!(
+            "runtime `{other}` not wired under `grx cluster daemon` — \
+             use `--runtime jsc` or `--runtime cpython`"
+        ))),
+    }
+}
+
+/// Build a daemon and drive it for the configured duration (or
+/// until SIGINT). Used by the binary; the test path uses
+/// [`start_daemon`] directly.
+pub async fn run_daemon_blocking(opts: DaemonOptions) -> Result<String, CommandError> {
+    let duration = opts.duration_secs;
+    let mut handle = start_daemon(opts).await?;
+    drive_handle_until(&mut handle, duration).await?;
+    handle.shutdown().await;
+    Ok(if duration.is_some() {
+        format!("daemon exited after {}s", duration.unwrap_or(0))
+    } else {
+        "daemon exited (signal)".to_string()
+    })
+}
+
+/// One-shot dial. Spins up an empty cluster, opens a TLS
+/// connection to `peer_addr`, holds the connection alive for
+/// `duration_secs` (or until SIGINT when absent — symmetric
+/// with `daemon`'s default), then exits.
+pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, CommandError> {
+    let duration = opts.duration_secs;
+    let scheduler = Box::new(Scheduler::default());
+    let mut host = SchedulerHost::Empty(scheduler);
+    let config = ClusterConfig {
+        node_id: opts.node_id.clone(),
+        creation: Creation(default_creation()),
+        listen_addr: opts.listen,
+        cookie: opts.cookie,
+        tls: opts.tls,
+        capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+        net_tick: opts.net_tick,
+        net_split_policy: opts.net_split_policy,
+    };
+    let cluster = Cluster::start(config, host.scheduler_mut()).await?;
+    cluster.connect(opts.peer_addr, opts.peer.clone()).await?;
+    let mut handle = DaemonHandle {
+        cluster,
+        host,
+        observer: None,
+        // **M16-Backend P10.** `connect` is a one-shot dial; no
+        // OTel sink is constructed for it (the OTel sink lives on
+        // `start_daemon`'s daemon, not on connect's minimal
+        // cluster). `None` here regardless of feature.
+        #[cfg(feature = "otel")]
+        otel_provider: None,
+    };
+    drive_handle_until(&mut handle, duration).await?;
+    handle.shutdown().await;
+    Ok(match duration {
+        Some(secs) => format!("connect to `{}` exited after {secs}s", opts.peer),
+        None => format!("connect to `{}` exited (signal)", opts.peer),
+    })
+}
+
+/// Drive the daemon's `process_batch` on a 50ms cadence until
+/// either `duration` elapses (when `Some`) OR SIGINT fires
+/// (when `None`). `pub` so binaries can split
+/// `start_daemon` + readiness signal + drive into separate
+/// steps (the subprocess CLI test relies on the binary
+/// printing its bound address BETWEEN start and drive).
+pub async fn drive_handle_until(
+    handle: &mut DaemonHandle,
+    duration: Option<u64>,
+) -> Result<(), CommandError> {
+    let deadline =
+        duration.map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs));
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.tick().await; // skip immediate
+    loop {
+        if let Some(d) = deadline {
+            if tokio::time::Instant::now() >= d {
+                return Ok(());
+            }
+        }
+        // Race a process_batch tick against ctrl_c (and the
+        // optional deadline). `tokio::select!` is fair across
+        // arms so the deadline arm gets evaluated even under
+        // sustained tick traffic.
+        let signal = tokio::signal::ctrl_c();
+        tokio::select! {
+            _ = tick.tick() => {
+                handle.scheduler().process_batch().map_err(|e| {
+                    CommandError::Runtime(crate::runtime::RuntimeError::from(e))
+                })?;
+                // M16-Backend P4 — drain pending management-API
+                // snapshot requests. Each request was posted by
+                // an axum handler running on a tokio worker
+                // thread; we respond on the scheduler thread (the
+                // only thread that can read scheduler state, since
+                // Scheduler is !Send). Worst-case latency for an
+                // API request: one process_batch round (~50ms tick
+                // cadence + the drain that follows).
+                drain_management_api_snapshots(handle);
+            }
+            _ = signal, if duration.is_none() => {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Drain any pending management-API snapshot requests from the
+/// observer's bridge channel + respond from scheduler state.
+/// Called once per `drive_handle_until` tick (after `process_batch`
+/// completes) so handlers see consistent post-batch state.
+fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
+    use graphreact_observer::SnapshotRequest;
+    let Some(observer) = handle.observer.as_mut() else {
+        return;
+    };
+    // Borrow split: pull the receiver out of the &mut observer,
+    // call introspect_* on the scheduler (which lives in
+    // host.scheduler_mut()) without conflicting with the receiver
+    // borrow.
+    let scheduler = handle.host.scheduler_mut();
+    graphreact_observer::drain_snapshot_requests(&mut observer.snapshot_rx, |req| {
+        match req {
+            SnapshotRequest::Nodes(tx) => {
+                let _ = tx.send(scheduler.introspect_nodes());
+            }
+            SnapshotRequest::NodeDetail(id, tx) => {
+                let _ = tx.send(scheduler.introspect_node(&id));
+            }
+            SnapshotRequest::SupervisorTree(tx) => {
+                let _ = tx.send(scheduler.introspect_supervisors());
+            }
+        }
+    });
+}
+
+/// Process-monotonic creation epoch. Increments per
+/// `start_daemon` / `run_connect_blocking` call so two
+/// in-process instances spawned by the same test see
+/// distinguishable Creation values (the OTP convention).
+fn default_creation() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+// ---------------------------------------------------------------------
+// CLI argument helpers — translate the raw `clap`-parsed strings into
+// the structured forms `start_daemon` / `run_connect_blocking` consume.
+// ---------------------------------------------------------------------
+
+/// Parse a peer entry of the form `name@host:port` into a
+/// `(NodeId, SocketAddr)`. The host:port suffix doubles as the
+/// dial address; `NodeId::host` is `host:port` literally and is
+/// handed to `tokio::net::TcpStream::connect` (via `dial`).
+pub fn parse_peer_entry(spec: &str) -> Result<(NodeId, SocketAddr), CommandError> {
+    let id: NodeId = spec.parse().map_err(|e| {
+        CommandError::ClusterArg(format!("peer `{spec}`: {e}"))
+    })?;
+    let addr: SocketAddr = id.host().parse().map_err(|e| {
+        CommandError::ClusterArg(format!(
+            "peer `{spec}` host `{}` is not a valid socket address: {e}",
+            id.host()
+        ))
+    })?;
+    Ok((id, addr))
+}
+
+/// Resolve the cookie source (env / file) into a [`SecretCookie`].
+/// Returns [`CommandError::ClusterArg`] when neither is provided.
+pub fn resolve_cookie(
+    cookie_env: Option<&str>,
+    cookie_file: Option<&Path>,
+) -> Result<SecretCookie, CommandError> {
+    match (cookie_env, cookie_file) {
+        (Some(name), None) => Ok(SecretCookie::from_env(name)?),
+        (None, Some(path)) => Ok(SecretCookie::from_file(path)?),
+        (None, None) => Err(CommandError::ClusterArg(
+            "must specify --cookie-env or --cookie-file".into(),
+        )),
+        (Some(_), Some(_)) => Err(CommandError::ClusterArg(
+            "--cookie-env and --cookie-file are mutually exclusive".into(),
+        )),
+    }
+}
+
+/// Load PEM material from disk into a [`TlsConfig`]. mTLS is
+/// always required (matches the production default).
+pub fn load_tls_from_paths(
+    cert_path: &Path,
+    key_path: &Path,
+    ca_path: &Path,
+) -> Result<TlsConfig, CommandError> {
+    let cert_path_str = cert_path.display();
+    let key_path_str = key_path.display();
+    let ca_path_str = ca_path.display();
+    let cert_chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(cert_path)
+            .map_err(|e| CommandError::ClusterArg(format!("cert {cert_path_str}: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CommandError::ClusterArg(format!("cert {cert_path_str}: {e}")))?;
+    let private_key: PrivateKeyDer<'static> =
+        PrivateKeyDer::from_pem_file(key_path)
+            .map_err(|e| CommandError::ClusterArg(format!("key {key_path_str}: {e}")))?;
+    let ca: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_path)
+        .map_err(|e| CommandError::ClusterArg(format!("ca {ca_path_str}: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CommandError::ClusterArg(format!("ca {ca_path_str}: {e}")))?;
+    Ok(TlsConfig::from_pem_bytes(cert_chain, private_key, ca, true)?)
+}
+
+// `Arc` import is used by `load_tls_from_paths`'s arena symbol
+// resolution under `pub use rustls::sign::CertifiedKey` (clippy
+// would warn otherwise).
+#[allow(dead_code)]
+fn _arc_kept_alive() -> Arc<()> {
+    Arc::new(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **M15 Phase 9.** `grx reload <path>` returns an error today —
+    /// remote-daemon reload requires M16-Backend's management API.
+    /// The error message must redirect users to `grx run --watch`
+    /// so scripts fail loudly rather than silently no-op.
+    #[test]
+    fn run_reload_returns_redirect_error() {
+        let result = run_reload(Path::new("foo.grx"));
+        let err = result.expect_err("run_reload must error today");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--watch"),
+            "redirect message must mention --watch: {msg}",
+        );
+        assert!(
+            msg.contains("M16-Backend") || msg.contains("management API"),
+            "redirect must explain why this is gated: {msg}",
+        );
+    }
+}

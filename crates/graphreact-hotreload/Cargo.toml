@@ -1,0 +1,43 @@
+[package]
+name = "graphreact-hotreload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Hot reload for GraphReact (M15) — file watcher, diff classifier, apply orchestrator, rollback. Second BEAM-class property."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+graphreact-core = { path = "../graphreact-core" }
+graphreact-grx-parser = { path = "../graphreact-grx-parser" }
+notify.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true
+arc-swap.workspace = true
+rustc-hash.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# **M15 Phase 3** — per-language hook-AST diffing. JS bodies use swc;
+# Python bodies use rustpython-parser. Both pure-Rust deps; no native
+# linkage. swc is heavy (~2 min cold compile) but is the canonical JS
+# AST in the Rust ecosystem and is reusable for future tooling (LSP,
+# formatter improvements). rustpython-parser is mature plus widely
+# used; ruff's parser is the modern alternative we can swap to later
+# if compile times become a concern.
+swc_common = "21"
+swc_ecma_ast = "23"
+swc_ecma_parser = "39"
+swc_ecma_visit = "23"
+rustpython-parser = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true
+
+[lints]
+workspace = true

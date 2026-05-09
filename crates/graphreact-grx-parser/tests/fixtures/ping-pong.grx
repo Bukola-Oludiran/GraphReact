@@ -1,0 +1,26 @@
+<!-- Ping-Pong: Two nodes bouncing messages in a cycle.
+     TTL prevents infinite loops. -->
+<Graph id="ping-pong">
+  <Ping id="ping">
+    <Pong id="pong" />
+  </Ping>
+
+  <!-- Explicit edge with TTL limit for cycle protection -->
+  <edge source="ping" target="pong" ttl={5} />
+</Graph>
+
+<Ping>
+  const [bounces, setBounces] = useState(0);
+  const emit = useEmit();
+  useMessage('pong', function() { setBounces(bounces + 1); });
+  useEffect(function() { emit('ping', { from: ctx.id, n: bounces }); }, [bounces]);
+  return { accepts: ['pong'], emits: ['ping'] };
+</Ping>
+
+<Pong>
+  const [bounces, setBounces] = useState(0);
+  const emit = useEmit();
+  useMessage('ping', function() { setBounces(bounces + 1); });
+  useEffect(function() { emit('pong', { from: ctx.id, n: bounces }); }, [bounces]);
+  return { accepts: ['ping'], emits: ['pong'] };
+</Pong>

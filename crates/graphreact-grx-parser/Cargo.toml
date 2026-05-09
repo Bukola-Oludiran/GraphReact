@@ -1,0 +1,32 @@
+[package]
+name = "graphreact-grx-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Parser + IR builder for the GraphReact `.grx` markup language. Hand-rolled recursive descent matching the TypeScript reference parser; tree-sitter swap planned for M15 (hot-reload incremental reparse)."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+serde.workspace = true
+# `preserve_order` keeps attribute iteration in insertion order, matching
+# the TypeScript reference parser's `Record<string, unknown>` semantics.
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror.workspace = true
+rustc-hash.workspace = true
+# **M15 Phase 1B** — tree-sitter incremental reparse.
+tree-sitter.workspace = true
+tree-sitter-grx = { path = "../../tree-sitter-grx" }
+
+[dev-dependencies]
+# **M15 Phase 1 slice 1A** — ParseCache tests need real-disk
+# fixtures so `mtime`-based staleness can fire. tempfile gives us
+# auto-cleanup tempdirs.
+tempfile = "3"
+
+[lints]
+workspace = true

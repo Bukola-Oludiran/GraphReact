@@ -1,0 +1,51 @@
+<!-- Counter Network: Fan-in aggregation pattern.
+     Two counters feed into an aggregator, which feeds a logger.
+     Demonstrates multi-parent and data flow. -->
+<Graph id="counter-network">
+  <Aggregator id="agg">
+    <Counter id="counter-a" initialCount={0} label="Alpha" />
+    <Counter id="counter-b" initialCount={10} label="Beta" />
+  </Aggregator>
+
+  <!-- Logger also receives from both counters (multi-parent) -->
+  <Logger id="logger">
+    <Counter id="counter-a" />
+    <Counter id="counter-b" />
+  </Logger>
+</Graph>
+
+<Counter>
+  const initial = (ctx.props.initialCount === undefined ? 0 : ctx.props.initialCount);
+  const [count, setCount] = useState(initial);
+  const emit = useEmit();
+
+  useMessage('increment', function() { setCount(count + 1); });
+
+  useEffect(function() {
+    emit('count-updated', { nodeId: ctx.id, value: count });
+  }, [count]);
+
+  return { accepts: ['increment'], emits: ['count-updated'] };
+</Counter>
+
+<Aggregator>
+  const [total, setTotal] = useState(0);
+  const emit = useEmit();
+
+  useMessage('count-updated', function(msg) {
+    const v = (msg && msg.payload && msg.payload.value) || 0;
+    setTotal(total + v);
+  });
+
+  useEffect(function() {
+    emit('total-updated', { total: total });
+  }, [total]);
+
+  return { accepts: ['count-updated'], emits: ['total-updated'] };
+</Aggregator>
+
+<Logger>
+  useMessage('count-updated', function() {});
+  useMessage('total-updated', function() {});
+  return { accepts: ['count-updated', 'total-updated'], emits: [] };
+</Logger>

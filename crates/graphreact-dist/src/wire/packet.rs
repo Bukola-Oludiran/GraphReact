@@ -1,0 +1,472 @@
+//! Packet payload types + the [`Packet`] dispatch enum.
+//!
+//! Every variant on [`PacketType`] has exactly one struct here that
+//! is `#[derive(Serialize, Deserialize)]` postcard-compatible.
+//!
+//! Field order in each struct is the on-wire order.
+
+use serde::{Deserialize, Serialize};
+
+/// Current wire protocol revision. Bumped on schema-breaking changes.
+///
+/// **History:**
+/// - `1` — initial M14 substrate (handshake + Message + supervision +
+///   pg + Tick + Disconnect packets).
+/// - `2` — M15 Phase 10. Adds `PacketType::ReloadModule` for
+///   cluster-wide hot reload propagation. `ChallengeAck` widens to
+///   carry the server's capabilities so client-side connections
+///   learn peer capabilities the same way server-side connections
+///   learn them from `Hello`.
+/// - `3` — **M16-Backend Phase 10.** Adds
+///   [`Message::trace_context: Option<[u8; 24]>`] for cross-node OTel
+///   span linkage (`TraceID(16) || SpanID(8)`). Peers advertising the
+///   [`crate::OBSERVER_OTEL_V1_CAPABILITY`] flag in their `Hello` /
+///   `ChallengeAck` capabilities populate the field on outbound
+///   remote messages; receivers attach the context as an OTel `Link`
+///   on the receiver-side `message.deliver` span. Peers without the
+///   capability still receive v3 packets correctly (the field
+///   deserializes as `None`); they simply don't populate the field
+///   on their outbound side. **No backwards-compatible bridge to v2
+///   peers** — the bumped [`MIN_SUPPORTED_VERSION`] makes this a hard
+///   floor; M-Prod owns rolling-version negotiation. Capability-bit
+///   mixing ("graceful mixed-version") happens *within* a v3 cluster
+///   via the `Hello.capabilities` list, not across wire versions.
+pub const WIRE_VERSION: u16 = 3;
+/// Minimum protocol version this build will accept on a Hello/Challenge.
+/// Equal to [`WIRE_VERSION`] today; widens on backwards-compatible
+/// extension, narrows on deprecation.
+pub const MIN_SUPPORTED_VERSION: u16 = 3;
+
+/// Single-byte type discriminant for every wire packet.
+///
+/// Codes are stable — never re-numbered, never reused.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PacketType {
+    Hello = 0x01,
+    Challenge = 0x02,
+    ChallengeReply = 0x03,
+    ChallengeAck = 0x04,
+
+    Message = 0x10,
+    MonitorRequest = 0x11,
+    MonitorAck = 0x12,
+    Demonitor = 0x13,
+    Down = 0x14,
+    LinkRequest = 0x15,
+    Unlink = 0x16,
+    Exit = 0x17,
+
+    PgJoin = 0x20,
+    PgLeave = 0x21,
+    PgSync = 0x22,
+    PgDiscover = 0x23,
+    PgBroadcast = 0x24,
+
+    Tick = 0x30,
+    TickAck = 0x31,
+
+    /// **M15 Phase 10.** Cluster-wide hot reload. Origin ships
+    /// origin-authoritative IR to every peer that advertised the
+    /// `"reload-v1"` capability in its `Hello.capabilities` /
+    /// `ChallengeAck.server_capabilities`. Peers without the
+    /// capability are skipped at the origin (operator warning
+    /// logged) — they never see this packet, so v1 peers don't
+    /// trip on the unknown type code.
+    ReloadModule = 0x40,
+
+    Disconnect = 0xFF,
+}
+
+impl PacketType {
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0x01 => Self::Hello,
+            0x02 => Self::Challenge,
+            0x03 => Self::ChallengeReply,
+            0x04 => Self::ChallengeAck,
+            0x10 => Self::Message,
+            0x11 => Self::MonitorRequest,
+            0x12 => Self::MonitorAck,
+            0x13 => Self::Demonitor,
+            0x14 => Self::Down,
+            0x15 => Self::LinkRequest,
+            0x16 => Self::Unlink,
+            0x17 => Self::Exit,
+            0x20 => Self::PgJoin,
+            0x21 => Self::PgLeave,
+            0x22 => Self::PgSync,
+            0x23 => Self::PgDiscover,
+            0x24 => Self::PgBroadcast,
+            0x30 => Self::Tick,
+            0x31 => Self::TickAck,
+            0x40 => Self::ReloadModule,
+            0xFF => Self::Disconnect,
+            _ => return None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------
+// Handshake (M14.3 wires these into a state machine)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Hello {
+    pub version: u16,
+    pub flags: u32,
+    pub node_name: String,
+    pub creation: u32,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Challenge {
+    pub challenge: [u8; 32],
+    pub server_name: String,
+    pub creation: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChallengeReply {
+    pub challenge: [u8; 32],
+    /// HMAC-SHA256(cookie, server_challenge_bytes). Constant-time
+    /// compared on the receiver side via `subtle::ConstantTimeEq`
+    /// (lands in M14.3).
+    pub digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChallengeAck {
+    /// HMAC-SHA256(cookie, client_challenge_bytes).
+    pub digest: [u8; 32],
+    /// **M15 Phase 10 / wire v2.** The server's capabilities
+    /// echoed back to the client. Closes the M14.3 substrate gap
+    /// where client-side `client_handshake` returned
+    /// `peer_capabilities: Vec::new()` because nothing in the
+    /// flow carried them. With this field the client side learns
+    /// the peer's capabilities the same way the server side
+    /// learns them from `Hello.capabilities`, so cluster-wide
+    /// hot reload (and any future capability-gated dispatch) can
+    /// filter peers regardless of which side dialled.
+    pub server_capabilities: Vec<String>,
+}
+
+// ---------------------------------------------------------------------
+// Data plane — Message routing across the wire
+// ---------------------------------------------------------------------
+
+/// On-wire form of `graphreact_core::Message`.
+///
+/// **TTL inheritance is preserved end-to-end** via the
+/// `inherited_ttl` field. The receiving side installs it into the
+/// scheduler's `current_delivery_ttl` for the duration of dispatch
+/// so emits during re-render see the same TTL bound the local
+/// scheduler would have applied. One hop = one decrement, regardless
+/// of how many physical machines the message traversed.
+///
+/// **`from` is rewritten authoritatively** by the receiving side
+/// from the authenticated peer NodeId — sender-supplied `from` is
+/// never trusted (forgery prevention).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Message {
+    pub id: String,
+    pub msg_type: String,
+    pub from: String,
+    pub to: String,
+    /// `serde_json::to_vec` output. Engines re-parse; cross-language
+    /// payloads stay JSON for parity with the existing FFI marshalling.
+    pub payload: Vec<u8>,
+    pub ttl: u32,
+    /// Wall-clock millisecond timestamp at creation (sender side).
+    /// Telemetry only — Lamport-style ordering is not used yet
+    /// (single TCP connection preserves order per peer pair).
+    pub timestamp: u64,
+    pub direct: bool,
+    pub inherited_ttl: Option<u32>,
+    /// **M16-Backend Phase 10.** Optional remote OTel span context
+    /// (`TraceID(16) || SpanID(8)` = 24 bytes). Populated by the
+    /// outbound peer's [`crate::Cluster::install_wire_tracing_hook`]
+    /// installation when the local thread has an active OTel span
+    /// (typically the `scheduler.tick` span emitted by
+    /// `graphreact-observer::OtelSink`). The receiving peer's
+    /// [`crate::dispatch_inbound`] propagates the context into the
+    /// local
+    /// [`graphreact_core::runtime::types::Message::trace_context`] so
+    /// the scheduler's `MessageDelivered` event carries it; the
+    /// receiver-side `OtelSink` consumes it and attaches as an OTel
+    /// `Link` on the `message.deliver` span. `None` for peers without
+    /// the [`crate::OBSERVER_OTEL_V1_CAPABILITY`] capability, or for
+    /// messages with no active span at outbound time. Wire format
+    /// landed at `WIRE_VERSION = 3`.
+    pub trace_context: Option<[u8; 24]>,
+}
+
+// ---------------------------------------------------------------------
+// Supervision — distributed monitors, links, exits
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorRequest {
+    pub observer: String,
+    pub target: String,
+    pub remote_ref: u64,
+    pub creation: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorAck {
+    pub remote_ref: u64,
+    pub target_alive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Demonitor {
+    pub remote_ref: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Down {
+    pub remote_ref: u64,
+    pub target: String,
+    pub reason: WireExitReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkRequest {
+    pub a: String,
+    pub b: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Unlink {
+    pub a: String,
+    pub b: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Exit {
+    pub from: String,
+    pub reason: WireExitReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WireExitReason {
+    Normal,
+    Shutdown,
+    Crashed { detail: String },
+    /// Synthesized by the dist crate when a peer connection drops or
+    /// the tick threshold is exceeded. Maps to OTP's `noconnection`
+    /// reason string.
+    NodeDown,
+}
+
+// ---------------------------------------------------------------------
+// pg — distributed group registry (gossip protocol)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PgJoin {
+    pub group: String,
+    /// `"local_id@node"` — fully qualified.
+    pub member: String,
+    /// Vector clock entries `(node_name, lamport)` so receivers can
+    /// reconcile concurrent joins/leaves.
+    pub vc: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PgLeave {
+    pub group: String,
+    pub member: String,
+    pub vc: Vec<(String, u64)>,
+}
+
+/// Full snapshot — sent on initial discovery and after partition heal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PgSync {
+    pub groups: Vec<(String, Vec<String>)>,
+    pub vc: Vec<(String, u64)>,
+}
+
+/// Initial peer interrogation. Receiver responds with [`PgSync`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PgDiscover {
+    pub groups_known: Vec<String>,
+    pub vc: Vec<(String, u64)>,
+}
+
+/// Decentralized tree-based broadcast — M14.6 hub-and-spoke
+/// updated to M14.8.x-followon (Phase F) tree fan-out. The
+/// originating node populates `visited_peers = [our_name]` and
+/// sends to every peer hosting ≥1 member of `group`. Each
+/// receiver fans to its local members AND relays to every peer
+/// in `peers_with_members(group)` not already in `visited_peers`,
+/// pushing its own name onto `visited_peers` first. Loop
+/// prevention: the visited list grows monotonically; each peer
+/// is reached at most once. **Wire size grows linearly with
+/// cluster size** — packets carry a list of peer names, ~30
+/// bytes each, capped well under `MAX_FRAME_BYTES = 16 MiB`.
+///
+/// Pre-Phase-F clusters that send `PgBroadcast` without
+/// `visited_peers` populated are still correctly handled (the
+/// field is parsed as empty by the receiver, who treats itself
+/// as the only visited peer when relaying).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PgBroadcast {
+    pub group: String,
+    pub msg_type: String,
+    /// `serde_json::to_vec` output. Engines re-parse on receipt;
+    /// payload encoding mirrors [`Message::payload`].
+    pub payload: Vec<u8>,
+    /// Already-qualified `from_local_id@origin_node` form. The
+    /// receiver enqueues local Messages with this as `from`
+    /// verbatim so handlers see the same authoritative source as
+    /// any other cross-node Message.
+    pub from_qualified: String,
+    /// Wall-clock millisecond timestamp, telemetry only.
+    pub timestamp: u64,
+    /// **M14.8.x-followon (Phase F).** Peer names that have
+    /// already received this broadcast. Originator populates with
+    /// `[our_name]`; each relay appends its own name before
+    /// shipping downstream. Loop prevention: receivers only
+    /// relay to peers not in this list.
+    #[serde(default)]
+    pub visited_peers: Vec<String>,
+}
+
+// ---------------------------------------------------------------------
+// Hot reload — M15 Phase 10
+// ---------------------------------------------------------------------
+
+/// Origin-authoritative `.grx` reload payload shipped to every
+/// peer that advertised the `"reload-v1"` capability.
+///
+/// Peers decode `ir_payload` as a JSON-encoded
+/// `graphreact_grx_parser::ir::GrxIr` (mirrors `Message.payload`'s
+/// outer-postcard / inner-JSON split — postcard itself can't
+/// serialise `AttrMap`'s `serde_json::Value` field) and apply
+/// via the same classifier + orchestrator pipeline used for
+/// local reloads — no re-parse from local disk in v1 (peer-side
+/// re-parse + hash verification is M-Prod's third-party security
+/// audit deliverable). `ir_hash` is the SHA-256 over `ir_payload`,
+/// shipped alongside so peers can surface a tracing warning on
+/// mismatch (mismatch is non-fatal in v1; see [`crate::cluster`]
+/// inbound dispatch).
+///
+/// `version` is a monotonic per-origin reload counter intended
+/// for replay defence + simple operator visibility (e.g. "alice
+/// shipped reload #7"). Per-origin uniqueness only — peers
+/// receiving multiple origins' reloads track them independently.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReloadModulePacket {
+    /// Bare origin-node name (e.g. `alice`, not `alice@127.0.0.1`).
+    /// Receivers compare directly against the authenticated peer
+    /// name from the handshake, mirroring the `Message` forgery
+    /// rejection pattern.
+    pub origin: String,
+    /// Canonical path on the origin's filesystem. Informational
+    /// plus tracing-friendly; peers treat it as opaque and do
+    /// not re-read from local disk in v1.
+    pub file_path: String,
+    /// SHA-256 of `ir_payload`. Lets peers detect transit
+    /// corruption over the encoded bytes (TLS already guards
+    /// against that, so a non-matching hash post-decode is
+    /// substrate evidence of an encoder bug or a hash
+    /// misconfiguration; we log + continue rather than reject).
+    pub ir_hash: [u8; 32],
+    /// `postcard::to_stdvec(&GrxIr)`. Decoded by the peer side
+    /// of the reload pipeline (no parser invocation; pure
+    /// deserialisation of the origin-authoritative IR shape).
+    pub ir_payload: Vec<u8>,
+    /// Per-origin monotonic reload counter. M-Prod will harden
+    /// this with signed packets + replay defence beyond the
+    /// counter; v1 just logs the version for ops visibility.
+    pub version: u64,
+}
+
+// ---------------------------------------------------------------------
+// Liveness — net-tick (M14.7)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Tick {
+    pub seq: u64,
+    pub sent_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TickAck {
+    pub seq: u64,
+}
+
+// ---------------------------------------------------------------------
+// Top-level dispatch enum
+// ---------------------------------------------------------------------
+
+/// Tagged union of every wire-protocol packet. Decoded from
+/// `(PacketType, &[u8])` via [`crate::wire::WireCodec`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Packet {
+    Hello(Hello),
+    Challenge(Challenge),
+    ChallengeReply(ChallengeReply),
+    ChallengeAck(ChallengeAck),
+
+    Message(Message),
+    MonitorRequest(MonitorRequest),
+    MonitorAck(MonitorAck),
+    Demonitor(Demonitor),
+    Down(Down),
+    LinkRequest(LinkRequest),
+    Unlink(Unlink),
+    Exit(Exit),
+
+    PgJoin(PgJoin),
+    PgLeave(PgLeave),
+    PgSync(PgSync),
+    PgDiscover(PgDiscover),
+    PgBroadcast(PgBroadcast),
+
+    Tick(Tick),
+    TickAck(TickAck),
+
+    /// **M15 Phase 10.** Cluster-wide hot reload payload.
+    ReloadModule(ReloadModulePacket),
+
+    /// Graceful disconnect — peer announces it's leaving the cluster.
+    /// Carries no payload; the type code is sufficient.
+    Disconnect,
+}
+
+impl Packet {
+    pub fn packet_type(&self) -> PacketType {
+        match self {
+            Self::Hello(_) => PacketType::Hello,
+            Self::Challenge(_) => PacketType::Challenge,
+            Self::ChallengeReply(_) => PacketType::ChallengeReply,
+            Self::ChallengeAck(_) => PacketType::ChallengeAck,
+            Self::Message(_) => PacketType::Message,
+            Self::MonitorRequest(_) => PacketType::MonitorRequest,
+            Self::MonitorAck(_) => PacketType::MonitorAck,
+            Self::Demonitor(_) => PacketType::Demonitor,
+            Self::Down(_) => PacketType::Down,
+            Self::LinkRequest(_) => PacketType::LinkRequest,
+            Self::Unlink(_) => PacketType::Unlink,
+            Self::Exit(_) => PacketType::Exit,
+            Self::PgJoin(_) => PacketType::PgJoin,
+            Self::PgLeave(_) => PacketType::PgLeave,
+            Self::PgSync(_) => PacketType::PgSync,
+            Self::PgDiscover(_) => PacketType::PgDiscover,
+            Self::PgBroadcast(_) => PacketType::PgBroadcast,
+            Self::Tick(_) => PacketType::Tick,
+            Self::TickAck(_) => PacketType::TickAck,
+            Self::ReloadModule(_) => PacketType::ReloadModule,
+            Self::Disconnect => PacketType::Disconnect,
+        }
+    }
+}

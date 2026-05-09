@@ -1,0 +1,26 @@
+<!-- M13-phase3b: effect with deps + cleanup. Logs 'mount:<count>' on
+     fire; cleanup logs 'cleanup:<count>'. When the externally-driven
+     setter bumps `count`, deps change, cleanup runs, then the new
+     mount fires. NameError-guarded for clean CLI smoke. -->
+
+<Logger lang="python">
+def body(ctx):
+    count, set_count = use_state(0)
+    def on_mount():
+        try:
+            host_log(f'mount:{count}')
+        except NameError:
+            pass
+        def cleanup():
+            try:
+                host_log(f'cleanup:{count}')
+            except NameError:
+                pass
+        return cleanup
+    use_effect(on_mount, [count])
+    return {'accepts': [], 'emits': []}
+</Logger>
+
+<Graph id="py-effect">
+  <Logger id="logger-1" />
+</Graph>

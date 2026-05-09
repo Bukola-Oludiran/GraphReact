@@ -1,0 +1,18 @@
+<!-- M13-phase3b: counter body using `use_state`. Tests register
+     `host_observe` to capture per-render values; the CLI path skips
+     it via the NameError guard so the same fixture runs cleanly in
+     both contexts. -->
+
+<Counter lang="python">
+def body(ctx):
+    count, set_count = use_state(0)
+    try:
+        host_observe(count)
+    except NameError:
+        pass
+    return {'accepts': [], 'emits': [], 'count': count}
+</Counter>
+
+<Graph id="py-counter">
+  <Counter id="counter-1" />
+</Graph>

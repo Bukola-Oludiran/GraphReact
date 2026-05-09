@@ -1,0 +1,13 @@
+.{
+    .name = .graphreact_jsc_zig,
+    .fingerprint = 0xce1ee4b9393c79d2,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "jsc.zig",
+        "echo.zig",
+    },
+    .dependencies = .{},
+}

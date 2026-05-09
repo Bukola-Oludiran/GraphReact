@@ -1,0 +1,31 @@
+<!-- M13-phase3a canonical Python fixture.
+     Two nodes wired by an explicit edge; both bodies are Python.
+     Demonstrates lang="python" definitions producing manifest dicts
+     via the CPython engine end-to-end. -->
+
+<Sensor lang="python">
+def init(ctx):
+    return {
+        'id': ctx['id'],
+        'kind': 'sensor',
+        'accepts': [],
+        'emits': ['reading'],
+    }
+</Sensor>
+
+<Logger lang="python">
+def init(ctx):
+    return {
+        'id': ctx['id'],
+        'kind': 'logger',
+        'accepts': ['reading'],
+        'emits': [],
+        'props_seen': sorted(ctx.get('props', {}).keys()),
+    }
+</Logger>
+
+<Graph id="py-smoke">
+  <Sensor id="sensor-a" interval={500} />
+  <Logger id="logger" sink="stdout" />
+  <edge source="sensor-a" target="logger" />
+</Graph>

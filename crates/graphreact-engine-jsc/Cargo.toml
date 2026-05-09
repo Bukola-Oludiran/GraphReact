@@ -1,0 +1,34 @@
+[package]
+name = "graphreact-engine-jsc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "JSC (JavaScriptCore) engine bridge — M12.3a slice. Wraps `zig/bridge/jsc.zig` (built via `cargo xtask zig-build`) and links the macOS system `JavaScriptCore` framework. Linux/Windows via vendored WebKit is the M12.3b deliverable."
+links = "graphreact_jsc"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+graphreact-engine-zig = { path = "../graphreact-engine-zig" }
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+parking_lot.workspace = true
+rustc-hash.workspace = true
+
+[build-dependencies]
+# M12.3b-phase1.5: macOS-only C++ drain shim. Compiles
+# `src/drain_shim.cpp` and links it alongside the Zig static lib +
+# `JavaScriptCore.framework`. Build-time only.
+cc = "1"
+
+[dev-dependencies]
+# RSS measurement in the 1000-cycle stress test (M12.3a-phase3c
+# acceptance gate). Test-only; not pulled into the production build.
+libc = "0.2"
+
+[lints]
+workspace = true

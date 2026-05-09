@@ -1,0 +1,31 @@
+[package]
+name = "graphreact-napi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "NAPI bindings for GraphReact — published as @graphreact/native"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+graphreact-core = { path = "../graphreact-core" }
+graphreact-algorithms = { path = "../graphreact-algorithms" }
+graphreact-graspologic = { path = "../graphreact-graspologic" }
+napi = { workspace = true, features = ["napi8", "tokio_rt", "serde-json"] }
+napi-derive.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true }
+notify = { workspace = true }
+parking_lot = { workspace = true }
+
+[build-dependencies]
+napi-build.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+<!-- M13-phase3b: counter body whose effect calls the setter on mount,
+     bumping count from 0 → 1. Second process_batch round observes
+     the bumped value, proving the Python-side setter actually marks
+     the owning node dirty. NameError-guards `host_observe` so the
+     same fixture runs cleanly under the CLI (where host_observe
+     isn't registered). -->
+
+<Setter lang="python">
+def body(ctx):
+    count, set_count = use_state(0)
+    try:
+        host_observe(count)
+    except NameError:
+        pass
+    def on_mount():
+        if count == 0:
+            set_count(1)
+    use_effect(on_mount, [])
+    return {'accepts': [], 'emits': []}
+</Setter>
+
+<Graph id="py-setter">
+  <Setter id="setter-1" />
+</Graph>

@@ -1,0 +1,70 @@
+[package]
+name = "graphreact-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Standalone `grx` CLI — parses and runs `.grx` files. Engine selection (JSC / null / future) lives behind the graphreact-engine-zig trait."
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "grx"
+path = "src/bin/grx.rs"
+
+[dependencies]
+graphreact-algorithms = { path = "../graphreact-algorithms" }
+graphreact-core = { path = "../graphreact-core" }
+graphreact-dist = { path = "../graphreact-dist" }
+graphreact-engine-cpython = { path = "../graphreact-engine-cpython" }
+graphreact-engine-echo = { path = "../graphreact-engine-echo" }
+graphreact-engine-jsc = { path = "../graphreact-engine-jsc" }
+graphreact-engine-null = { path = "../graphreact-engine-null" }
+graphreact-engine-zig = { path = "../graphreact-engine-zig" }
+graphreact-grx-parser = { path = "../graphreact-grx-parser" }
+graphreact-hotreload = { path = "../graphreact-hotreload" }
+graphreact-observer = { path = "../graphreact-observer" }
+clap.workspace = true
+clap_complete.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+rustls = { workspace = true, default-features = false, features = ["std", "ring"] }
+rustls-native-certs.workspace = true
+tokio-rustls = { workspace = true, default-features = false, features = ["ring"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+rand.workspace = true
+notify = { workspace = true }
+tracing.workspace = true
+postcard.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+tokio-tungstenite.workspace = true
+
+[features]
+default = []
+# **M16-Backend P10.** Pulls in the `graphreact-observer` crate's
+# `otel` feature, which adds opentelemetry SDK deps and unlocks the
+# `--observer-otel-endpoint` CLI flag + start_daemon's OtelSink
+# construction. Default off so non-OTel users don't pay the OTel SDK
+# dep cost (~30 transitive crates).
+otel = ["graphreact-observer/otel"]
+
+[dev-dependencies]
+tempfile = "3"
+clap_complete.workspace = true
+rcgen.workspace = true
+assert_cmd = "2"
+# **M16-Backend P11.1.** Validates /v1/metrics output round-trips
+# through the upstream Prometheus exposition parser (catches any
+# encoder regression). Mirrors graphreact-observer's existing dev-dep.
+prometheus-parse.workspace = true
+
+[lints]
+workspace = true

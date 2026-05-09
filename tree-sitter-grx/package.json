@@ -1,0 +1,13 @@
+{
+  "name": "tree-sitter-grx",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for GraphReact .grx markup (M15 Phase 1B).",
+  "license": "MIT OR Apache-2.0",
+  "main": "bindings/node",
+  "tree-sitter": [
+    {
+      "scope": "source.grx",
+      "file-types": ["grx"]
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Note: this workflow uses only safe GitHub Actions contexts (matrix.*, secrets via
+# action env, no untrusted user-controlled inputs flow into shell commands).
+# See https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # M14.8.x-followon (Phase I) — per-OS × per-Python-minor matrix.
+        # Closes the M13-phase3h "no automated CI matrix" deferral.
+        # Windows is intentionally excluded today: pkg-config probe
+        # works in theory per build.rs but isn't verified end-to-end.
+        # 3.14t (free-threaded, PEP 703) is excluded until
+        # actions/setup-python ships free-threaded support — track
+        # follow-on once available.
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.12", "3.13", "3.14"]
+    env:
+      # Matrix values are workflow-defined (not from untrusted
+      # event payloads); piping them through env keeps the
+      # downstream `run:` block free of `${{ … }}` interpolation.
+      MATRIX_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Bust the cache between Python minors so each cell
+          # rebuilds the cpython engine against the right ABI.
+          key: py${{ matrix.python }}
+      - name: Resolve Python pkg-config name
+        # The cpython build.rs probes pkg-config in descending
+        # version order; we set GRAPHREACT_PYTHON_PKGCONFIG to
+        # pin THIS matrix cell's Python minor.
+        run: |
+          echo "GRAPHREACT_PYTHON_PKGCONFIG=python-${MATRIX_PYTHON}-embed" >> "$GITHUB_ENV"
+          echo "GRAPHREACT_PYTHON_VERSION=${MATRIX_PYTHON}" >> "$GITHUB_ENV"
+      - run: cargo test --workspace --all-features
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources

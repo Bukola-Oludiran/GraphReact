@@ -1,0 +1,47 @@
+<!-- M13-phase3c: Python ping-pong over use_emit + use_message. The
+     edge ttl={5} caps the cycle so the system terminates naturally
+     via TTL exhaustion (no Python-side bounds counter required).
+     host_observe / host_log are NameError-guarded so this fixture
+     runs cleanly under the CLI smoke path where those test-only
+     callbacks aren't registered. -->
+
+<Ping lang="python">
+def body(ctx):
+    bounces, set_bounces = use_state(0)
+    emit = use_emit()
+    def on_pong(msg):
+        set_bounces(bounces + 1)
+    use_message('pong', on_pong)
+    def on_mount():
+        emit('ping', {'from': ctx['id'], 'n': bounces})
+    use_effect(on_mount, [bounces])
+    try:
+        host_observe(bounces)
+    except NameError:
+        pass
+    return {'accepts': ['pong'], 'emits': ['ping']}
+</Ping>
+
+<Pong lang="python">
+def body(ctx):
+    bounces, set_bounces = use_state(0)
+    emit = use_emit()
+    def on_ping(msg):
+        set_bounces(bounces + 1)
+    use_message('ping', on_ping)
+    def on_mount():
+        emit('pong', {'from': ctx['id'], 'n': bounces})
+    use_effect(on_mount, [bounces])
+    try:
+        host_observe(bounces)
+    except NameError:
+        pass
+    return {'accepts': ['ping'], 'emits': ['pong']}
+</Pong>
+
+<Graph id="py-ping-pong">
+  <Ping id="ping" />
+  <Pong id="pong" />
+  <edge source="ping" target="pong" ttl={5} />
+  <edge source="pong" target="ping" ttl={5} />
+</Graph>

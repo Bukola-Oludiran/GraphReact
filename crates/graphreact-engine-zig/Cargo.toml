@@ -1,0 +1,20 @@
+[package]
+name = "graphreact-engine-zig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Engine-agnostic Rust trait surface for embedding host languages (JSC / CPython / V8 / JVM) into GraphReact's standalone runtime. Concrete impls live in graphreact-engine-* sister crates."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true

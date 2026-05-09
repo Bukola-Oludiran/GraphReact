@@ -1,0 +1,460 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "M16-Backend P11 closeout. Dashboard for graphreact-observer's Prometheus exporter. Provisioning-format JSON; copy to /etc/grafana/provisioning/dashboards/ or import via the Grafana UI. Pairs with docs/backend/m16-prometheus.md (metric catalog) + m16-management-api.md (endpoint catalog).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Cumulative count of messages delivered through the scheduler's deliver path (includes both accepted + rejected). Increments on `on_message_delivered` regardless of `accepted` field; rejected messages count under `grx_messages_dropped_total{reason=policy_rejected}`.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum(grx_messages_delivered_total)",
+          "refId": "A"
+        }
+      ],
+      "title": "Messages Delivered (total)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Cumulative count of node-evaluate calls. One increment per `on_node_evaluate_end` event regardless of body-success / body-error.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum(grx_node_renders_total)",
+          "refId": "A"
+        }
+      ],
+      "title": "Node Evaluations (total)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Cumulative count of supervisor decisions, broken down by action. Proceeded = supervisor plan ran on first hook return. Deferred = supervisor parked the decision. Escalated = retry_after deadline elapsed and the plan ran unconditionally.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "sum by (action) (grx_supervisor_restarts_total)",
+          "legendFormat": "{{action}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Supervisor Decisions (by action)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Live observer WebSocket subscribers. Increments on subscribe / decrements on disconnect (or kick after RecvError::Lagged). Pair with grx_observer_subscribers_kicked_total to spot lag-driven kicks.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 200 }
+            ]
+          }
+        }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "expr": "grx_observer_subscribers_active",
+          "refId": "A"
+        }
+      ],
+      "title": "WS Subscribers (active)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Per-second message-delivery rate, broken down by message type. High-cardinality {from,to,type} label set; aggregate by type for headline view. Drill into specific from/to via the management API's /v1/nodes/:id/messages/recent.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "unit": "msg/s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (type) (rate(grx_messages_delivered_total[1m]))",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Message Delivery Rate (by type)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Live queue depths sampled once per `process_batch` cascade round. messages = pending in scheduler; dirty = nodes flagged for re-render; pending_topology = topology events buffered; external_inbox = messages from external sources (P5 sources hooks); pending_mutations = AcceptEdge / topology mutations queued.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "id": 6,
+      "options": {
+        "legend": { "calcs": ["max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        { "expr": "grx_queue_depth_messages", "legendFormat": "messages", "refId": "A" },
+        { "expr": "grx_queue_depth_dirty", "legendFormat": "dirty", "refId": "B" },
+        { "expr": "grx_queue_depth_pending_topology", "legendFormat": "pending_topology", "refId": "C" },
+        { "expr": "grx_queue_depth_external_inbox", "legendFormat": "external_inbox", "refId": "D" },
+        { "expr": "grx_queue_depth_pending_mutations", "legendFormat": "pending_mutations", "refId": "E" }
+      ],
+      "title": "Queue Depths (live)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "process_batch latency distribution. 14 powers-of-2 buckets from 4µs to 65ms. p50/p95/p99 give the headline; the full histogram via heatmap visualization shows the bimodal pattern (light ticks vs cascade rounds).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "id": 7,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(grx_process_batch_duration_seconds_bucket[1m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(grx_process_batch_duration_seconds_bucket[1m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(grx_process_batch_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "title": "process_batch Duration (p50/p95/p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "M14 cross-node remote message rate, broken down by peer + direction. Outbound = local->peer; Inbound = peer->local. Asymmetry between in/out for a peer indicates one-direction packet drop or NAT misconfiguration.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisLabel": "",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "msg/s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "id": 8,
+      "options": {
+        "legend": { "calcs": ["mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (peer, direction) (rate(grx_remote_messages_routed_total[1m]))",
+          "legendFormat": "{{peer}} ({{direction}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Remote Message Rate (by peer / direction)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "M15 hot reload events broken down by outcome. success = compatible swap or incompatible drain+remount completed. error = post-swap render errored / orchestrator rolled back. Spike in errors after a deploy is a strong signal to roll the deploy.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          },
+          "mappings": [],
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "error" },
+              "properties": [
+                { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+              ]
+            }
+          ]
+        }
+      },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 20 },
+      "id": 9,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(grx_hot_reload_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Hot Reloads (by outcome)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "P7 WebSocket subscriber kicks. Counter increments on RecvError::Lagged (slow subscriber couldn't keep up; server emitted Resync close-frame and dropped the connection). Sustained kicks indicate the broadcast capacity (1024) is too small for current subscriber count + event rate; bump in M-Prod's flow-control work.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "yellow" },
+          "custom": {
+            "axisLabel": "",
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 20 },
+      "id": 10,
+      "options": {
+        "legend": { "calcs": ["max"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "expr": "rate(grx_observer_subscribers_kicked_total[5m])",
+          "legendFormat": "kicks/s",
+          "refId": "A"
+        }
+      ],
+      "title": "WS Subscriber Kicks (lag-driven)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Cumulative count of messages dropped after delivery-time policy resolution. reason=policy_rejected = the channel-policy / accept-list / transform path rejected the message (the target's handlers did NOT run). reason=max_depth = the scheduler's process_batch hit MaxDepthExceeded for this tick (one increment per saturated tick, not per pending message).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 26 },
+      "id": 11,
+      "options": {
+        "legend": { "calcs": [], "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(grx_messages_dropped_total[1m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Messages Dropped (by reason)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["graphreact", "m16-backend", "observer"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "GraphReact (M16-Backend) — Observer",
+  "uid": "graphreact-m16-backend-observer",
+  "version": 1,
+  "weekStart": ""
+}

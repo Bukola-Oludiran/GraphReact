@@ -1,0 +1,19 @@
+<!-- M13-phase3b: empty deps `[]` should fire effect exactly once on
+     mount, never on subsequent re-renders even when state changes.
+     NameError-guarded for clean CLI smoke. -->
+
+<Once lang="python">
+def body(ctx):
+    count, set_count = use_state(0)
+    def on_mount():
+        try:
+            host_log('mount')
+        except NameError:
+            pass
+    use_effect(on_mount, [])
+    return {'accepts': [], 'emits': []}
+</Once>
+
+<Graph id="py-once">
+  <Once id="once-1" />
+</Graph>

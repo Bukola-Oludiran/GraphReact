@@ -1,0 +1,18 @@
+<!-- M14.8.x pub/sub demo — bob's side. Mirror of alice.grx but
+     with `bob-sub` as the subscriber id so the two daemons mount
+     distinct local nodes (cluster names are unique by convention). -->
+<Graph id="pubsub-bob">
+  <Subscriber id="bob-sub" name="bob" />
+</Graph>
+
+<Subscriber>
+  const myName = (ctx.props && ctx.props.name) || ctx.id;
+  const [received, setReceived] = useState([]);
+  useGroupJoin('chat:general');
+  useMessage('post', function(msg) {
+    const text = (msg && msg.payload && msg.payload.text) || '';
+    const author = (msg && msg.payload && msg.payload.author) || '?';
+    setReceived(received.concat([{ author: author, text: text, recipient: myName }]));
+  });
+  return { accepts: ['post'], emits: ['post'] };
+</Subscriber>

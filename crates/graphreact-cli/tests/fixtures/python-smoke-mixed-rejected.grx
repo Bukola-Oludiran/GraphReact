@@ -1,0 +1,19 @@
+<!-- M13-phase3a: a fixture mixing lang="python" + lang="js" definitions.
+     Phase 3a routes single-engine systems only — feeding this to the
+     cpython arm errors out with a clear EngineMisroute diagnostic.
+     M22 unifies multi-engine; phase 3a is intentionally strict. -->
+
+<Sensor lang="python">
+def init(ctx):
+    return {'id': ctx['id'], 'kind': 'sensor', 'accepts': [], 'emits': ['reading']}
+</Sensor>
+
+<Logger lang="js">
+return { id: ctx.id, kind: 'logger', accepts: ['reading'], emits: [] };
+</Logger>
+
+<Graph id="mixed">
+  <Sensor id="sensor-a" />
+  <Logger id="logger" />
+  <edge source="sensor-a" target="logger" />
+</Graph>

@@ -1,0 +1,18 @@
+{
+  "name": "@graphreact/native-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Vitest contract tests for the @graphreact/native binding",
+  "type": "module",
+  "scripts": {
+    "build": "cd ../../.. && cargo xtask napi-build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "vitest run --config vitest.bench.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  }
+}

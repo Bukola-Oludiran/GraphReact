@@ -1,0 +1,30 @@
+[package]
+name = "graphreact-linalg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Linear algebra kernel for GraphReact — SVD, eigh, gemm, solve, normalize on faer matrices"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+faer.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "linalg"
+harness = false
+
+[lints]
+workspace = true

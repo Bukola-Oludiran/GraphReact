@@ -1,0 +1,39 @@
+<!-- Pipeline: A linear chain of processing nodes.
+     Data flows: Source → Transform → Sink -->
+<Graph id="pipeline">
+  <Source id="source">
+    <Transform id="transform">
+      <Sink id="sink" />
+    </Transform>
+  </Source>
+</Graph>
+
+<Source>
+  const emit = useEmit();
+  useMessage('produce', function(msg) {
+    const items = (msg && msg.payload && msg.payload.items) || [];
+    for (var i = 0; i < items.length; i++) {
+      emit('raw-data', { value: items[i] });
+    }
+  });
+  return { accepts: ['produce'], emits: ['raw-data'] };
+</Source>
+
+<Transform>
+  const emit = useEmit();
+  useMessage('raw-data', function(msg) {
+    const v = (msg && msg.payload && msg.payload.value) || 0;
+    emit('transformed-data', { value: v * 2 });
+  });
+  return { accepts: ['raw-data'], emits: ['transformed-data'] };
+</Transform>
+
+<Sink>
+  const [results, setResults] = useState([]);
+  useMessage('transformed-data', function(msg) {
+    const v = (msg && msg.payload && msg.payload.value) || 0;
+    setResults(results.concat([v]));
+  });
+  useEffect(function() {}, [results]);
+  return { accepts: ['transformed-data'], emits: [] };
+</Sink>

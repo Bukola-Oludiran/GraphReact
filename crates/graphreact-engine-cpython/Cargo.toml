@@ -1,0 +1,34 @@
+[package]
+name = "graphreact-engine-cpython"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "CPython engine bridge — M13-phase1 slice. Wraps `zig/bridge/cpython.zig` (built via `cargo xtask zig-build`) and links the macOS system Python framework. Mirrors graphreact-engine-jsc's shape; M13-phase2+ lifts eval/resolve/call from stubs to real `PyRun_String` / `PyObject_GetAttrString` / `PyObject_Call` with GIL-aware marshalling."
+links = "graphreact_cpython"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+graphreact-engine-zig = { path = "../graphreact-engine-zig" }
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+parking_lot.workspace = true
+rustc-hash.workspace = true
+# M13-phase3i: per-shard locking for the callback registry. Removes
+# the single-RwLock bottleneck where every concurrent
+# register/dispose contends on one writer; reads remain
+# concurrent within each shard.
+dashmap.workspace = true
+
+[dev-dependencies]
+# RSS measurement in the 1000-cycle stress test (M13-phase1 acceptance
+# gate, mirrored from M12.3a-phase3c). Test-only; not pulled into the
+# production build.
+libc = "0.2"
+
+[lints]
+workspace = true

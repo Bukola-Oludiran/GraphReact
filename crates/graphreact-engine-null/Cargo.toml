@@ -1,0 +1,20 @@
+[package]
+name = "graphreact-engine-null"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Null engine — implements graphreact-engine-zig's Engine trait without executing any guest code. Validates the lifecycle architecture and serves as the default for `grx run --runtime=null` topology dry-runs."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+graphreact-engine-zig = { path = "../graphreact-engine-zig" }
+parking_lot.workspace = true
+rustc-hash.workspace = true
+
+[lints]
+workspace = true

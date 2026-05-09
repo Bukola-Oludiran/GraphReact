@@ -1,0 +1,37 @@
+<!-- Sensor component library — definitions only, no graph -->
+
+<TempSensor>
+  const { zone } = ctx.props;
+  const [reading, setReading] = useState(0);
+  const emit = useEmit();
+
+  useMessage('poll', () => {
+    setReading(Math.round(Math.random() * 15 + 20));
+  });
+
+  useEffect(() => {
+    if (reading > 0) {
+      emit('sensor-data', { sensorId: ctx.id, type: 'temperature', zone, value: reading });
+    }
+  }, [reading]);
+
+  return { accepts: ['poll'], emits: ['sensor-data'] };
+</TempSensor>
+
+<HumiditySensor>
+  const { zone } = ctx.props;
+  const [reading, setReading] = useState(0);
+  const emit = useEmit();
+
+  useMessage('poll', () => {
+    setReading(Math.round(Math.random() * 40 + 40));
+  });
+
+  useEffect(() => {
+    if (reading > 0) {
+      emit('sensor-data', { sensorId: ctx.id, type: 'humidity', zone, value: reading });
+    }
+  }, [reading]);
+
+  return { accepts: ['poll'], emits: ['sensor-data'] };
+</HumiditySensor>

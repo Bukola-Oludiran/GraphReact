@@ -1,0 +1,54 @@
+<!-- Pipeline: A linear chain of processing nodes.
+     Single-file format — topology and definitions in one place. -->
+
+<Graph id="pipeline">
+  <Source id="source">
+    <Transform id="transform">
+      <Sink id="sink" />
+    </Transform>
+  </Source>
+</Graph>
+
+<Source>
+  const emit = useEmit();
+
+  useMessage('produce', (msg) => {
+    const data = msg.payload;
+    console.log(`  Source: producing ${data.items.length} items`);
+    for (const item of data.items) {
+      emit('raw-data', { value: item });
+    }
+  });
+
+  return { accepts: ['produce'], emits: ['raw-data'] };
+</Source>
+
+<Transform>
+  const emit = useEmit();
+
+  useMessage('raw-data', (msg) => {
+    const { value } = msg.payload;
+    const transformed = value * 2;
+    console.log(`  Transform: ${value} → ${transformed}`);
+    emit('transformed-data', { value: transformed });
+  });
+
+  return { accepts: ['raw-data'], emits: ['transformed-data'] };
+</Transform>
+
+<Sink>
+  const [results, setResults] = useState([]);
+
+  useMessage('transformed-data', (msg) => {
+    const { value } = msg.payload;
+    setResults(prev => [...prev, value]);
+  });
+
+  useEffect(() => {
+    if (results.length > 0) {
+      console.log(`  Sink: collected [${results.join(', ')}]`);
+    }
+  }, [results]);
+
+  return { accepts: ['transformed-data'], emits: [] };
+</Sink>

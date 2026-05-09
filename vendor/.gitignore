@@ -1,0 +1,5 @@
+# M12.3b-phase2: vendored WebKit clone (~2-3 GB) lives at vendor/WebKit/.
+# Never committed — phase 3 produces libJavaScriptCore.a from this clone
+# under target/webkit/<target>/<mode>/, which is also git-ignored via the
+# workspace's existing target/ rule.
+WebKit/

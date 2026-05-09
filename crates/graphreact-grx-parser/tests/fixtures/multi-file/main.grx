@@ -1,0 +1,20 @@
+<!-- Multi-file greenhouse example.
+     Imports sensor and output definitions from separate .grx files. -->
+
+<import src="./sensors.grx" />
+<import src="./outputs.grx" />
+
+<Graph id="greenhouse">
+  <Aggregator id="agg">
+    <TempSensor id="temp-a" zone="A" />
+    <TempSensor id="temp-b" zone="B" />
+    <HumiditySensor id="humid-a" zone="A" />
+  </Aggregator>
+
+  <!-- Logger also receives from all sensors (multi-parent) -->
+  <Logger id="log">
+    <TempSensor id="temp-a" />
+    <TempSensor id="temp-b" />
+    <HumiditySensor id="humid-a" />
+  </Logger>
+</Graph>

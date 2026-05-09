@@ -1,0 +1,94 @@
+[package]
+name = "graphreact-observer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Observer + telemetry surfaces for GraphReact (Backend) — JSON logs, Prometheus, OTel, management API, ratatui terminal UI. Phase-1 substrate: TelemetrySink consumers + bench harness."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+graphreact-core = { path = "../graphreact-core" }
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+itoa.workspace = true
+
+# M16-Backend P2 — Prometheus exporter + bind/auth/tls substrate.
+dashmap.workspace = true
+rustc-hash.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+
+# M16-Backend P4 — Management API on axum.
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+# M16-Backend P7 — WebSocket + SSE live event stream.
+futures.workspace = true
+
+# M16-Backend P10 — OpenTelemetry traces (feature-gated). Default off
+# so non-OTel users don't pay the dep cost. The `otel` feature unlocks
+# `OtelSink: TelemetrySink` which exports spans via OTLP/gRPC to a
+# stock OTel collector (Tempo/Jaeger/Honeycomb/etc.). Cross-node span
+# links propagate via the M14 wire format's `trace_context` field
+# (`OBSERVER_OTEL_V1` capability + `WIRE_VERSION = 3`).
+#
+# `graphreact-dist` is a dep ONLY under `otel` because OtelSink
+# implements `graphreact_dist::WireTracingHook` (the trait lives in
+# dist where capability negotiation + wire serialization happens; the
+# impl lives here where OTel SpanContext extraction happens). Default
+# observer builds don't pull dist (or any of its M14 dep tree).
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace"], optional = true }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic"], optional = true }
+graphreact-dist = { path = "../graphreact-dist", optional = true }
+
+[features]
+default = []
+# **M16-Backend P10.** OpenTelemetry traces via OTLP/gRPC. See
+# `docs/backend/m16-otel.md` for the span shape + cross-node link
+# protocol.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:graphreact-dist",
+]
+# **M16-Backend P10.** Enables `opentelemetry_sdk`'s `testing` feature
+# so headless tests can drive `InMemorySpanExporter` for span-shape
+# pinning. Implies `otel`. Used as `cargo test -p graphreact-observer
+# --features otel-test`.
+otel-test = ["otel", "opentelemetry_sdk?/testing"]
+
+[dev-dependencies]
+graphreact-core = { path = "../graphreact-core" }
+criterion.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+parking_lot.workspace = true
+serde_json.workspace = true
+prometheus-parse.workspace = true
+rcgen.workspace = true
+tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
+
+[[bench]]
+name = "scheduler_overhead"
+harness = false
+
+[lints]
+workspace = true

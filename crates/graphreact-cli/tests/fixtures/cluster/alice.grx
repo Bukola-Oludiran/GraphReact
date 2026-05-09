@@ -1,0 +1,23 @@
+<!-- M14.8.x pub/sub demo — alice's side.
+     A single `Subscriber` node joins the `chat:general` pg group
+     and records every `post` message that arrives. The same
+     component definition is re-used in bob.grx; running the two
+     daemons under `grx cluster daemon` connects them via M14.3
+     handshake; M14.6's PgSync converges the group across both
+     hosts; broadcasts from EITHER side fan out via PgBroadcast
+     to BOTH local subscribers. -->
+<Graph id="pubsub-alice">
+  <Subscriber id="alice-sub" name="alice" />
+</Graph>
+
+<Subscriber>
+  const myName = (ctx.props && ctx.props.name) || ctx.id;
+  const [received, setReceived] = useState([]);
+  useGroupJoin('chat:general');
+  useMessage('post', function(msg) {
+    const text = (msg && msg.payload && msg.payload.text) || '';
+    const author = (msg && msg.payload && msg.payload.author) || '?';
+    setReceived(received.concat([{ author: author, text: text, recipient: myName }]));
+  });
+  return { accepts: ['post'], emits: ['post'] };
+</Subscriber>
