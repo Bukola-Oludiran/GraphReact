@@ -252,6 +252,7 @@ fn run_batch(setup: &mut Setup, batch_size: u64, payload: &serde_json::Value) {
                 direct: false,
                 inherited_ttl: None,
                 trace_context: None,
+                correlation_id: None,
             };
             // Permit-based send so the bench measures
             // back-pressure-aware throughput rather than the

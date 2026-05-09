@@ -59,6 +59,11 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 cc = "1"
 
+# M-Ingress phase 2 — server-side correlation_id mint for
+# `POST /v1/nodes/:id/call`. UUIDv4 keeps the space wide enough that
+# accidental reuse is ~impossible.
+uuid = { version = "1", features = ["v4"] }
+
 # M15 Phase 1B — tree-sitter incremental reparse for `.grx` parser.
 tree-sitter = "0.25"
 tree-sitter-language = "0.1"
@@ -91,7 +96,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 # P7 added the `ws` feature for WebSocket upgrade on /v1/observer/events.
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "matched-path", "query", "ws"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
-tower-http = { version = "0.6", default-features = false, features = ["trace"] }
+tower-http = { version = "0.6", default-features = false, features = ["trace", "cors"] }
 
 # M16-Backend P7 — WebSocket client (tokio-tungstenite) for the CLI's
 # `grx observer` ws_client; pairs with the axum `ws` feature on the

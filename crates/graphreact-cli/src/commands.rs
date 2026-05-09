@@ -1252,8 +1252,20 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     // so the capability is only advertised when OTel is actually
     // wired.
     #[allow(unused_mut)] // mut only needed under `--features otel`
-    let mut capabilities: Vec<String> =
-        vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()];
+    let mut capabilities: Vec<String> = vec![
+        "grx-v1".into(),
+        RELOAD_V1_CAPABILITY.into(),
+        // **M-Ingress phase 2.** This daemon understands
+        // `wire::Message.correlation_id` — peers advertising the
+        // same flag will propagate correlation_id over the wire,
+        // letting cross-cluster `POST /v1/nodes/:id/call` flows
+        // resolve replies on remote handlers' emits. Always
+        // advertised because the daemon ships the management API
+        // call endpoint by default; non-call workloads pay no
+        // additional wire cost (correlation_id stays None on
+        // every emit).
+        graphreact_dist::INGRESS_CALL_V1_CAPABILITY.into(),
+    ];
     #[cfg(feature = "otel")]
     if opts.observer_otel_endpoint.is_some() {
         capabilities.push(graphreact_dist::OBSERVER_OTEL_V1_CAPABILITY.into());
@@ -1353,6 +1365,14 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
             mux_builder = mux_builder.push(ws_dyn);
         }
+        // **M-Ingress phase 2.** Add the PendingCalls registry as
+        // a multiplex consumer so the scheduler's `on_call_reply`
+        // event resolves the awaiting `oneshot::Sender` for any
+        // in-flight `POST /v1/nodes/:id/call`.
+        let pending_calls_dyn =
+            std::sync::Arc::new(server.pending_calls.clone())
+                as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
+        mux_builder = mux_builder.push(pending_calls_dyn);
         // **M16-Backend P10.** Add OtelSink as a fourth multiplex
         // consumer (after Prom + Ring + WS). Only installed when
         // `--observer-otel-endpoint` is set; non-OTel deployments
@@ -1515,7 +1535,11 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         listen_addr: opts.listen,
         cookie: opts.cookie,
         tls: opts.tls,
-        capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+        capabilities: vec![
+            "grx-v1".into(),
+            RELOAD_V1_CAPABILITY.into(),
+            graphreact_dist::INGRESS_CALL_V1_CAPABILITY.into(),
+        ],
         net_tick: opts.net_tick,
         net_split_policy: opts.net_split_policy,
     };
@@ -1611,6 +1635,125 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
             }
             SnapshotRequest::SupervisorTree(tx) => {
                 let _ = tx.send(scheduler.introspect_supervisors());
+            }
+            // **M-Ingress phase 1.** Validate node existence on the
+            // scheduler thread (we hold the Scheduler borrow), then
+            // dispatch via `SchedulerHandle::send` which prepends
+            // `from = "__external__"` so the manifest's
+            // `accepts_external` allowlist is enforced at delivery.
+            SnapshotRequest::InjectMessage {
+                node_id,
+                message_type,
+                payload,
+                oneshot_tx,
+            } => {
+                if scheduler.introspect_node(&node_id).is_none() {
+                    let _ = oneshot_tx
+                        .send(graphreact_observer::InjectResult::NodeNotFound);
+                } else {
+                    // `send_ingress` prepends `from = "__ingress__"`, which
+                    // makes `Scheduler::deliver` enforce the target's
+                    // `manifest.accepts_external` allowlist. Pre-existing
+                    // `send` callers (tests, dist, sources) keep the
+                    // legacy bypass under `from = "__external__"`.
+                    scheduler
+                        .handle()
+                        .send_ingress(node_id, message_type, payload);
+                    let _ = oneshot_tx
+                        .send(graphreact_observer::InjectResult::Accepted);
+                }
+            }
+            // **M-Ingress phase 2.** Validate node existence + the
+            // manifest's `accepts_external_call` table on the
+            // scheduler thread (we hold the borrow). Match the
+            // (request_type, reply_type) pair against the
+            // declared entries; unmatched → `RejectedByManifest`
+            // (HTTP 403). On dispatch, `send_ingress_with_correlation`
+            // attaches the correlation_id so `Scheduler::deliver`'s
+            // auto-propagation tags the first matching reply.
+            SnapshotRequest::InjectMessageWithReply {
+                node_id,
+                message_type,
+                payload,
+                reply_type,
+                correlation_id,
+                oneshot_tx,
+            } => {
+                if scheduler.introspect_node(&node_id).is_none() {
+                    let _ = oneshot_tx.send(
+                        graphreact_observer::InjectMessageWithReplyDisposition::NodeNotFound,
+                    );
+                } else {
+                    // Look up the manifest from the scheduler's
+                    // live index for the matching
+                    // `accepts_external_call` entry.
+                    let manifest_match = scheduler
+                        .manifests
+                        .borrow()
+                        .get(&node_id)
+                        .map(|m| {
+                            m.accepts_external_call.iter().any(|c| {
+                                c.request_type == message_type
+                                    && c.reply_type == reply_type
+                            })
+                        })
+                        .unwrap_or(false);
+                    if manifest_match {
+                        scheduler.handle().send_ingress_with_correlation(
+                            node_id,
+                            message_type,
+                            payload,
+                            correlation_id,
+                        );
+                        let _ = oneshot_tx.send(
+                            graphreact_observer::InjectMessageWithReplyDisposition::Dispatched,
+                        );
+                    } else {
+                        let _ = oneshot_tx.send(
+                            graphreact_observer::InjectMessageWithReplyDisposition::RejectedByManifest,
+                        );
+                    }
+                }
+            }
+            // **M-Ingress phase 3.** Per-line bulk inject. Same
+            // node-existence + manifest-gate sequence as the call
+            // path, but reusing Phase 1's `accepts_external`
+            // allowlist (single-shot shape, not call shape) since
+            // bulk lines are fire-and-forget. The manifest check
+            // is hoisted to drain (rather than deferring to
+            // `Scheduler::deliver` like Phase 1's single-shot
+            // path) so the per-line response can surface
+            // `RejectedByManifest` synchronously to the streaming
+            // NDJSON client.
+            SnapshotRequest::InjectMessageBulkLine {
+                node_id,
+                message_type,
+                payload,
+                oneshot_tx,
+            } => {
+                if scheduler.introspect_node(&node_id).is_none() {
+                    let _ = oneshot_tx
+                        .send(graphreact_observer::BulkInjectResult::NodeNotFound);
+                } else {
+                    let manifest_match = scheduler
+                        .manifests
+                        .borrow()
+                        .get(&node_id)
+                        .map(|m| {
+                            m.accepts_external.iter().any(|t| t == &message_type)
+                        })
+                        .unwrap_or(false);
+                    if manifest_match {
+                        scheduler
+                            .handle()
+                            .send_ingress(node_id, message_type, payload);
+                        let _ = oneshot_tx
+                            .send(graphreact_observer::BulkInjectResult::Accepted);
+                    } else {
+                        let _ = oneshot_tx
+                            .send(graphreact_observer::BulkInjectResult::RejectedByManifest);
+                    }
+                }
             }
         }
     });

@@ -119,6 +119,41 @@ pub struct MessageDelivered<'a> {
     pub trace_context: Option<[u8; 24]>,
 }
 
+/// **M-Ingress phase 2.** Fired by the scheduler's `make_emit`
+/// closure the moment an outgoing message is auto-tagged with an
+/// inbound HTTP-call's `correlation_id`. Carries the payload
+/// directly so the `PendingCalls` consumer can resolve the call's
+/// awaiting `tokio::sync::oneshot::Sender` without waiting on (or
+/// requiring) actual scheduler delivery.
+///
+/// PII note: this event reveals the reply payload to whichever
+/// `TelemetrySink` consumes it. The substrate-level commitment
+/// is that ONLY the `PendingCalls` registry consumes this event;
+/// other built-in sinks (Prometheus / ring buffer / OTel /
+/// WebSocket) ignore it via the default no-op `on_call_reply`
+/// impl. Custom sinks that opt into reading payloads inherit the
+/// same operator-controlled exposure as the call API itself
+/// (the application opted in by declaring
+/// `accepts_external_call`).
+#[derive(Debug, Clone, Serialize)]
+pub struct CallReply<'a> {
+    /// Opaque correlation id minted by the call handler
+    /// (`POST /v1/nodes/:id/call`) — the same value the inbound
+    /// request carried; matches a key in `PendingCalls`.
+    pub correlation_id: &'a str,
+    /// Reply payload, forwarded verbatim to the awaiting HTTP
+    /// caller as the `200 OK` response body.
+    pub payload: &'a serde_json::Value,
+    /// Local id of the node that emitted this reply. Surfaced so
+    /// operators tracing call flows (via custom sinks) can
+    /// attribute replies to specific handlers.
+    pub from: &'a str,
+    /// Wire `type` of the outgoing message — i.e. the
+    /// `reply_type` the manifest's `accepts_external_call` entry
+    /// declared for the inbound `request_type`.
+    pub reply_type: &'a str,
+}
+
 /// Fired by `Scheduler::add_node_at_runtime` after the node has been
 /// registered + connected + its mount cycle drained. NOT fired for
 /// nodes added via the initial `register_node` mount (those land
@@ -364,4 +399,19 @@ pub trait TelemetrySink: Send + Sync {
 
     #[inline]
     fn on_hot_reload(&self, _ev: &HotReload<'_>) {}
+
+    /// **M-Ingress phase 2.** Fired by the scheduler's `make_emit`
+    /// closure the moment it auto-tags an outgoing reply with an
+    /// inbound HTTP-call's `correlation_id`. Lets the
+    /// `graphreact_observer::management_api::PendingCalls` registry
+    /// resolve the awaiting `oneshot` IMMEDIATELY at emit-time —
+    /// the reply Message still flows through normal scheduler
+    /// delivery, but the call origin doesn't depend on the reply
+    /// reaching any specific graph node to receive its payload.
+    /// This keeps the `POST /v1/nodes/:id/call` API ergonomic for
+    /// leaf nodes (no neighbors required) while preserving the
+    /// existing emit semantics. No-op default: most sinks
+    /// (Prometheus, ring buffer, OTel) ignore call replies.
+    #[inline]
+    fn on_call_reply(&self, _ev: &CallReply<'_>) {}
 }

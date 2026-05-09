@@ -42,19 +42,23 @@
 //! auth-checked because metrics include high-cardinality labels
 //! that may leak topology information.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_rustls::TlsAcceptor;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::BearerToken;
 use crate::bind::BindConfig;
@@ -76,6 +80,357 @@ pub enum SnapshotRequest {
     NodeDetail(String, oneshot::Sender<Option<NodeIntrospection>>),
     /// `GET /v1/supervisor/tree` — supervisor + child mapping.
     SupervisorTree(oneshot::Sender<Vec<SupervisorIntrospection>>),
+    /// **M-Ingress phase 1.** `POST /v1/nodes/:id/messages` — inject
+    /// an externally-originated message into a node's inbox. The
+    /// drain handler validates node existence, then routes via
+    /// `SchedulerHandle::send` (which prepends `from = "__external__"`
+    /// so `Scheduler::deliver` enforces the manifest's
+    /// `accepts_external` allowlist). `IdempotencyConflict` is
+    /// surfaced *before* this variant ever reaches the bridge —
+    /// the handler's `IdempotencyCache` short-circuits at HTTP
+    /// boundary so the scheduler thread is never bothered with a
+    /// duplicate retry.
+    InjectMessage {
+        node_id: String,
+        message_type: String,
+        payload: Value,
+        oneshot_tx: oneshot::Sender<InjectResult>,
+    },
+    /// **M-Ingress phase 3.** `POST /v1/nodes/:id/messages/bulk` —
+    /// per-line dispatch from a streaming NDJSON request body.
+    /// The bulk handler issues ONE bridge request per parsed
+    /// line; the drain handler validates node existence + the
+    /// manifest's `accepts_external` allowlist (same gate as
+    /// `Scheduler::deliver` enforces at delivery time, hoisted
+    /// to drain so the per-line response can surface
+    /// `RejectedByManifest` synchronously). Distinct from the
+    /// Phase-1 `InjectMessage` variant — that one preserves the
+    /// "202 = queued, manifest decided at delivery" contract for
+    /// single-shot inject. For bulk we want richer per-line
+    /// feedback so application-class clients (NewsCaster
+    /// firehose, ComplyFlow audit-log) can detect failures
+    /// mid-stream.
+    InjectMessageBulkLine {
+        node_id: String,
+        message_type: String,
+        payload: Value,
+        oneshot_tx: oneshot::Sender<BulkInjectResult>,
+    },
+    /// **M-Ingress phase 2.** `POST /v1/nodes/:id/call` —
+    /// synchronously inject a request and await a reply. The
+    /// drain handler validates node existence + the manifest's
+    /// `accepts_external_call` table for a matching
+    /// `(request_type, reply_type)` pair, then dispatches via
+    /// `SchedulerHandle::send_ingress_with_correlation`. The
+    /// HTTP-side handler is responsible for awaiting the
+    /// `oneshot::Receiver<Value>` it pre-registered in the
+    /// `PendingCalls` registry under `correlation_id` (NOT routed
+    /// through this `oneshot_tx`); this `oneshot_tx` carries
+    /// only the disposition (`Dispatched` /
+    /// `RejectedByManifest` / `NodeNotFound`) so the handler
+    /// knows whether to await the reply or fail fast.
+    InjectMessageWithReply {
+        node_id: String,
+        message_type: String,
+        payload: Value,
+        reply_type: String,
+        correlation_id: String,
+        oneshot_tx: oneshot::Sender<InjectMessageWithReplyDisposition>,
+    },
+}
+
+/// **M-Ingress phase 2.** Initial drain disposition for a call —
+/// distinct from [`CallResult`] because the call handler awaits
+/// the reply (or timeout) on a separate `oneshot::Receiver<Value>`
+/// pre-registered in the `PendingCalls` registry, while this
+/// disposition tells the handler whether dispatch even succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InjectMessageWithReplyDisposition {
+    /// Manifest gate passed and the message was injected via
+    /// `SchedulerHandle::send_ingress_with_correlation`. The
+    /// handler now awaits the `PendingCalls` oneshot for the
+    /// reply payload (or the `tokio::time::timeout` for the
+    /// 504 path).
+    Dispatched,
+    /// Target's `accepts_external_call` did not contain a matching
+    /// `(request_type, reply_type)` pair → 403.
+    RejectedByManifest,
+    /// Target node id did not resolve → 404.
+    NodeNotFound,
+}
+
+/// Outcome of an inject-message bridge round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InjectResult {
+    /// Message accepted onto the inbox. Note: this does NOT mean the
+    /// node *handled* the message — only that it was queued. The
+    /// telemetry sink (`MessageDelivered { accepted }`) reflects
+    /// the manifest-level disposition asynchronously.
+    Accepted,
+    /// Node id did not resolve at the moment of delivery. Maps to
+    /// HTTP 404.
+    NodeNotFound,
+}
+
+/// **M-Ingress phase 3.** Per-line bulk inject disposition.
+///
+/// Distinct from [`InjectResult`] because bulk surfaces manifest
+/// gating to the caller synchronously (per-line response in the
+/// streaming NDJSON body), whereas Phase 1 single-shot defers
+/// manifest gating to delivery and observes via the telemetry
+/// stream. Substrate-not-MVP: ingestion-shaped applications
+/// (NewsCaster firehose, ComplyFlow audit-log) need to know
+/// per-line outcomes inline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BulkInjectResult {
+    /// Manifest's `accepts_external` allows this `(node_id,
+    /// message_type)` pair AND the message has been dispatched
+    /// via `SchedulerHandle::send_ingress`.
+    Accepted,
+    /// Manifest's `accepts_external` does NOT contain this
+    /// `message_type`. Maps to per-line `"rejected_by_manifest"`
+    /// response.
+    RejectedByManifest,
+    /// Node id did not resolve. Maps to per-line
+    /// `"node_not_found"` response.
+    NodeNotFound,
+}
+
+/// **M-Ingress phase 2.** Outcome of an HTTP-call bridge round-trip
+/// (`POST /v1/nodes/:id/call`).
+///
+/// `Replied` is the success path; `Timeout` covers the case where
+/// the handler never emitted a reply within `timeout_ms`;
+/// `RejectedByManifest` surfaces server-side gating against the
+/// target's `accepts_external_call` table; `NodeNotFound` mirrors
+/// the inject path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallResult {
+    /// Handler emitted a reply matching the declared `reply_type`;
+    /// payload forwarded to the awaiting HTTP caller as 200 OK.
+    Replied(Value),
+    /// `timeout_ms` elapsed before any matching reply arrived.
+    /// Maps to HTTP 504 Gateway Timeout.
+    Timeout,
+    /// Target's `accepts_external_call` did NOT contain a matching
+    /// `(request_type, reply_type)` pair. Maps to HTTP 403.
+    RejectedByManifest,
+    /// Target node id did not resolve at the moment of dispatch.
+    /// Maps to HTTP 404.
+    NodeNotFound,
+}
+
+/// **M-Ingress phase 2.** Bounded pending-calls registry. Each
+/// `POST /v1/nodes/:id/call` registers `(correlation_id →
+/// oneshot::Sender<Value>)` here before crossing the bridge to
+/// the scheduler thread; the registry is wired as a `TelemetrySink`
+/// alongside Prometheus + ring buffer + WebSocket so the scheduler's
+/// `on_call_reply` event resolves the awaiting oneshot directly,
+/// without depending on actual graph delivery (leaf-node call
+/// handlers still work).
+///
+/// **Bounded under load.** [`Self::HARD_CAP`] entries; once
+/// reached, [`Self::register`] returns `false` so the call
+/// handler can surface 503 Service Unavailable. Callers MUST
+/// take responsibility for their oneshot half via the returned
+/// `Drop` guard ([`PendingCallGuard`]) — when the call future
+/// is dropped (HTTP client disconnect, axum future drop), the
+/// guard evicts the registry entry so the registry doesn't leak
+/// on cancelled requests.
+pub struct PendingCalls {
+    inner: Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+}
+
+impl PendingCalls {
+    /// Maximum concurrent in-flight calls before backpressure
+    /// surfaces as 503 Service Unavailable.
+    pub const HARD_CAP: usize = 10_000;
+
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Try to register `correlation_id → oneshot_tx`. Returns
+    /// `Some(guard)` on success — caller must hold the guard for
+    /// the lifetime of the call so HTTP-client-disconnect
+    /// (axum future drop) evicts the entry. Returns `None` if
+    /// the registry is at [`Self::HARD_CAP`].
+    pub fn register(
+        &self,
+        correlation_id: String,
+        oneshot_tx: oneshot::Sender<Value>,
+    ) -> Option<PendingCallGuard> {
+        let mut inner = self.inner.lock();
+        if inner.len() >= Self::HARD_CAP {
+            return None;
+        }
+        inner.insert(correlation_id.clone(), oneshot_tx);
+        Some(PendingCallGuard {
+            inner: Arc::clone(&self.inner),
+            correlation_id,
+            disarmed: false,
+        })
+    }
+
+    /// Current entry count. O(1) under the lock.
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// `true` if no in-flight calls are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+}
+
+impl Default for PendingCalls {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for PendingCalls {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+/// **M-Ingress phase 2.** TelemetrySink impl: resolve the awaiting
+/// `oneshot::Sender` IMMEDIATELY at scheduler-emit-time. The
+/// `Scheduler::deliver` auto-propagation logic constructs the
+/// reply Message + fires `on_call_reply` from `make_emit` BEFORE
+/// the reply Message enters the queue, so the HTTP call handler
+/// observes the reply without needing the reply to actually be
+/// delivered to a graph node.
+impl graphreact_core::TelemetrySink for PendingCalls {
+    #[inline]
+    fn on_call_reply(&self, ev: &graphreact_core::CallReply<'_>) {
+        let mut inner = self.inner.lock();
+        if let Some(tx) = inner.remove(ev.correlation_id) {
+            // The oneshot may already have been dropped (the
+            // axum future was cancelled); ignore the send error
+            // — the guard's Drop will have removed the entry
+            // anyway, so this branch only fires for racey cases
+            // where the disconnect arrives between `lock()` and
+            // `tx.send()`.
+            let _ = tx.send(ev.payload.clone());
+        }
+    }
+}
+
+/// **M-Ingress phase 2.** RAII guard returned by
+/// [`PendingCalls::register`]. Evicts the registry entry on drop
+/// so HTTP-client-disconnect (axum future cancellation) doesn't
+/// leak the entry. Disarmed on graceful resolution by the
+/// telemetry sink (i.e. the oneshot was successfully resolved).
+pub struct PendingCallGuard {
+    inner: Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    correlation_id: String,
+    disarmed: bool,
+}
+
+impl PendingCallGuard {
+    /// Mark this guard as disarmed — the call resolved gracefully
+    /// or timed out; the entry has already been removed from the
+    /// registry by the telemetry sink path (or by the timeout
+    /// path), and the guard's `Drop` should NOT perform a second
+    /// removal (which would otherwise be a no-op but races with
+    /// other ids on the same lock).
+    pub fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for PendingCallGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.inner.lock().remove(&self.correlation_id);
+        }
+    }
+}
+
+/// **M-Ingress phase 1.** Bounded idempotency-key cache. Lookup-or-insert
+/// at the HTTP boundary so duplicate retries (same `Idempotency-Key`
+/// header) short-circuit with HTTP 409 Conflict before ever crossing
+/// the cross-thread bridge.
+///
+/// Implementation: `parking_lot::Mutex<HashMap<String, Instant>>` plus
+/// lazy pruning on every insert. When the map exceeds [`Self::HIGH_WATER`]
+/// entries we sweep all expired entries (older than [`Self::TTL`]) in
+/// one pass. Cap is [`Self::HARD_CAP`]; once reached we evict the
+/// oldest half (Vec::sort by insert time) before accepting new keys.
+/// Substrate-not-MVP: bounded under load; no unbounded LRU growth.
+pub struct IdempotencyCache {
+    inner: parking_lot::Mutex<HashMap<String, Instant>>,
+}
+
+impl IdempotencyCache {
+    /// Maximum entries kept in the cache. Beyond this we evict the
+    /// oldest 50%.
+    pub const HARD_CAP: usize = 10_000;
+    /// Above this, every insert triggers an opportunistic prune.
+    pub const HIGH_WATER: usize = 8_000;
+    /// Idempotency-key TTL. After this elapses, a duplicate POST
+    /// with the same key is *not* a conflict.
+    pub const TTL: Duration = Duration::from_secs(600);
+
+    pub fn new() -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Try to insert `key` as a fresh idempotency entry. Returns
+    /// `true` if accepted (caller proceeds with the inject), or
+    /// `false` if a non-expired entry already exists (caller
+    /// returns HTTP 409).
+    pub fn try_insert(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut inner = self.inner.lock();
+        if let Some(prev) = inner.get(key) {
+            if now.duration_since(*prev) < Self::TTL {
+                return false;
+            }
+        }
+        if inner.len() >= Self::HIGH_WATER {
+            self.prune_locked(&mut inner, now);
+        }
+        if inner.len() >= Self::HARD_CAP {
+            // Oldest-half eviction. Collect, sort by Instant, drop first half.
+            let mut entries: Vec<(String, Instant)> = inner.drain().collect();
+            entries.sort_by_key(|(_, t)| *t);
+            let cutoff = entries.len() / 2;
+            for (k, t) in entries.into_iter().skip(cutoff) {
+                inner.insert(k, t);
+            }
+        }
+        inner.insert(key.to_string(), now);
+        true
+    }
+
+    fn prune_locked(&self, inner: &mut HashMap<String, Instant>, now: Instant) {
+        inner.retain(|_, t| now.duration_since(*t) < Self::TTL);
+    }
+
+    /// Current entry count. Exposed for tests + ops-debug ad-hoc.
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// `true` if no entries are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+}
+
+impl Default for IdempotencyCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Identity payload returned by `GET /v1/identity`. Operators detect
@@ -115,6 +470,20 @@ pub struct ApiState {
     /// is opt-in; older deploys keep the WS-disabled error
     /// response — `503 Service Unavailable`).
     pub websocket: Option<crate::websocket::WebSocketSink>,
+    /// **M-Ingress phase 1.** Bounded idempotency-key cache for
+    /// `POST /v1/nodes/:id/messages`. Shared by every inject
+    /// handler invocation; the dedup decision is made before the
+    /// cross-thread bridge so duplicate retries never reach the
+    /// scheduler.
+    pub idempotency_cache: Arc<IdempotencyCache>,
+    /// **M-Ingress phase 2.** In-flight HTTP-call registry. Each
+    /// `POST /v1/nodes/:id/call` registers `(correlation_id →
+    /// oneshot::Sender<Value>)` here before dispatch; the
+    /// scheduler-side `on_call_reply` event resolves the awaiting
+    /// oneshot. RAII guard returned from
+    /// [`PendingCalls::register`] handles HTTP-client-disconnect
+    /// eviction.
+    pub pending_calls: PendingCalls,
 }
 
 /// Maximum number of in-flight `SnapshotRequest`s on the bridge
@@ -122,6 +491,43 @@ pub struct ApiState {
 /// see 503 Service Unavailable rather than unbounded memory growth.
 /// Substrate-not-MVP: backpressure visible from day one.
 pub const SNAPSHOT_CHANNEL_CAPACITY: usize = 256;
+
+/// **M-Ingress phase 3.** Default line cap on
+/// `POST /v1/nodes/:id/messages/bulk` requests. Beyond this
+/// number of NDJSON lines the handler emits a final
+/// `{"line": N, "result": "exceeded_line_cap"}` and closes the
+/// response stream. Configurable via the `GRX_INGRESS_BULK_LINE_CAP`
+/// env var (substrate-level safety bound; operators can tune up or
+/// down for their workload).
+pub const DEFAULT_BULK_LINE_CAP: usize = 10_000;
+
+/// **M-Ingress phase 3.** Hard per-line byte cap. A single NDJSON
+/// line larger than this surfaces as `{"line": N, "result":
+/// "line_too_large"}` and the handler skips that line (the stream
+/// continues for subsequent lines). Substrate-level safety —
+/// operators can't override; if your application needs >1MB
+/// per-line, switch to single-shot `POST /v1/nodes/:id/messages`
+/// or chunk client-side.
+pub const BULK_MAX_LINE_BYTES: usize = 1_048_576; // 1 MiB
+
+/// **M-Ingress phase 3.** Pre-flight `Content-Length` cap. Requests
+/// declaring a body larger than this are rejected with HTTP 413
+/// before any streaming begins. Computed as `DEFAULT_BULK_LINE_CAP
+/// × BULK_MAX_LINE_BYTES` so a perfectly-packed maximal request
+/// fits but typo'd `Content-Length: 99999999999` is rejected
+/// up-front.
+pub const BULK_MAX_BODY_BYTES: u64 = (DEFAULT_BULK_LINE_CAP as u64) * (BULK_MAX_LINE_BYTES as u64);
+
+/// Read the configured bulk line cap from env var, falling back
+/// to [`DEFAULT_BULK_LINE_CAP`]. Parse failure (non-numeric or
+/// zero) also falls back to the default.
+fn bulk_line_cap() -> usize {
+    std::env::var("GRX_INGRESS_BULK_LINE_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BULK_LINE_CAP)
+}
 
 /// Outcome of a server bind, mirroring P2's `http_server::ServerHandle`.
 pub struct ApiServerHandle {
@@ -141,6 +547,17 @@ pub struct ApiServerHandle {
     /// here so the daemon caller can install it as a [`TelemetrySink`]
     /// consumer in the [`crate::MultiplexSink`] stack.
     pub websocket: Option<crate::websocket::WebSocketSink>,
+    /// **M-Ingress phase 1.** Idempotency cache backing
+    /// `POST /v1/nodes/:id/messages`. Shared between API state and
+    /// the daemon caller; lifetime tied to the daemon process.
+    pub idempotency_cache: Arc<IdempotencyCache>,
+    /// **M-Ingress phase 2.** PendingCalls registry backing
+    /// `POST /v1/nodes/:id/call`. The daemon caller installs this
+    /// as a `TelemetrySink` consumer (typically inside its
+    /// `MultiplexSink` stack alongside Prometheus + ring buffer +
+    /// WebSocket) so the scheduler's `on_call_reply` event
+    /// resolves awaiting oneshots.
+    pub pending_calls: PendingCalls,
 }
 
 impl ApiServerHandle {
@@ -168,6 +585,28 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/nodes", get(nodes_list))
         .route("/v1/nodes/:id", get(node_detail))
         .route("/v1/nodes/:id/messages/recent", get(node_messages_recent))
+        // **M-Ingress phase 1.** External-client message injection.
+        // Default-deny enforced at delivery time via the target
+        // node's `manifest.accepts_external` allowlist (see
+        // `Scheduler::deliver`). Idempotency-Key + bridge backpressure
+        // handled in `inject_message_handler`.
+        .route("/v1/nodes/:id/messages", post(inject_message_handler))
+        // **M-Ingress phase 2.** Synchronous request/response call.
+        // Manifest gate: `accepts_external_call` must contain a
+        // matching `(request_type, reply_type)` pair.
+        // Auto-correlation: scheduler tags the first matching reply
+        // emit with the inbound's `correlation_id`; the
+        // `PendingCalls` registry resolves the awaiting oneshot.
+        .route("/v1/nodes/:id/call", post(inject_call_handler))
+        // **M-Ingress phase 3.** Bulk/streaming NDJSON inject.
+        // Per-line manifest gating + per-line idempotency_key
+        // + streaming per-line `{"line": N, "result": "..."}`
+        // response. Body cap configurable via
+        // `GRX_INGRESS_BULK_LINE_CAP` env var.
+        .route(
+            "/v1/nodes/:id/messages/bulk",
+            post(bulk_inject_handler),
+        )
         .route("/v1/supervisor/tree", get(supervisor_tree))
         // M16-Backend P7 — live event stream (WebSocket primary,
         // SSE fallback). Both paths share the auth middleware +
@@ -182,7 +621,27 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer));
 
-    public_routes.merge(protected_routes).with_state(state)
+    // **M-Ingress phase 1.** Browser is now a first-class consumer
+    // of management-API + ingress endpoints. Baseline `*` origin
+    // suits loopback bind defaults; production deploys behind a
+    // header-injecting reverse proxy provide their own per-origin
+    // policy. M-Prod refines (per-origin allowlists, credential
+    // modes). Allowed methods cover ingress (POST), snapshots
+    // (GET), and preflight (OPTIONS); allowed headers cover
+    // bearer auth + JSON body + Idempotency-Key.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderName::from_static("idempotency-key"),
+        ]);
+
+    public_routes
+        .merge(protected_routes)
+        .with_state(state)
+        .layer(cors)
 }
 
 /// Spawn the management API HTTP server. Returns an
@@ -210,6 +669,8 @@ pub async fn spawn(
     });
     let ring = Arc::new(RingBufferTelemetry::new());
     let websocket = crate::websocket::WebSocketSink::default();
+    let idempotency_cache = Arc::new(IdempotencyCache::new());
+    let pending_calls = PendingCalls::new();
     let state = ApiState {
         metrics,
         snapshot_tx,
@@ -217,6 +678,8 @@ pub async fn spawn(
         identity,
         ring: ring.clone(),
         websocket: Some(websocket.clone()),
+        idempotency_cache: idempotency_cache.clone(),
+        pending_calls: pending_calls.clone(),
     };
     let router = build_router(state);
 
@@ -238,6 +701,8 @@ pub async fn spawn(
         snapshot_rx,
         ring,
         websocket: Some(websocket),
+        idempotency_cache,
+        pending_calls,
     })
 }
 
@@ -406,6 +871,605 @@ async fn node_messages_recent(
 #[derive(serde::Deserialize, Default)]
 struct RecentParams {
     limit: Option<usize>,
+}
+
+/// Request body shape for `POST /v1/nodes/:id/messages`.
+#[derive(Debug, Deserialize)]
+pub struct InjectMessageBody {
+    /// Message type — runtime-checked against the target's
+    /// `manifest.accepts_external`.
+    pub r#type: String,
+    /// Arbitrary JSON payload, forwarded verbatim to the node's
+    /// inbox. Runtime does not introspect this.
+    #[serde(default)]
+    pub payload: Value,
+}
+
+/// **M-Ingress phase 2.** Request body shape for
+/// `POST /v1/nodes/:id/call`.
+#[derive(Debug, Deserialize)]
+pub struct CallMessageBody {
+    /// Inbound message type — runtime-checked against the target's
+    /// `manifest.accepts_external_call[*].request_type`.
+    pub r#type: String,
+    /// Expected reply message type — runtime-checked against the
+    /// matching entry's `reply_type`. The runtime auto-tags the
+    /// first outgoing emit with this `type` (in the receiving
+    /// handler) with the correlation_id.
+    pub reply_type: String,
+    /// Arbitrary JSON payload, forwarded verbatim to the node's
+    /// inbox. Runtime does not introspect this.
+    #[serde(default)]
+    pub payload: Value,
+    /// Maximum time the call handler waits for the reply before
+    /// returning 504 Gateway Timeout. Defaults to 30 000 (30s);
+    /// server caps at 5 minutes (300 000) to bound resource
+    /// consumption.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// **M-Ingress phase 1.** `POST /v1/nodes/:id/messages` handler.
+///
+/// Pipeline:
+/// 1. (Optional) `Idempotency-Key` header dedup — duplicate retry → 409.
+/// 2. Cross-thread bridge to the scheduler thread for node-existence
+///    check + `SchedulerHandle::send` dispatch (origin = `__external__`).
+/// 3. `Scheduler::deliver` enforces `manifest.accepts_external` at the
+///    moment of delivery — types not on the allowlist are dropped with
+///    `MessageDelivered { accepted: false }` for ops visibility, but
+///    the HTTP response is still 202 Accepted (the semantics: "the
+///    daemon received your inject; the manifest decides what happens
+///    to it"). 403 is reserved for header-level rejection (which the
+///    HTTP path doesn't currently use; future M-Prod auth tightens this).
+async fn inject_message_handler(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InjectMessageBody>,
+) -> Response {
+    // Idempotency-Key dedup before crossing the bridge.
+    if let Some(key) = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        if !state.idempotency_cache.try_insert(key) {
+            return (
+                StatusCode::CONFLICT,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": "idempotency_conflict",
+                    "key": key,
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let req = SnapshotRequest::InjectMessage {
+        node_id: id,
+        message_type: body.r#type,
+        payload: body.payload,
+        oneshot_tx: tx,
+    };
+    if state.snapshot_tx.send(req).await.is_err() {
+        return service_unavailable("scheduler bridge closed");
+    }
+    match rx.await {
+        Ok(InjectResult::Accepted) => (
+            StatusCode::ACCEPTED,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "status": "accepted" }).to_string(),
+        )
+            .into_response(),
+        Ok(InjectResult::NodeNotFound) => (
+            StatusCode::NOT_FOUND,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "error": "node_not_found" }).to_string(),
+        )
+            .into_response(),
+        Err(_) => service_unavailable("scheduler bridge dropped response"),
+    }
+}
+
+/// **M-Ingress phase 2.** Cap the per-call timeout at 5 minutes
+/// to bound resource consumption (PendingCalls registry slots +
+/// scheduler thread bridge entries). Operators wanting longer
+/// waits should poll a status endpoint instead of hold-blocking
+/// HTTP.
+const MAX_CALL_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
+/// **M-Ingress phase 2.** Default per-call timeout when the
+/// caller doesn't supply `timeout_ms`. 30s matches typical HTTP
+/// client default-read timeouts so callers see a clean 504 rather
+/// than a TCP-level hang on stuck handlers.
+const DEFAULT_CALL_TIMEOUT_MS: u64 = 30_000;
+
+/// **M-Ingress phase 2.** `POST /v1/nodes/:id/call` handler.
+///
+/// Pipeline:
+/// 1. Generate `correlation_id` (UUIDv4) server-side.
+/// 2. Pre-register `(correlation_id → oneshot::Sender<Value>)` in
+///    the [`PendingCalls`] registry; if the registry is full,
+///    return 503. The registration returns a [`PendingCallGuard`]
+///    that evicts the entry on Drop — covers HTTP-client-disconnect
+///    via axum future cancellation.
+/// 3. Cross the bridge to the scheduler thread via
+///    [`SnapshotRequest::InjectMessageWithReply`]. The drain
+///    handler validates `accepts_external_call` for a matching
+///    `(request_type, reply_type)` pair; mismatch → 403.
+/// 4. Wrap the `oneshot::Receiver<Value>` in a `tokio::time::timeout`
+///    capped at [`MAX_CALL_TIMEOUT_MS`]. On reply, return 200 +
+///    payload. On timeout, return 504; the registry guard's Drop
+///    handles eviction.
+async fn inject_call_handler(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<CallMessageBody>,
+) -> Response {
+    // Server-side correlation_id mint. UUIDv4 keeps the space
+    // wide enough that operator-driven `correlation_id` reuse is
+    // ~impossible without explicit collusion.
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+
+    // Server-side timeout cap. Callers asking for longer waits
+    // get clamped to MAX_CALL_TIMEOUT_MS; smaller values pass
+    // through verbatim.
+    let timeout_ms = body
+        .timeout_ms
+        .unwrap_or(DEFAULT_CALL_TIMEOUT_MS)
+        .min(MAX_CALL_TIMEOUT_MS);
+
+    // Pre-register the awaiting oneshot BEFORE the bridge so the
+    // sink can resolve even if dispatch + emit happen faster than
+    // we can register (small but real race window).
+    let (reply_tx, reply_rx) = oneshot::channel::<Value>();
+    let Some(guard) = state.pending_calls.register(correlation_id.clone(), reply_tx) else {
+        return service_unavailable("pending_calls registry full");
+    };
+
+    // Bridge dispatch.
+    let (disp_tx, disp_rx) = oneshot::channel();
+    let req = SnapshotRequest::InjectMessageWithReply {
+        node_id: id,
+        message_type: body.r#type,
+        payload: body.payload,
+        reply_type: body.reply_type.clone(),
+        correlation_id: correlation_id.clone(),
+        oneshot_tx: disp_tx,
+    };
+    if state.snapshot_tx.send(req).await.is_err() {
+        // Drop `guard` evicts the registry entry.
+        drop(guard);
+        return service_unavailable("scheduler bridge closed");
+    }
+    let disposition = match disp_rx.await {
+        Ok(d) => d,
+        Err(_) => {
+            drop(guard);
+            return service_unavailable("scheduler bridge dropped response");
+        }
+    };
+
+    match disposition {
+        InjectMessageWithReplyDisposition::RejectedByManifest => {
+            drop(guard);
+            (
+                StatusCode::FORBIDDEN,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": "rejected_by_manifest",
+                    "reason": "no matching accepts_external_call entry",
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
+        InjectMessageWithReplyDisposition::NodeNotFound => {
+            drop(guard);
+            (
+                StatusCode::NOT_FOUND,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "error": "node_not_found" }).to_string(),
+            )
+                .into_response()
+        }
+        InjectMessageWithReplyDisposition::Dispatched => {
+            // Now race the reply against the timeout. The
+            // registry guard's Drop handles HTTP-disconnect
+            // (axum cancels this future, the guard drops, the
+            // registry entry evicts).
+            let timeout_dur = Duration::from_millis(timeout_ms);
+            match tokio::time::timeout(timeout_dur, reply_rx).await {
+                Ok(Ok(payload)) => {
+                    // Reply received — guard's slot was already
+                    // evicted by the sink on resolution. Disarm
+                    // so Drop doesn't double-evict.
+                    guard.disarm();
+                    let body = serde_json::json!({
+                        "reply_type": body.reply_type,
+                        "payload": payload,
+                    });
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body.to_string(),
+                    )
+                        .into_response()
+                }
+                Ok(Err(_)) => {
+                    // The oneshot was dropped without sending —
+                    // shouldn't happen on the live path because
+                    // the sink either sends a value or doesn't
+                    // touch the channel. Treat as 504.
+                    drop(guard);
+                    timeout_response(timeout_ms)
+                }
+                Err(_) => {
+                    // tokio::time::timeout elapsed. Drop the
+                    // guard so the entry evicts; the sink may
+                    // still attempt to resolve (race), but its
+                    // remove-then-send returns a closed channel
+                    // which is silently ignored.
+                    drop(guard);
+                    timeout_response(timeout_ms)
+                }
+            }
+        }
+    }
+}
+
+fn timeout_response(timeout_ms: u64) -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "error": "reply_timeout",
+            "timeout_ms": timeout_ms,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// **M-Ingress phase 3.** Per-line shape parsed out of the
+/// NDJSON request body for `POST /v1/nodes/:id/messages/bulk`.
+/// `idempotency_key` lives per-line because the
+/// `Idempotency-Key` HTTP header is single-valued and doesn't
+/// apply to a bulk request that carries many distinct messages.
+#[derive(Debug, Deserialize)]
+struct BulkLineBody {
+    r#type: String,
+    #[serde(default)]
+    payload: Value,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// **M-Ingress phase 3.** `POST /v1/nodes/:id/messages/bulk` —
+/// streaming NDJSON dispatch.
+///
+/// Pipeline:
+/// 1. Pre-flight `Content-Length` cap → 413 if the declared body
+///    exceeds [`BULK_MAX_BODY_BYTES`].
+/// 2. Spawn a producer task that:
+///    - Reads the request body as a `Stream<Item = Result<Bytes>>`
+///      and buffers a line at a time (split on `\n`).
+///    - Per line: enforces [`BULK_MAX_LINE_BYTES`] (oversized →
+///      `"line_too_large"`); parses JSON (malformed →
+///      `"bad_json"`); checks `IdempotencyCache` (duplicate →
+///      `"idempotency_conflict"`); then dispatches via the bridge
+///      and awaits the `BulkInjectResult` oneshot.
+///    - Streams a per-line `{"line": N, "result": "..."}` into
+///      the response body channel as each disposition resolves.
+/// 3. Stops at [`bulk_line_cap`] lines with a final
+///    `"exceeded_line_cap"` line.
+/// 4. mpsc-bridge full at any line → terminator
+///    `{"line": N, "result": "backpressure_503"}` + close stream
+///    (clients can retry from line N+1).
+///
+/// Status: 200 OK + `Transfer-Encoding: chunked` always (once the
+/// pre-flight `Content-Length` check passes); per-line dispositions
+/// surface as NDJSON in the streamed body. The 200 status is sent
+/// at handler entry, so even a partial-failure run carries a 200
+/// status — the per-line response shape is the source-of-truth for
+/// client decision-making.
+async fn bulk_inject_handler(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    use axum::body::Body;
+    use bytes::{Bytes, BytesMut};
+    use futures::StreamExt as _;
+
+    // Pre-flight Content-Length cap. Browsers + curl always set
+    // Content-Length on POST; chunked-transfer-encoded clients
+    // bypass this gate (the per-line cap still applies).
+    if let Some(cl) = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if cl > BULK_MAX_BODY_BYTES {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": "body_too_large",
+                    "max_bytes": BULK_MAX_BODY_BYTES,
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+    }
+
+    let line_cap = bulk_line_cap();
+    let snapshot_tx = state.snapshot_tx.clone();
+    let idem_cache = Arc::clone(&state.idempotency_cache);
+    let body = request.into_body();
+
+    // Bounded channel between the producer (parses + dispatches)
+    // and the response-body stream (relays bytes to the client).
+    // Capacity 64 lines of buffered output gives the producer
+    // headroom without unbounded memory growth if the client is
+    // slow.
+    let (out_tx, out_rx) = mpsc::channel::<Bytes>(64);
+
+    tokio::spawn(async move {
+        let mut data_stream = body.into_data_stream();
+        let mut buf: BytesMut = BytesMut::new();
+        let mut line_num: u64 = 0;
+        let mut eof = false;
+
+        while !eof {
+            // Ensure the buffer has at least one full line, OR EOF.
+            while !buf.contains(&b'\n') && !eof {
+                match data_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        buf.extend_from_slice(&chunk);
+                        // Per-line size cap: even before we see a
+                        // `\n`, if the line buffer is already too
+                        // large, eject this line and resync to the
+                        // next `\n`.
+                        if buf.len() > BULK_MAX_LINE_BYTES {
+                            if write_result(&out_tx, line_num, "line_too_large")
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            line_num += 1;
+                            if !drain_to_next_newline(&mut buf, &mut data_stream).await {
+                                return;
+                            }
+                            if line_num >= line_cap as u64 {
+                                let _ =
+                                    write_result(&out_tx, line_num, "exceeded_line_cap")
+                                        .await;
+                                return;
+                            }
+                        }
+                    }
+                    Some(Err(_)) | None => {
+                        eof = true;
+                    }
+                }
+            }
+
+            // Drain any complete lines from buf.
+            while let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
+                let line = buf.split_to(nl_pos + 1);
+                let line_text = &line[..line.len() - 1]; // drop the trailing '\n'
+                // Strip optional CR from CRLF-terminated lines.
+                let line_text = line_text
+                    .strip_suffix(b"\r")
+                    .unwrap_or(line_text);
+                // Empty lines (NDJSON tolerates / ignores them):
+                // skip without incrementing line_num. Real
+                // application clients should not emit blanks
+                // mid-stream, but trailing newlines after the
+                // last record are common.
+                if line_text.is_empty() {
+                    continue;
+                }
+                if line_num >= line_cap as u64 {
+                    let _ =
+                        write_result(&out_tx, line_num, "exceeded_line_cap").await;
+                    return;
+                }
+                let result = process_bulk_line(
+                    &state_ref(&snapshot_tx, &idem_cache),
+                    &id,
+                    line_text,
+                )
+                .await;
+                if write_line_result(&out_tx, line_num, &result).await.is_err() {
+                    return;
+                }
+                line_num += 1;
+                if matches!(result, BulkLineDisposition::BackpressureClosed) {
+                    return;
+                }
+            }
+        }
+
+        // EOF with leftover bytes (no trailing newline) — treat
+        // the remainder as the last line if non-empty.
+        if !buf.is_empty() {
+            let line_text = buf
+                .strip_suffix(b"\r")
+                .unwrap_or(&buf);
+            if !line_text.is_empty() && line_num < line_cap as u64 {
+                let result = process_bulk_line(
+                    &state_ref(&snapshot_tx, &idem_cache),
+                    &id,
+                    line_text,
+                )
+                .await;
+                let _ = write_line_result(&out_tx, line_num, &result).await;
+            }
+        }
+    });
+
+    let stream = futures::stream::unfold(out_rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<_, std::io::Error>(chunk), rx))
+    });
+    let body = Body::from_stream(stream);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-ndjson; charset=utf-8",
+        )
+        .body(body)
+        .unwrap_or_else(|_| service_unavailable("response body assembly failed"))
+}
+
+/// **M-Ingress phase 3.** Disposition of a single bulk-inject
+/// line, mapped to the per-line response result string by
+/// [`write_line_result`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BulkLineDisposition {
+    Accepted,
+    NodeNotFound,
+    RejectedByManifest,
+    BadJson,
+    IdempotencyConflict,
+    /// mpsc bridge full — caller should retry from line N+1.
+    /// Producer task closes the response stream after writing
+    /// this line.
+    BackpressureClosed,
+    /// Bridge dropped its oneshot before responding (scheduler
+    /// shutdown, race with daemon teardown). Stream continues
+    /// for subsequent lines but operators should investigate.
+    BridgeDropped,
+}
+
+/// State borrow shared between the producer task's per-line
+/// processing — clones are cheap (Arc / mpsc::Sender).
+struct BulkProducerState {
+    snapshot_tx: mpsc::Sender<SnapshotRequest>,
+    idem_cache: Arc<IdempotencyCache>,
+}
+
+fn state_ref(
+    snapshot_tx: &mpsc::Sender<SnapshotRequest>,
+    idem_cache: &Arc<IdempotencyCache>,
+) -> BulkProducerState {
+    BulkProducerState {
+        snapshot_tx: snapshot_tx.clone(),
+        idem_cache: Arc::clone(idem_cache),
+    }
+}
+
+/// Process one NDJSON line: validate, dedupe, dispatch via bridge,
+/// await the disposition.
+async fn process_bulk_line(
+    state: &BulkProducerState,
+    node_id: &str,
+    line_bytes: &[u8],
+) -> BulkLineDisposition {
+    let parsed: BulkLineBody = match serde_json::from_slice(line_bytes) {
+        Ok(p) => p,
+        Err(_) => return BulkLineDisposition::BadJson,
+    };
+
+    // Per-line idempotency check at the HTTP boundary.
+    if let Some(key) = parsed.idempotency_key.as_deref() {
+        if !key.is_empty() && !state.idem_cache.try_insert(key) {
+            return BulkLineDisposition::IdempotencyConflict;
+        }
+    }
+
+    let (tx, rx) = oneshot::channel::<BulkInjectResult>();
+    let req = SnapshotRequest::InjectMessageBulkLine {
+        node_id: node_id.to_string(),
+        message_type: parsed.r#type,
+        payload: parsed.payload,
+        oneshot_tx: tx,
+    };
+    match state.snapshot_tx.try_send(req) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            return BulkLineDisposition::BackpressureClosed;
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return BulkLineDisposition::BridgeDropped;
+        }
+    }
+    match rx.await {
+        Ok(BulkInjectResult::Accepted) => BulkLineDisposition::Accepted,
+        Ok(BulkInjectResult::NodeNotFound) => BulkLineDisposition::NodeNotFound,
+        Ok(BulkInjectResult::RejectedByManifest) => {
+            BulkLineDisposition::RejectedByManifest
+        }
+        Err(_) => BulkLineDisposition::BridgeDropped,
+    }
+}
+
+/// Drain the body data stream up to (and including) the next
+/// `\n`, then truncate the line buffer. Used after a
+/// `line_too_large` rejection to resynchronize at the next
+/// record boundary without buffering the rest of the oversized
+/// line. Returns `false` if the stream ended without a `\n` —
+/// which is fine, the caller drops out of the read loop.
+async fn drain_to_next_newline<S>(buf: &mut bytes::BytesMut, data_stream: &mut S) -> bool
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, axum::Error>> + Unpin,
+{
+    use futures::StreamExt as _;
+    if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let _ = buf.split_to(pos + 1);
+        return true;
+    }
+    buf.clear();
+    while let Some(chunk) = data_stream.next().await {
+        let Ok(chunk) = chunk else {
+            return false;
+        };
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&chunk[pos + 1..]);
+            return true;
+        }
+    }
+    false
+}
+
+/// Send a per-line response chunk into the response body
+/// channel. Returns `Err` if the receiver has been dropped (e.g.
+/// the client disconnected); callers MUST respect that and stop
+/// dispatching to avoid wasted work.
+async fn write_line_result(
+    out_tx: &mpsc::Sender<bytes::Bytes>,
+    line_num: u64,
+    disposition: &BulkLineDisposition,
+) -> Result<(), mpsc::error::SendError<bytes::Bytes>> {
+    let result_str = match disposition {
+        BulkLineDisposition::Accepted => "accepted",
+        BulkLineDisposition::NodeNotFound => "node_not_found",
+        BulkLineDisposition::RejectedByManifest => "rejected_by_manifest",
+        BulkLineDisposition::BadJson => "bad_json",
+        BulkLineDisposition::IdempotencyConflict => "idempotency_conflict",
+        BulkLineDisposition::BackpressureClosed => "backpressure_503",
+        BulkLineDisposition::BridgeDropped => "bridge_dropped",
+    };
+    write_result(out_tx, line_num, result_str).await
+}
+
+async fn write_result(
+    out_tx: &mpsc::Sender<bytes::Bytes>,
+    line_num: u64,
+    result: &str,
+) -> Result<(), mpsc::error::SendError<bytes::Bytes>> {
+    let chunk = format!("{{\"line\":{line_num},\"result\":\"{result}\"}}\n");
+    out_tx.send(bytes::Bytes::from(chunk)).await
 }
 
 async fn supervisor_tree(

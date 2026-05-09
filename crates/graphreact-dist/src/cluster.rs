@@ -66,7 +66,9 @@ use crate::reload::{
 };
 use crate::secret::SecretCookie;
 use crate::supervision::RemoteSupervision;
-use crate::observability::{WireTracingHook, WireTracingHookSlot};
+use crate::observability::{
+    WireTracingHook, WireTracingHookSlot, INGRESS_CALL_V1_CAPABILITY,
+};
 use crate::telemetry::TelemetrySinkSlot;
 use crate::tls_config::TlsConfig;
 use crate::transport::{accept_over, dial, dial_over, Connection, Listener};
@@ -887,7 +889,20 @@ fn route_outbound(
     // returns None and the wire packet's `trace_context` field stays
     // empty.
     let trace_context = wire_tracing_hook.extract_outbound();
-    let wire = local_to_wire(msg, trace_context);
+    // **M-Ingress phase 2.** Capability-gated correlation_id
+    // propagation: only ship the field if the target peer
+    // advertised `INGRESS_CALL_V1_CAPABILITY` in its handshake. A
+    // peer without the capability still parses v4 wire bytes
+    // correctly (`Option<String>` round-trips either way under
+    // postcard) but won't have a `PendingCalls` registry to
+    // resolve against, so we strip on outbound to avoid leaking
+    // call metadata that has no semantic effect on the receiver.
+    let correlation_id = if peer_supports_ingress_call_v1(&peer) {
+        msg.correlation_id.clone()
+    } else {
+        None
+    };
+    let wire = local_to_wire(msg, trace_context, correlation_id);
     let byte_size = wire.payload.len();
     match peer.send_tx.try_send(Packet::Message(wire)) {
         Ok(()) => {
@@ -941,7 +956,16 @@ fn route_outbound(
 /// observer crate's `OtelSink` populates it from the current
 /// thread's active OTel span). `None` for non-OTel deployments + for
 /// outbound emissions from non-scheduler threads.
-fn local_to_wire(msg: &Message, trace_context: Option<[u8; 24]>) -> WireMessage {
+///
+/// **M-Ingress phase 2.** `correlation_id` is supplied by the
+/// caller after capability-flag gating (peers without
+/// [`crate::INGRESS_CALL_V1_CAPABILITY`] receive `None` regardless
+/// of the local Message's value).
+fn local_to_wire(
+    msg: &Message,
+    trace_context: Option<[u8; 24]>,
+    correlation_id: Option<String>,
+) -> WireMessage {
     let payload = serde_json::to_vec(&msg.payload).unwrap_or_else(|e| {
         // Should not happen — serde_json::Value always serialises.
         // Log + send empty payload so the wire shape stays
@@ -965,7 +989,18 @@ fn local_to_wire(msg: &Message, trace_context: Option<[u8; 24]>) -> WireMessage 
         // `docs/wire-protocol.md` for the analysis.
         inherited_ttl: None,
         trace_context,
+        correlation_id,
     }
+}
+
+/// **M-Ingress phase 2.** Whether the peer advertised
+/// [`crate::INGRESS_CALL_V1_CAPABILITY`] in its handshake. Used by
+/// `route_outbound` to decide whether to ship a Message's
+/// `correlation_id` over the wire.
+fn peer_supports_ingress_call_v1(peer: &PeerHandle) -> bool {
+    peer.capabilities
+        .iter()
+        .any(|c| c == INGRESS_CALL_V1_CAPABILITY)
 }
 
 /// Convert wire `WireMessage` → local Message. **Authoritative
@@ -1014,6 +1049,14 @@ fn wire_to_local(
         // receiver-side `OtelSink` to attach as a `Link`. `None`
         // when the sender lacked an active span at outbound time.
         trace_context: wire.trace_context,
+        // **M-Ingress phase 2.** Forward the wire-carried
+        // correlation_id into the local Message so the scheduler's
+        // `MessageDelivered` event surfaces it for the
+        // receiver-side `PendingCalls` consumer to look up. The
+        // wire format always parses this field on v4 — outbound
+        // capability-gating happens at the sender's `route_outbound`
+        // (peers without `INGRESS_CALL_V1_CAPABILITY` send `None`).
+        correlation_id: wire.correlation_id,
     })
 }
 
@@ -3730,5 +3773,112 @@ mod tests {
         alice_cluster.shutdown();
         bob_cluster.shutdown();
         carol_cluster.shutdown();
+    }
+
+    /// **M-Ingress phase 2.** Cap-flag-gating unit test for the
+    /// outbound correlation_id propagation path. Mirrors the
+    /// scenario described in the plan file's "Cluster
+    /// compatibility test" row: a peer WITHOUT the
+    /// `ingress-call-v1` capability advertised must NOT receive
+    /// correlation_id over the wire, even when the local
+    /// Message carries one. A peer WITH the capability does.
+    ///
+    /// We exercise the two helpers `route_outbound` calls
+    /// (`peer_supports_ingress_call_v1` + `local_to_wire`)
+    /// directly because spinning up a full handshake just to
+    /// pin a capability bit would dwarf the unit being tested.
+    /// The `roundtrip_message_with_correlation_id` test in
+    /// `wire/frame.rs` already pins the postcard wire shape;
+    /// this test pins the policy decision.
+    #[test]
+    fn ingress_call_v1_cap_flag_gates_correlation_id_outbound() {
+        // Peer A: advertises `ingress-call-v1` → outbound carries
+        // the correlation_id.
+        let (tx_a, _rx_a) = mpsc::channel(8);
+        let peer_with_cap = PeerHandle::new(
+            "alice@127.0.0.1".parse().unwrap(),
+            Creation(1),
+            tx_a,
+            vec!["grx-v1".into(), INGRESS_CALL_V1_CAPABILITY.into()],
+        );
+        assert!(peer_supports_ingress_call_v1(&peer_with_cap));
+
+        // Peer B: NO `ingress-call-v1` (e.g. an older v4 daemon
+        // running under `grx connect` without the capability
+        // advertised, or any future feature-flag deployment
+        // shape) → outbound MUST strip correlation_id.
+        let (tx_b, _rx_b) = mpsc::channel(8);
+        let peer_without_cap = PeerHandle::new(
+            "bob@127.0.0.1".parse().unwrap(),
+            Creation(1),
+            tx_b,
+            vec!["grx-v1".into()],
+        );
+        assert!(!peer_supports_ingress_call_v1(&peer_without_cap));
+
+        // Build a local Message carrying a correlation_id (e.g.
+        // the auto-tagged reply from a `POST /v1/nodes/:id/call`
+        // flow on this daemon) targeting a remote node.
+        let mut msg = graphreact_core::create_message(
+            "query_result",
+            "aggregator@local",
+            "client@bob",
+            serde_json::json!({"answer": 42}),
+            None,
+        );
+        msg.correlation_id = Some("abc-123".into());
+
+        // Cap-pass: correlation_id rides on the wire.
+        let wire_with = local_to_wire(&msg, None, msg.correlation_id.clone());
+        assert_eq!(wire_with.correlation_id, Some("abc-123".to_string()));
+
+        // Cap-strip: correlation_id is None on the wire even
+        // though the local Message has it set. This is what
+        // `route_outbound` does when the target peer lacks the
+        // capability.
+        let wire_without = local_to_wire(&msg, None, None);
+        assert_eq!(wire_without.correlation_id, None);
+    }
+
+    /// **M-Ingress phase 2.** Inbound roundtrip:
+    /// `wire_to_local` must preserve `correlation_id` so the
+    /// receiver-side `Scheduler::deliver` can route the
+    /// auto-propagation context. Tested for both the present
+    /// and absent cases — peers without the capability send
+    /// `None` upstream, which `wire_to_local` must propagate
+    /// faithfully (no spurious empty-string materialisation).
+    #[test]
+    fn wire_to_local_preserves_correlation_id_round_trip() {
+        let with_cid = WireMessage {
+            id: "m1".into(),
+            msg_type: "query".into(),
+            from: "client@bob".into(),
+            to: "aggregator@alice".into(),
+            payload: b"{}".to_vec(),
+            ttl: 8,
+            timestamp: 0,
+            direct: false,
+            inherited_ttl: None,
+            trace_context: None,
+            correlation_id: Some("xyz-789".into()),
+        };
+        let local = wire_to_local(with_cid, "bob", "alice").expect("decode");
+        assert_eq!(local.correlation_id, Some("xyz-789".to_string()));
+
+        let without_cid = WireMessage {
+            id: "m2".into(),
+            msg_type: "query".into(),
+            from: "client@bob".into(),
+            to: "aggregator@alice".into(),
+            payload: b"{}".to_vec(),
+            ttl: 8,
+            timestamp: 0,
+            direct: false,
+            inherited_ttl: None,
+            trace_context: None,
+            correlation_id: None,
+        };
+        let local = wire_to_local(without_cid, "bob", "alice").expect("decode");
+        assert_eq!(local.correlation_id, None);
     }
 }

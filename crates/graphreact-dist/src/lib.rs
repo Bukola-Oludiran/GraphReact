@@ -80,7 +80,8 @@ pub use node_id::{Creation, NodeId, RemoteNodeRef};
 pub use groups::{DistGroups, MIN_GOSSIP_INTERVAL};
 pub use net_tick::{NetSplitPolicy, NetTickConfig};
 pub use observability::{
-    WireTracingHook, WireTracingHookSlot, OBSERVER_OTEL_V1_CAPABILITY,
+    WireTracingHook, WireTracingHookSlot, INGRESS_CALL_V1_CAPABILITY,
+    OBSERVER_OTEL_V1_CAPABILITY,
 };
 pub use registry::{NodeRegistry, PeerHandle};
 pub use reload::{

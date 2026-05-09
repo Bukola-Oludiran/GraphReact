@@ -39,6 +39,14 @@ pub fn create_message(
         // this field when a message arrives from a remote peer with
         // OTel tracing enabled.
         trace_context: None,
+        // **M-Ingress phase 2.** Locally-emitted messages are not
+        // part of an HTTP call flow by default. The runtime's
+        // auto-propagation logic in `Scheduler::deliver` overlays
+        // the inbound correlation_id onto the first matching
+        // outgoing emit; explicit ingress entrypoints
+        // (`SchedulerHandle::send_ingress_with_correlation`) set
+        // it directly on construction.
+        correlation_id: None,
     }
 }
 

@@ -39,6 +39,9 @@ axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 
+# M-Ingress phase 2 — UUIDv4 correlation_id mint for `POST /v1/nodes/:id/call`.
+uuid.workspace = true
+
 # M16-Backend P7 — WebSocket + SSE live event stream.
 futures.workspace = true
 

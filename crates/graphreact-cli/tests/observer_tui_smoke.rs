@@ -85,6 +85,12 @@ async fn spawn_fixture(process_start_id: u64) -> (ApiServerHandle, JoinHandle<()
                         ],
                     }]);
                 }
+                // **M-Ingress.** TUI smoke test does not exercise inject /
+                // call / bulk; dedicated coverage is in
+                // observer/tests/{inject,call,bulk}_e2e.rs.
+                SnapshotRequest::InjectMessage { .. }
+                | SnapshotRequest::InjectMessageWithReply { .. }
+                | SnapshotRequest::InjectMessageBulkLine { .. } => {}
             }
         }
     });

@@ -31,11 +31,28 @@ use serde::{Deserialize, Serialize};
 ///   floor; M-Prod owns rolling-version negotiation. Capability-bit
 ///   mixing ("graceful mixed-version") happens *within* a v3 cluster
 ///   via the `Hello.capabilities` list, not across wire versions.
-pub const WIRE_VERSION: u16 = 3;
+/// - `4` — **M-Ingress phase 2.** Adds
+///   [`Message::correlation_id: Option<String>`] for end-to-end
+///   correlation of synchronous HTTP calls (`POST /v1/nodes/:id/call`
+///   in the management API) with their auto-tagged replies. Peers
+///   advertising the [`crate::INGRESS_CALL_V1_CAPABILITY`] flag in
+///   their `Hello` / `ChallengeAck` capabilities populate the field
+///   when a local handler emits a reply tagged by
+///   [`graphreact_core::Scheduler::deliver`]'s auto-propagation
+///   (per the local manifest's `accepts_external_call` table); peers
+///   without the capability strip the field on outbound and ignore
+///   it on inbound (the wire bytes still parse — `Option<String>`
+///   round-trips correctly under postcard either way — but a v4
+///   peer treats correlation_id from a non-cap peer as "not part
+///   of any call I'm tracking"). Same hard-floor invariant as the
+///   `2 → 3` bump: v3 peers cannot interop with v4 peers; M-Prod
+///   owns rolling-version negotiation. The capability flag handles
+///   in-version graceful-mixed-version operation.
+pub const WIRE_VERSION: u16 = 4;
 /// Minimum protocol version this build will accept on a Hello/Challenge.
 /// Equal to [`WIRE_VERSION`] today; widens on backwards-compatible
 /// extension, narrows on deprecation.
-pub const MIN_SUPPORTED_VERSION: u16 = 3;
+pub const MIN_SUPPORTED_VERSION: u16 = 4;
 
 /// Single-byte type discriminant for every wire packet.
 ///
@@ -204,6 +221,26 @@ pub struct Message {
     /// messages with no active span at outbound time. Wire format
     /// landed at `WIRE_VERSION = 3`.
     pub trace_context: Option<[u8; 24]>,
+    /// **M-Ingress phase 2.** Opaque correlation identifier paired
+    /// with synchronous HTTP calls (`POST /v1/nodes/:id/call` in the
+    /// management API). Generated server-side as a UUIDv4 by the
+    /// call handler before crossing the cross-thread bridge to the
+    /// scheduler; the auto-propagation logic in
+    /// [`graphreact_core::Scheduler::deliver`] copies it onto the
+    /// first outgoing emit whose `type` matches the call's declared
+    /// `reply_type` (per the local manifest's
+    /// `accepts_external_call` table). Cluster wire propagation is
+    /// gated on the [`crate::INGRESS_CALL_V1_CAPABILITY`] flag — a
+    /// sender targeting a peer without the capability serializes
+    /// `None` here regardless of the local Message's value;
+    /// receivers from peers without the capability ignore the field
+    /// on inbound (a v4 peer without the capability still parses the
+    /// wire bytes correctly — postcard deserializes `Option<String>`
+    /// either way — but treats correlation_id from a non-cap peer as
+    /// "not part of any call I'm tracking"). `None` for messages
+    /// that aren't part of a call flow. Wire format landed at
+    /// `WIRE_VERSION = 4`.
+    pub correlation_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------

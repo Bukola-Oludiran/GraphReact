@@ -231,6 +231,73 @@ fn bench_case_g_otel_sink(c: &mut Criterion) {
     });
 }
 
+/// **M-Ingress phase 4 closeout gate.** Trait + ring scheduler + the
+/// HTTP-ingress dispatch path. Each iteration sends `MESSAGE_ROUNDS`
+/// messages through `SchedulerHandle::send_ingress` (the
+/// `from = "__ingress__"` origin), driving the `accepts_external`
+/// manifest gate at delivery — the new branch the M-Ingress phase-1
+/// scheduler split introduces. The ring nodes here declare
+/// `accepts_external: ['hop']` so the gate passes; the bench
+/// measures the cost of the ingress branch on the accepted path.
+///
+/// Gate: `case_h / case_a` within the macOS noise band consistent
+/// with M16-Backend P1-P11 trend (-1% to +3%).
+fn bench_case_h_external_inject(c: &mut Criterion) {
+    c.bench_function("scheduler_overhead/case_h_external_inject", |b| {
+        b.iter(|| {
+            let mut scheduler = build_external_inject_scheduler();
+            drive_ingress_rounds(&mut scheduler);
+        });
+    });
+}
+
+/// Build the same ring shape as [`build_ring_scheduler`] but with
+/// `accepts_external: ['hop']` declared per-node so the M-Ingress
+/// `__ingress__` origin gate passes at delivery. Otherwise identical
+/// — same node count, same edges, same TTL=1 termination.
+fn build_external_inject_scheduler() -> Scheduler {
+    let mut graph = CommunicationGraph::new();
+    for i in 0..RING_NODE_COUNT {
+        graph.add_node(format!("n{i}"), Attrs::new());
+    }
+    for i in 0..RING_NODE_COUNT {
+        let from = format!("n{i}");
+        let to = format!("n{}", (i + 1) % RING_NODE_COUNT);
+        graph.add_edge(from, to, None, Attrs::new());
+    }
+    let mut scheduler = Scheduler::new(graph);
+    for i in 0..RING_NODE_COUNT {
+        let node_id = format!("n{i}");
+        let definition = NodeDefinition::new(&node_id, |_ctx: &NodeContext| {
+            let mut m = PermissionManifest::new(
+                vec!["hop".to_string()],
+                vec!["hop".to_string()],
+            );
+            m.accepts_external.push("hop".to_string());
+            m
+        });
+        scheduler
+            .register_node(definition, node_id, Attrs::new(), 0)
+            .expect("register");
+    }
+    scheduler.start().expect("start");
+    scheduler
+}
+
+/// Drive `MESSAGE_ROUNDS` rounds via the M-Ingress
+/// `SchedulerHandle::send_ingress` entrypoint instead of the local
+/// `Scheduler::send` path. Same per-round shape — round-robin
+/// inject across the ring; one message per round; one cascade
+/// per process_batch.
+fn drive_ingress_rounds(scheduler: &mut Scheduler) {
+    let handle = scheduler.handle();
+    for r in 0..MESSAGE_ROUNDS {
+        let to = format!("n{}", r % RING_NODE_COUNT);
+        handle.send_ingress(to, "hop", serde_json::json!({ "r": r }));
+        scheduler.process_batch().expect("batch");
+    }
+}
+
 #[cfg(not(feature = "otel-test"))]
 criterion_group!(
     benches,
@@ -239,7 +306,8 @@ criterion_group!(
     bench_case_c,
     bench_case_mux,
     bench_case_d,
-    bench_case_e
+    bench_case_e,
+    bench_case_h_external_inject
 );
 #[cfg(feature = "otel-test")]
 criterion_group!(
@@ -250,6 +318,7 @@ criterion_group!(
     bench_case_mux,
     bench_case_d,
     bench_case_e,
-    bench_case_g_otel_sink
+    bench_case_g_otel_sink,
+    bench_case_h_external_inject
 );
 criterion_main!(benches);

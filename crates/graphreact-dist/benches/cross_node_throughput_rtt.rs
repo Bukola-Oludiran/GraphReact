@@ -304,6 +304,7 @@ fn run_batch(setup: &mut Setup, batch_size: u64, payload: &serde_json::Value) {
                 direct: false,
                 inherited_ttl: None,
                 trace_context: None,
+                correlation_id: None,
             };
             peer.send_tx
                 .send(graphreact_dist::Packet::Message(wire))

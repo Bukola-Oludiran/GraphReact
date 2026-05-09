@@ -49,6 +49,32 @@ use parking_lot::RwLock;
 /// `tests/observer_otel_capability_constant_matches.rs`.
 pub const OBSERVER_OTEL_V1_CAPABILITY: &str = "observer-otel-v1";
 
+/// **M-Ingress phase 2.** Capability flag a node advertises in its
+/// [`crate::wire::Hello`] / [`crate::wire::ChallengeAck`] to say
+/// "I understand the [`crate::wire::Message::correlation_id`] field
+/// — propagate it on outbound and consume it on inbound". Peer-pair-
+/// level: when both ends advertise it, the
+/// `POST /v1/nodes/:id/call` flow can target a remote node and
+/// have its reply route back through the call origin's
+/// `PendingCalls` registry. When only one side advertises it, the
+/// non-advertising side strips correlation_id on outbound (silently
+/// — the reply will time out at the call origin) and ignores it on
+/// inbound (the call origin's `PendingCalls` lookup never resolves).
+///
+/// This is the same shape as
+/// [`OBSERVER_OTEL_V1_CAPABILITY`]: hard wire-version floor at the
+/// `WIRE_VERSION` boundary (v3 ↔ v4 are not interop-compatible per
+/// the `MIN_SUPPORTED_VERSION == WIRE_VERSION` invariant), then
+/// in-version capability gating for the new feature so two v4
+/// peers running different daemon configurations can coexist
+/// gracefully.
+///
+/// **String stability** — pinned by the
+/// `ingress_call_v1_capability_string_is_ingress_call_v1` test
+/// below. Higher-level crates (e.g. `graphreact-cli`'s daemon
+/// capability advertisement) depend on this exact byte sequence.
+pub const INGRESS_CALL_V1_CAPABILITY: &str = "ingress-call-v1";
+
 /// **M16-Backend Phase 10.** Trait the observer crate's `OtelSink`
 /// implements to provide the dist outbound path with the current
 /// thread's active OTel span context. Called once per outbound
@@ -117,6 +143,13 @@ mod tests {
     #[test]
     fn observer_otel_v1_capability_string_is_observer_otel_v1() {
         assert_eq!(OBSERVER_OTEL_V1_CAPABILITY, "observer-otel-v1");
+    }
+
+    /// **M-Ingress phase 2.** Same shape — pin the literal so a
+    /// rename on one side surfaces immediately as a test failure.
+    #[test]
+    fn ingress_call_v1_capability_string_is_ingress_call_v1() {
+        assert_eq!(INGRESS_CALL_V1_CAPABILITY, "ingress-call-v1");
     }
 
     /// A freshly-constructed slot is empty and returns None for both

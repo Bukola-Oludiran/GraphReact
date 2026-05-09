@@ -41,7 +41,7 @@ pub use supervision::{
 };
 pub use transforms::{get_transform, list_transforms, register_transform};
 pub use types::{
-    ChannelPolicy, ChildRef, ComposeChildSpec, EmitOptions, IncomingMessage, Message,
+    ChannelPolicy, ChildRef, ComposeChildSpec, EmitOptions, ExternalCall, IncomingMessage, Message,
     MessageHandler, NodeContext, PermissionManifest, TopologyEventKind, TopologyFilterOptions,
     TopologyHandler, TransformFn,
 };

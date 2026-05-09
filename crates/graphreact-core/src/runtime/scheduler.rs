@@ -56,6 +56,23 @@ new_key_type! {
 /// Height of a node in the hierarchy — used for dirty-queue ordering.
 pub type Height = u32;
 
+/// **M-Ingress phase 2.** Per-handler-invocation context capturing
+/// the inbound HTTP-call shape so `make_emit` can auto-tag the
+/// reply.
+///
+/// `correlation_id` is the opaque id minted by the call handler;
+/// `reply_type` is the message type the runtime should auto-tag
+/// (sourced from the matching `accepts_external_call` entry's
+/// `reply_type`); `tagged` flips on first match so a handler
+/// emitting multiple downstream messages doesn't accidentally tag
+/// them all as replies.
+#[derive(Debug, Clone)]
+struct CallContext {
+    correlation_id: String,
+    reply_type: String,
+    tagged: bool,
+}
+
 /// Reactive scheduler. Owns nodes, the message queue, and the dirty queue.
 ///
 /// Single-threaded by design — `Rc` and `RefCell` carry shared state. Use
@@ -107,6 +124,20 @@ pub struct Scheduler {
     /// (ping-pong ran unbounded because each re-emit reset to
     /// `DEFAULT_TTL`).
     last_received_ttl: Rc<RefCell<FxHashMap<NodeKey, u32>>>,
+
+    /// **M-Ingress phase 2.** Per-handler-invocation context for
+    /// auto-propagating `correlation_id` from an inbound HTTP-call
+    /// message onto the outgoing reply. Set by `deliver()` BEFORE
+    /// invoking handlers when the inbound `Message.correlation_id`
+    /// is `Some(_)` AND the target's manifest declares a matching
+    /// `accepts_external_call` entry; cleared on handler exit (with
+    /// save/restore so nested deliveries don't cross-contaminate).
+    /// Read by `make_emit` to overlay the captured correlation_id
+    /// onto exactly the first outgoing message whose `type` matches
+    /// `reply_type` — `tagged` flips on first match so
+    /// multi-emit handlers don't accidentally tag downstream
+    /// messages as replies.
+    current_call_context: Rc<RefCell<Option<CallContext>>>,
 
     /// Active monitors. Drained per-target on `unmount` to deliver
     /// `__DOWN__` system messages.
@@ -485,6 +516,7 @@ impl Scheduler {
             sources: Rc::new(RefCell::new(FxHashMap::default())),
             current_delivery_ttl: Rc::new(std::cell::Cell::new(None)),
             last_received_ttl: Rc::new(RefCell::new(FxHashMap::default())),
+            current_call_context: Rc::new(RefCell::new(None)),
             monitors: Rc::new(RefCell::new(MonitorRegistry::new())),
             links: Rc::new(RefCell::new(LinkRegistry::new())),
             groups: Rc::new(RefCell::new(GroupRegistry::new())),
@@ -2170,9 +2202,17 @@ impl Scheduler {
 
         let mut incoming = IncomingMessage::from_message(&msg);
 
-        // External messages bypass accept-list checks; they're explicitly
-        // host-injected (`Scheduler::send`).
-        let is_external = matches!(
+        // **M-Ingress.** Three origin classes for non-policy-checked paths:
+        // - `__ingress__` — HTTP-injected via `POST /v1/nodes/:id/messages`
+        //   (`SchedulerHandle::send_ingress`). Default-deny: type must be
+        //   declared in `manifest.accepts_external`. New in M-Ingress.
+        // - `__external__` — in-process inject (`SchedulerHandle::send`,
+        //   used by tests, benches, dist remote dispatch glue, source
+        //   bridges). Legacy bypass preserved for backward compatibility.
+        // - `__source__` / `__system__` — synthetic origins from
+        //   `EventSource` and supervision. Legacy bypass.
+        let is_ingress = msg.from == "__ingress__";
+        let is_legacy_external = matches!(
             msg.from.as_str(),
             "__external__" | "__source__" | "__system__"
         );
@@ -2185,7 +2225,7 @@ impl Scheduler {
         // `manifest.accepts` is still enforced — direct doesn't grant
         // a capability the target hasn't declared. Mirrors the TS
         // scheduler's `_direct` semantics introduced in Phase 9.
-        let accepted = if !is_external && msg.direct {
+        let accepted = if !is_ingress && !is_legacy_external && msg.direct {
             match target_rc.borrow().manifest.clone() {
                 Some(manifest) => manifest.accepts.iter().any(|t| t == &msg.r#type),
                 None => false,
@@ -2197,8 +2237,38 @@ impl Scheduler {
                 &self.graph.borrow(),
                 None,
             );
-            let accept_listed =
-                is_external || policy.accepts.iter().any(|t| t == &msg.r#type);
+            let accept_listed = if is_ingress {
+                // **M-Ingress.** HTTP-injected messages: default-deny
+                // unless the manifest opts in. Phase 1 uses
+                // `accepts_external` (single-shot). Phase 2 adds
+                // call-shape: when `correlation_id.is_some()`, the
+                // `request_type` must appear in
+                // `accepts_external_call`. Two separate trust
+                // boundaries — declaring a call-shape doesn't grant
+                // single-shot inject and vice versa. `request_type`
+                // alone is checked here; the (request_type,
+                // reply_type) pair is gated server-side by the
+                // call drain handler before this delivery runs.
+                target_rc
+                    .borrow()
+                    .manifest
+                    .as_ref()
+                    .map(|m| {
+                        if msg.correlation_id.is_some() {
+                            m.accepts_external_call
+                                .iter()
+                                .any(|c| c.request_type == msg.r#type)
+                        } else {
+                            m.accepts_external.iter().any(|t| t == &msg.r#type)
+                        }
+                    })
+                    .unwrap_or(false)
+            } else if is_legacy_external {
+                // Legacy bypass for in-process injection paths.
+                true
+            } else {
+                policy.accepts.iter().any(|t| t == &msg.r#type)
+            };
             if accept_listed {
                 if let Some(transform) = &policy.transform {
                     match transform(&incoming, &Attrs::new()) {
@@ -2256,10 +2326,43 @@ impl Scheduler {
         let target_neighbors = self.graph.borrow().neighbors(&target_id).unwrap_or_default();
         let hook_ctx = self.build_hook_ctx(target_key, target_id, target_neighbors);
         set_hook_ctx(Some(hook_ctx));
+
+        // **M-Ingress phase 2.** Auto-propagation context capture.
+        // If this inbound message carries a `correlation_id` (i.e.
+        // it came in via `POST /v1/nodes/:id/call`) AND the target
+        // node's manifest declares a matching
+        // `accepts_external_call` entry for this `request_type`,
+        // capture `(correlation_id, reply_type)` so `make_emit`
+        // can auto-tag the first matching outgoing reply. We
+        // save/restore the prior value so nested deliveries
+        // (handlers triggering immediate inbox push that gets
+        // delivered before the outer handler returns) don't
+        // cross-contaminate. First-match-only is enforced via the
+        // `tagged` flag — flipped in `make_emit` after the first
+        // match so subsequent matching emits in the same
+        // invocation are NOT tagged.
+        let prev_call_context = self.current_call_context.borrow_mut().take();
+        let new_call_context = msg.correlation_id.as_ref().and_then(|cid| {
+            target_rc.borrow().manifest.as_ref().and_then(|m| {
+                m.accepts_external_call
+                    .iter()
+                    .find(|c| c.request_type == msg.r#type)
+                    .map(|c| CallContext {
+                        correlation_id: cid.clone(),
+                        reply_type: c.reply_type.clone(),
+                        tagged: false,
+                    })
+            })
+        });
+        *self.current_call_context.borrow_mut() = new_call_context;
+
         for handler in handlers {
             handler(&incoming);
         }
         set_hook_ctx(None);
+
+        // Restore the prior call context (supports nested deliveries).
+        *self.current_call_context.borrow_mut() = prev_call_context;
 
         // If any handler called `postpone()`, defer this message into the
         // target's postpone queue. It re-enters the main queue at the
@@ -2316,6 +2419,15 @@ impl Scheduler {
         let id_to_key = self.id_to_key.clone();
         let current_ttl = Rc::clone(&self.current_delivery_ttl);
         let last_received_ttl = Rc::clone(&self.last_received_ttl);
+        let call_context = Rc::clone(&self.current_call_context);
+        // **M-Ingress phase 2.** Snapshot the telemetry sink at
+        // make_emit time so the auto-propagation `on_call_reply`
+        // path can fire without re-acquiring the ArcSwap on every
+        // emit. Same shape as the other snapshot-at-build-time
+        // captures (`remote_sink`, `our_node_name`); install /
+        // replace lands on the next hook-ctx rebuild.
+        let telemetry_snapshot: Option<Arc<crate::telemetry::TelemetrySinkRef>> =
+            self.telemetry.load_full();
         let from_key = self.id_to_key.get(&from).copied();
         // Snapshot neighbor lookup table for emission targeting.
         let graph = self.graph.borrow();
@@ -2382,6 +2494,56 @@ impl Scheduler {
                 .or_else(|| current_ttl.get())
                 .or_else(|| from_key.and_then(|k| last_received_ttl.borrow().get(&k).copied()));
             let proposed_ttl = inherited_ttl_opt.unwrap_or(DEFAULT_TTL);
+
+            // **M-Ingress phase 2.** Decide once per emit whether to
+            // auto-tag this outgoing message with the inbound
+            // call's correlation_id. Tagging happens IFF:
+            //   1. There's an active call context (set by `deliver`
+            //      when an inbound `correlation_id` met the manifest
+            //      gate).
+            //   2. The outgoing `type` matches the call's declared
+            //      `reply_type`.
+            //   3. We haven't already tagged a prior outgoing message
+            //      in this handler invocation (first-match-only).
+            // We compute the id once and apply to every constructed
+            // Message in this loop iteration's broadcast (multi-
+            // neighbor emit produces one outgoing per neighbor; for
+            // a typical single-neighbor reply, only one is created).
+            // Then flip `tagged` so subsequent emit() calls in the
+            // same handler don't tag.
+            let auto_correlation_id: Option<String> = {
+                let mut slot = call_context.borrow_mut();
+                match slot.as_mut() {
+                    Some(ctx) if !ctx.tagged && ctx.reply_type == r#type => {
+                        ctx.tagged = true;
+                        Some(ctx.correlation_id.clone())
+                    }
+                    _ => None,
+                }
+            };
+
+            // **M-Ingress phase 2.** When auto-tagging fires, surface
+            // the reply payload to any installed `TelemetrySink` so the
+            // `PendingCalls` registry (the consumer in
+            // `graphreact-observer`) can resolve the awaiting
+            // `tokio::sync::oneshot::Sender` IMMEDIATELY at emit-time.
+            // This decouples call resolution from actual scheduler
+            // delivery — leaf-node call handlers can reply without
+            // needing graph connectivity to a reply-accepting neighbor.
+            // The reply Message still flows through the normal queue
+            // for any listening graph consumers (e.g. monitoring nodes
+            // that also accept the reply type).
+            if let Some(cid) = auto_correlation_id.as_deref() {
+                if let Some(sink_arc) = telemetry_snapshot.as_ref() {
+                    sink_arc.0.on_call_reply(&crate::telemetry::CallReply {
+                        correlation_id: cid,
+                        payload: &payload,
+                        from: from.as_str(),
+                        reply_type: r#type,
+                    });
+                }
+            }
+
             let mut q = messages.borrow_mut();
             for target in targets {
                 // M14 distribution: classify the target into Local /
@@ -2407,6 +2569,7 @@ impl Scheduler {
                         Some(final_ttl),
                     );
                     msg.direct = is_direct;
+                    msg.correlation_id.clone_from(&auto_correlation_id);
                     q.push_back(msg);
                 } else if is_remote_addr {
                     // Cross-node target. Build the message with the
@@ -2424,6 +2587,7 @@ impl Scheduler {
                         Some(proposed_ttl),
                     );
                     msg.direct = is_direct;
+                    msg.correlation_id.clone_from(&auto_correlation_id);
                     if let Some(sink) = &remote_sink {
                         // Sink is responsible for delivery; we don't
                         // enqueue locally. Sink's bool return is
@@ -3050,6 +3214,53 @@ impl SchedulerHandle {
     /// it up at the start of its next batch.
     pub fn send(&self, target_id: impl Into<String>, r#type: impl Into<String>, payload: Value) {
         let msg = create_message(r#type, "__external__", target_id, payload, None);
+        self.inbox.lock().push(msg);
+        self.notify.notify_one();
+    }
+
+    /// **M-Ingress phase 1.** Inject a message via the HTTP-ingress path.
+    /// The constructed message carries `from = "__ingress__"`, which
+    /// triggers default-deny enforcement against the target node's
+    /// `manifest.accepts_external` allowlist in `Scheduler::deliver`.
+    ///
+    /// Use this when the message is logically "external to the cluster"
+    /// — e.g., `POST /v1/nodes/:id/messages` ingress dispatch from the
+    /// management API. For in-process / dist / source / test injection
+    /// that should bypass the allowlist, use [`Self::send`].
+    pub fn send_ingress(
+        &self,
+        target_id: impl Into<String>,
+        r#type: impl Into<String>,
+        payload: Value,
+    ) {
+        let msg = create_message(r#type, "__ingress__", target_id, payload, None);
+        self.inbox.lock().push(msg);
+        self.notify.notify_one();
+    }
+
+    /// **M-Ingress phase 2.** Inject an HTTP-call message via the
+    /// HTTP-ingress path with an attached `correlation_id`. The
+    /// constructed message carries `from = "__ingress__"` (so
+    /// `Scheduler::deliver` enforces the manifest's
+    /// `accepts_external_call` gate, falling back to
+    /// `accepts_external` for the legacy single-shot path) AND a
+    /// `correlation_id: Some(id)` field that the scheduler's
+    /// auto-propagation logic copies onto the first matching outgoing
+    /// reply (per the manifest's `accepts_external_call` table).
+    ///
+    /// Used by the `POST /v1/nodes/:id/call` axum handler in the
+    /// observer crate after generating a UUIDv4 server-side and
+    /// registering the awaiting `oneshot::Sender` in the
+    /// `PendingCalls` registry.
+    pub fn send_ingress_with_correlation(
+        &self,
+        target_id: impl Into<String>,
+        r#type: impl Into<String>,
+        payload: Value,
+        correlation_id: impl Into<String>,
+    ) {
+        let mut msg = create_message(r#type, "__ingress__", target_id, payload, None);
+        msg.correlation_id = Some(correlation_id.into());
         self.inbox.lock().push(msg);
         self.notify.notify_one();
     }

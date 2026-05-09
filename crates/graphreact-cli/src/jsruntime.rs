@@ -4258,6 +4258,8 @@ fn host_value_to_manifest(hv: HostValue) -> PermissionManifest {
     };
     let mut accepts: Vec<String> = Vec::new();
     let mut emits: Vec<String> = Vec::new();
+    let mut accepts_external: Vec<String> = Vec::new();
+    let mut accepts_external_call: Vec<graphreact_core::ExternalCall> = Vec::new();
     for (k, v) in pairs {
         match (k.as_str(), v) {
             ("accepts", HostValue::Array(arr)) => {
@@ -4284,10 +4286,66 @@ fn host_value_to_manifest(hv: HostValue) -> PermissionManifest {
                     })
                     .collect();
             }
+            // **M-Ingress.** Optional component-declared list of message
+            // types accepted from external HTTP injection (POST
+            // /v1/nodes/:id/messages). Default-deny semantics — absent
+            // or empty means the node refuses every external type.
+            ("accepts_external", HostValue::Array(arr)) => {
+                accepts_external = arr
+                    .into_iter()
+                    .filter_map(|x| {
+                        if let HostValue::String(s) = x {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            }
+            // **M-Ingress phase 2.** Optional component-declared list of
+            // call-shaped external acceptance — `[{ request_type, reply_type }, ...]`.
+            // Powers `POST /v1/nodes/:id/call` with auto-correlation:
+            // the runtime tags the first outgoing emit whose `type`
+            // matches a `reply_type` here with the inbound `correlation_id`.
+            // Entries missing either field are silently skipped (the
+            // pair is meaningless without both halves).
+            ("accepts_external_call", HostValue::Array(arr)) => {
+                accepts_external_call = arr
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let HostValue::Object(pairs) = entry else {
+                            return None;
+                        };
+                        let mut request_type: Option<String> = None;
+                        let mut reply_type: Option<String> = None;
+                        for (k, v) in pairs {
+                            match (k.as_str(), v) {
+                                ("request_type", HostValue::String(s)) => {
+                                    request_type = Some(s);
+                                }
+                                ("reply_type", HostValue::String(s)) => {
+                                    reply_type = Some(s);
+                                }
+                                _ => {}
+                            }
+                        }
+                        match (request_type, reply_type) {
+                            (Some(rq), Some(rp)) => Some(graphreact_core::ExternalCall {
+                                request_type: rq,
+                                reply_type: rp,
+                            }),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+            }
             _ => {}
         }
     }
-    PermissionManifest::new(accepts, emits)
+    let mut manifest = PermissionManifest::new(accepts, emits);
+    manifest.accepts_external = accepts_external;
+    manifest.accepts_external_call = accepts_external_call;
+    manifest
 }
 
 // ---------------------------------------------------------------------

@@ -20,9 +20,9 @@
 use std::sync::Arc;
 
 use graphreact_core::{
-    HotReload, MessageDelivered, NodeEvaluateEnd, NodeEvaluateStart, NodeMounted, NodeUnmounted,
-    QueueDepths, RemoteMessage, SchedulerTickEnd, SchedulerTickStart, SupervisorDecisionMade,
-    TelemetrySink, TopologyEventOccurred,
+    CallReply, HotReload, MessageDelivered, NodeEvaluateEnd, NodeEvaluateStart, NodeMounted,
+    NodeUnmounted, QueueDepths, RemoteMessage, SchedulerTickEnd, SchedulerTickStart,
+    SupervisorDecisionMade, TelemetrySink, TopologyEventOccurred,
 };
 
 /// Fan-out sink. Holds `Arc<dyn TelemetrySink>` per consumer; every
@@ -169,6 +169,13 @@ impl TelemetrySink for MultiplexSink {
     fn on_hot_reload(&self, ev: &HotReload<'_>) {
         for sink in &self.sinks {
             sink.on_hot_reload(ev);
+        }
+    }
+
+    #[inline]
+    fn on_call_reply(&self, ev: &CallReply<'_>) {
+        for sink in &self.sinks {
+            sink.on_call_reply(ev);
         }
     }
 }

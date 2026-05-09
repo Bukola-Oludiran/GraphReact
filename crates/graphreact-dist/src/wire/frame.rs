@@ -167,6 +167,7 @@ mod tests {
             direct: false,
             inherited_ttl: Some(6),
             trace_context: None,
+            correlation_id: None,
         }));
     }
 
@@ -190,6 +191,28 @@ mod tests {
             direct: false,
             inherited_ttl: None,
             trace_context: Some(tc),
+            correlation_id: None,
+        }));
+    }
+
+    /// **M-Ingress phase 2.** Wire-format round-trip with the new
+    /// `correlation_id` field populated. Validates the field
+    /// serializes / deserializes cleanly through postcard alongside
+    /// the existing v3-era fields.
+    #[test]
+    fn roundtrip_message_with_correlation_id() {
+        roundtrip(Packet::Message(Message {
+            id: "m3".into(),
+            msg_type: "query_result".into(),
+            from: "aggregator@a".into(),
+            to: "__ingress__".into(),
+            payload: serde_json::to_vec(&serde_json::json!({"answer": 42})).unwrap(),
+            ttl: 8,
+            timestamp: 1_700_000_000_000,
+            direct: false,
+            inherited_ttl: None,
+            trace_context: None,
+            correlation_id: Some("7b3f8a2e-9c1d-4f8b-a3e5-2b8a1f3c6d7e".into()),
         }));
     }
 

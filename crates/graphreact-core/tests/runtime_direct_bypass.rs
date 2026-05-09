@@ -58,6 +58,8 @@ fn direct_message_bypasses_channel_policy_that_would_reject() {
                 accepts: vec!["data".into()],
                 emits: Vec::new(),
                 channels,
+                accepts_external: Vec::new(),
+                accepts_external_call: Vec::new(),
             }
         }
     };

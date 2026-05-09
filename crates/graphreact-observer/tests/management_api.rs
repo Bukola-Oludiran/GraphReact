@@ -85,6 +85,13 @@ async fn spawn_with_fixture(
                         children: vec!["beta".into()],
                     }]);
                 }
+                // **M-Ingress.** This test suite predates ingress and
+                // does not exercise inject / call / bulk — silently
+                // drop all three. Dedicated coverage in
+                // `inject_e2e.rs`, `call_e2e.rs`, `bulk_e2e.rs`.
+                SnapshotRequest::InjectMessage { .. }
+                | SnapshotRequest::InjectMessageWithReply { .. }
+                | SnapshotRequest::InjectMessageBulkLine { .. } => {}
             }
         }
     });

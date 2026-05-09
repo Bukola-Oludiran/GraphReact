@@ -33,6 +33,8 @@ fn manifest_with_channels(
         accepts: accepts.into_iter().map(String::from).collect(),
         emits: emits.into_iter().map(String::from).collect(),
         channels: channel_map,
+        accepts_external: Vec::new(),
+        accepts_external_call: Vec::new(),
     }
 }
 

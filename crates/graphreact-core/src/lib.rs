@@ -18,10 +18,10 @@ pub mod telemetry;
 pub use reactive::{Memo, ReactiveNode, ReactiveNodeState, ReactiveSignal};
 
 pub use telemetry::{
-    HotReload, MessageDelivered, NodeEvaluateEnd, NodeEvaluateStart, NodeMounted, NodeUnmounted,
-    QueueDepths, QueueDepthsSnapshot, RemoteDirection, RemoteMessage, SchedulerTickEnd,
-    SchedulerTickStart, SupervisorAction, SupervisorDecisionMade, TelemetrySink, TelemetrySinkRef,
-    TopologyEventOccurred,
+    CallReply, HotReload, MessageDelivered, NodeEvaluateEnd, NodeEvaluateStart, NodeMounted,
+    NodeUnmounted, QueueDepths, QueueDepthsSnapshot, RemoteDirection, RemoteMessage,
+    SchedulerTickEnd, SchedulerTickStart, SupervisorAction, SupervisorDecisionMade, TelemetrySink,
+    TelemetrySinkRef, TopologyEventOccurred,
 };
 
 pub use error::{GraphError, RuntimeError};
@@ -41,7 +41,8 @@ pub use runtime::{
     use_monitor, use_neighbors, use_reducer, use_source, use_spawn_child, use_state, use_topology,
     use_unlink, use_unmount_self, AsyncEffectCleanup, ChannelPolicy, ChildId, ChildRef, ChildSpec,
     ComposeChildSpec, DirectoryEntry, EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource,
-    EventSourceFactory, ExitReason, GraphDirectory, GroupRegistry, IncomingMessage, LinkRegistry,
+    EventSourceFactory, ExitReason, ExternalCall, GraphDirectory, GroupRegistry, IncomingMessage,
+    LinkRegistry,
     Message, MessageHandler, MonitorRef, MonitorRegistry, NodeContext, NodeDefinition,
     GroupOp, NodeInstance, NodeKey, PermissionManifest, PostponeQueue, RemoteBroadcastSink,
     RemoteGroupSink, RemoteLinkSink, RemoteMonitorSink, RemoteSink, RemoteUnlinkSink, ResolvedPolicy,

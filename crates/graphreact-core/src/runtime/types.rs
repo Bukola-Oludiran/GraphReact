@@ -45,6 +45,25 @@ pub struct Message {
     /// local-origin messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_context: Option<[u8; 24]>,
+    /// **M-Ingress phase 2.** Opaque correlation identifier carried
+    /// end-to-end across the runtime so a synchronous HTTP call
+    /// (`POST /v1/nodes/:id/call`) can route the eventual reply
+    /// back to the awaiting `tokio::oneshot`. The HTTP call handler
+    /// generates a UUIDv4, attaches it to the inbound ingress
+    /// message, and registers an entry in
+    /// `graphreact_observer::management_api::PendingCalls`. The
+    /// scheduler captures the inbound id in the per-handler-invocation
+    /// context and **auto-attaches** it to the first outgoing
+    /// emit whose `type` matches the call's declared `reply_type`
+    /// (per the manifest's `accepts_external_call` table). The
+    /// observer's PendingCalls sink, watching `MessageDelivered`
+    /// events, looks up the correlation_id and resolves the
+    /// oneshot. `None` for messages that aren't part of a call
+    /// flow. Cluster wire propagation is gated by the
+    /// `INGRESS_CALL_V1` capability — peers without it strip the
+    /// field outbound and ignore it inbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 /// Trimmed view of a [`Message`] handed to user `useMessage` handlers.
@@ -93,6 +112,23 @@ impl std::fmt::Debug for ChannelPolicy {
     }
 }
 
+/// **M-Ingress phase 2.** Declared call-shape for `POST /v1/nodes/:id/call`.
+///
+/// Each entry in [`PermissionManifest::accepts_external_call`]
+/// pairs a `request_type` (the inbound ingress message type) with a
+/// `reply_type` (the outgoing message type the runtime auto-tags
+/// with the inbound's `correlation_id`). The component author
+/// writes `useEmit('reply_type', payload)` as normal; the scheduler
+/// identifies the matching outgoing emit and copies the
+/// correlation_id onto exactly that one outgoing message
+/// (first-match-only, so handlers emitting multiple downstream
+/// messages don't accidentally tag them all as replies).
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct ExternalCall {
+    pub request_type: String,
+    pub reply_type: String,
+}
+
 /// Permission manifest returned from a node's component function.
 ///
 /// Defines what messages the node accepts/emits globally, plus optional
@@ -105,6 +141,22 @@ pub struct PermissionManifest {
     /// Per-neighbor channel policies. Keys are neighbor node IDs, with
     /// `*` reserved for the wildcard default.
     pub channels: IndexMap<String, ChannelPolicy>,
+    /// **M-Ingress.** Message types this node accepts when injected by
+    /// an external HTTP client via `POST /v1/nodes/:id/messages`. Empty
+    /// by default — default-deny semantics. Distinct from `accepts`,
+    /// which governs node-to-node delivery; external HTTP injection is
+    /// a separate trust boundary and the manifest declares opt-in.
+    pub accepts_external: Vec<String>,
+    /// **M-Ingress phase 2.** Call-shaped external acceptance —
+    /// declares which `(request_type, reply_type)` pairs the node
+    /// will service for `POST /v1/nodes/:id/call`. Inbound HTTP
+    /// calls whose `type` is NOT a `request_type` here are
+    /// rejected with 403 (manifest gating). Outgoing emits whose
+    /// `type` matches the corresponding `reply_type` are
+    /// auto-tagged with the inbound `correlation_id` so the HTTP
+    /// handler can match the reply. Distinct from `accepts_external`
+    /// (single-shot inject) — call shape is request/response.
+    pub accepts_external_call: Vec<ExternalCall>,
 }
 
 impl std::fmt::Debug for PermissionManifest {
@@ -113,6 +165,8 @@ impl std::fmt::Debug for PermissionManifest {
             .field("accepts", &self.accepts)
             .field("emits", &self.emits)
             .field("channels", &self.channels)
+            .field("accepts_external", &self.accepts_external)
+            .field("accepts_external_call", &self.accepts_external_call)
             .finish()
     }
 }
@@ -131,6 +185,8 @@ impl PermissionManifest {
             accepts: accepts.into_iter().map(Into::into).collect(),
             emits: emits.into_iter().map(Into::into).collect(),
             channels: IndexMap::new(),
+            accepts_external: Vec::new(),
+            accepts_external_call: Vec::new(),
         }
     }
 }
