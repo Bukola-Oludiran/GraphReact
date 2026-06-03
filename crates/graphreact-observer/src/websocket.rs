@@ -132,6 +132,19 @@ impl WebSocketSink {
         });
     }
 
+    /// Push an application-defined [`TelemetryEvent::Custom`] onto the
+    /// broadcast — the host-extension escape hatch (e.g. PCBPnR's
+    /// reactive harness publishing regime / geometry deltas to
+    /// subscribers). Best-effort like every telemetry send: dropped when
+    /// there are no live subscribers.
+    pub fn emit_custom(&self, event: impl Into<String>, payload: serde_json::Value) {
+        let _ = self.inner.tx.send(TelemetryEvent::Custom {
+            ts_ms: unix_ms(),
+            event: event.into(),
+            payload,
+        });
+    }
+
     fn record_kick(&self) {
         self.inner.kicked.fetch_add(1, Ordering::Relaxed);
     }

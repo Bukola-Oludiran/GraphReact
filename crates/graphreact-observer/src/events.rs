@@ -133,6 +133,16 @@ pub enum TelemetryEvent {
         ts_ms: u64,
         missed: u64,
     },
+    /// Application-defined event pushed by a host over the same
+    /// telemetry stream (the host-extension escape hatch — e.g. PCBPnR's
+    /// reactive harness publishing manufacturability-regime / geometry
+    /// deltas). `event` is the application sub-kind; `payload` is an
+    /// opaque JSON object the framework does not interpret.
+    Custom {
+        ts_ms: u64,
+        event: String,
+        payload: serde_json::Value,
+    },
 }
 
 impl TelemetryEvent {
@@ -154,6 +164,7 @@ impl TelemetryEvent {
             TelemetryEvent::RemoteMessage { .. } => "remote_message",
             TelemetryEvent::HotReload { .. } => "hot_reload",
             TelemetryEvent::Resync { .. } => "resync",
+            TelemetryEvent::Custom { .. } => "custom",
         }
     }
 
@@ -173,7 +184,8 @@ impl TelemetryEvent {
             | TelemetryEvent::SupervisorDecision { ts_ms, .. }
             | TelemetryEvent::RemoteMessage { ts_ms, .. }
             | TelemetryEvent::HotReload { ts_ms, .. }
-            | TelemetryEvent::Resync { ts_ms, .. } => *ts_ms,
+            | TelemetryEvent::Resync { ts_ms, .. }
+            | TelemetryEvent::Custom { ts_ms, .. } => *ts_ms,
         }
     }
 
@@ -204,7 +216,8 @@ impl TelemetryEvent {
             | TelemetryEvent::TickEnd { .. }
             | TelemetryEvent::QueueDepths { .. }
             | TelemetryEvent::HotReload { .. }
-            | TelemetryEvent::Resync { .. } => false,
+            | TelemetryEvent::Resync { .. }
+            | TelemetryEvent::Custom { .. } => false,
         }
     }
 }
