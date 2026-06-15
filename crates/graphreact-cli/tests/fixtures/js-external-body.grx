@@ -1,0 +1,11 @@
+<!-- PCBPnR Phase 5-D follow-on item #2 — external JS body fixture
+     (mirror of python-external-body.grx for the JSC path). Proves
+     the parser → resolver → IR → JSC sub-isolate flow works
+     identically to inline-body definitions, AND identically to the
+     CPython path for external Python bodies. -->
+
+<Counter src="./js-external-body.js" lang="js" />
+
+<Graph id="js-external-body">
+  <Counter id="counter-1" />
+</Graph>

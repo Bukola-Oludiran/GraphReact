@@ -1,0 +1,10 @@
+<!-- PCBPnR Phase 5-D follow-on item #2 — external Python body fixture.
+     The <Counter> body lives in a sibling .py file rather than inline,
+     proving the parser → resolver → IR → CPython runtime path works
+     identically to the inline-body case. -->
+
+<Counter src="./python-external-body.py" lang="python" />
+
+<Graph id="py-external-body">
+  <Counter id="counter-1" />
+</Graph>

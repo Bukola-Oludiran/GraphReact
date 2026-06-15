@@ -713,8 +713,9 @@ pub fn run_run(
                     let ir = graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
                         imports: resolved.root.imports.clone(),
                         graph: Some(g),
+                        subgraphs: resolved.root.subgraphs.clone(),
                         definitions: resolved.root.definitions.clone(),
-                    });
+                    })?;
                     (ir.nodes.len(), ir.edges.len())
                 } else {
                     (0, 0)
@@ -934,7 +935,7 @@ pub fn build_ir_for_path(
 ) -> Result<graphreact_grx_parser::GrxIr, CommandError> {
     let source = std::fs::read_to_string(path)?;
     let file = Parser::parse_file(&source)?;
-    Ok(build_ir(&file))
+    Ok(build_ir(&file)?)
 }
 
 // =====================================================================

@@ -38,6 +38,9 @@ impl Parser {
     pub fn parse_grx_file(&mut self) -> GrxResult<GrxFile> {
         let mut imports = Vec::new();
         let mut definitions = Vec::new();
+        let mut subgraphs: Vec<crate::ast::SubgraphDecl> = Vec::new();
+        let mut seen_subgraph_names: rustc_hash::FxHashMap<String, SourceLoc> =
+            rustc_hash::FxHashMap::default();
         let mut graph: Option<GraphDecl> = None;
 
         while self.pos < self.tokens.len() {
@@ -54,6 +57,21 @@ impl Parser {
                     }
                     graph = Some(self.parse_graph()?);
                 }
+                // PCBPnR Phase 5-D §2.2 — exportable named subgraphs.
+                // Multiple `<Subgraph>` blocks per file allowed; duplicate
+                // names within the same file are a hard error.
+                TokenType::OpenTag if token.value == "Subgraph" => {
+                    let sg = self.parse_subgraph_block()?;
+                    if let Some(prev_loc) = seen_subgraph_names.get(&sg.name) {
+                        return Err(GrxParseError::DuplicateSubgraphName {
+                            name: sg.name.clone(),
+                            first_loc: *prev_loc,
+                            second_loc: sg.loc,
+                        });
+                    }
+                    seen_subgraph_names.insert(sg.name.clone(), sg.loc);
+                    subgraphs.push(sg);
+                }
                 TokenType::OpenTag => {
                     definitions.push(self.parse_definition_block()?);
                 }
@@ -67,6 +85,7 @@ impl Parser {
         Ok(GrxFile {
             imports,
             graph,
+            subgraphs,
             definitions,
         })
     }
@@ -114,6 +133,26 @@ impl Parser {
             Some(JsonValue::String(s)) => s.clone(),
             _ => return Err(GrxParseError::MissingImportSrc { loc: open.loc }),
         };
+        // PCBPnR Phase 5-D §2.1. Optional `as="..."` namespace alias.
+        // Validated against Rust identifier shape; reject otherwise.
+        let alias = match attrs.get("as") {
+            Some(JsonValue::String(a)) => {
+                if !ImportDirective::is_valid_alias(a) {
+                    return Err(GrxParseError::InvalidImportAlias {
+                        alias: a.clone(),
+                        loc: open.loc,
+                    });
+                }
+                Some(a.clone())
+            }
+            Some(_) => {
+                return Err(GrxParseError::parse(
+                    "`as` attribute on `<import>` must be a string literal",
+                    open.loc,
+                ));
+            }
+            None => None,
+        };
         let next = self.peek();
         match next.kind {
             TokenType::SelfClose => {
@@ -121,19 +160,55 @@ impl Parser {
             }
             _ => return Err(GrxParseError::NonSelfClosingImport { loc: next.loc }),
         }
-        Ok(ImportDirective { src, loc: open.loc })
+        Ok(ImportDirective {
+            src,
+            alias,
+            loc: open.loc,
+        })
+    }
+
+    /// PCBPnR Phase 5-D §2.2. Parse a `<Subgraph name="..."> ... </Subgraph>`
+    /// block. Children mirror `<Graph>` children — `<edge>` or any node
+    /// tag. Distinct from `<Graph>` in that a file may carry zero or
+    /// more `<Subgraph>` blocks (vs at most one `<Graph>`), and that
+    /// they're spliced in by reference rather than mounted directly.
+    fn parse_subgraph_block(&mut self) -> GrxResult<crate::ast::SubgraphDecl> {
+        let open = self.expect(TokenType::OpenTag, "root")?;
+        debug_assert_eq!(open.value, "Subgraph");
+        let attrs = self.parse_attributes()?;
+        let name = match attrs.get("name") {
+            Some(JsonValue::String(s)) => s.clone(),
+            _ => {
+                return Err(GrxParseError::MissingSubgraphName { loc: open.loc });
+            }
+        };
+        self.expect(TokenType::TagEnd, "Subgraph")?;
+        let children = self.parse_children("Subgraph")?;
+        let close = self.expect(TokenType::CloseTag, "Subgraph")?;
+        if close.value != "Subgraph" {
+            return Err(GrxParseError::MismatchedClose {
+                expected: "Subgraph".to_string(),
+                got: close.value.clone(),
+                loc: close.loc,
+            });
+        }
+        Ok(crate::ast::SubgraphDecl {
+            name,
+            children,
+            loc: open.loc,
+        })
     }
 
     fn parse_definition_block(&mut self) -> GrxResult<NodeDefinitionBlock> {
         let open = self.expect(TokenType::OpenTag, "definition")?;
         let component = open.value.clone();
         // M13-phase3a: definition blocks accept a (small) attribute set
-        // — currently just `lang="js"` (default) / `lang="python"`. The
-        // lexer's raw-content trigger ("non-reserved tag, no `id`
-        // attr") still fires on `lang`-only attribute lists since
-        // there's no `id`. Other attributes are tolerated but ignored
-        // for now; phase 3+ may use them (e.g., `version="3.12+"` for
-        // CPython feature gates).
+        // — `lang="js"` (default) / `lang="python"` + (PCBPnR Phase 5-D
+        // follow-on) optional `src="./body.py"` for external body
+        // file references. The lexer's raw-content trigger ("non-
+        // reserved tag, no `id` attr") still fires on `lang`+`src`-
+        // only attribute lists since there's no `id`. Other
+        // attributes are tolerated but ignored; phase 3+ may use them.
         let attrs = self.parse_attributes()?;
         let lang = match attrs.get("lang") {
             Some(JsonValue::String(s)) => crate::ast::ComponentLang::from_attr_str(s).ok_or_else(
@@ -153,10 +228,59 @@ impl Parser {
             }
             None => crate::ast::ComponentLang::default(),
         };
+        // PCBPnR Phase 5-D follow-on — `src="./body.py"` on a
+        // definition block. When present, the body lives in an
+        // external file; the multi-file resolver populates `code`
+        // at resolution time. Self-closing form required (no inline
+        // body when src= is set).
+        let src = match attrs.get("src") {
+            Some(JsonValue::String(s)) => Some(s.clone()),
+            Some(_) => {
+                return Err(GrxParseError::parse(
+                    format!("`src` attribute on `<{component}>` must be a string literal"),
+                    open.loc,
+                ));
+            }
+            None => None,
+        };
+
+        // Accept either self-closing (with src= REQUIRED) or open/
+        // close form (with inline raw-body, src= forbidden).
+        if self.peek().kind == TokenType::SelfClose {
+            self.advance();
+            if src.is_none() {
+                return Err(GrxParseError::parse(
+                    format!(
+                        "definition `<{component} />` must either have a body \
+                         (`<{component}>...code...</{component}>`) or specify \
+                         `src=\"./file.py\"` for an external body"
+                    ),
+                    open.loc,
+                ));
+            }
+            return Ok(NodeDefinitionBlock {
+                component,
+                code: String::new(),
+                src,
+                lang,
+                loc: open.loc,
+            });
+        }
+
         self.expect(TokenType::TagEnd, &component)?;
         let mut code = String::new();
         if self.peek().kind == TokenType::RawContent {
             code.clone_from(&self.advance().value);
+        }
+        // Inline body + src= is contradictory: pick one form.
+        if src.is_some() && !code.is_empty() {
+            return Err(GrxParseError::parse(
+                format!(
+                    "definition `<{component}>` carries both `src=\"…\"` and an inline body \
+                     — pick one form (self-close with src=, or open/close with an inline body)"
+                ),
+                open.loc,
+            ));
         }
         if self.peek().kind == TokenType::CloseTag && self.peek().value == component {
             self.advance();
@@ -164,6 +288,7 @@ impl Parser {
         Ok(NodeDefinitionBlock {
             component,
             code,
+            src,
             lang,
             loc: open.loc,
         })
@@ -487,7 +612,173 @@ mod tests {
         assert_eq!(f.imports.len(), 2);
         assert_eq!(f.imports[0].src, "./sensors.grx");
         assert_eq!(f.imports[1].src, "./outputs.grx");
+        // PCBPnR §2.1 backward-compat regression: imports without
+        // `as=` must keep `alias: None` so the resolver continues
+        // flattening into the global namespace (no behavior change).
+        assert!(f.imports[0].alias.is_none());
+        assert!(f.imports[1].alias.is_none());
         assert!(f.graph.is_some());
+    }
+
+    // -- PCBPnR Phase 5-D §2.1: per-import `as=` aliasing -------------
+
+    #[test]
+    fn parses_aliased_import() {
+        let f = file(r#"<import src="./rf.grx" as="rf" />
+<Graph id="g"><Logger id="log" /></Graph>"#);
+        assert_eq!(f.imports.len(), 1);
+        assert_eq!(f.imports[0].src, "./rf.grx");
+        assert_eq!(f.imports[0].alias.as_deref(), Some("rf"));
+    }
+
+    #[test]
+    fn rejects_invalid_alias_hyphen() {
+        // Hyphens are not permitted in aliases (Rust identifier shape).
+        // Dot-prefix splice addressing makes them ambiguous in `{expr}`.
+        let src = r#"<import src="./rf.grx" as="rf-1" />
+<Graph id="g"><Logger id="log" /></Graph>"#;
+        let err = Parser::parse_file(src).expect_err("hyphen alias must reject");
+        match err {
+            GrxParseError::InvalidImportAlias { alias, .. } => {
+                assert_eq!(alias, "rf-1");
+            }
+            other => panic!("expected InvalidImportAlias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_alias_starts_with_digit() {
+        let src = r#"<import src="./rf.grx" as="1rf" />
+<Graph id="g"><Logger id="log" /></Graph>"#;
+        let err = Parser::parse_file(src).expect_err("digit-start alias must reject");
+        assert!(matches!(err, GrxParseError::InvalidImportAlias { .. }));
+    }
+
+    // -- PCBPnR Phase 5-D §2.2: exportable `<Subgraph>` blocks --------
+
+    #[test]
+    fn parses_single_subgraph() {
+        let src = r#"<Subgraph name="RfFrontEnd">
+  <Component id="ANT1" footprint="ChipAnt" />
+  <Component id="L1" footprint="0402" />
+</Subgraph>"#;
+        let f = file(src);
+        assert_eq!(f.subgraphs.len(), 1);
+        assert_eq!(f.subgraphs[0].name, "RfFrontEnd");
+        assert_eq!(f.subgraphs[0].children.len(), 2);
+        // §2.2 backward-compat regression: a file with only a Subgraph
+        // (no top-level `<Graph>`) must still parse cleanly. This was
+        // already the case for definitions-only files; preserve.
+        assert!(f.graph.is_none());
+    }
+
+    #[test]
+    fn parses_multiple_subgraphs_in_one_file() {
+        let src = r#"<Subgraph name="RfFrontEnd">
+  <Component id="ANT1" />
+</Subgraph>
+<Subgraph name="RfHarmonicFilter">
+  <Component id="L1" />
+</Subgraph>"#;
+        let f = file(src);
+        assert_eq!(f.subgraphs.len(), 2);
+        let names: Vec<&str> = f.subgraphs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["RfFrontEnd", "RfHarmonicFilter"]);
+    }
+
+    #[test]
+    fn parses_subgraph_alongside_top_level_graph() {
+        let src = r#"<Subgraph name="ShelfA">
+  <Component id="A1" />
+</Subgraph>
+<Graph id="board">
+  <Logger id="log" />
+</Graph>"#;
+        let f = file(src);
+        assert_eq!(f.subgraphs.len(), 1);
+        assert_eq!(f.subgraphs[0].name, "ShelfA");
+        assert!(f.graph.is_some());
+        assert_eq!(f.graph.as_ref().unwrap().id, "board");
+    }
+
+    #[test]
+    fn rejects_duplicate_subgraph_name_in_same_file() {
+        let src = r#"<Subgraph name="X">
+  <Component id="A" />
+</Subgraph>
+<Subgraph name="X">
+  <Component id="B" />
+</Subgraph>"#;
+        let err = Parser::parse_file(src).expect_err("duplicate name must reject");
+        match err {
+            GrxParseError::DuplicateSubgraphName { name, first_loc, second_loc } => {
+                assert_eq!(name, "X");
+                assert_ne!(first_loc, second_loc);
+            }
+            other => panic!("expected DuplicateSubgraphName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_subgraph_without_name() {
+        let err =
+            Parser::parse_file("<Subgraph>\n  <Component id=\"A\" />\n</Subgraph>")
+                .expect_err("missing name must reject");
+        assert!(matches!(err, GrxParseError::MissingSubgraphName { .. }));
+    }
+
+    // -- PCBPnR Phase 5-D follow-on: external body via `src=` --------
+
+    #[test]
+    fn parses_self_closing_definition_with_external_src() {
+        let f = file(r#"<Counter src="./counter.py" lang="python" />
+<Graph id="g"><Counter id="c" /></Graph>"#);
+        assert_eq!(f.definitions.len(), 1);
+        let def = &f.definitions[0];
+        assert_eq!(def.component, "Counter");
+        assert_eq!(def.src.as_deref(), Some("./counter.py"));
+        assert_eq!(def.lang, crate::ast::ComponentLang::Python);
+        // Parser leaves code empty for external-body definitions; the
+        // multi-file resolver populates it from disk.
+        assert!(def.code.is_empty());
+    }
+
+    #[test]
+    fn rejects_self_closing_definition_without_src() {
+        // Definition blocks must EITHER have an inline body OR carry
+        // src=. A bare `<Counter />` is meaningless.
+        let err = Parser::parse_file("<Counter />\n<Graph id=\"g\"><Counter id=\"c\"/></Graph>")
+            .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("body"), "error should mention body: {msg}");
+        assert!(msg.contains("src"), "error should mention src=: {msg}");
+    }
+
+    #[test]
+    fn rejects_definition_with_both_src_and_inline_body() {
+        let err = Parser::parse_file(
+            "<Counter src=\"./counter.py\" lang=\"python\">\ninline body\n</Counter>",
+        )
+        .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("both"), "error should explain conflict: {msg}");
+    }
+
+    #[test]
+    fn inline_body_definition_still_parses_with_no_src() {
+        // Regression check — existing fixture shape must keep working.
+        let f = file("<Counter>\nconst x = 1;\n</Counter>");
+        assert_eq!(f.definitions.len(), 1);
+        let def = &f.definitions[0];
+        assert!(def.src.is_none());
+        assert!(def.code.contains("const x = 1"));
+    }
+
+    #[test]
+    fn accepts_underscore_alias() {
+        let f = file(r#"<import src="./rf.grx" as="_rf_v2" />
+<Graph id="g"><Logger id="log" /></Graph>"#);
+        assert_eq!(f.imports[0].alias.as_deref(), Some("_rf_v2"));
     }
 
     #[test]

@@ -30,7 +30,7 @@
 //! both backends co-exist; consumers can pick by importing the
 //! function they want.
 
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 use serde_json::Value as JsonValue;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -174,12 +174,24 @@ fn build_ir_from_tree(tree: &Tree, source: &str) -> GrxResult<GrxIr> {
     let mut graph_loc: SourceLoc = SourceLoc::default();
     let mut nodes: Vec<IrNode> = Vec::new();
     let mut edges: Vec<IrEdge> = Vec::new();
-    let mut seen_ids: FxHashSet<String> = FxHashSet::default();
+    let mut seen_ids: FxHashMap<String, crate::ir::FirstOccurrence> = FxHashMap::default();
 
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
         match child.kind() {
-            "comment" => {}
+            "comment" | "subgraph" => {
+                // PCBPnR Phase 5-D §2.2 — Subgraph blocks are
+                // recognized at the grammar level but the v1
+                // tree-sitter→IR pipeline doesn't yet flatten them
+                // (splice resolution at step 4 lives in the
+                // hand-rolled IR builder for now; tree-sitter parity
+                // for splice arrives at step 5). Accepting them
+                // silently here lets fixtures with Subgraphs parse
+                // through the tree-sitter backend without erroring;
+                // the resulting IR has no Subgraph trace, matching
+                // the hand-rolled "Subgraph not spliced in this IR"
+                // shape.
+            }
             "import_decl" => {
                 if let Some(src) = extract_attribute_string(child, source, "src") {
                     imports.push(src);
@@ -278,7 +290,7 @@ fn walk_graph_children(
     parent_path: &[String],
     nodes: &mut Vec<IrNode>,
     edges: &mut Vec<IrEdge>,
-    seen_ids: &mut FxHashSet<String>,
+    seen_ids: &mut FxHashMap<String, crate::ir::FirstOccurrence>,
 ) -> GrxResult<()> {
     let mut cursor = graph_or_node.walk();
     for child in graph_or_node.named_children(&mut cursor) {
@@ -308,7 +320,7 @@ fn process_graph_node(
     parent_path: &[String],
     nodes: &mut Vec<IrNode>,
     edges: &mut Vec<IrEdge>,
-    seen_ids: &mut FxHashSet<String>,
+    seen_ids: &mut FxHashMap<String, crate::ir::FirstOccurrence>,
 ) -> GrxResult<()> {
     // Determine the open-tag (graph_node_open OR graph_node_self_close)
     // and walk its attributes.
@@ -360,6 +372,24 @@ fn process_graph_node(
         )
     })?;
 
+    // PCBPnR Phase 5-D §3 — desugar `style="…"` on this node before
+    // any further IR processing, so tree-sitter and hand-rolled
+    // backends agree on the post-desugar AttrMap shape (the Part 2
+    // parity contract).
+    if attrs.contains_key("style") {
+        // The tree-sitter `attrs` map includes the `id` key (the
+        // hand-rolled AST strips it). Temporarily remove `id` so the
+        // desugarer doesn't see it as a numeric attribute when
+        // checking for §3.7 conflicts.
+        let id_attr = attrs.shift_remove("id");
+        if let Err(style_err) = crate::style::desugar_style(&component, &mut attrs) {
+            return Err(style_err.into_parse_error(node_loc(graph_node).into_inner()));
+        }
+        if let Some(v) = id_attr {
+            attrs.insert("id".to_string(), v);
+        }
+    }
+
     // Build the inclusive node-path: parent_path + self. The
     // hand-rolled parser stores the node's OWN id at the end of
     // `parent_path`, and `_parentPath` echoes the same — quirky
@@ -367,38 +397,74 @@ fn process_graph_node(
     let mut node_path: Vec<String> = parent_path.to_vec();
     node_path.push(id.clone());
 
-    let is_first_occurrence = seen_ids.insert(id.clone());
-
-    if is_first_occurrence {
-        // Inject the auto-keys the IR builder uses (`component`,
-        // `_depth`, `_parentPath`).
-        let mut full_attrs = AttrMap::new();
-        full_attrs.insert("component".into(), JsonValue::String(component.clone()));
-        full_attrs.insert(
-            "_depth".into(),
-            JsonValue::Number(serde_json::Number::from(depth)),
-        );
-        full_attrs.insert(
-            "_parentPath".into(),
-            JsonValue::Array(
-                node_path
-                    .iter()
-                    .cloned()
-                    .map(JsonValue::String)
-                    .collect(),
-            ),
-        );
-        for (k, v) in &attrs {
-            full_attrs.insert(k.clone(), v.clone());
+    // PCBPnR Phase 5-D §2.4 reconciliation — mirrors ir.rs's
+    // process_children logic. First occurrence declares attrs +
+    // component; subsequent occurrences must be attribute-free
+    // re-mentions with the matching component tag. Keeps both
+    // parser backends in lockstep on the reconciled rule.
+    let this_loc = node_loc(graph_node).into_inner();
+    match seen_ids.get(&id) {
+        None => {
+            // Inject the auto-keys the IR builder uses (`component`,
+            // `_depth`, `_parentPath`).
+            let mut full_attrs = AttrMap::new();
+            full_attrs.insert("component".into(), JsonValue::String(component.clone()));
+            full_attrs.insert(
+                "_depth".into(),
+                JsonValue::Number(serde_json::Number::from(depth)),
+            );
+            full_attrs.insert(
+                "_parentPath".into(),
+                JsonValue::Array(
+                    node_path
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect(),
+                ),
+            );
+            for (k, v) in &attrs {
+                full_attrs.insert(k.clone(), v.clone());
+            }
+            nodes.push(IrNode {
+                id: id.clone(),
+                component: component.clone(),
+                attrs: full_attrs,
+                depth,
+                parent_path: node_path.clone(),
+                source_loc: this_loc,
+            });
+            seen_ids.insert(
+                id.clone(),
+                crate::ir::FirstOccurrence {
+                    loc: this_loc,
+                    component: component.clone(),
+                },
+            );
         }
-        nodes.push(IrNode {
-            id: id.clone(),
-            component: component.clone(),
-            attrs: full_attrs,
-            depth,
-            parent_path: node_path.clone(),
-            source_loc: node_loc(graph_node).into_inner(),
-        });
+        Some(first) => {
+            // Multi-parent reference. Strip the `id` attr from the
+            // attrs map (it's not user-visible content; it was hoisted
+            // out earlier) and any other attrs are a hard error.
+            let extra_attrs = attrs.len() - usize::from(attrs.contains_key("id"));
+            if extra_attrs > 0 {
+                return Err(GrxParseError::IdConflictWithAttrs {
+                    id: id.clone(),
+                    first_loc: first.loc,
+                    second_loc: this_loc,
+                });
+            }
+            if first.component != component {
+                return Err(GrxParseError::IdComponentMismatch {
+                    id: id.clone(),
+                    first_component: first.component.clone(),
+                    first_loc: first.loc,
+                    second_component: component.clone(),
+                    second_loc: this_loc,
+                });
+            }
+            // Valid multi-parent reference — fall through to edge emission.
+        }
     }
 
     // Structural edge from parent → this node.
@@ -777,6 +843,117 @@ def init():
     /// `std::str::from_utf8` on the byte range. The
     /// `tree_sitter_backend_preserves_utf8_in_definition_bodies`
     /// test below explicitly captures the tree-sitter parity win.
+    //
+    // PCBPnR Phase 5-D step 5 — parity for the Subgraph reserved
+    // word. Files containing `<Subgraph>` blocks (without `<Subsystem>`
+    // splice references) must produce identical IRs across both
+    // backends because neither backend materializes Subgraph blocks
+    // into IR — the hand-rolled side keeps them in `file.subgraphs`
+    // (consumed by the splice pass at build_ir time), and the
+    // tree-sitter side skips them at the grammar boundary.
+    //
+    // `<Subsystem>` splice parity is deferred: the tree-sitter
+    // backend does not yet run splice resolution. Fixtures with
+    // splice references are excluded from cross-backend parity
+    // until the tree-sitter bridge is refactored to route through
+    // the hand-rolled AST builder (substrate refactor, follow-up
+    // scope).
+    #[test]
+    fn cross_validate_backends_handle_subgraph_blocks_identically() {
+        use crate::ir::parse_to_ir;
+        // Subgraph-only fixture: defines two named subgraphs that are
+        // never spliced (no Subsystem reference). Neither backend
+        // materializes them into IR — both should produce an IR with
+        // only the top-level <Graph>'s nodes.
+        let src = r#"<Subgraph name="ShelfA">
+  <Component id="A1" />
+</Subgraph>
+<Subgraph name="ShelfB">
+  <Component id="B1" />
+</Subgraph>
+<Graph id="board">
+  <Logger id="log" />
+</Graph>"#;
+        let a = parse_to_ir(src).expect("hand-rolled parses ok");
+        let b = parse_to_ir_via_treesitter(src).expect("tree-sitter parses ok");
+        assert_eq!(a.graph_id, b.graph_id);
+        let a_ids: Vec<&str> = a.nodes.iter().map(|n| n.id.as_str()).collect();
+        let b_ids: Vec<&str> = b.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(a_ids, b_ids);
+        // Neither backend should materialize Subgraph contents.
+        assert!(!a_ids.contains(&"A1"));
+        assert!(!a_ids.contains(&"B1"));
+        // Only the <Graph>'s <Logger> appears.
+        assert_eq!(a_ids, vec!["log"]);
+    }
+
+    /// PCBPnR Phase 5-D step 5 — aliased `<import as="...">` parses
+    /// through both backends. The tree-sitter side currently doesn't
+    /// surface alias metadata into the IR (the IR's `imports` field
+    /// is `Vec<String>` of paths only), so parity holds at the IR
+    /// level; the alias only matters for the hand-rolled splice pass
+    /// at build_ir time (which tree-sitter doesn't run — see note
+    /// above).
+    #[test]
+    fn cross_validate_backends_handle_aliased_import_identically() {
+        use crate::ir::parse_to_ir;
+        let src = r#"<import src="./rf.grx" as="rf" />
+<Graph id="board">
+  <Logger id="log" />
+</Graph>"#;
+        let a = parse_to_ir(src).expect("hand-rolled parses ok");
+        let b = parse_to_ir_via_treesitter(src).expect("tree-sitter parses ok");
+        assert_eq!(a.imports, b.imports);
+        let a_ids: Vec<&str> = a.nodes.iter().map(|n| n.id.as_str()).collect();
+        let b_ids: Vec<&str> = b.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(a_ids, b_ids);
+    }
+
+    /// PCBPnR Phase 5-D §3.8 #10 — Part 2 parity. Both backends
+    /// must produce identical desugared AttrMaps for elements
+    /// carrying `style="…"`. Validates that the tree-sitter bridge
+    /// invokes the shared `crate::style::desugar_style` function
+    /// (same code path, same outputs) as the hand-rolled IR builder.
+    #[test]
+    fn cross_validate_backends_desugar_style_identically() {
+        use crate::ir::parse_to_ir;
+        // Multi-property style on a Component; both backends must
+        // desugar to identical `at` + `layer` keys, with `style` key
+        // consumed.
+        let src = r#"<Graph id="board">
+  <Component id="ANT1" footprint="ChipAnt"
+    style="position:absolute; left:30mm; top:5mm; rotate:90deg; layer:F.Cu" />
+</Graph>"#;
+        let a = parse_to_ir(src).expect("hand-rolled ok");
+        let b = parse_to_ir_via_treesitter(src).expect("tree-sitter ok");
+        let a_attrs = &a.nodes.iter().find(|n| n.id == "ANT1").unwrap().attrs;
+        let b_attrs = &b.nodes.iter().find(|n| n.id == "ANT1").unwrap().attrs;
+        // Both backends consume the `style` key.
+        assert!(!a_attrs.contains_key("style"), "hand-rolled consumed style");
+        assert!(!b_attrs.contains_key("style"), "tree-sitter consumed style");
+        // Both produce matching `at` and `layer`.
+        assert_eq!(a_attrs.get("at"), b_attrs.get("at"), "at parity");
+        assert_eq!(a_attrs.get("layer"), b_attrs.get("layer"), "layer parity");
+    }
+
+    /// PCBPnR Phase 5-D §3 — Pad with clip-path inset(round). Tests
+    /// the load-bearing parity case: `width:` + `height:` siblings
+    /// feed BOTH `size` and `geometry`'s rect dimensions.
+    #[test]
+    fn cross_validate_backends_pad_inset_round_identically() {
+        use crate::ir::parse_to_ir;
+        let src = r#"<Graph id="board">
+  <Pad id="p1" net="GND"
+    style="position:absolute; left:0mm; top:0mm; width:0.5mm; height:0.5mm; clip-path: inset(0 0 0 0 round 0.05mm)" />
+</Graph>"#;
+        let a = parse_to_ir(src).expect("hand-rolled ok");
+        let b = parse_to_ir_via_treesitter(src).expect("tree-sitter ok");
+        let a_p = &a.nodes.iter().find(|n| n.id == "p1").unwrap().attrs;
+        let b_p = &b.nodes.iter().find(|n| n.id == "p1").unwrap().attrs;
+        assert_eq!(a_p.get("size"), b_p.get("size"), "size parity");
+        assert_eq!(a_p.get("geometry"), b_p.get("geometry"), "geometry parity");
+    }
+
     #[test]
     fn cross_validate_backends_against_canonical_fixtures() {
         use crate::ir::parse_to_ir;

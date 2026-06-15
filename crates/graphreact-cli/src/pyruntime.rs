@@ -5357,8 +5357,9 @@ pub fn mount_with_scheduler(path: &std::path::Path) -> Result<PyRuntime, Runtime
     let ir = graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
         imports: resolved.root.imports.clone(),
         graph: Some(graph_block.clone()),
+        subgraphs: resolved.root.subgraphs.clone(),
         definitions: resolved.root.definitions.clone(),
-    });
+    })?;
     let n_nodes = ir.nodes.len();
     let n_edges = ir.edges.len();
 
@@ -5841,6 +5842,37 @@ mod tests {
         assert_eq!(runtime.graph_id, "py-smoke");
         assert_eq!(runtime.n_nodes, 2);
         assert_eq!(runtime.mounted.len(), 2);
+        runtime.shutdown().expect("shutdown ok");
+    }
+
+    /// PCBPnR Phase 5-D follow-on item #2 — external `.py` body
+    /// referenced via `<Counter src="./body.py" lang="python"/>` must
+    /// route through the same mount path as inline-body definitions.
+    /// Closes the end-to-end loop: parser reads `src=`, multi-file
+    /// resolver loads the .py file from disk, IR carries the body,
+    /// `mount_with_scheduler` evals it in the CPython sub-interpreter
+    /// identically to inline bodies. Phase 5-F's user-provided
+    /// component bodies ride on this path.
+    ///
+    /// Successful mount IS the proof the body executed: the engine
+    /// resolves `body(ctx)` / `init(ctx)` from the eval'd module and
+    /// invokes it; the body must return a manifest dict or mount
+    /// fails. So a clean mount + correct `n_nodes` + `mounted.len()`
+    /// proves the body content was loaded from disk AND executed in
+    /// the CPython sub-interpreter (not just "the file was read").
+    #[test]
+    fn phase5d_followon_external_python_body_executes_end_to_end() {
+        let _g = engine_lock();
+        reset_global_state();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/python-external-body.grx");
+        let mut runtime = mount_python_definitions(&fixture).expect("mount ok");
+
+        assert_eq!(runtime.graph_id, "py-external-body");
+        assert_eq!(runtime.n_nodes, 1);
+        assert_eq!(runtime.mounted.len(), 1);
+        assert_eq!(runtime.mounted[0], "counter-1");
+
         runtime.shutdown().expect("shutdown ok");
     }
 

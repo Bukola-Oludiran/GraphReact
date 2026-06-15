@@ -1,0 +1,11 @@
+<!-- PCBPnR Phase 5-D §2.3 negative fixture — mutual splice cycle. -->
+
+<import src="./b.grx" as="b" />
+
+<Subgraph name="A">
+  <Subsystem ref="b:B" id="b" />
+</Subgraph>
+
+<Graph id="root">
+  <Subsystem ref="A" id="r" />
+</Graph>

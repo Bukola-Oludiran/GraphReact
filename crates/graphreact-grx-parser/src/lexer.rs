@@ -48,6 +48,12 @@ fn reserved_tags() -> FxHashSet<&'static str> {
     s.insert("Graph");
     s.insert("edge");
     s.insert("import");
+    // PCBPnR Phase 5-D §2.2/§2.3 — these top-level/structural tags
+    // are NOT definition blocks even though they have no `id` attr.
+    // Mark them reserved so the lexer doesn't treat their body as
+    // raw component-body source.
+    s.insert("Subgraph");
+    s.insert("Subsystem");
     s
 }
 

@@ -4511,21 +4511,17 @@ pub fn mount_with_scheduler(path: &std::path::Path) -> Result<JsRuntime, Runtime
             path: resolved.root_path.display().to_string(),
         })?;
 
+    let built = graphreact_grx_parser::ir::build_ir(&GrxFile {
+        imports: resolved.root.imports.clone(),
+        graph: Some(graph_block.clone()),
+        subgraphs: resolved.root.subgraphs.clone(),
+        definitions: resolved.root.definitions.clone(),
+    })?;
     let ir = GrxIr {
         graph_id: graph_block.id.clone(),
         graph_loc: graph_block.loc,
-        nodes: graphreact_grx_parser::ir::build_ir(&GrxFile {
-            imports: resolved.root.imports.clone(),
-            graph: Some(graph_block.clone()),
-            definitions: resolved.root.definitions.clone(),
-        })
-        .nodes,
-        edges: graphreact_grx_parser::ir::build_ir(&GrxFile {
-            imports: resolved.root.imports.clone(),
-            graph: Some(graph_block.clone()),
-            definitions: resolved.root.definitions.clone(),
-        })
-        .edges,
+        nodes: built.nodes,
+        edges: built.edges,
         definitions: definitions
             .iter()
             .map(|(_, comp, code, lang)| graphreact_grx_parser::ir::IrDefinition {
@@ -4917,6 +4913,32 @@ mod tests {
     /// same mutex.
     fn engine_lock() -> MutexGuard<'static, ()> {
         super::engine_lock()
+    }
+
+    /// PCBPnR Phase 5-D follow-on item #2 — external `.js` body
+    /// referenced via `<Counter src="./body.js" lang="js"/>` must
+    /// route through the same JSC-mount path as inline-body
+    /// definitions. Closes the end-to-end loop for the JS side
+    /// (mirror of `pyruntime::tests::phase5d_followon_external_python_body_executes_end_to_end`).
+    ///
+    /// Successful mount IS the proof the body executed: the engine
+    /// resolves the wrapped body function and invokes it; the body
+    /// must return a manifest object or mount fails. So a clean
+    /// mount + correct n_nodes proves the body content was loaded
+    /// from disk AND executed in the JSC sub-isolate.
+    #[test]
+    fn phase5d_followon_external_js_body_executes_end_to_end() {
+        let _g = engine_lock();
+        reset_global_state();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/js-external-body.grx");
+        let mut runtime =
+            super::mount_with_scheduler(&fixture).expect("mount ok");
+
+        assert_eq!(runtime.graph_id, "js-external-body");
+        assert_eq!(runtime.n_nodes, 1);
+
+        runtime.shutdown().expect("shutdown ok");
     }
 
     /// Phase 3b: `useState` preserves value across renders.

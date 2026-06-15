@@ -58,7 +58,7 @@ module.exports = grammar({
     source_file: ($) => repeat($._top_level_item),
 
     _top_level_item: ($) =>
-      choice($.import_decl, $.graph, $.definition_block),
+      choice($.import_decl, $.graph, $.subgraph, $.definition_block),
 
     // ----------------------------------------------------------------
     // Imports
@@ -79,6 +79,18 @@ module.exports = grammar({
     _graph_close: ($) => seq('<', '/', 'Graph', '>'),
 
     _graph_child: ($) => choice($.graph_node, $.edge_decl),
+
+    // ----------------------------------------------------------------
+    // Subgraph — PCBPnR Phase 5-D §2.2. Same child shape as Graph
+    // (nodes + edge_decls). Distinguished from Graph by tag literal.
+    // ----------------------------------------------------------------
+
+    subgraph: ($) => seq($._subgraph_open, repeat($._graph_child), $._subgraph_close),
+
+    _subgraph_open: ($) =>
+      seq('<', 'Subgraph', repeat($.attribute), '>'),
+
+    _subgraph_close: ($) => seq('<', '/', 'Subgraph', '>'),
 
     // Graph nodes have an `id` attribute and contain other graph
     // children. The grammar doesn't enforce the id-attribute presence
@@ -104,11 +116,20 @@ module.exports = grammar({
     // Definition blocks (top-level, raw body)
     // ----------------------------------------------------------------
 
+    // Definition blocks: either inline-body (open + raw_body + close)
+    // OR self-closing with `src="./body.py"` for an external body
+    // file (PCBPnR Phase 5-D follow-on).
     definition_block: ($) =>
-      seq($._definition_open, $.raw_body, $._definition_close),
+      choice(
+        seq($._definition_open, $.raw_body, $._definition_close),
+        $._definition_self_close,
+      ),
 
     _definition_open: ($) =>
       seq('<', $.tag_name, repeat($.attribute), '>'),
+
+    _definition_self_close: ($) =>
+      seq('<', $.tag_name, repeat($.attribute), '/>'),
 
     _definition_close: ($) => seq('<', '/', $.tag_name, '>'),
 

@@ -1,0 +1,6 @@
+<!-- PCBPnR Phase 5-D §2.2/§2.3 fixture — MCU subsystem definition. -->
+
+<Subgraph name="McuCore">
+  <Component id="U1" footprint="QFN32" />
+  <Component id="X1" footprint="SMD-3225" />
+</Subgraph>

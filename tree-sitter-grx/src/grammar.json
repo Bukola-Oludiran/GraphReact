@@ -23,6 +23,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "subgraph"
+        },
+        {
+          "type": "SYMBOL",
           "name": "definition_block"
         }
       ]
@@ -126,6 +130,71 @@
         {
           "type": "SYMBOL",
           "name": "edge_decl"
+        }
+      ]
+    },
+    "subgraph": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "_subgraph_open"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_graph_child"
+          }
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_subgraph_close"
+        }
+      ]
+    },
+    "_subgraph_open": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "<"
+        },
+        {
+          "type": "STRING",
+          "value": "Subgraph"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "attribute"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ">"
+        }
+      ]
+    },
+    "_subgraph_close": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "<"
+        },
+        {
+          "type": "STRING",
+          "value": "/"
+        },
+        {
+          "type": "STRING",
+          "value": "Subgraph"
+        },
+        {
+          "type": "STRING",
+          "value": ">"
         }
       ]
     },
@@ -252,19 +321,28 @@
       ]
     },
     "definition_block": {
-      "type": "SEQ",
+      "type": "CHOICE",
       "members": [
         {
-          "type": "SYMBOL",
-          "name": "_definition_open"
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "_definition_open"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "raw_body"
+            },
+            {
+              "type": "SYMBOL",
+              "name": "_definition_close"
+            }
+          ]
         },
         {
           "type": "SYMBOL",
-          "name": "raw_body"
-        },
-        {
-          "type": "SYMBOL",
-          "name": "_definition_close"
+          "name": "_definition_self_close"
         }
       ]
     },
@@ -289,6 +367,30 @@
         {
           "type": "STRING",
           "value": ">"
+        }
+      ]
+    },
+    "_definition_self_close": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "<"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "tag_name"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "attribute"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "/>"
         }
       ]
     },

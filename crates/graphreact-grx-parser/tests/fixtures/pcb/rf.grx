@@ -1,0 +1,17 @@
+<!-- PCBPnR Phase 5-D §2.2/§2.3 fixture — RF subsystem definitions.
+
+     NOTE: The parser is engine-/domain-agnostic. PCB-specific tags
+     like <Pin>/<Pad> inside <Net>/<Component> live in the consumer
+     (PCBPnR's `pcb-board-nodes`), not in this grammar. This fixture
+     uses id-bearing tags everywhere so it round-trips through the
+     standard parser. Domain-shape coupling is Phase 5-D Part 3. -->
+
+<Subgraph name="RfFrontEnd">
+  <Component id="ANT1" footprint="ChipAnt_2450" />
+  <Component id="L1" footprint="0402" />
+</Subgraph>
+
+<Subgraph name="RfHarmonicFilter">
+  <Component id="C1" footprint="0402" />
+  <Component id="L2" footprint="0402" />
+</Subgraph>

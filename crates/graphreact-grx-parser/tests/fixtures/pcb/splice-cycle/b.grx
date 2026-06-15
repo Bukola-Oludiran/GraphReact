@@ -1,0 +1,7 @@
+<!-- PCBPnR Phase 5-D §2.3 negative fixture — back-edge of the splice cycle. -->
+
+<import src="./a.grx" as="a" />
+
+<Subgraph name="B">
+  <Subsystem ref="a:A" id="a" />
+</Subgraph>

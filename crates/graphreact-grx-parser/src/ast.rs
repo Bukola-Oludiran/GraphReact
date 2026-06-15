@@ -11,11 +11,36 @@ use crate::error::SourceLoc;
 
 /// A whole `.grx` file (Phase-7 multi-file format). Either contains
 /// graph markup, definition blocks (component bodies), or both.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `subgraphs` (PCBPnR Phase 5-D §2.2) holds zero-or-more named
+/// reusable subgraph fragments. They are peer to the optional
+/// top-level `<Graph>` block, addressable by name from importers
+/// (qualified by the importer's `as=` alias if any). Subsystem
+/// splice resolution at IR-build time replaces each `<Subsystem>`
+/// reference with the named subgraph's children, prefixed with
+/// the local id.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GrxFile {
     pub imports: Vec<ImportDirective>,
     pub graph: Option<GraphDecl>,
+    pub subgraphs: Vec<SubgraphDecl>,
     pub definitions: Vec<NodeDefinitionBlock>,
+}
+
+/// PCBPnR Phase 5-D §2.2. A named reusable subgraph fragment,
+/// exported by its containing file and addressable from importers
+/// via the splice syntax `<Subsystem ref="<alias>:<name>" id="..."/>`.
+///
+/// Children mirror the shape of `<Graph>` children — `<Component>`,
+/// `<Net>`, `<Pin>`, `<Pad>`, nested `<Subsystem>` references, and
+/// `<edge>` declarations. Splice resolution prefixes inner ids with
+/// the splice's local id so they become addressable as
+/// `<local-id>.<inner-id>` from the outer scope.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubgraphDecl {
+    pub name: String,
+    pub children: Vec<GrxNode>,
+    pub loc: SourceLoc,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,7 +83,32 @@ pub struct EdgeDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportDirective {
     pub src: String,
+    /// PCBPnR Phase 5-D §2.1. Optional namespace alias from
+    /// `<import src="./rf.grx" as="rf"/>`. When `None`, definitions
+    /// plus subgraphs from the imported file flatten into the global
+    /// namespace (pre-§2.1 behavior). When `Some(alias)`, every
+    /// definition and `<Subgraph name="X"/>` the file exports is
+    /// namespaced as `alias:X` and is NOT flattened into the global
+    /// namespace. Alias must match `[a-zA-Z_][a-zA-Z0-9_]*` (Rust
+    /// identifier style — stricter than `id` because dot-prefix
+    /// splice addressing makes hyphens ambiguous in `{expr}` values).
+    pub alias: Option<String>,
     pub loc: SourceLoc,
+}
+
+impl ImportDirective {
+    /// Validate that a candidate alias matches the
+    /// `[a-zA-Z_][a-zA-Z0-9_]*` shape required by §2.1.
+    /// Returns `true` when the alias is well-formed.
+    #[must_use]
+    pub fn is_valid_alias(alias: &str) -> bool {
+        let mut chars = alias.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,7 +116,17 @@ pub struct NodeDefinitionBlock {
     /// Tag name = component name.
     pub component: String,
     /// Raw component-body code. Language-specific; see [`Self::lang`].
+    /// When [`Self::src`] is `Some`, this is populated by the
+    /// multi-file resolver after reading the external body file;
+    /// the parser itself leaves it empty in that case.
     pub code: String,
+    /// PCBPnR Phase 5-D follow-on (item #2 from session 2026-05-26).
+    /// Optional external body source path on a self-closing
+    /// definition block: `<Component src="./body.py" lang="python"/>`.
+    /// Resolved relative to the importing `.grx` file's directory
+    /// by [`crate::multi_file::resolve_multi_file`]. `None` for the
+    /// canonical inline-body form `<Component>...code...</Component>`.
+    pub src: Option<String>,
     /// Body language. Default is [`ComponentLang::Js`] when no `lang`
     /// attribute is present (preserves backward compatibility with
     /// pre-M13-phase3 fixtures). [`ComponentLang::Python`] routes
@@ -156,4 +216,29 @@ pub struct WalkedNode<'a> {
     pub node: &'a NodeDecl,
     pub depth: usize,
     pub parent_path: Vec<&'a str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImportDirective;
+
+    #[test]
+    fn alias_validation_accepts_identifier_shape() {
+        for ok in &["rf", "_x", "Mcu", "rf_v2", "_2", "A0"] {
+            assert!(
+                ImportDirective::is_valid_alias(ok),
+                "expected `{ok}` valid"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_validation_rejects_non_identifier_shape() {
+        for bad in &["", "rf-1", "1rf", "rf.x", "rf:x", "rf/x", "rf x"] {
+            assert!(
+                !ImportDirective::is_valid_alias(bad),
+                "expected `{bad}` invalid"
+            );
+        }
+    }
 }

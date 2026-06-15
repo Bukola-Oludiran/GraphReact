@@ -85,8 +85,9 @@ pub fn assemble_resolved_ir(resolved: &MultiFileResolved) -> RuntimeResult<GrxIr
     let nodes_edges_ir = graphreact_grx_parser::ir::build_ir(&GrxFile {
         imports: resolved.root.imports.clone(),
         graph: Some(graph.clone()),
+        subgraphs: resolved.root.subgraphs.clone(),
         definitions: resolved.root.definitions.clone(),
-    });
+    })?;
 
     Ok(GrxIr {
         graph_id: graph.id.clone(),
@@ -174,21 +175,17 @@ pub fn dry_mount(
         path: resolved.root_path.display().to_string(),
     })?;
 
+    let built = graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
+        imports: resolved.root.imports.clone(),
+        graph: Some(graph.clone()),
+        subgraphs: resolved.root.subgraphs.clone(),
+        definitions: resolved.root.definitions.clone(),
+    })?;
     let ir = GrxIr {
         graph_id: graph.id.clone(),
         graph_loc: graph.loc,
-        nodes: graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
-            imports: resolved.root.imports.clone(),
-            graph: Some(graph.clone()),
-            definitions: resolved.root.definitions.clone(),
-        })
-        .nodes,
-        edges: graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
-            imports: resolved.root.imports.clone(),
-            graph: Some(graph.clone()),
-            definitions: resolved.root.definitions.clone(),
-        })
-        .edges,
+        nodes: built.nodes,
+        edges: built.edges,
         definitions: definitions
             .iter()
             .map(|(_, comp, code, lang)| graphreact_grx_parser::ir::IrDefinition {
@@ -307,21 +304,17 @@ pub fn dry_mount_jsc(
         path: resolved.root_path.display().to_string(),
     })?;
 
+    let built = graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
+        imports: resolved.root.imports.clone(),
+        graph: Some(graph.clone()),
+        subgraphs: resolved.root.subgraphs.clone(),
+        definitions: resolved.root.definitions.clone(),
+    })?;
     let ir = GrxIr {
         graph_id: graph.id.clone(),
         graph_loc: graph.loc,
-        nodes: graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
-            imports: resolved.root.imports.clone(),
-            graph: Some(graph.clone()),
-            definitions: resolved.root.definitions.clone(),
-        })
-        .nodes,
-        edges: graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
-            imports: resolved.root.imports.clone(),
-            graph: Some(graph.clone()),
-            definitions: resolved.root.definitions.clone(),
-        })
-        .edges,
+        nodes: built.nodes,
+        edges: built.edges,
         definitions: definitions
             .iter()
             .map(|(_, comp, code, lang)| graphreact_grx_parser::ir::IrDefinition {

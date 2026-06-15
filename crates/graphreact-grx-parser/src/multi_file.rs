@@ -37,6 +37,86 @@ pub struct ImportedFile {
     pub file: GrxFile,
 }
 
+impl MultiFileResolved {
+    /// PCBPnR Phase 5-D §2.2/§2.3 — roll up root + root-level imports'
+    /// subgraphs into a single list with alias-qualified names. The
+    /// returned list is suitable for assigning to a [`GrxFile.subgraphs`]
+    /// field passed to [`crate::ir::build_ir`] for splice resolution.
+    ///
+    /// Aliased root-level imports register their subgraphs under
+    /// `"<alias>:<name>"`. Unaliased imports flatten into the bare
+    /// namespace (matches today's import-flatten semantic). The root
+    /// file's own subgraphs are bare.
+    ///
+    /// Transitively-imported files (imports-of-imports) are NOT
+    /// flattened with alias context — their subgraphs are only visible
+    /// to their immediate importer. This matches the v1 scope chosen
+    /// in the Phase 5-D plan; the open question on transitive alias
+    /// propagation is deferred to a future revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::GrxParseError::DuplicateSubgraphAcrossImports`]
+    /// when two root-level imports register the same qualified name
+    /// (typically the unaliased-collision case).
+    pub fn collect_root_subgraphs(&self) -> crate::GrxResult<Vec<crate::ast::SubgraphDecl>> {
+        use crate::ast::SubgraphDecl;
+        use crate::GrxParseError;
+
+        let mut out: Vec<SubgraphDecl> = Vec::new();
+        let mut seen: rustc_hash::FxHashMap<String, crate::error::SourceLoc> =
+            rustc_hash::FxHashMap::default();
+
+        // First, root's own subgraphs (bare names).
+        for sg in &self.root.subgraphs {
+            if let Some(_prev_loc) = seen.get(&sg.name) {
+                return Err(GrxParseError::DuplicateSubgraphAcrossImports {
+                    qualified_name: sg.name.clone(),
+                    loc: sg.loc,
+                });
+            }
+            seen.insert(sg.name.clone(), sg.loc);
+            out.push(sg.clone());
+        }
+
+        // Then, each root-level import's subgraphs, qualified by alias.
+        let root_dir = self.root_path.parent().map(Path::to_path_buf);
+        for import in &self.root.imports {
+            let resolved_path = match &root_dir {
+                Some(d) => match canonicalize(&d.join(&import.src)) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                },
+                None => continue,
+            };
+            let imp_file = match self.imports.iter().find(|i| i.path == resolved_path) {
+                Some(i) => &i.file,
+                None => continue,
+            };
+            for sg in &imp_file.subgraphs {
+                let qualified = match &import.alias {
+                    Some(alias) => format!("{alias}:{}", sg.name),
+                    None => sg.name.clone(),
+                };
+                if let Some(_prev_loc) = seen.get(&qualified) {
+                    return Err(GrxParseError::DuplicateSubgraphAcrossImports {
+                        qualified_name: qualified,
+                        loc: sg.loc,
+                    });
+                }
+                seen.insert(qualified.clone(), sg.loc);
+                out.push(SubgraphDecl {
+                    name: qualified,
+                    children: sg.children.clone(),
+                    loc: sg.loc,
+                });
+            }
+        }
+
+        Ok(out)
+    }
+}
+
 /// Resolve a `.grx` file plus all of its transitive `<import>`s from
 /// disk. Errors on circular imports or missing files.
 pub fn resolve_multi_file(root_path: &Path) -> GrxResult<MultiFileResolved> {
@@ -257,7 +337,7 @@ impl Resolver {
                 source,
             })?;
 
-        let file: GrxFile = match cache.entries.get(path) {
+        let mut file: GrxFile = match cache.entries.get(path) {
             Some(entry) if entry.mtime == mtime => {
                 cache.hits += 1;
                 entry.file.clone()
@@ -283,6 +363,17 @@ impl Resolver {
         };
 
         let parent_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+
+        // PCBPnR Phase 5-D follow-on — resolve external definition
+        // bodies (`<Component src="./body.py"/>`). The cache key on
+        // the `.grx` file itself is mtime-based; external body files
+        // are read fresh on every resolve (low cost — typically a
+        // few hundred bytes per body — and matches `--watch` mode's
+        // expectation that body changes trigger reload).
+        resolve_external_definition_bodies(&mut file, &parent_dir, &mut |p| {
+            std::fs::read_to_string(p)
+        })?;
+
         for import in &file.imports {
             let resolved = parent_dir.join(&import.src);
             let canonical = canonicalize_or(&resolved, &resolved);
@@ -339,7 +430,7 @@ impl Resolver {
                 source,
             })?;
 
-        let file: GrxFile = match cache.entries.get(path) {
+        let mut file: GrxFile = match cache.entries.get(path) {
             Some(entry) if entry.mtime == mtime && entry.tree.is_some() => {
                 cache.hits += 1;
                 entry.file.clone()
@@ -373,6 +464,13 @@ impl Resolver {
         };
 
         let parent_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+
+        // PCBPnR Phase 5-D follow-on — resolve external definition
+        // bodies. See note on `load_via_cache`.
+        resolve_external_definition_bodies(&mut file, &parent_dir, &mut |p| {
+            std::fs::read_to_string(p)
+        })?;
+
         for import in &file.imports {
             let resolved = parent_dir.join(&import.src);
             let canonical = canonicalize_or(&resolved, &resolved);
@@ -413,8 +511,14 @@ impl Resolver {
             path: path.display().to_string(),
             source,
         })?;
-        let file = Parser::parse_file(&source)?;
+        let mut file = Parser::parse_file(&source)?;
         let parent_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+
+        // PCBPnR Phase 5-D follow-on — resolve external definition
+        // bodies (`<Component src="./body.py"/>`) relative to the
+        // importing file's directory. Routes through the same `load`
+        // callback so in-memory test variants work too.
+        resolve_external_definition_bodies(&mut file, &parent_dir, load)?;
 
         for import in &file.imports {
             let resolved = parent_dir.join(&import.src);
@@ -491,6 +595,48 @@ fn canonicalize(path: &Path) -> GrxResult<PathBuf> {
         path: path.display().to_string(),
         source,
     })
+}
+
+/// PCBPnR Phase 5-D follow-on — read external `.py`/`.js` body files
+/// for definition blocks that use `<Component src="./body.py"/>`
+/// instead of an inline body, populating `code` in place.
+///
+/// Paths are resolved relative to the importing `.grx` file's
+/// directory. Read errors surface as
+/// [`GrxParseError::DefinitionBodyIo`] with the originating
+/// definition's source location for editor diagnostics.
+///
+/// No-op for definitions without `src=` (the canonical inline-body
+/// form). Callable through the load closure so in-memory test
+/// variants (`resolve_multi_file_with`) work the same as disk-IO
+/// variants.
+fn resolve_external_definition_bodies<F>(
+    file: &mut GrxFile,
+    parent_dir: &Path,
+    load: &mut F,
+) -> GrxResult<()>
+where
+    F: FnMut(&Path) -> Result<String, std::io::Error>,
+{
+    for def in &mut file.definitions {
+        if let Some(src) = &def.src {
+            let resolved = parent_dir.join(src);
+            match load(&resolved) {
+                Ok(body) => {
+                    def.code = body;
+                }
+                Err(source) => {
+                    return Err(GrxParseError::DefinitionBodyIo {
+                        component: def.component.clone(),
+                        path: resolved.display().to_string(),
+                        source,
+                        loc: def.loc,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn canonicalize_or(path: &Path, fallback: &Path) -> PathBuf {

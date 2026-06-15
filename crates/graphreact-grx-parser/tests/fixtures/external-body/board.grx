@@ -1,0 +1,8 @@
+<!-- PCBPnR Phase 5-D follow-on fixture — top-level `.grx` that loads
+     its `<Counter>` body from an external `.py` file. -->
+
+<Counter src="./counter.py" lang="python" />
+
+<Graph id="board">
+  <Counter id="c1" initialCount={5} />
+</Graph>

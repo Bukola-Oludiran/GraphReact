@@ -34,11 +34,12 @@ pub mod ir;
 pub mod lexer;
 pub mod multi_file;
 pub mod parser;
+pub mod style;
 pub mod treesitter;
 
 pub use ast::{
     AttrMap, EdgeDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl,
-    NodeDefinitionBlock, WalkedNode,
+    NodeDefinitionBlock, SubgraphDecl, WalkedNode,
 };
 pub use error::{GrxParseError, GrxResult, SourceLoc};
 pub use ir::{GrxIr, IrEdge, IrNode};

@@ -213,6 +213,10 @@
         {
           "type": "import_decl",
           "named": true
+        },
+        {
+          "type": "subgraph",
+          "named": true
         }
       ]
     }
@@ -227,6 +231,29 @@
       "types": [
         {
           "type": "escape_sequence",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "subgraph",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "attribute",
+          "named": true
+        },
+        {
+          "type": "edge_decl",
+          "named": true
+        },
+        {
+          "type": "graph_node",
           "named": true
         }
       ]
@@ -281,6 +308,10 @@
   },
   {
     "type": "Graph",
+    "named": false
+  },
+  {
+    "type": "Subgraph",
     "named": false
   },
   {

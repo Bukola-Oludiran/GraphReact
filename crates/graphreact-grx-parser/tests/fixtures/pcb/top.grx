@@ -1,0 +1,13 @@
+<!-- PCBPnR Phase 5-D fixture — top-level board that imports rf + mcu
+     subsystems via aliased imports and splices them into a single
+     <Graph>. Outer-scope <edge> uses dot-prefixed component refs to
+     reach inner components after splicing. -->
+
+<import src="./rf.grx" as="rf" />
+<import src="./mcu.grx" as="mcu" />
+
+<Graph id="main">
+  <Subsystem ref="rf:RfFrontEnd" id="rf" />
+  <Subsystem ref="mcu:McuCore" id="mcu" />
+  <edge source="rf.ANT1" target="mcu.U1" channel="ANT_FEED_OUT" />
+</Graph>
