@@ -6,6 +6,8 @@
 >
 > **Comparable to**: Akka, Erlang/OTP, Orleans.
 
+> **New developers start here:** see [`../onboarding.md`](../onboarding.md) for orientation + reading order, or [`../architecture.md`](../architecture.md) for the crate map.
+
 ## What this product is
 
 GraphReact (the Backend product) is a server-side runtime that executes `.grx` systems. A `.grx` file declares nodes (with bodies in JS / Python / future JVM), edges, supervision policies, and message-routing channels. The runtime parses the file, mounts the components, schedules message dispatch, and handles supervision crash-recovery — all server-side.
