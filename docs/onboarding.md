@@ -123,7 +123,17 @@ Every milestone tag you will see in commits, doc cross-links, or memory entries:
 | M15 | Hot reload (second BEAM-class property) | shipped 2026-05-07 | [backend/m15-hot-reload.md](backend/m15-hot-reload.md) |
 | M16-Backend | Observer + telemetry (third BEAM-class property) | SHIPPED 2026-05-08 | [backend/m16-backend-observer.md](backend/m16-backend-observer.md) |
 | M-Ingress | External HTTP ingress substrate (M16.5-Backend) | SHIPPED 2026-05-09 | [backend/m16.5-ingress.md](backend/m16.5-ingress.md) |
-| M18 | WebAssembly server-WASM bindings | UNSHIPPED (stub) | [backend/README.md](backend/README.md) |
+| **M17** | **Go runtime engine bridge (third in-process language host; replaces JVM per Java→Go pivot 2026-06-15)** | PLANNED — replanned 2026-06-15 | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| M18 | WebAssembly server-WASM bindings | UNSHIPPED (stub; orthogonal) | [backend/README.md](backend/README.md) + [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M22** | **Mixed-runtime systems — JS + Python + Go in same `.grx`** | PLANNED — replanned 2026-06-15 | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M23** | **LSP server for `.grx` (outer-shell MVP)** | PLANNED — replanned 2026-06-15 | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **Cleanup-Pass** | **Pre-M-Prod deferred-cleanup slice (13 named residuals)** | PLANNED — replanned 2026-06-15 | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M-Prod** | **Production-readiness milestone — 9 sub-tracks (auth / TLS / secrets / lifecycle (incl. M14.11) / observability / rate limiting / supply-chain / packaging / chaos+fuzz)** | PLANNED — replanned 2026-06-15 | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M19** | **`graphreact-persistence` — own segment log + snapshot + replay** | PLANNED — replanned 2026-06-15 (DB-product track) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M20** | **`graphreact-db-distributed` — sharded `CommunicationGraph`, Raft per shard** | PLANNED — replanned 2026-06-15 (DB-product track) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M21** | **`graphreact-query` — SpacetimeDB-style reducer-with-subscription (supersedes "Cypher-shaped" wording in ADR-0003 + db/README)** | PLANNED — replanned 2026-06-15 (DB-product track) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M24** | **DB client SDK protocol — WS + binary BSATN; canonical React SDK; typed-binding codegen** | PLANNED — replanned 2026-06-15 (DB-product track) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M25 / M25.a / M25.b** | **Additional client SDKs — Rust → Swift → C#/Unity (per locked Q11)** | PLANNED — replanned 2026-06-15 (DB-product track) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
 
 ---
 
@@ -168,7 +178,7 @@ Five layers exist; consult the lowest one that answers your question.
 
 | Layer | Path shape | Use when |
 |---|---|---|
-| Strategic plan | `~/.claude/plans/toasty-crafting-lantern.md` (workspace-parent) | You need the roadmap framing, milestone definitions, or the rationale for what comes next. |
+| Strategic plan | `~/.claude/plans/graphreact-rust-later-milestones.md` (workspace-parent) | You need the M17–M25+ roadmap framing, milestone definitions, or the rationale for what comes next. (Replaces the prior `toasty-crafting-lantern.md`, which is lost on disk; the new plan is a substrate-faithful reconstruction.) |
 | Decision docs (ADRs) | `docs/decisions/000N-*.md` | You are asking *why* a structural choice was made (backend-only, bifurcation, ingress shape, V8 omission). Four ADRs total; all four are short. |
 | Milestone narratives | `docs/backend/m*.md` | You want to know *what* a milestone shipped, the acceptance criteria it closed against, and the deferrals it consciously left open. |
 | Per-crate READMEs | `crates/*/README.md` (where present), otherwise `Cargo.toml` + module-level rustdoc | You are touching one crate and need the local entry points; module-level `//!` docs are the canonical surface where a README is absent. |

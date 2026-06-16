@@ -160,6 +160,6 @@ M-Prod adds production-shaped hardening:
 - **Phase 11 memory**: [project_graphreact_m15_phase11.md](../../../../.claude/projects/-Users-damioludiran-jays-workspace/memory/project_graphreact_m15_phase11.md)
 - **Aggregate M15 memory**: [project_graphreact_m15.md](../../../../.claude/projects/-Users-damioludiran-jays-workspace/memory/project_graphreact_m15.md)
 - **Implementation plan**: [`~/.claude/plans/plan-implementation-for-closing-cached-pascal.md`](../../../../.claude/plans/plan-implementation-for-closing-cached-pascal.md)
-- **Canonical strategic plan**: [`~/.claude/plans/toasty-crafting-lantern.md`](../../../../.claude/plans/toasty-crafting-lantern.md)
+- **Canonical strategic plan**: [`~/.claude/plans/graphreact-rust-later-milestones.md`](../../../../.claude/plans/graphreact-rust-later-milestones.md) (replaces the lost `toasty-crafting-lantern.md`; reconstructed 2026-06-15)
 - **M14 distribution narrative**: [m14-distribution.md](m14-distribution.md) — substrate Phase 10 builds on
 - **M-Prod policy** in plan file (~L1245)

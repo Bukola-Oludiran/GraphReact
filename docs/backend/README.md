@@ -37,20 +37,29 @@ GraphReact (Backend) ships first. GraphReactDB starts materializing after the Ba
 
 ## Key milestones for the Backend product
 
-(See the [strategic plan](../../../../../.claude/plans/toasty-crafting-lantern.md) for full milestone definitions; tagged `[Backend]` or `[Shared substrate]`.)
+(See the [later-milestone strategic plan](../../../../../.claude/plans/graphreact-rust-later-milestones.md) for M17–M25+ definitions; tagged `[Backend]` / `[Shared substrate]` / `[DB]` per [ADR-0003](../decisions/0003-graphreact-bifurcates-into-backend-and-db.md). Pre-M17 milestones live in the per-milestone narrative docs in this directory.)
 
-| Milestone | What it delivers |
-|---|---|
-| M11 | `.grx` parser (Shared) |
-| M12 / M12.1-polish / M12.3a / M12.3b / M12.3a-followon | Standalone `grx` CLI + JSC engine bridge |
-| M12.4 | Node-API compat for JSC bodies — first-class backend NPM ecosystem access |
-| M13 | CPython engine bridge — Python authors first-class; PyPI works |
-| M14 | Distribution layer — multi-host clustering, distributed supervision |
-| M15 | Hot reload — compatible-change reload preserves state + queue |
-| M16-Backend | Ops surface — Prometheus + OTel + JSON logs + management API + `grx observer` terminal CLI |
-| M17 | JVM engine bridge (primary M17 deliverable) |
-| M18 | Server-WASM target — Cloudflare Workers / Wasmtime / Wasmer / sandbox plugins |
-| M22 | Mixed-runtime systems — JS + Python + JVM in same `.grx` |
+| Milestone | Product-tag | What it delivers |
+|---|---|---|
+| M11 | [Shared] | `.grx` parser |
+| M12 / M12.1-polish / M12.3a / M12.3b / M12.3a-followon | [Backend] | Standalone `grx` CLI + JSC engine bridge |
+| M12.4 | [Backend] | Node-API compat for JSC bodies — first-class backend NPM ecosystem access |
+| M13 | [Backend] | CPython engine bridge — Python authors first-class; PyPI works |
+| M14 | [Backend] | Distribution layer — multi-host clustering, distributed supervision |
+| M15 | [Backend] | Hot reload — compatible-change reload preserves state + queue |
+| M16-Backend | [Backend] | Ops surface — Prometheus + OTel + JSON logs + management API + `grx observer` terminal CLI |
+| M-Ingress (M16.5) | [Backend] | External HTTP ingress substrate — POST `/v1/nodes/:id/{messages,call}` + bulk NDJSON; default-deny via manifest |
+| **M17** | [Backend] | **Go runtime engine bridge — third in-process language host (replaces JVM per Java→Go pivot 2026-06-15)** |
+| **M22** | [Backend] | **Mixed-runtime systems — JS + Python + Go in same `.grx`** |
+| **M23** | [Shared] | **LSP server for `.grx` (outer-shell MVP per locked Q10)** |
+| **Cleanup-Pass** | [Backend / Shared] | **Pre-M-Prod deferred-cleanup slice (13 named residuals)** |
+| **M-Prod** | [Production-hardening] | **Production-readiness milestone — 9 sub-tracks (auth / TLS / secrets / lifecycle (incl. M14.11) / observability / rate limiting / supply-chain / packaging / chaos+fuzz)** |
+| **M19** | [DB] | **`graphreact-persistence` — own segment log + snapshot + replay** |
+| **M20** | [DB] | **`graphreact-db-distributed` — sharded `CommunicationGraph` with Raft per shard** |
+| **M21** | [DB] | **`graphreact-query` — SpacetimeDB-style reducer-with-subscription (supersedes the prior "Cypher-shaped" wording)** |
+| **M24** | [DB] | **DB client SDK protocol — WS + binary BSATN; canonical React SDK; typed-binding codegen** |
+| **M25 / M25.a / M25.b** | [DB] | **Additional client SDKs — Rust → Swift → C#/Unity (per locked Q11)** |
+| M18 | [Backend] | Server-WASM target — orthogonal, ships on host-platform demand (Cloudflare Workers / Fastly / Wasmtime / Wasmer / WAMR) |
 
 ## Quickstart (placeholder — fills in as product stabilises)
 

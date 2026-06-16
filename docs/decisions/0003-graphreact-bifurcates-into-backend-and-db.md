@@ -1,7 +1,13 @@
 # 0003 — GraphReact bifurcates into two products: GraphReact (Backend) + GraphReactDB
 
-**Status:** DECIDED — recorded 2026-05-03.
-**Related:** Strategic plan at `~/.claude/plans/toasty-crafting-lantern.md`. Decision 0001 (V8 soft-demote) and decision 0002 (backend-only architecture) both stay valid; this decision sits on top.
+**Status:** DECIDED — recorded 2026-05-03; partially amended 2026-06-15 (see Amendments).
+**Related:** Strategic plan at `~/.claude/plans/graphreact-rust-later-milestones.md` (replaces the lost `toasty-crafting-lantern.md`; this ADR's original Strategic-plan reference therefore now points at the reconstruction). Decision 0001 (V8 soft-demote) and decision 0002 (backend-only architecture) both stay valid; this decision sits on top. A follow-up ADR-0005 will record the Java→Go pivot for the M17 third-runtime slot (see Amendments).
+
+## Amendments
+
+- **2026-06-15 — Java→Go pivot for M22 mixed-runtime composition.** The line below that reads "Mixed-runtime systems (M22) | JS + Python + JVM in the same `.grx` system" was decided as **JS + Python + Go** in the 2026-06-15 replanning session (Q1 paired with M17 ships the Go engine; M22 relaxes for mixed-runtime). The "JVM" wording below remains as the historical record of the original 2026-05-03 decision; treat the later-milestone plan as authoritative for current scope. ADR-0005 will record this pivot in full.
+- **2026-06-15 — M21 reducer-with-subscription supersedes Cypher-shaped query language.** The line below that reads "graphreact-query (M21) | Cypher-shaped query language compiled to Memo dependency forest" was decided as **SpacetimeDB-style reducer-with-subscription** in the 2026-06-15 replanning session (Q4). The "Cypher-shaped" wording below remains as historical record; treat the later-milestone plan as authoritative for current scope.
+- **2026-06-15 — Plan-file reference.** The cited `toasty-crafting-lantern.md` is lost on disk and unrecoverable; the equivalent reconstruction lives at `~/.claude/plans/graphreact-rust-later-milestones.md`. Line-number citations to the lost original (e.g. line 138 below) reference text that no longer exists; the line numbers will not resolve.
 
 ## The decision
 

@@ -227,31 +227,43 @@ The architectural decisions that shape current scope. Each one is a single page;
 
 ## Milestone status
 
-Every milestone tag in the workspace glossary, the crate(s) it owns, and the narrative doc. Stable shipped milestones are the load-bearing surface; UNSHIPPED entries are living documents that track in-flight scope.
+Every milestone tag in the workspace glossary, the crate(s) it owns, the product-tag per [ADR-0003](decisions/0003-graphreact-bifurcates-into-backend-and-db.md), and the narrative doc. Stable shipped milestones are the load-bearing surface; UNSHIPPED entries are living documents that track in-flight scope; PLANNED entries belong to the later-milestone replan (M17–M25+) at [`~/.claude/plans/graphreact-rust-later-milestones.md`](../../../.claude/plans/graphreact-rust-later-milestones.md).
 
-| Tag | Name | Status | Crate(s) | Narrative |
-|---|---|---|---|---|
-| M2 | `CommunicationGraph` data structure (foundational substrate) | shipped (pre-M14) | `graphreact-core` | [`../crates/graphreact-core/README.md`](../crates/graphreact-core/README.md) |
-| M3 | NetworkX-parity graph algorithms (components, cycles, DAG, pathfinding, traversal, validation) | shipped (pre-M14) | `graphreact-algorithms` | [`backend/m6.6-engine-parity.md`](backend/m6.6-engine-parity.md) |
-| M4 | Reactive runtime / scheduler | shipped (pre-M14) | `graphreact-core` | [`backend/README.md`](backend/README.md) |
-| M5 | OTP-inspired supervision | shipped (pre-M14) | `graphreact-core` | [`../crates/graphreact-core/README.md`](../crates/graphreact-core/README.md) |
-| M6.6 | TS feature parity audit, per-engine sign-off | UNSHIPPED (living, 2026-05-02) | `graphreact-napi`, `graphreact-engine-jsc`, `graphreact-engine-cpython` | [`backend/m6.6-engine-parity.md`](backend/m6.6-engine-parity.md) |
-| M7 | Telemetry sink trait (`TelemetrySink`) — substrate hot path | shipped (pre-M14) | `graphreact-core` | [`../crates/graphreact-core/README.md`](../crates/graphreact-core/README.md) |
-| M8 | Linear algebra kernel + partition (Leiden, modularity) | shipped (pre-M14) | `graphreact-linalg`, `graphreact-graspologic` | [`../crates/graphreact-linalg/README.md`](../crates/graphreact-linalg/README.md) |
-| M9 | Spectral embeddings (ASE/LSE/OMNI/MASE/CASE + Procrustes + dimension selection) | shipped (pre-M14) | `graphreact-graspologic` | [`../crates/graphreact-graspologic/README.md`](../crates/graphreact-graspologic/README.md) |
-| M10 | Cluster / inference / match / nominate analytics (GMM, latent-position, Hungarian+FAQ, spectral VN) | shipped (pre-M14) | `graphreact-graspologic` | [`../crates/graphreact-graspologic/README.md`](../crates/graphreact-graspologic/README.md) |
-| M11 | `.grx` parser + IR builder | shipped (pre-M14) | `graphreact-grx-parser` | [`backend/README.md`](backend/README.md) |
-| M11.5 | PCBPnR Phase 5-D shape substrate for the parser | SHIPPED 2026-05-26 | `graphreact-grx-parser` | [`backend/m11.5-pcb-shape-substrate.md`](backend/m11.5-pcb-shape-substrate.md) |
-| M12 | Engine-substrate trio — engine-agnostic Rust trait + null + echo bridges | shipped (pre-M14) | `graphreact-engine-zig`, `graphreact-engine-null`, `graphreact-engine-echo` | [`backend/m6.6-engine-parity.md`](backend/m6.6-engine-parity.md) |
-| M12.1 | Standalone `grx` CLI skeleton (parse / check / run / fmt / engine selection) | shipped (pre-M14) | `graphreact-cli` | [`../crates/graphreact-cli/README.md`](../crates/graphreact-cli/README.md) |
-| M12.3a | JSC engine bridge (macOS system framework) | shipped | `graphreact-engine-jsc` | [`backend/m6.6-engine-parity.md`](backend/m6.6-engine-parity.md) |
-| M12.3b | WebKit vendoring for JSC on Linux/Windows | UNSHIPPED (living, 2026-05-02) | `graphreact-engine-jsc` | [`backend/m12.3b-webkit-vendoring.md`](backend/m12.3b-webkit-vendoring.md) |
-| M13 | CPython engine bridge | shipped 2026-05-06 | `graphreact-engine-cpython` | [`backend/m13-phases.md`](backend/m13-phases.md) |
-| M14 | Distribution layer (first BEAM-class property) | shipped 2026-05-05 | `graphreact-dist` | [`backend/m14-distribution.md`](backend/m14-distribution.md) |
-| M15 | Hot reload (second BEAM-class property) | shipped 2026-05-07 | `graphreact-grx-parser`, `graphreact-hotreload` | [`backend/m15-hot-reload.md`](backend/m15-hot-reload.md) |
-| M16-Backend | Observer + telemetry (third BEAM-class property) | SHIPPED 2026-05-08 | `graphreact-observer`, `graphreact-cli` | [`backend/m16-backend-observer.md`](backend/m16-backend-observer.md) |
-| M-Ingress | External HTTP ingress substrate (M16.5-Backend) | SHIPPED 2026-05-09 | `graphreact-observer`, `graphreact-cli` | [`backend/m16.5-ingress.md`](backend/m16.5-ingress.md) |
-| M18 | WebAssembly server-WASM bindings | UNSHIPPED (stub) | `graphreact-wasm` | [`backend/README.md`](backend/README.md) |
+| Tag | Product-tag | Name | Status | Crate(s) | Narrative |
+|---|---|---|---|---|---|
+| M2 | [Shared] | `CommunicationGraph` data structure (foundational substrate) | shipped (pre-M14) | `graphreact-core` | [`../crates/graphreact-core/README.md`](../crates/graphreact-core/README.md) |
+| M3 | [Shared] | NetworkX-parity graph algorithms (components, cycles, DAG, pathfinding, traversal, validation) | shipped (pre-M14) | `graphreact-algorithms` | [`backend/m6.6-engine-parity.md`](backend/m6.6-engine-parity.md) |
+| M4 | [Shared] | Reactive runtime / scheduler | shipped (pre-M14) | `graphreact-core` | [`backend/README.md`](backend/README.md) |
+| M5 | [Shared] | OTP-inspired supervision | shipped (pre-M14) | `graphreact-core` | [`../crates/graphreact-core/README.md`](../crates/graphreact-core/README.md) |
+| M6.6 | [Backend] | TS feature parity audit, per-engine sign-off | UNSHIPPED (living, 2026-05-02) | `graphreact-napi`, `graphreact-engine-jsc`, `graphreact-engine-cpython` | [`backend/m6.6-engine-parity.md`](backend/m6.6-engine-parity.md) |
+| M7 | [Shared] | Telemetry sink trait (`TelemetrySink`) — substrate hot path | shipped (pre-M14) | `graphreact-core` | [`../crates/graphreact-core/README.md`](../crates/graphreact-core/README.md) |
+| M8 | [Shared] | Linear algebra kernel + partition (Leiden, modularity) | shipped (pre-M14) | `graphreact-linalg`, `graphreact-graspologic` | [`../crates/graphreact-linalg/README.md`](../crates/graphreact-linalg/README.md) |
+| M9 | [Shared] | Spectral embeddings (ASE/LSE/OMNI/MASE/CASE + Procrustes + dimension selection) | shipped (pre-M14) | `graphreact-graspologic` | [`../crates/graphreact-graspologic/README.md`](../crates/graphreact-graspologic/README.md) |
+| M10 | [Shared] | Cluster / inference / match / nominate analytics (GMM, latent-position, Hungarian+FAQ, spectral VN) | shipped (pre-M14) | `graphreact-graspologic` | [`../crates/graphreact-graspologic/README.md`](../crates/graphreact-graspologic/README.md) |
+| M11 | [Shared] | `.grx` parser + IR builder | shipped (pre-M14) | `graphreact-grx-parser` | [`backend/README.md`](backend/README.md) |
+| M11.5 | [Shared] | PCBPnR Phase 5-D shape substrate for the parser | SHIPPED 2026-05-26 | `graphreact-grx-parser` | [`backend/m11.5-pcb-shape-substrate.md`](backend/m11.5-pcb-shape-substrate.md) |
+| M12 | [Backend] | Engine-substrate trio — engine-agnostic Rust trait + null + echo bridges | shipped (pre-M14) | `graphreact-engine-zig`, `graphreact-engine-null`, `graphreact-engine-echo` | [`backend/m6.6-engine-parity.md`](backend/m6.6-engine-parity.md) |
+| M12.1 | [Backend] | Standalone `grx` CLI skeleton (parse / check / run / fmt / engine selection) | shipped (pre-M14) | `graphreact-cli` | [`../crates/graphreact-cli/README.md`](../crates/graphreact-cli/README.md) |
+| M12.3a | [Backend] | JSC engine bridge (macOS system framework) | shipped | `graphreact-engine-jsc` | [`backend/m6.6-engine-parity.md`](backend/m6.6-engine-parity.md) |
+| M12.3b | [Backend] | WebKit vendoring for JSC on Linux/Windows | UNSHIPPED (living, 2026-05-02) | `graphreact-engine-jsc` | [`backend/m12.3b-webkit-vendoring.md`](backend/m12.3b-webkit-vendoring.md) |
+| M13 | [Backend] | CPython engine bridge | shipped 2026-05-06 | `graphreact-engine-cpython` | [`backend/m13-phases.md`](backend/m13-phases.md) |
+| M14 | [Backend] | Distribution layer (first BEAM-class property) | shipped 2026-05-05 | `graphreact-dist` | [`backend/m14-distribution.md`](backend/m14-distribution.md) |
+| M15 | [Backend] | Hot reload (second BEAM-class property) | shipped 2026-05-07 | `graphreact-grx-parser`, `graphreact-hotreload` | [`backend/m15-hot-reload.md`](backend/m15-hot-reload.md) |
+| M16-Backend | [Backend] | Observer + telemetry (third BEAM-class property) | SHIPPED 2026-05-08 | `graphreact-observer`, `graphreact-cli` | [`backend/m16-backend-observer.md`](backend/m16-backend-observer.md) |
+| M-Ingress | [Backend] | External HTTP ingress substrate (M16.5-Backend) | SHIPPED 2026-05-09 | `graphreact-observer`, `graphreact-cli` | [`backend/m16.5-ingress.md`](backend/m16.5-ingress.md) |
+| **M17** | **[Backend]** | **Go runtime engine bridge — cgo + c-shared, build-step codegen .grx → Go (replaces JVM per Java→Go pivot 2026-06-15)** | **PLANNED — replanned 2026-06-15** | `graphreact-engine-go` (new), `graphreact-codegen-go` (new), `graphreact-cli`, `graphreact-grx-parser` | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| M18 | [Backend] | WebAssembly server-WASM bindings (orthogonal; ships on host demand) | DEFERRED (stub) | `graphreact-wasm` | [`backend/README.md`](backend/README.md) + [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M22** | **[Backend]** | **Mixed-runtime systems — JS + Python + Go in same `.grx`** | **PLANNED — replanned 2026-06-15** | `graphreact-core`, `graphreact-cli`, `graphreact-observer` | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M23** | **[Shared]** | **LSP server for `.grx` — outer-shell MVP per locked Q10** | **PLANNED — replanned 2026-06-15** | `graphreact-lsp` (new), `graphreact-grx-parser`, `tree-sitter-grx` | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **Cleanup-Pass** | **[Backend / Shared]** | **Pre-M-Prod deferred-cleanup slice (13 named residuals)** | **PLANNED — replanned 2026-06-15** | (multi) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M-Prod** | **[Production-hardening]** | **Production-readiness — 9 sub-tracks (auth / TLS / secrets / lifecycle (incl. M14.11) / observability / rate limiting / supply-chain / packaging / chaos+fuzz)** | **PLANNED — replanned 2026-06-15** | (multi) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M19** | **[DB]** | **`graphreact-persistence` — own segment log + snapshot + replay** | **PLANNED — replanned 2026-06-15** | `graphreact-persistence` (new), `graphreact-core`, `graphreact-cli` | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M20** | **[DB]** | **`graphreact-db-distributed` — sharded `CommunicationGraph`, Raft per shard** | **PLANNED — replanned 2026-06-15** | `graphreact-db-distributed` (new), `graphreact-core`, `graphreact-dist` | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M21** | **[DB]** | **`graphreact-query` — SpacetimeDB-style reducer-with-subscription (supersedes "Cypher-shaped" wording in ADR-0003 + db/README)** | **PLANNED — replanned 2026-06-15** | `graphreact-query` (new), `graphreact-core`, `graphreact-observer` | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M24** | **[DB]** | **DB client SDK protocol — WS + binary BSATN; canonical React SDK; typed-binding codegen** | **PLANNED — replanned 2026-06-15** | `graphreact-codegen-client` (new), `graphreact-bsatn` (new), `graphreact-query` | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M25** | **[DB]** | **Rust client SDK — substrate-native first per Q11** | **PLANNED — replanned 2026-06-15** | `graphreact-client-rust` (new) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M25.a** | **[DB]** | **Swift client SDK — mobile alignment with M12.3b WebKit** | **PLANNED — replanned 2026-06-15** | `GraphReactClient` (Swift package) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M25.b** | **[DB]** | **C#/Unity client SDK — game-state pitch (Unity needs `ClientWebSocket`, not `System.Net.WebSockets`)** | **PLANNED — replanned 2026-06-15** | `GraphReactClient` (C# library + Unity package) | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
 
 ---
 
@@ -260,6 +272,6 @@ Every milestone tag in the workspace glossary, the crate(s) it owns, and the nar
 - **Canonical React client**: [`../../graphreact-visualizer/docs/onboarding.md`](../../graphreact-visualizer/docs/onboarding.md) and [`../../graphreact-visualizer/docs/architecture.md`](../../graphreact-visualizer/docs/architecture.md) — the downstream library that consumes the M16-Backend management API + SSE/WS event stream + M-Ingress endpoints.
 - **Per-crate detail**: each crate ships its own README at [`../crates/<name>/README.md`](../crates/) — see the tier tables above for direct links. Start with `graphreact-core` if you want to read the scheduler; start with `graphreact-cli` if you want to read the binary entry point.
 - **Onboarding**: [`onboarding.md`](onboarding.md) walks a fresh contributor through cloning, building, running `grx run --runtime=null` against a sample `.grx` file, then progressively wiring in JSC / CPython / distribution / observer.
-- **Plan file**: the active workspace plan lives at [`~/.claude/plans/`](../../.claude/plans/) — search for the most recent `phoenix` / `waffle` / milestone-tagged plan.
+- **Later-milestone roadmap**: the canonical M17–M25+ strategic plan lives at [`~/.claude/plans/graphreact-rust-later-milestones.md`](../../../.claude/plans/graphreact-rust-later-milestones.md) (replaces the lost `toasty-crafting-lantern.md`; reconstructed 2026-06-15 with phase decomps for M17 Go-runtime, M22 mixed-runtime, M23 LSP, Cleanup-Pass, M-Prod, M19 persistence, M20 sharded comm-graph, M21 reducer-with-subscription, M24 DB client SDK protocol, M25/M25.a/M25.b per-language SDKs).
 - **Deep dives by milestone tag**: every shipped milestone has a narrative doc under [`backend/`](backend/) — see the milestone-status table above. The decision docs under [`decisions/`](decisions/) explain *why* the shape is what it is; the milestone narratives explain *what* shipped and *what's deferred*.
 - **Wire-format specs**: distribution wire format at [`../crates/graphreact-dist/docs/wire-protocol.md`](../crates/graphreact-dist/docs/wire-protocol.md); M-Ingress wire format at [`backend/m16.5-ingress-protocol.md`](backend/m16.5-ingress-protocol.md); Prometheus metric catalog at [`backend/m16-prometheus.md`](backend/m16-prometheus.md); management API endpoint catalog at [`backend/m16-management-api.md`](backend/m16-management-api.md).

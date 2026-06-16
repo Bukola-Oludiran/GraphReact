@@ -35,4 +35,4 @@ cargo clippy --workspace -- -D warnings
 
 ## Status
 
-Pre-alpha. Initial milestone (M0 — workspace scaffolding) in progress. See [the plan](../../../.claude/plans/toasty-crafting-lantern.md) for the full milestone roadmap.
+Pre-alpha. M-Ingress (M16.5-Backend) shipped 2026-05-09; backend product is at M16-Backend SHIPPED + M-Ingress + P11.1, with later-milestone roadmap M17–M25+ replanned 2026-06-15 (M17 Go-runtime + M22 mixed-runtime + M23 LSP + Cleanup-Pass + M-Prod + the DB-product track M19/M20/M21/M24 + per-language SDKs M25/M25.a/M25.b). See [the later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) for the full roadmap.

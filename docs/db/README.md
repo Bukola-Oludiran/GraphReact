@@ -22,7 +22,7 @@ GraphReactDB takes the same `.grx` system you'd run on the Backend product and e
 - **Typed reducers.** Clients call typed functions (message-sends to nodes) over the wire; server validates against permission manifests; state mutates; subscriptions push deltas to all subscribers.
 - **Authoritative server.** Clients can't bypass validation; the runtime is the source of truth.
 - **Persistence.** Event-sourced graph mutation log + replay-to-state (M19); restart-safe.
-- **Tier-aware queries.** Cypher-shaped query language (M21) with `MATCH ... USING TIER 2 BY 'message-type'` — clients can ask "what's the policy-derived reachability set for this message type?" not just "what edges exist".
+- **Tier-aware reducers + subscriptions.** SpacetimeDB-style typed reducers + filtered subscriptions (M21) with per-reducer tier declaration — Tier 1 reducers read the live `CommunicationGraph`, Tier 2 reducers consume the policy-derived directed graph, Tier 3 reducers consume the negotiation-aware view via `useEdgeAcceptHandler`. Clients invoke typed reducers and subscribe to filtered subsets of state. (Locked Q4 of the 2026-06-15 replan; supersedes the earlier "Cypher-shaped query language" sketch — see [`~/.claude/plans/graphreact-rust-later-milestones.md`](../../../../../.claude/plans/graphreact-rust-later-milestones.md) §M21.)
 - **Schema-introspection-driven typed clients.** `GET /v1/db/schema` returns the running runtime's `.grx` JSON-AST + per-node manifests; client SDKs use that to generate typed bindings.
 
 ## Conceptual analog: SpacetimeDB
@@ -34,7 +34,7 @@ GraphReactDB is conceptually SpacetimeDB-shaped, but over graph-reactive state i
 | A *module* (compiled WASM) declaring tables + reducers | A `.grx` system declaring nodes + edges + bodies + per-node `useState` |
 | *Tables* (relational rows) | *Nodes* (graph vertices with hook state + permission manifest) |
 | *Reducers* (typed RPC functions, server-side mutations) | *Messages* (typed events processed by `useMessage` handlers, mutating state via setters) |
-| *Subscriptions* (SQL-like queries) | *Live state subscriptions* (M21 Cypher-shaped queries; clients subscribe to subgraphs + state slots + message types) |
+| *Subscriptions* (SQL-like queries) | *Live state subscriptions* (M21 reducer-with-subscription; clients invoke typed reducers + subscribe to filtered subsets of state — subgraphs, state slots, message types) |
 | Authoritative server validates reducer calls | Authoritative scheduler validates incoming messages against permission manifests (and optionally edge-accept predicates per [followon-F three-tier model](https://example.com)) |
 | `@clockworklabs/spacetimedb-sdk` is the canonical client | `@graphreact/client-react` (working name) is the canonical React client SDK |
 
@@ -53,16 +53,18 @@ The same `.grx` system can run on either; what changes is which product wrapper 
 
 ## Key milestones for the DB product
 
-(See the [strategic plan](../../../../../.claude/plans/toasty-crafting-lantern.md) for full milestone definitions; tagged `[DB]` or `[Shared substrate]`.)
+(See the [later-milestone strategic plan](../../../../../.claude/plans/graphreact-rust-later-milestones.md) for full M17–M25+ milestone definitions; tagged `[DB]` / `[Backend]` / `[Shared substrate]` / `[Production-hardening]` per [decision 0003 line 111](../decisions/0003-graphreact-bifurcates-into-backend-and-db.md). Replaces the prior `toasty-crafting-lantern.md`, which is lost on disk; the new plan is a substrate-faithful reconstruction with 12 locked Q&A answers captured 2026-06-15.)
 
 | Milestone | What it delivers | Status |
 |---|---|---|
-| M16-DB | Client SDK gateway — WebSocket subscription manager + typed reducer endpoints + schema introspection | Sketched 2026-05-03; not active |
-| M19 | Persistence — event-sourced graph mutation log + replay-to-state + durable monitor refs | Sketched as first-class (was future) 2026-05-03 |
-| M20 | Sharded `CommunicationGraph` with client-visibility consistency model | Sketched as first-class (was future) 2026-05-03 |
-| M21 | Cypher-shaped, tier-aware query language for client subscriptions | Sketched as first-class (was future) 2026-05-03 |
-| M24 | Wire-format spec + canonical React client SDK reference pattern + typed-binding codegen strategy | Sketched 2026-05-03 |
-| M25+ | Additional client SDK languages (Rust, Swift, C# / Unity) — companion ecosystem | Sketched |
+| M16-DB | Client SDK gateway — WebSocket subscription manager + typed reducer endpoints + schema introspection | Sketched 2026-05-03; folded into M24 (DB client SDK protocol) per the 2026-06-15 replan |
+| M19 | Persistence — own segment log + snapshot + replay + durable monitor refs (locked Q6; supersedes earlier "event-sourced graph mutation log" framing — own-segment-log is the same shape, made concrete) | PLANNED — replanned 2026-06-15 |
+| M20 | Sharded `CommunicationGraph` — causal across shards + linearizable per shard + Raft per shard (locked Q7) | PLANNED — replanned 2026-06-15 |
+| M21 | SpacetimeDB-style reducer-with-subscription for client subscriptions (locked Q4; supersedes the earlier "Cypher-shaped" wording) | PLANNED — replanned 2026-06-15 |
+| M24 | DB client SDK protocol — WS + binary BSATN; canonical React SDK (`@graphreact/client-react-db` — distinct from the Backend `@graphreact/client-react`); typed-binding codegen (locked Q5) | PLANNED — replanned 2026-06-15 |
+| M25 | Rust client SDK (substrate-native first per locked Q11) | PLANNED — replanned 2026-06-15 |
+| M25.a | Swift client SDK (mobile alignment with M12.3b WebKit work) | PLANNED — replanned 2026-06-15 |
+| M25.b | C#/Unity client SDK (game-state pitch; Unity needs `ClientWebSocket`, not `System.Net.WebSockets`) | PLANNED — replanned 2026-06-15 |
 
 ## Decisions touching this product
 

@@ -1,7 +1,11 @@
 # 0001 — Do we actually need V8?
 
-**Status:** DECIDED — option (i) soft-demote. Recorded 2026-05-01; decision flipped 2026-05-03.
-**Related:** Strategic plan at `~/.claude/plans/toasty-crafting-lantern.md` no longer features V8 as a first-party M17 deliverable. M12.3 is JSC-via-Zig (decided 2026-05-01; see `~/.claude/projects/.../memory/project_graphreact_m12_jsc_decision.md`).
+**Status:** DECIDED — option (i) soft-demote. Recorded 2026-05-01; decision flipped 2026-05-03; M17 third-engine slot reshaped from JVM to Go on 2026-06-15 (see Amendment below).
+**Related:** Strategic plan at `~/.claude/plans/graphreact-rust-later-milestones.md` (replaces the lost `toasty-crafting-lantern.md`; reconstructed 2026-06-15) no longer features V8 as a first-party M17 deliverable. M12.3 is JSC-via-Zig (decided 2026-05-01; see `~/.claude/projects/.../memory/project_graphreact_m12_jsc_decision.md`).
+
+## Amendment (2026-06-15) — M17 third-engine slot is Go, not JVM
+
+The "JVM as primary first-party deliverable" framing below remains the historical record of the 2026-05-03 decision. As of 2026-06-15, the M17 third-engine slot has been pivoted to **Go** (cgo + c-shared, build-step codegen `.grx` → Go). The "JVM" wording in the Decision and Reasoning sections below is preserved for historical fidelity; **ADR-0005 will record the Java→Go pivot in full** and supersede the JVM commitment. See [`~/.claude/plans/graphreact-rust-later-milestones.md`](/Users/damioludiran/.claude/plans/graphreact-rust-later-milestones.md) §M17 for the current authoritative scope.
 
 ## Decision (2026-05-03)
 

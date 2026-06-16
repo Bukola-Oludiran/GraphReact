@@ -369,7 +369,7 @@ didn't depend on substrate that doesn't exist yet. The M14.10 slice
 ## Cross-references
 
 - **Wire protocol byte layout**: [`crates/graphreact-dist/docs/wire-protocol.md`](../../crates/graphreact-dist/docs/wire-protocol.md)
-- **Strategic plan**: [`~/.claude/plans/toasty-crafting-lantern.md`](../../../../.claude/plans/toasty-crafting-lantern.md) — search "M14"
+- **Strategic plan**: [`~/.claude/plans/graphreact-rust-later-milestones.md`](../../../../.claude/plans/graphreact-rust-later-milestones.md) (replaces the lost `toasty-crafting-lantern.md` 2026-06-15; M14 is referenced as the actor-cluster substrate distinct from M20's graph-shaped sharding, and as the M-Prod #4 lifecycle dependency)
 - **Sub-staging plan**: [`~/.claude/plans/plan-the-implementation-for-splendid-waffle.md`](../../../../.claude/plans/plan-the-implementation-for-splendid-waffle.md)
 - **OTP references**:
   - [`otp/lib/kernel/src/net_kernel.erl`](../../../../otp/lib/kernel/src/net_kernel.erl) — node discovery + connection establishment

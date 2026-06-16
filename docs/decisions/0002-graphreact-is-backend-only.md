@@ -1,7 +1,7 @@
 # 0002 — GraphReact is a backend runtime; no bundled frontend
 
 **Status:** DECIDED — recorded 2026-05-03. Addendum 2026-05-03 (same day) on backend-NPM access.
-**Related:** Strategic plan at `~/.claude/plans/toasty-crafting-lantern.md`. Companion ecosystem section + M16 (Observer) + M18 (WASM target) + **M12.4 (Node-API compat for JSC bodies)** all touch this commitment.
+**Related:** Strategic plan at `~/.claude/plans/graphreact-rust-later-milestones.md` (replaces the lost `toasty-crafting-lantern.md` 2026-06-15). Companion ecosystem section + M16 (Observer) + M18 (WASM target) + **M12.4 (Node-API compat for JSC bodies)** all touch this commitment.
 
 ## The architectural commitment
 
@@ -119,7 +119,7 @@ See plan file's M12.4 section for sub-staging + acceptance gates + risk mitigati
 
 ## Cross-references
 
-- Plan file `~/.claude/plans/toasty-crafting-lantern.md`: M16 rewrite, M18 reframe, companion-ecosystem section, **M12.4 (Node-API compat for JSC bodies)** all reference this decision.
+- Plan file `~/.claude/plans/graphreact-rust-later-milestones.md` (replaces the lost `toasty-crafting-lantern.md` 2026-06-15): M16 / M18 / companion-ecosystem section / **M12.4 (Node-API compat for JSC bodies)** + M24 DB client SDK protocol's separation between `@graphreact/client-react-db` (DB-product) and `@graphreact/client-react` (Backend) all reference this decision.
 - Decision 0001 (V8 soft-demote) is independent but architecturally aligned — both reflect "the runtime's value is in the runtime, not in the surfaces around it; commit to focused scope, encourage ecosystem." M12.4 reinforces 0001: with Node-compat at JSC, the V8 soft-demote becomes more grounded (JSC truly suffices for backend-NPM, the original V8 motivation).
 - Memory file `project_graphreact_backend_only_decision.md` (created alongside this doc) carries the framing forward to future sessions.
 - Memory file `project_graphreact_m12_4_node_compat.md` (created with this addendum) captures the M12.4 commitment as a recall hook for future sessions.
