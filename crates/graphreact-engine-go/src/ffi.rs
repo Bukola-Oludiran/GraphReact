@@ -117,3 +117,17 @@ pub type gr_go_callback_register_fn = unsafe extern "C" fn(
 ) -> c_int;
 
 pub type gr_go_microtasks_drain_fn = unsafe extern "C" fn(isolate: u64) -> c_int;
+
+/// **M17 phase 3c.** Rust → Go handler-invocation symbol. Resolves
+/// optionally — older artifacts (phase 3b-real) don't ship it, in
+/// which case `host_message` delivery is a no-op. Invoked by the
+/// scheduler's `host_message` host-callback closure to dispatch a
+/// marshalled `{from, type, payload, ttl}` envelope to the Go
+/// `UseMessage` handler stored under `token` in the prelude's
+/// `handlerRegistry`. `args_json` is a single-element JSON array
+/// `[envelope]` matching the M13 phase 3c shape.
+pub type gr_go_invoke_handler_fn = unsafe extern "C" fn(
+    token: u64,
+    args_json: *const c_char,
+    args_len: usize,
+) -> c_int;

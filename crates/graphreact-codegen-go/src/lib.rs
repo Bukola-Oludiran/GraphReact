@@ -410,6 +410,25 @@ mod tests {
                 "prelude missing required body-dispatch surface: {sym}"
             );
         }
+        // M17 phase 3c surface: UseEmit / UseMessage hooks +
+        // GrxInvokeHandler ABI symbol + host_emit / host_message
+        // slot intercept. A regression that strips any of these
+        // breaks the emit/message round-trip.
+        for sym in [
+            "func UseEmit()",
+            "func UseMessage(",
+            "GrxInvokeHandler",
+            "hostEmitSlot",
+            "hostMessageSlot",
+            "handlerRegistry",
+            "registerMessageHandler",
+            "invokeHostCallback",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3c hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();

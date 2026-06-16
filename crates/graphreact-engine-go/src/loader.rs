@@ -60,6 +60,13 @@ pub struct LoadedRuntime {
 
     pub microtasks_drain: ffi::gr_go_microtasks_drain_fn,
 
+    /// **M17 phase 3c.** Rust → Go handler-invocation symbol. Optional
+    /// so older phase 3b-real artifacts that don't ship the symbol
+    /// keep loading; in that case, scheduled `host_message` deliveries
+    /// will surface a clear runtime error rather than dlopen-fail at
+    /// load time.
+    pub invoke_handler: Option<ffi::gr_go_invoke_handler_fn>,
+
     /// Owns the dlopen handle. Declared LAST so it drops LAST —
     /// any future non-Copy field pointing into the Library is
     /// safely outlived. The leading underscore documents that we
@@ -150,6 +157,12 @@ impl LoadedRuntime {
         let microtasks_drain =
             resolve::<ffi::gr_go_microtasks_drain_fn>(&lib, "GrxMicrotasksDrain")?;
 
+        // M17 phase 3c — optional. Older artifacts that don't ship
+        // the symbol can still be hot-reload short-circuited; only
+        // host_message-driven dispatch needs it.
+        let invoke_handler =
+            resolve_optional::<ffi::gr_go_invoke_handler_fn>(&lib, "GrxInvokeHandler");
+
         Ok(Self {
             abi_version,
             engine_initialize,
@@ -162,6 +175,7 @@ impl LoadedRuntime {
             function_call,
             callback_register,
             microtasks_drain,
+            invoke_handler,
             _lib: lib,
         })
     }

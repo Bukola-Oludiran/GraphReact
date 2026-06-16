@@ -1,0 +1,41 @@
+<!-- M17-phase3c: minimal emit/message round-trip fixture. Pinger
+     emits `ping` on first render (no use_effect — the body emits
+     unconditionally during render); Ponger registers a UseMessage
+     handler for `ping` that invokes the test-side host_observe
+     callback via the prelude's Invoke(name, args...) helper. The
+     receiver's manifest declares `accepts: ['ping']` so the
+     scheduler doesn't drop the message at delivery time. -->
+
+<Pinger lang="go">
+func PingerBody(ctx Ctx) Manifest {
+    emit := UseEmit()
+    emit("ping", nil)
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{"ping"},
+    }
+}
+</Pinger>
+
+<Ponger lang="go">
+func PongerBody(ctx Ctx) Manifest {
+    UseMessage("ping", func(msg map[string]interface{}) {
+        // Surface delivery to the test via the prelude's name-based
+        // host-callback invoker. The test registers "host_observe"
+        // before driving process_batch.
+        _, _ = Invoke("host_observe", "pong-received")
+    })
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"ping"},
+        Emits:   []string{},
+    }
+}
+</Ponger>
+
+<Graph id="go-emit-smoke">
+  <Pinger id="pinger" />
+  <Ponger id="ponger" />
+  <edge source="pinger" target="ponger" />
+</Graph>

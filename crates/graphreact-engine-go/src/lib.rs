@@ -258,6 +258,57 @@ impl GoEngine {
             .cloned()
             .ok_or_else(|| EngineError::Internal("graphreact-engine-go: not initialised".into()))
     }
+
+    /// **M17 phase 3c.** Dispatch a marshalled message envelope to
+    /// the Go-side `UseMessage` handler registered under `token`. The
+    /// `goruntime::build_host_message_callback` closure invokes this
+    /// on every scheduler delivery; the closure captures the
+    /// engine + isolate via TLS-installed [`Rc`] and the token
+    /// returned at registration time.
+    ///
+    /// `msg` is the `{from, type, payload, ttl}` envelope built by
+    /// the host_message callback; it crosses the FFI boundary as a
+    /// single-element JSON array `[envelope]` mirroring the M13
+    /// phase 3c shape so the Go side can deserialise into
+    /// `map[string]interface{}` cleanly.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Internal`] if the loaded artifact does not
+    ///   export `GrxInvokeHandler` (older phase 3b-real codegen).
+    /// - [`EngineError::CallbackNotFound`] if `token` was never
+    ///   registered (or was already dropped).
+    /// - JSON serialisation errors surface as
+    ///   [`EngineError::Internal`].
+    pub fn invoke_handler(&self, token: u64, msg: &HostValue) -> EngineResult<()> {
+        let runtime = self.runtime()?;
+        let invoke = runtime.invoke_handler.ok_or_else(|| {
+            EngineError::Internal(
+                "graphreact-engine-go: artifact missing GrxInvokeHandler — rebuild via codegen \
+                 with M17 phase 3c+ (use_emit / use_message)"
+                    .into(),
+            )
+        })?;
+        let envelope = serde_json::Value::Array(vec![msg.clone().into_json()]);
+        let envelope_json = serde_json::to_string(&envelope)
+            .map_err(|e| EngineError::Internal(format!("invoke_handler envelope: {e}")))?;
+        let bytes = envelope_json.as_bytes();
+        // SAFETY: `bytes` is a borrowed slice from `envelope_json`,
+        // which lives for the duration of this call. The callee reads
+        // up to `bytes.len()` from `bytes.as_ptr()` and immediately
+        // dispatches synchronously to the registered handler before
+        // returning. No pointers escape the Go side.
+        let rc = unsafe { invoke(token, bytes.as_ptr().cast::<c_char>(), bytes.len()) };
+        if rc == ffi::GR_OK {
+            Ok(())
+        } else if rc == ffi::GR_ERR_CALLBACK_NOT_FOUND {
+            Err(EngineError::CallbackNotFound {
+                name: format!("handler-token:{token}"),
+            })
+        } else {
+            Err(map_status(rc))
+        }
+    }
 }
 
 /// Map a Go-bridge status code to a typed `EngineError`. Mirrors

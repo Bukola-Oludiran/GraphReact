@@ -1,0 +1,18 @@
+<!-- M17-phase3c: mixed-engine negative fixture. A JS body inside an
+     otherwise-Go graph forces mount_with_scheduler to surface an
+     EngineMisroute diagnostic. Mirrors
+     python-smoke-mixed-rejected.grx for CPython. -->
+
+<JsTagger lang="js">
+// Deliberately a JS body — fed to the Go arm to trigger the
+// single-engine-per-system check. M22 will relax this; until then
+// the early error keeps authors out of "go build failed because of
+// JS syntax" surprises.
+function init(ctx) {
+  return { id: ctx.id, accepts: [], emits: [] };
+}
+</JsTagger>
+
+<Graph id="go-mixed-rejected">
+  <JsTagger id="tagger-1" />
+</Graph>
