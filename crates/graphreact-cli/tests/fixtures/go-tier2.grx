@@ -1,0 +1,118 @@
+<!-- M17-phase3d-ε: Tier 2 directed-adjacency acceptance.
+
+     Per-node manifests for msg-type "metric":
+       producer  emits  metric, accepts: ∅
+       relay     emits  metric, accepts: metric    (forwarder)
+       sink      emits  ∅,      accepts: metric    (terminal)
+       observer  emits  ∅,      accepts: metric    (terminal)
+
+     Tier 1 structural edges (driving STRUCTURAL flavor):
+       producer → relay
+       relay    → sink
+       producer → observer  (skips relay)
+
+     STRUCTURAL Tier 2 view for "metric":
+       producer's neighbours = [observer, relay]  (relay accepts +
+                              has structural edge; observer accepts
+                              + has structural edge)
+       relay's neighbours    = [sink]
+       sink/observer         = []  (terminal — no emits)
+
+     DIRECTORY-SHORTCUT view for "metric":
+       producer's neighbours = [observer, relay, sink]  (every
+                              acceptor reached in 1 hop)
+       relay's neighbours    = [observer, sink]
+       sink/observer         = []  (still terminal)
+
+     The probe runs each test from `producer` and surfaces results
+     via host_observe_tier2_*. -->
+
+<Producer lang="go">
+func ProducerBody(ctx Ctx) Manifest {
+    // use_state(0) so the test can externally bump producer to
+    // re-render AFTER all other nodes' manifests have been installed
+    // on the first batch. The Tier 2 view depends on every node's
+    // emits/accepts pair, which isn't visible until each body has
+    // returned its Manifest. Probe-body pattern requires a re-render
+    // window.
+    _, _ = UseState(0.0)
+
+    g := UseGraphQuery()
+
+    // STRUCTURAL flavor (default).
+    nsStruct := g.Tier2("metric").Neighbors("producer")
+    nsStructPayload := make([]interface{}, len(nsStruct))
+    for i, id := range nsStruct {
+        nsStructPayload[i] = id
+    }
+    _, _ = Invoke("host_observe_tier2_neighbors_struct", nsStructPayload)
+
+    sp := g.Tier2("metric").ShortestPath("producer", "sink")
+    spPayload := make([]interface{}, len(sp))
+    for i, id := range sp {
+        spPayload[i] = id
+    }
+    _, _ = Invoke("host_observe_tier2_shortest_struct", spPayload)
+
+    // DIRECTORY-SHORTCUT flavor.
+    nsShortcut := g.Tier2("metric", Tier2Opts{DirectoryShortcuts: true}).Neighbors("producer")
+    nsShortcutPayload := make([]interface{}, len(nsShortcut))
+    for i, id := range nsShortcut {
+        nsShortcutPayload[i] = id
+    }
+    _, _ = Invoke("host_observe_tier2_neighbors_shortcut", nsShortcutPayload)
+
+    // Cycle detection over the Tier 2 directed adjacency. The DAG
+    // shape (terminal sinks) → HasCycle = false. Directed cycle
+    // detection at Tier 2 is well-defined (unlike Tier 1's
+    // undirected algorithm).
+    cycle := g.Tier2("metric").CycleDetection()
+    _, _ = Invoke("host_observe_tier2_cycle_struct", cycle.HasCycle)
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{"metric"},
+    }
+}
+</Producer>
+
+<Relay lang="go">
+func RelayBody(ctx Ctx) Manifest {
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"metric"},
+        Emits:   []string{"metric"},
+    }
+}
+</Relay>
+
+<Sink lang="go">
+func SinkBody(ctx Ctx) Manifest {
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"metric"},
+        Emits:   []string{},
+    }
+}
+</Sink>
+
+<Observer lang="go">
+func ObserverBody(ctx Ctx) Manifest {
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"metric"},
+        Emits:   []string{},
+    }
+}
+</Observer>
+
+<Graph id="go-tier2">
+  <Producer id="producer" />
+  <Relay id="relay" />
+  <Sink id="sink" />
+  <Observer id="observer" />
+  <edge source="producer" target="relay" />
+  <edge source="relay" target="sink" />
+  <edge source="producer" target="observer" />
+</Graph>

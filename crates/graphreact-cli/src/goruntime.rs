@@ -1213,6 +1213,977 @@ fn build_host_graph_cycle_detection_callback() -> BoxCallback {
     })
 }
 
+// ---------------------------------------------------------------------
+// M17 phase 3d-ε — Tier 2 directed adjacency + 12 accessors + 5 A*
+// heuristics + 2 reachability flavors
+// ---------------------------------------------------------------------
+//
+// Tier 2 surfaces directed reachability derived from per-node
+// `PermissionManifest.emits/accepts` pairs. An edge `s → u` exists for
+// message-type T iff `s.emits ∋ T ∧ u.accepts ∋ T`, optionally also
+// requiring a Tier 1 structural edge between the two (default
+// "structural"; opt-in "directory-shortcut" flavor drops the Tier 1
+// requirement). Verbatim port from `pyruntime` phase 3d-ε. Algorithm
+// helpers are parameterised over a `DirectedAdj` trait so 3d-ζ's
+// Tier 3 adjacency (filtered through `use_edge_accept_handler`
+// predicates) reuses them without duplication.
+
+/// Directed adjacency + node set for a single message type, derived
+/// from per-node `PermissionManifest.emits/accepts` pairs.
+struct Tier2Adj {
+    /// All nodes registered with the scheduler at query time. Sorted.
+    nodes: Vec<String>,
+    /// `out[s]` = sorted list of nodes `u` such that `s.emits` contains
+    /// the message type T and `u.accepts` contains T.
+    out: FxHashMap<String, Vec<String>>,
+}
+
+/// Common shape consumed by Tier 2 algorithm helpers. Lets
+/// `tier2_*` functions remain a single canonical implementation while
+/// being callable with either a [`Tier2Adj`] or 3d-ζ's `Tier3Adj`.
+trait DirectedAdj {
+    fn nodes_slice(&self) -> &[String];
+    fn neighbors(&self, id: &str) -> &[String];
+    fn has_node(&self, id: &str) -> bool;
+    fn has_edge(&self, u: &str, v: &str) -> bool;
+}
+
+impl DirectedAdj for Tier2Adj {
+    fn nodes_slice(&self) -> &[String] {
+        &self.nodes
+    }
+    fn neighbors(&self, id: &str) -> &[String] {
+        self.out.get(id).map(Vec::as_slice).unwrap_or(&[])
+    }
+    fn has_node(&self, id: &str) -> bool {
+        self.out.contains_key(id)
+    }
+    fn has_edge(&self, u: &str, v: &str) -> bool {
+        self.out.get(u).is_some_and(|outs| outs.iter().any(|t| t == v))
+    }
+}
+
+/// Build the Tier 2 directed adjacency for `msg_type`. Two flavors,
+/// selected by `include_directory_shortcuts`:
+///
+/// - **Structural** (default): edge `(s, u)` exists iff a Tier 1 edge
+///   `s ↔ u` exists in the live graph AND `s.emits ∋ msg_type` AND
+///   `u.accepts ∋ msg_type`.
+/// - **Directory-shortcut**: edge `(s, u)` exists iff
+///   `s.emits ∋ msg_type ∧ u.accepts ∋ msg_type`. Tier 1 presence
+///   ignored — any emitter reaches any acceptor in 1 hop.
+fn build_tier2_adj(
+    graph: &CommunicationGraph,
+    manifests: &FxHashMap<String, PermissionManifest>,
+    msg_type: &str,
+    include_directory_shortcuts: bool,
+) -> Tier2Adj {
+    let mut nodes: Vec<String> = manifests.keys().cloned().collect();
+    nodes.sort();
+
+    let mut out: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    for id in &nodes {
+        let emits_t = manifests
+            .get(id)
+            .is_some_and(|m| m.emits.iter().any(|t| t == msg_type));
+        let outs: Vec<String> = if !emits_t {
+            Vec::new()
+        } else if include_directory_shortcuts {
+            nodes
+                .iter()
+                .filter(|n| {
+                    n.as_str() != id.as_str()
+                        && manifests
+                            .get(*n)
+                            .is_some_and(|m| m.accepts.iter().any(|t| t == msg_type))
+                })
+                .cloned()
+                .collect()
+        } else {
+            let mut neighbors = graph.neighbors(id).unwrap_or_default();
+            neighbors.sort();
+            neighbors
+                .into_iter()
+                .filter(|n| {
+                    n != id
+                        && manifests
+                            .get(n)
+                            .is_some_and(|m| m.accepts.iter().any(|t| t == msg_type))
+                })
+                .collect()
+        };
+        out.insert(id.clone(), outs);
+    }
+    Tier2Adj { nodes, out }
+}
+
+// --- Tier 2 algorithm helpers (parameterised over &dyn DirectedAdj) ---
+
+fn tier2_bfs(adj: &dyn DirectedAdj, start: &str, depth_limit: Option<usize>) -> Vec<String> {
+    use std::collections::VecDeque;
+    if !adj.has_node(start) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    queue.push_back((start.to_string(), 0));
+    visited.insert(start.to_string());
+    while let Some((cur, depth)) = queue.pop_front() {
+        out.push(cur.clone());
+        if let Some(limit) = depth_limit {
+            if depth >= limit {
+                continue;
+            }
+        }
+        for nbr in adj.neighbors(&cur) {
+            if visited.insert(nbr.clone()) {
+                queue.push_back((nbr.clone(), depth + 1));
+            }
+        }
+    }
+    out
+}
+
+fn tier2_dfs(adj: &dyn DirectedAdj, start: &str, depth_limit: Option<usize>) -> Vec<String> {
+    if !adj.has_node(start) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<(String, usize)> = vec![(start.to_string(), 0)];
+    while let Some((cur, depth)) = stack.pop() {
+        if !visited.insert(cur.clone()) {
+            continue;
+        }
+        out.push(cur.clone());
+        if let Some(limit) = depth_limit {
+            if depth >= limit {
+                continue;
+            }
+        }
+        for nbr in adj.neighbors(&cur).iter().rev() {
+            if !visited.contains(nbr) {
+                stack.push((nbr.clone(), depth + 1));
+            }
+        }
+    }
+    out
+}
+
+fn tier2_shortest_path(adj: &dyn DirectedAdj, from: &str, to: &str) -> Option<Vec<String>> {
+    use std::collections::VecDeque;
+    if !adj.has_node(from) || !adj.has_node(to) {
+        return None;
+    }
+    if from == to {
+        return Some(vec![from.to_string()]);
+    }
+    let mut prev: FxHashMap<String, String> = FxHashMap::default();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(from.to_string());
+    visited.insert(from.to_string());
+    while let Some(cur) = queue.pop_front() {
+        for nbr in adj.neighbors(&cur) {
+            if !visited.insert(nbr.clone()) {
+                continue;
+            }
+            prev.insert(nbr.clone(), cur.clone());
+            if nbr == to {
+                let mut path = vec![to.to_string()];
+                let mut step = to.to_string();
+                while let Some(p) = prev.get(&step) {
+                    path.push(p.clone());
+                    step = p.clone();
+                    if step == from {
+                        break;
+                    }
+                }
+                path.reverse();
+                return Some(path);
+            }
+            queue.push_back(nbr.clone());
+        }
+    }
+    None
+}
+
+fn tier2_all_paths_dfs(
+    adj: &dyn DirectedAdj,
+    cur: &str,
+    target: &str,
+    path: &mut Vec<String>,
+    on_path: &mut std::collections::HashSet<String>,
+    max_depth: Option<usize>,
+    out: &mut Vec<Vec<String>>,
+) {
+    if let Some(d) = max_depth {
+        if path.len() > d {
+            return;
+        }
+    }
+    for nbr in adj.neighbors(cur) {
+        if on_path.contains(nbr) {
+            continue;
+        }
+        path.push(nbr.clone());
+        on_path.insert(nbr.clone());
+        if nbr == target {
+            out.push(path.clone());
+        } else {
+            tier2_all_paths_dfs(adj, nbr, target, path, on_path, max_depth, out);
+        }
+        path.pop();
+        on_path.remove(nbr);
+    }
+}
+
+fn tier2_all_paths(
+    adj: &dyn DirectedAdj,
+    from: &str,
+    to: &str,
+    max_depth: Option<usize>,
+) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    if !adj.has_node(from) || !adj.has_node(to) {
+        return out;
+    }
+    if from == to {
+        out.push(vec![from.to_string()]);
+        return out;
+    }
+    let mut path = vec![from.to_string()];
+    let mut on_path: std::collections::HashSet<String> = std::collections::HashSet::new();
+    on_path.insert(from.to_string());
+    tier2_all_paths_dfs(adj, from, to, &mut path, &mut on_path, max_depth, &mut out);
+    out.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tier2_strongconnect(
+    v: &str,
+    adj: &dyn DirectedAdj,
+    index_counter: &mut usize,
+    index: &mut FxHashMap<String, usize>,
+    lowlink: &mut FxHashMap<String, usize>,
+    on_stack: &mut std::collections::HashSet<String>,
+    stack: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
+) {
+    index.insert(v.to_string(), *index_counter);
+    lowlink.insert(v.to_string(), *index_counter);
+    *index_counter += 1;
+    stack.push(v.to_string());
+    on_stack.insert(v.to_string());
+
+    for w in adj.neighbors(v) {
+        if !index.contains_key(w) {
+            tier2_strongconnect(w, adj, index_counter, index, lowlink, on_stack, stack, out);
+            let w_low = lowlink.get(w).copied().unwrap_or(usize::MAX);
+            let v_low = lowlink.get(v).copied().unwrap_or(usize::MAX);
+            lowlink.insert(v.to_string(), v_low.min(w_low));
+        } else if on_stack.contains(w) {
+            let w_idx = index.get(w).copied().unwrap_or(usize::MAX);
+            let v_low = lowlink.get(v).copied().unwrap_or(usize::MAX);
+            lowlink.insert(v.to_string(), v_low.min(w_idx));
+        }
+    }
+
+    if lowlink.get(v).copied().unwrap_or(usize::MAX) == index.get(v).copied().unwrap_or(usize::MAX)
+    {
+        let mut component: Vec<String> = Vec::new();
+        loop {
+            let w = stack.pop().expect("stack non-empty during SCC pop");
+            on_stack.remove(&w);
+            let done = w == v;
+            component.push(w);
+            if done {
+                break;
+            }
+        }
+        component.sort();
+        out.push(component);
+    }
+}
+
+fn tier2_strongly_connected_components(adj: &dyn DirectedAdj) -> Vec<Vec<String>> {
+    use std::collections::HashSet;
+    let mut index_counter: usize = 0;
+    let mut index: FxHashMap<String, usize> = FxHashMap::default();
+    let mut lowlink: FxHashMap<String, usize> = FxHashMap::default();
+    let mut on_stack: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for v in adj.nodes_slice() {
+        if !index.contains_key(v) {
+            tier2_strongconnect(
+                v,
+                adj,
+                &mut index_counter,
+                &mut index,
+                &mut lowlink,
+                &mut on_stack,
+                &mut stack,
+                &mut out,
+            );
+        }
+    }
+    out.sort_by(|a, b| {
+        let amin = a.first().cloned().unwrap_or_default();
+        let bmin = b.first().cloned().unwrap_or_default();
+        amin.cmp(&bmin)
+    });
+    out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tier2DfsColor {
+    White,
+    Gray,
+    Black,
+}
+
+fn tier2_cycle_dfs(
+    v: &str,
+    adj: &dyn DirectedAdj,
+    color: &mut std::collections::HashMap<String, Tier2DfsColor>,
+    parent: &mut std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    color.insert(v.to_string(), Tier2DfsColor::Gray);
+    for w in adj.neighbors(v) {
+        match color.get(w).copied().unwrap_or(Tier2DfsColor::White) {
+            Tier2DfsColor::White => {
+                parent.insert(w.clone(), v.to_string());
+                if let Some(found) = tier2_cycle_dfs(w, adj, color, parent) {
+                    return Some(found);
+                }
+            }
+            Tier2DfsColor::Gray => {
+                return Some((v.to_string(), w.clone()));
+            }
+            Tier2DfsColor::Black => {}
+        }
+    }
+    color.insert(v.to_string(), Tier2DfsColor::Black);
+    None
+}
+
+fn tier2_directed_cycle_detection(adj: &dyn DirectedAdj) -> (bool, Option<Vec<(String, String)>>) {
+    use std::collections::HashMap;
+    let mut color: HashMap<String, Tier2DfsColor> = HashMap::new();
+    let mut parent: HashMap<String, String> = HashMap::new();
+    for v in adj.nodes_slice() {
+        if color.get(v).copied().unwrap_or(Tier2DfsColor::White) == Tier2DfsColor::White {
+            if let Some((closer, target)) = tier2_cycle_dfs(v, adj, &mut color, &mut parent) {
+                let mut nodes_in_cycle: Vec<String> = vec![closer.clone()];
+                let mut step = closer.clone();
+                while let Some(p) = parent.get(&step) {
+                    if p == &target {
+                        nodes_in_cycle.push(target.clone());
+                        break;
+                    }
+                    nodes_in_cycle.push(p.clone());
+                    step = p.clone();
+                    if nodes_in_cycle.len() > adj.nodes_slice().len() {
+                        break;
+                    }
+                }
+                nodes_in_cycle.reverse();
+                let mut edges: Vec<(String, String)> = Vec::new();
+                for win in nodes_in_cycle.windows(2) {
+                    edges.push((win[0].clone(), win[1].clone()));
+                }
+                edges.push((closer, target));
+                return (true, Some(edges));
+            }
+        }
+    }
+    (false, None)
+}
+
+fn tier2_topological_sort(adj: &dyn DirectedAdj) -> Option<Vec<String>> {
+    use std::collections::VecDeque;
+    let mut in_deg: FxHashMap<String, usize> =
+        adj.nodes_slice().iter().map(|n| (n.clone(), 0)).collect();
+    for u in adj.nodes_slice() {
+        for v in adj.neighbors(u) {
+            *in_deg.entry(v.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for n in adj.nodes_slice() {
+        if in_deg.get(n).copied().unwrap_or(0) == 0 {
+            queue.push_back(n.clone());
+        }
+    }
+    let mut out: Vec<String> = Vec::with_capacity(adj.nodes_slice().len());
+    while let Some(cur) = queue.pop_front() {
+        out.push(cur.clone());
+        for nbr in adj.neighbors(&cur) {
+            if let Some(d) = in_deg.get_mut(nbr) {
+                if *d > 0 {
+                    *d -= 1;
+                    if *d == 0 {
+                        queue.push_back(nbr.clone());
+                    }
+                }
+            }
+        }
+    }
+    if out.len() == adj.nodes_slice().len() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Cost-from-policy heuristic identifier for Tier 2 A*. Five named
+/// heuristics from the application-space framing — latency /
+/// compliance / hierarchy / trust-attenuated / prerequisite-distance —
+/// plus the default uniform (BFS-equivalent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AStarHeuristic {
+    Uniform,
+    Latency,
+    Compliance,
+    Hierarchy,
+    TrustAttenuated,
+    PrerequisiteDistance,
+}
+
+impl AStarHeuristic {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "latency" => Some(Self::Latency),
+            "compliance" => Some(Self::Compliance),
+            "hierarchy" => Some(Self::Hierarchy),
+            "trust-attenuated" => Some(Self::TrustAttenuated),
+            "prerequisite-distance" => Some(Self::PrerequisiteDistance),
+            _ => None,
+        }
+    }
+}
+
+fn tier2_step_cost(
+    h: AStarHeuristic,
+    snapshot: &GraphSnapshot,
+    from: &str,
+    to: &str,
+    directory: Option<&Rc<RefCell<GraphDirectory>>>,
+) -> f64 {
+    match h {
+        AStarHeuristic::Uniform => 1.0,
+        AStarHeuristic::Latency => {
+            let g = snapshot.graph.borrow();
+            if let Ok(attrs) = g.get_edge_data(from, to, None) {
+                attrs
+                    .get("latency")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(1.0)
+            } else {
+                1.0
+            }
+        }
+        AStarHeuristic::Compliance => {
+            let g = snapshot.graph.borrow();
+            let mut cost = 1.0;
+            if let Ok(eattrs) = g.get_edge_data(from, to, None) {
+                let encrypted = eattrs
+                    .get("encrypted")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                if !encrypted {
+                    cost += 10.0;
+                }
+            }
+            if let Ok(nattrs) = g.get_node_data(to) {
+                let compliant = nattrs
+                    .get("compliant")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                if !compliant {
+                    cost += 10.0;
+                }
+            }
+            cost
+        }
+        AStarHeuristic::Hierarchy => {
+            let Some(dir) = directory else { return 1.0 };
+            let dir = dir.borrow();
+            let from_depth = dir.find_by_id(from).map(|e| i64::from(e.depth));
+            let to_depth = dir.find_by_id(to).map(|e| i64::from(e.depth));
+            #[allow(clippy::cast_precision_loss)]
+            match (from_depth, to_depth) {
+                (Some(a), Some(b)) => 1.0 + (a - b).unsigned_abs() as f64,
+                _ => 1.0,
+            }
+        }
+        AStarHeuristic::TrustAttenuated => {
+            let g = snapshot.graph.borrow();
+            let trust = g
+                .get_edge_data(from, to, None)
+                .ok()
+                .and_then(|attrs| attrs.get("trust").and_then(serde_json::Value::as_f64));
+            match trust {
+                Some(t) if t > 0.0 => 1.0 / t,
+                _ => 1.0,
+            }
+        }
+        AStarHeuristic::PrerequisiteDistance => {
+            let g = snapshot.graph.borrow();
+            let difficulty = g
+                .get_node_data(to)
+                .ok()
+                .and_then(|attrs| attrs.get("difficulty").and_then(serde_json::Value::as_f64))
+                .unwrap_or(0.0);
+            1.0 + difficulty.max(0.0)
+        }
+    }
+}
+
+fn tier2_heuristic(
+    h: AStarHeuristic,
+    cur: &str,
+    target: &str,
+    directory: Option<&Rc<RefCell<GraphDirectory>>>,
+) -> f64 {
+    match h {
+        AStarHeuristic::Uniform
+        | AStarHeuristic::Latency
+        | AStarHeuristic::Compliance
+        | AStarHeuristic::TrustAttenuated
+        | AStarHeuristic::PrerequisiteDistance => 0.0,
+        AStarHeuristic::Hierarchy => {
+            let Some(dir) = directory else { return 0.0 };
+            let dir = dir.borrow();
+            let cur_depth = dir.find_by_id(cur).map(|e| i64::from(e.depth));
+            let tgt_depth = dir.find_by_id(target).map(|e| i64::from(e.depth));
+            #[allow(clippy::cast_precision_loss)]
+            match (cur_depth, tgt_depth) {
+                (Some(a), Some(b)) => (a - b).unsigned_abs() as f64,
+                _ => 0.0,
+            }
+        }
+    }
+}
+
+/// Wrapper for f64 priorities in [`tier2_astar_path`]'s BinaryHeap.
+/// BinaryHeap is max-heap; this ordering flips so smallest-f pops
+/// first.
+#[derive(PartialEq)]
+struct OrderedF(f64);
+impl Eq for OrderedF {}
+impl PartialOrd for OrderedF {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedF {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .0
+            .partial_cmp(&self.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+fn tier2_astar_path(
+    adj: &dyn DirectedAdj,
+    snapshot: &GraphSnapshot,
+    directory: Option<&Rc<RefCell<GraphDirectory>>>,
+    from: &str,
+    to: &str,
+    heuristic: AStarHeuristic,
+) -> Option<Vec<String>> {
+    use std::collections::BinaryHeap;
+    if !adj.has_node(from) || !adj.has_node(to) {
+        return None;
+    }
+    let mut g_score: FxHashMap<String, f64> = FxHashMap::default();
+    let mut prev: FxHashMap<String, String> = FxHashMap::default();
+    let mut open: BinaryHeap<(OrderedF, String)> = BinaryHeap::new();
+    g_score.insert(from.to_string(), 0.0);
+    open.push((
+        OrderedF(tier2_heuristic(heuristic, from, to, directory)),
+        from.to_string(),
+    ));
+    while let Some((_, cur)) = open.pop() {
+        if cur == to {
+            let mut path = vec![to.to_string()];
+            let mut step = to.to_string();
+            while let Some(p) = prev.get(&step) {
+                path.push(p.clone());
+                step = p.clone();
+                if step == from {
+                    break;
+                }
+            }
+            path.reverse();
+            return Some(path);
+        }
+        let cur_g = g_score.get(&cur).copied().unwrap_or(f64::INFINITY);
+        for nbr in adj.neighbors(&cur) {
+            let step = tier2_step_cost(heuristic, snapshot, &cur, nbr, directory);
+            let tentative = cur_g + step;
+            let known = g_score.get(nbr).copied().unwrap_or(f64::INFINITY);
+            if tentative < known {
+                prev.insert(nbr.clone(), cur.clone());
+                g_score.insert(nbr.clone(), tentative);
+                let f = tentative + tier2_heuristic(heuristic, nbr, to, directory);
+                open.push((OrderedF(f), nbr.clone()));
+            }
+        }
+    }
+    None
+}
+
+// --- 12 host_tier2_* callbacks ---
+//
+// Every callback's first arg is the message-type string; the LAST arg
+// is a Bool selecting the directory-shortcut flavor. `node_count` and
+// `has_node` ignore the flag (they read the manifest set directly).
+
+fn tier2_directory_shortcuts_flag(args: &[HostValue]) -> bool {
+    matches!(args.last(), Some(HostValue::Bool(true)))
+}
+
+fn build_host_tier2_node_count_callback() -> BoxCallback {
+    Box::new(|args| {
+        let _msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Number(0.0)),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Number(0.0));
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let count = snapshot.manifests.borrow().len() as f64;
+        Ok(HostValue::Number(count))
+    })
+}
+
+fn build_host_tier2_has_node_callback() -> BoxCallback {
+    Box::new(|args| {
+        let _msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let id: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Bool(false));
+        };
+        let has = snapshot.manifests.borrow().contains_key(&id);
+        Ok(HostValue::Bool(has))
+    })
+}
+
+fn build_host_tier2_neighbors_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let id: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let manifests = snapshot.manifests.borrow();
+        let graph = snapshot.graph.borrow();
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        Ok(HostValue::Array(
+            adj.neighbors(&id)
+                .iter()
+                .cloned()
+                .map(HostValue::String)
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier2_has_edge_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let u: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let v: String = match args.get(2) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Bool(false));
+        };
+        let manifests = snapshot.manifests.borrow();
+        let graph = snapshot.graph.borrow();
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        Ok(HostValue::Bool(adj.has_edge(&u, &v)))
+    })
+}
+
+fn build_host_tier2_bfs_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let depth_limit = match args.get(2) {
+            Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as usize),
+            _ => None,
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let manifests = snapshot.manifests.borrow();
+        let graph = snapshot.graph.borrow();
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        Ok(HostValue::Array(
+            tier2_bfs(&adj, &from, depth_limit)
+                .into_iter()
+                .map(HostValue::String)
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier2_dfs_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let depth_limit = match args.get(2) {
+            Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as usize),
+            _ => None,
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let manifests = snapshot.manifests.borrow();
+        let graph = snapshot.graph.borrow();
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        Ok(HostValue::Array(
+            tier2_dfs(&adj, &from, depth_limit)
+                .into_iter()
+                .map(HostValue::String)
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier2_shortest_path_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let to: String = match args.get(2) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Null);
+        };
+        let manifests = snapshot.manifests.borrow();
+        let graph = snapshot.graph.borrow();
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        match tier2_shortest_path(&adj, &from, &to) {
+            Some(path) => Ok(HostValue::Array(
+                path.into_iter().map(HostValue::String).collect(),
+            )),
+            None => Ok(HostValue::Null),
+        }
+    })
+}
+
+fn build_host_tier2_topological_sort_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Null);
+        };
+        let manifests = snapshot.manifests.borrow();
+        let graph = snapshot.graph.borrow();
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        match tier2_topological_sort(&adj) {
+            Some(order) => Ok(HostValue::Array(
+                order.into_iter().map(HostValue::String).collect(),
+            )),
+            None => Ok(HostValue::Null),
+        }
+    })
+}
+
+fn build_host_tier2_a_star_path_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let to: String = match args.get(2) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let heuristic: AStarHeuristic = match args.get(3) {
+            Some(HostValue::String(s)) => {
+                AStarHeuristic::from_str(s).unwrap_or(AStarHeuristic::Uniform)
+            }
+            _ => AStarHeuristic::Uniform,
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Null);
+        };
+        let manifests = snapshot.manifests.borrow();
+        let graph = snapshot.graph.borrow();
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        let dir_handle = current_directory();
+        match tier2_astar_path(&adj, &snapshot, dir_handle.as_ref(), &from, &to, heuristic) {
+            Some(path) => Ok(HostValue::Array(
+                path.into_iter().map(HostValue::String).collect(),
+            )),
+            None => Ok(HostValue::Null),
+        }
+    })
+}
+
+fn build_host_tier2_all_paths_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let to: String = match args.get(2) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max_depth = match args.get(3) {
+            Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as usize),
+            _ => None,
+        };
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let graph = snapshot.graph.borrow();
+        let manifests = snapshot.manifests.borrow();
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        let paths = tier2_all_paths(&adj, &from, &to, max_depth);
+        Ok(HostValue::Array(
+            paths
+                .into_iter()
+                .map(|p| HostValue::Array(p.into_iter().map(HostValue::String).collect()))
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier2_connected_components_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let graph = snapshot.graph.borrow();
+        let manifests = snapshot.manifests.borrow();
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        let components = tier2_strongly_connected_components(&adj);
+        Ok(HostValue::Array(
+            components
+                .into_iter()
+                .map(|c| HostValue::Array(c.into_iter().map(HostValue::String).collect()))
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier2_cycle_detection_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => {
+                return Ok(HostValue::Object(vec![
+                    ("hasCycle".to_string(), HostValue::Bool(false)),
+                    ("cycle".to_string(), HostValue::Null),
+                ]));
+            }
+        };
+        let dir_shortcuts = tier2_directory_shortcuts_flag(args);
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Object(vec![
+                ("hasCycle".to_string(), HostValue::Bool(false)),
+                ("cycle".to_string(), HostValue::Null),
+            ]));
+        };
+        let graph = snapshot.graph.borrow();
+        let manifests = snapshot.manifests.borrow();
+        let adj = build_tier2_adj(&graph, &manifests, &msg_type, dir_shortcuts);
+        let (has, cycle) = tier2_directed_cycle_detection(&adj);
+        let cycle_value = match cycle {
+            Some(edges) => HostValue::Array(
+                edges
+                    .into_iter()
+                    .map(|(u, v)| {
+                        HostValue::Array(vec![HostValue::String(u), HostValue::String(v)])
+                    })
+                    .collect(),
+            ),
+            None => HostValue::Null,
+        };
+        Ok(HostValue::Object(vec![
+            ("hasCycle".to_string(), HostValue::Bool(has)),
+            ("cycle".to_string(), cycle_value),
+        ]))
+    })
+}
+
 /// Parse the third argument of `host_emit` into [`EmitOptions`].
 /// Recognised keys mirror JSC + CPython: `to` (Array of String),
 /// `ttl` (Number), `edgeKey` (String), `direct` (String). Unknown
@@ -1561,6 +2532,71 @@ pub fn mount_with_scheduler(
             iso,
             "host_graph_cycle_detection",
             build_host_graph_cycle_detection_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        // M17 phase 3d-ε: 12 Tier 2 directed-adjacency accessors.
+        e.register_callback(
+            iso,
+            "host_tier2_node_count",
+            build_host_tier2_node_count_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier2_has_node",
+            build_host_tier2_has_node_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier2_neighbors",
+            build_host_tier2_neighbors_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier2_has_edge",
+            build_host_tier2_has_edge_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_tier2_bfs", build_host_tier2_bfs_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_tier2_dfs", build_host_tier2_dfs_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier2_shortest_path",
+            build_host_tier2_shortest_path_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier2_topological_sort",
+            build_host_tier2_topological_sort_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier2_a_star_path",
+            build_host_tier2_a_star_path_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier2_all_paths",
+            build_host_tier2_all_paths_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier2_connected_components",
+            build_host_tier2_connected_components_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier2_cycle_detection",
+            build_host_tier2_cycle_detection_callback(),
         )
         .map_err(RuntimeError::Engine)?;
         iso
@@ -2974,6 +4010,191 @@ mod tests {
         );
     }
 
+    /// Phase 3d-ε: Tier 2 directed adjacency derived from
+    /// emit/accept manifest pairs. The fixture wires four nodes
+    /// with policy roles; the probe asserts:
+    ///
+    /// - STRUCTURAL flavor (Tier 1 edge required): producer's
+    ///   neighbours = [observer, relay] for "metric".
+    /// - DIRECTORY-SHORTCUT flavor: producer's neighbours =
+    ///   [observer, relay, sink] (every acceptor reached in 1 hop).
+    /// - STRUCTURAL ShortestPath(producer, sink) = [producer, relay,
+    ///   sink] (must go through relay).
+    /// - CycleDetection on the Tier 2 directed adjacency reports
+    ///   HasCycle = false (terminals + DAG-shaped policy graph).
+    fn scenario_use_graph_query_tier_2_accessors() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-tier2.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("tier2");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-tier2.grx");
+
+        let neighbours_struct: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let neighbours_struct_cb = std::sync::Arc::clone(&neighbours_struct);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_tier2_neighbors_struct",
+                Box::new(move |args| {
+                    let row: Vec<String> = match args.first() {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    neighbours_struct_cb.lock().push(row);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_tier2_neighbors_struct");
+
+        let neighbours_shortcut: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let neighbours_shortcut_cb = std::sync::Arc::clone(&neighbours_shortcut);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_tier2_neighbors_shortcut",
+                Box::new(move |args| {
+                    let row: Vec<String> = match args.first() {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    neighbours_shortcut_cb.lock().push(row);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_tier2_neighbors_shortcut");
+
+        let shortest_struct: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let shortest_struct_cb = std::sync::Arc::clone(&shortest_struct);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_tier2_shortest_struct",
+                Box::new(move |args| {
+                    let row: Vec<String> = match args.first() {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    shortest_struct_cb.lock().push(row);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_tier2_shortest_struct");
+
+        let cycle_obs: std::sync::Arc<parking_lot::Mutex<Vec<bool>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let cycle_cb = std::sync::Arc::clone(&cycle_obs);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_tier2_cycle_struct",
+                Box::new(move |args| {
+                    if let Some(HostValue::Bool(b)) = args.first() {
+                        cycle_cb.lock().push(*b);
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_tier2_cycle_struct");
+
+        // Render 1: every node renders + returns its Manifest, which
+        // the scheduler installs into `manifests`. Producer's Tier 2
+        // observations on this first render see an incomplete
+        // snapshot (only its own manifest is registered before its
+        // body runs).
+        runtime.process_batch().expect("batch 1");
+
+        // Bump producer's use_state(0) externally to mark it dirty
+        // for the next batch. On render 2 producer re-evaluates and
+        // its Tier 2 observations now see every node's manifest.
+        let signal = signal_id_for("producer", 0)
+            .expect("producer should have a use_state(0) signal at hook position 0");
+        signal_set_external(signal, Value::Number(serde_json::Number::from(1)))
+            .expect("bump producer signal to trigger re-render");
+        runtime.process_batch().expect("batch 2");
+
+        let ns = neighbours_struct.lock();
+        let saw_struct = ns.iter().any(|row| {
+            row.len() == 2
+                && row.iter().any(|x| x == "observer")
+                && row.iter().any(|x| x == "relay")
+        });
+        assert!(
+            saw_struct,
+            "expected STRUCTURAL Neighbors(producer) for 'metric' = [observer, relay]; got {ns:?}"
+        );
+
+        let nsc = neighbours_shortcut.lock();
+        let saw_shortcut = nsc.iter().any(|row| {
+            row.len() == 3
+                && row.iter().any(|x| x == "observer")
+                && row.iter().any(|x| x == "relay")
+                && row.iter().any(|x| x == "sink")
+        });
+        assert!(
+            saw_shortcut,
+            "expected DIRECTORY-SHORTCUT Neighbors(producer) for 'metric' = [observer, relay, sink]; got {nsc:?}"
+        );
+
+        let sp = shortest_struct.lock();
+        let saw_sp = sp.iter().any(|row| {
+            row == &vec![
+                "producer".to_string(),
+                "relay".to_string(),
+                "sink".to_string(),
+            ]
+        });
+        assert!(
+            saw_sp,
+            "expected STRUCTURAL ShortestPath(producer -> sink) = [producer, relay, sink]; got {sp:?}"
+        );
+
+        let cy = cycle_obs.lock();
+        assert!(
+            cy.iter().any(|b| !*b),
+            "expected Tier 2 CycleDetection.HasCycle = false (directed; DAG); got {cy:?}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -3006,61 +4227,65 @@ mod tests {
         // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
         // between fixtures (each fresh mount expects to start at
         // signal id 1 for assertion stability).
-        eprintln!("[goruntime smoke 1/14] build_and_load + body dispatch");
+        eprintln!("[goruntime smoke 1/15] build_and_load + body dispatch");
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/14] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/15] EngineMisroute rejects non-Go bodies");
         reset_global_state();
         scenario_rejects_non_go_lang();
 
-        eprintln!("[goruntime smoke 3/14] emit/message round-trip");
+        eprintln!("[goruntime smoke 3/15] emit/message round-trip");
         reset_global_state();
         scenario_emit_dispatches_to_neighbor();
 
-        eprintln!("[goruntime smoke 4/14] use_state preserves value across renders");
+        eprintln!("[goruntime smoke 4/15] use_state preserves value across renders");
         reset_global_state();
         scenario_use_state_preserves_value_across_renders();
 
-        eprintln!("[goruntime smoke 5/14] state survives a message");
+        eprintln!("[goruntime smoke 5/15] state survives a message");
         reset_global_state();
         scenario_use_state_survives_a_message();
 
-        eprintln!("[goruntime smoke 6/14] use_effect with empty deps fires once");
+        eprintln!("[goruntime smoke 6/15] use_effect with empty deps fires once");
         reset_global_state();
         scenario_use_effect_empty_deps_fires_once();
 
-        eprintln!("[goruntime smoke 7/14] use_memo single-render fires factory once");
+        eprintln!("[goruntime smoke 7/15] use_memo single-render fires factory once");
         reset_global_state();
         scenario_use_memo_caches_when_deps_unchanged();
 
-        eprintln!("[goruntime smoke 8/14] use_memo recomputes on dep change");
+        eprintln!("[goruntime smoke 8/15] use_memo recomputes on dep change");
         reset_global_state();
         scenario_use_memo_caches_and_recomputes();
 
-        eprintln!("[goruntime smoke 9/14] use_reducer dispatch updates state");
+        eprintln!("[goruntime smoke 9/15] use_reducer dispatch updates state");
         reset_global_state();
         scenario_use_reducer_dispatch_updates_state();
 
-        eprintln!("[goruntime smoke 10/14] use_neighbors returns structural ids");
+        eprintln!("[goruntime smoke 10/15] use_neighbors returns structural ids");
         reset_global_state();
         scenario_use_neighbors_returns_structural_ids();
 
-        eprintln!("[goruntime smoke 11/14] use_accept_edge fires topology event");
+        eprintln!("[goruntime smoke 11/15] use_accept_edge fires topology event");
         reset_global_state();
         scenario_accept_edge_fires_topology_event();
 
-        eprintln!("[goruntime smoke 12/14] use_graph_query Tier 1 accessors");
+        eprintln!("[goruntime smoke 12/15] use_graph_query Tier 1 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_1_accessors();
 
-        eprintln!("[goruntime smoke 13/14] use_directory find_by_id");
+        eprintln!("[goruntime smoke 13/15] use_directory find_by_id");
         reset_global_state();
         scenario_use_directory_find_by_id();
 
-        eprintln!("[goruntime smoke 14/14] use_graph_query Tier 1 algorithms");
+        eprintln!("[goruntime smoke 14/15] use_graph_query Tier 1 algorithms");
         reset_global_state();
         scenario_use_graph_query_tier_1_algorithms();
+
+        eprintln!("[goruntime smoke 15/15] use_graph_query Tier 2 accessors");
+        reset_global_state();
+        scenario_use_graph_query_tier_2_accessors();
 
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup

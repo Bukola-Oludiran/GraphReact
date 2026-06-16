@@ -515,6 +515,29 @@ mod tests {
                 "prelude missing required M17 phase 3d-δ hook surface: {sym}"
             );
         }
+        // M17 phase 3d-ε surface: Tier 2 directed-adjacency view +
+        // 12 accessors + 5 A* heuristic constants + Tier2Opts.
+        for sym in [
+            "type Tier2Opts",
+            "type Tier2Query",
+            "func (GraphQuery) Tier2(",
+            "HeuristicLatency",
+            "HeuristicCompliance",
+            "HeuristicHierarchy",
+            "HeuristicTrustAttenuated",
+            "HeuristicPrerequisiteDistance",
+            "host_tier2_node_count",
+            "host_tier2_neighbors",
+            "host_tier2_topological_sort",
+            "host_tier2_a_star_path",
+            "host_tier2_connected_components",
+            "host_tier2_cycle_detection",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3d-ε hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();

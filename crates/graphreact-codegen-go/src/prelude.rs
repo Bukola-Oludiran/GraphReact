@@ -41,10 +41,19 @@
 //!   `graphreact_algorithms` against the live snapshot. Tier 1
 //!   AStarPath is heuristic-free; per-message-type variants land in
 //!   3d-ε via `g.Tier2(msgType).AStarPath(...)`.
+//! - **M17 phase 3d-ε:** SHIPPED. `g.Tier2(msgType, opts?)` opens a
+//!   Tier 2 directed-adjacency view derived from per-node
+//!   `Manifest.Emits/Accepts` pairs. 12 accessors layered onto a
+//!   `Tier2Query` handle: NodeCount, HasNode, Neighbors, HasEdge,
+//!   BFS, DFS, ShortestPath, TopologicalSort, AStarPath, AllPaths,
+//!   ConnectedComponents, CycleDetection. Five A* heuristic kinds
+//!   (HeuristicLatency / HeuristicCompliance / HeuristicHierarchy /
+//!   HeuristicTrustAttenuated / HeuristicPrerequisiteDistance) ride
+//!   on `Tier2Opts.Heuristic`. Two reachability flavors (structural
+//!   default; `DirectoryShortcuts` opt-in).
 //!
-//! Future M17 phase 3d-ε–h sessions add Tier 2/3 graph queries,
-//! supervision hooks, `UseSource`, and `UseEffectAsync` on top of
-//! this substrate.
+//! Future M17 phase 3d-ζ–h sessions add Tier 3 / supervision /
+//! `UseSource` / `UseEffectAsync` on top of this substrate.
 
 /// ABI version baked into the emitted prelude. Must match
 /// [`graphreact_engine_go::ffi::GRX_GO_ABI_VERSION`] (currently `1`).
@@ -1249,6 +1258,265 @@ type CycleDetectionResult struct {{
 // {{HasCycle: false, Cycle: nil}}.
 func (GraphQuery) CycleDetection() CycleDetectionResult {{
     raw, status := Invoke("host_graph_cycle_detection")
+    if status != GR_OK {{
+        return CycleDetectionResult{{}}
+    }}
+    var result CycleDetectionResult
+    if err := json.Unmarshal(raw, &result); err != nil {{
+        return CycleDetectionResult{{}}
+    }}
+    return result
+}}
+
+// ----- M17 phase 3d-ε: Tier 2 directed-adjacency surface -----
+
+// A* heuristic kinds for Tier2Query.AStarPath. String values match
+// the Rust-side `AStarHeuristic::from_str` mapping verbatim so
+// cross-engine `.grx` fixtures behave identically.
+const (
+    HeuristicUniform              = ""
+    HeuristicLatency              = "latency"
+    HeuristicCompliance           = "compliance"
+    HeuristicHierarchy            = "hierarchy"
+    HeuristicTrustAttenuated      = "trust-attenuated"
+    HeuristicPrerequisiteDistance = "prerequisite-distance"
+)
+
+// Tier2Opts customises the Tier 2 view returned by g.Tier2.
+//
+// - `DirectoryShortcuts`: false (default) → STRUCTURAL flavor (edge
+//   `(s, u)` requires both a Tier 1 graph edge AND the emit/accept
+//   policy pair). true → DIRECTORY-SHORTCUT flavor (any emitter
+//   reaches any acceptor in 1 hop, ignoring Tier 1 edges).
+// - `Heuristic`: A* heuristic kind for AStarPath. One of the
+//   Heuristic* constants. Empty string → uniform (BFS-equivalent).
+type Tier2Opts struct {{
+    DirectoryShortcuts bool
+    Heuristic          string
+}}
+
+// Tier2Query is a per-message-type, per-flavor directed-reachability
+// handle. Methods reuse the underlying GraphSnapshot's manifests +
+// graph + directory through dedicated host callbacks; each call
+// builds a fresh `Tier2Adj` Rust-side so mutations applied through
+// the scheduler are visible immediately.
+type Tier2Query struct {{
+    msgType            string
+    directoryShortcuts bool
+    heuristic          string
+}}
+
+// Tier2 returns a Tier 2 view for `msgType`. Optional `opts`
+// customise the flavor + A* heuristic. Multiple `Tier2Query` handles
+// for different message types may coexist within a single render —
+// each is cheap (a small struct, no allocation).
+func (GraphQuery) Tier2(msgType string, opts ...Tier2Opts) Tier2Query {{
+    var o Tier2Opts
+    if len(opts) > 0 {{
+        o = opts[0]
+    }}
+    return Tier2Query{{
+        msgType:            msgType,
+        directoryShortcuts: o.DirectoryShortcuts,
+        heuristic:          o.Heuristic,
+    }}
+}}
+
+// NodeCount returns the total number of nodes that have a registered
+// PermissionManifest at the snapshot. Flavor doesn't affect this.
+func (q Tier2Query) NodeCount() int {{
+    raw, status := Invoke("host_tier2_node_count", q.msgType, q.directoryShortcuts)
+    if status != GR_OK {{
+        return 0
+    }}
+    var n float64
+    if err := json.Unmarshal(raw, &n); err != nil {{
+        return 0
+    }}
+    return int(n)
+}}
+
+// HasNode returns true iff `id` has a registered manifest. Flavor
+// doesn't affect this.
+func (q Tier2Query) HasNode(id string) bool {{
+    raw, status := Invoke("host_tier2_has_node", q.msgType, id, q.directoryShortcuts)
+    if status != GR_OK {{
+        return false
+    }}
+    var b bool
+    if err := json.Unmarshal(raw, &b); err != nil {{
+        return false
+    }}
+    return b
+}}
+
+// Neighbors returns the Tier 2 directed neighbours of `id` for
+// `q.msgType` (per the active flavor). Sorted.
+func (q Tier2Query) Neighbors(id string) []string {{
+    raw, status := Invoke("host_tier2_neighbors", q.msgType, id, q.directoryShortcuts)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// HasEdge returns true iff the directed Tier 2 edge `(u, v)` exists.
+func (q Tier2Query) HasEdge(u, v string) bool {{
+    raw, status := Invoke("host_tier2_has_edge", q.msgType, u, v, q.directoryShortcuts)
+    if status != GR_OK {{
+        return false
+    }}
+    var b bool
+    if err := json.Unmarshal(raw, &b); err != nil {{
+        return false
+    }}
+    return b
+}}
+
+// BFS returns nodes reachable from `from` in breadth-first order over
+// the Tier 2 adjacency. `depthLimit=0` removes the bound.
+func (q Tier2Query) BFS(from string, depthLimit int) []string {{
+    raw, status := Invoke("host_tier2_bfs", q.msgType, from, depthLimit, q.directoryShortcuts)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// DFS returns nodes reachable from `from` in depth-first order over
+// the Tier 2 adjacency. `depthLimit=0` removes the bound.
+func (q Tier2Query) DFS(from string, depthLimit int) []string {{
+    raw, status := Invoke("host_tier2_dfs", q.msgType, from, depthLimit, q.directoryShortcuts)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// ShortestPath returns the BFS shortest path from `from` to `to`
+// over the Tier 2 adjacency, or nil if no path exists.
+func (q Tier2Query) ShortestPath(from, to string) []string {{
+    raw, status := Invoke("host_tier2_shortest_path", q.msgType, from, to, q.directoryShortcuts)
+    if status != GR_OK {{
+        return nil
+    }}
+    if len(raw) == 4 && string(raw) == "null" {{
+        return nil
+    }}
+    var path []string
+    if err := json.Unmarshal(raw, &path); err != nil {{
+        return nil
+    }}
+    return path
+}}
+
+// TopologicalSort returns a Kahn's topological order of the Tier 2
+// directed adjacency, or nil if it contains a directed cycle.
+func (q Tier2Query) TopologicalSort() []string {{
+    raw, status := Invoke("host_tier2_topological_sort", q.msgType, q.directoryShortcuts)
+    if status != GR_OK {{
+        return nil
+    }}
+    if len(raw) == 4 && string(raw) == "null" {{
+        return nil
+    }}
+    var order []string
+    if err := json.Unmarshal(raw, &order); err != nil {{
+        return nil
+    }}
+    return order
+}}
+
+// AStarPath returns the cost-from-policy A* path from `from` to `to`.
+// The heuristic kind is the one configured on `Tier2Opts.Heuristic`
+// at construction time; empty heuristic → uniform (BFS-equivalent).
+// Returns nil if no path exists.
+func (q Tier2Query) AStarPath(from, to string) []string {{
+    raw, status := Invoke(
+        "host_tier2_a_star_path",
+        q.msgType,
+        from,
+        to,
+        q.heuristic,
+        q.directoryShortcuts,
+    )
+    if status != GR_OK {{
+        return nil
+    }}
+    if len(raw) == 4 && string(raw) == "null" {{
+        return nil
+    }}
+    var path []string
+    if err := json.Unmarshal(raw, &path); err != nil {{
+        return nil
+    }}
+    return path
+}}
+
+// AllPaths returns every simple directed path from `from` to `to`
+// over the Tier 2 adjacency. `maxDepth=0` removes the bound; sorted
+// by length then lexicographic for stable output.
+func (q Tier2Query) AllPaths(from, to string, maxDepth int) [][]string {{
+    raw, status := Invoke(
+        "host_tier2_all_paths",
+        q.msgType,
+        from,
+        to,
+        maxDepth,
+        q.directoryShortcuts,
+    )
+    if status != GR_OK {{
+        return [][]string{{}}
+    }}
+    var paths [][]string
+    if err := json.Unmarshal(raw, &paths); err != nil {{
+        return [][]string{{}}
+    }}
+    return paths
+}}
+
+// ConnectedComponents returns every strongly-connected component of
+// the Tier 2 directed adjacency, computed via Tarjan's. Members
+// sorted within each component; outer slice sorted by smallest
+// member.
+func (q Tier2Query) ConnectedComponents() [][]string {{
+    raw, status := Invoke(
+        "host_tier2_connected_components",
+        q.msgType,
+        q.directoryShortcuts,
+    )
+    if status != GR_OK {{
+        return [][]string{{}}
+    }}
+    var comps [][]string
+    if err := json.Unmarshal(raw, &comps); err != nil {{
+        return [][]string{{}}
+    }}
+    return comps
+}}
+
+// CycleDetection returns directed-cycle detection over the Tier 2
+// adjacency. Unlike Tier 1's cycle detection (which is undirected),
+// Tier 2 cycles are well-defined per message type because direction
+// emerges from the emits/accepts pair.
+func (q Tier2Query) CycleDetection() CycleDetectionResult {{
+    raw, status := Invoke(
+        "host_tier2_cycle_detection",
+        q.msgType,
+        q.directoryShortcuts,
+    )
     if status != GR_OK {{
         return CycleDetectionResult{{}}
     }}
