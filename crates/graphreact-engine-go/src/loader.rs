@@ -67,6 +67,16 @@ pub struct LoadedRuntime {
     /// load time.
     pub invoke_handler: Option<ffi::gr_go_invoke_handler_fn>,
 
+    /// **M17 phase 3b-complete.** Rust → Go envelope-shaped callback
+    /// invocation symbol. Optional; older phase 3c artifacts that
+    /// don't ship it stay loadable but `host_effect` cleanup will
+    /// surface a clear runtime error.
+    pub invoke_callback: Option<ffi::gr_go_invoke_callback_fn>,
+
+    /// **M17 phase 3b-complete.** Rust → Go callback-release symbol.
+    /// Optional.
+    pub release_callback: Option<ffi::gr_go_release_callback_fn>,
+
     /// Owns the dlopen handle. Declared LAST so it drops LAST —
     /// any future non-Copy field pointing into the Library is
     /// safely outlived. The leading underscore documents that we
@@ -163,6 +173,14 @@ impl LoadedRuntime {
         let invoke_handler =
             resolve_optional::<ffi::gr_go_invoke_handler_fn>(&lib, "GrxInvokeHandler");
 
+        // M17 phase 3b-complete — optional. Older phase 3c artifacts
+        // that don't ship these stay loadable; only host_effect-
+        // driven dispatch needs them.
+        let invoke_callback =
+            resolve_optional::<ffi::gr_go_invoke_callback_fn>(&lib, "GrxInvokeCallback");
+        let release_callback =
+            resolve_optional::<ffi::gr_go_release_callback_fn>(&lib, "GrxReleaseCallback");
+
         Ok(Self {
             abi_version,
             engine_initialize,
@@ -176,6 +194,8 @@ impl LoadedRuntime {
             callback_register,
             microtasks_drain,
             invoke_handler,
+            invoke_callback,
+            release_callback,
             _lib: lib,
         })
     }

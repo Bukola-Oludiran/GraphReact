@@ -429,6 +429,23 @@ mod tests {
                 "prelude missing required M17 phase 3c hook surface: {sym}"
             );
         }
+        // M17 phase 3b-complete surface: UseState / UseEffect +
+        // callbackRegistry + GrxInvokeCallback / GrxReleaseCallback
+        // ABI symbols. A regression that strips any of these breaks
+        // the state survives-a-message acceptance gate.
+        for sym in [
+            "func UseState(",
+            "func UseEffect(",
+            "type StateResult",
+            "callbackRegistry",
+            "GrxInvokeCallback",
+            "GrxReleaseCallback",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3b-complete hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();

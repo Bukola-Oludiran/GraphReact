@@ -1,0 +1,30 @@
+<!-- M17-phase3b-complete: use_effect with deps=[] fires exactly once
+     across the body's render lifetime. The fixture exercises that
+     re-renders triggered by signal_set_external (use_state setter)
+     do NOT re-fire the effect. -->
+
+<Effect lang="go">
+func EffectBody(ctx Ctx) Manifest {
+    // use_state so an external signal_set_external can mark the
+    // node dirty between batches without changing the effect's
+    // observation. Hook position 0.
+    _, _ = UseState(0.0)
+
+    // use_effect with empty deps — fires on mount only. Hook
+    // position 1.
+    UseEffect(func() func() {
+        _, _ = Invoke("host_observe_effect")
+        return nil
+    }, []interface{}{})
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Effect>
+
+<Graph id="go-effect-once">
+  <Effect id="effect-1" />
+</Graph>

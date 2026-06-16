@@ -42,8 +42,9 @@ use serde_json::Value;
 
 use graphreact_codegen_go::{BuildArtifact, Codegen};
 use graphreact_core::{
-    use_emit as core_use_emit, use_message as core_use_message, Attrs, CommunicationGraph,
-    EmitOptions, IncomingMessage, NodeContext, NodeDefinition, PermissionManifest, Scheduler,
+    use_effect as core_use_effect, use_emit as core_use_emit, use_message as core_use_message,
+    use_state as core_use_state, Attrs, CommunicationGraph, EffectCleanup, EmitOptions,
+    IncomingMessage, NodeContext, NodeDefinition, PermissionManifest, Scheduler, Signal,
 };
 use graphreact_engine_go::GoEngine;
 use graphreact_engine_zig::{
@@ -71,6 +72,37 @@ thread_local! {
     /// The isolate the current batch is running against. Read along
     /// with [`CURRENT_ENGINE`] by the host_message callback.
     static CURRENT_ISO: Cell<Option<IsolateHandle>> = const { Cell::new(None) };
+
+    // ----- M17 phase 3b-complete: use_state + use_effect TLS -----
+
+    /// Registered Signals indexed by stable u64 id. Ids survive
+    /// re-renders — the same `(node_id, hook_pos)` always resolves
+    /// to the same id, even though `core_use_state` is called fresh
+    /// each render. Mirrors `pyruntime::SIGNAL_REGISTRY`.
+    static SIGNAL_REGISTRY: RefCell<FxHashMap<u64, Signal<Value>>> =
+        RefCell::new(FxHashMap::default());
+
+    /// Stable id assignment per `(node_id, hook_pos)`. Mirrors
+    /// `pyruntime::SIGNAL_BY_HOOK_POS`.
+    static SIGNAL_BY_HOOK_POS: RefCell<FxHashMap<(String, usize), u64>> =
+        RefCell::new(FxHashMap::default());
+
+    /// Monotonic id source for [`SIGNAL_REGISTRY`]. Mirrors
+    /// `pyruntime::NEXT_SIGNAL_ID`.
+    static NEXT_SIGNAL_ID: Cell<u64> = const { Cell::new(1) };
+
+    /// Active node id while a body is rendering. Set by
+    /// [`ComponentEvalGuard::new`]; cleared on drop. Read by
+    /// `host_state` to key `(node_id, hook_pos)` for stable Signal
+    /// id assignment. Mirrors `pyruntime::CURRENT_NODE_ID`.
+    static CURRENT_NODE_ID: RefCell<Option<String>> =
+        const { RefCell::new(None) };
+
+    /// Per-render hook-call counter. Reset to 0 by
+    /// [`ComponentEvalGuard`]; incremented by each host_state /
+    /// host_effect / future-host_X call. Mirrors
+    /// `pyruntime::PY_HOOK_INDEX`.
+    static GO_HOOK_INDEX: Cell<usize> = const { Cell::new(0) };
 }
 
 fn current_engine() -> Option<Rc<RefCell<GoEngine>>> {
@@ -79,6 +111,67 @@ fn current_engine() -> Option<Rc<RefCell<GoEngine>>> {
 
 fn current_iso() -> Option<IsolateHandle> {
     CURRENT_ISO.with(Cell::get)
+}
+
+fn current_node_id() -> Option<String> {
+    CURRENT_NODE_ID.with(|n| n.borrow().clone())
+}
+
+fn next_go_hook_index() -> usize {
+    GO_HOOK_INDEX.with(|i| {
+        let p = i.get();
+        i.set(p + 1);
+        p
+    })
+}
+
+/// RAII guard scoping a single component evaluation. Resets
+/// [`GO_HOOK_INDEX`] and stamps [`CURRENT_NODE_ID`] on construction;
+/// clears both on drop. Safe across panics + early returns. Mirrors
+/// `pyruntime::ComponentEvalGuard`.
+struct ComponentEvalGuard;
+
+impl ComponentEvalGuard {
+    fn new(node_id: &str) -> Self {
+        GO_HOOK_INDEX.with(|i| i.set(0));
+        CURRENT_NODE_ID.with(|n| *n.borrow_mut() = Some(node_id.to_string()));
+        Self
+    }
+}
+
+impl Drop for ComponentEvalGuard {
+    fn drop(&mut self) {
+        GO_HOOK_INDEX.with(|i| i.set(0));
+        CURRENT_NODE_ID.with(|n| *n.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn signal_set_external(id: u64, value: Value) -> Result<(), EngineError> {
+    SIGNAL_REGISTRY.with(|reg| {
+        let registry = reg.borrow();
+        let Some(signal) = registry.get(&id) else {
+            return Err(EngineError::Internal(format!(
+                "signal_set_external: no signal registered for id {id}"
+            )));
+        };
+        signal.set(value);
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+fn signal_id_for(node_id: &str, hook_pos: usize) -> Option<u64> {
+    SIGNAL_BY_HOOK_POS.with(|m| m.borrow().get(&(node_id.to_string(), hook_pos)).copied())
+}
+
+#[cfg(test)]
+fn reset_global_state() {
+    SIGNAL_REGISTRY.with(|r| r.borrow_mut().clear());
+    SIGNAL_BY_HOOK_POS.with(|m| m.borrow_mut().clear());
+    NEXT_SIGNAL_ID.with(|c| c.set(1));
+    CURRENT_NODE_ID.with(|n| *n.borrow_mut() = None);
+    GO_HOOK_INDEX.with(|i| i.set(0));
 }
 
 /// RAII guard that installs `(engine, iso)` into the TLS slots for
@@ -201,6 +294,194 @@ fn build_host_message_callback() -> BoxCallback {
                 eprintln!("[graphreact-cli] use_message handler invocation failed: {e}");
             }
         });
+        Ok(HostValue::Null)
+    })
+}
+
+// ----- M17 phase 3b-complete: host_state / host_state_set / host_effect -----
+
+/// Build the `host_state(initial) → {id, value}` callback. Go-side
+/// `UseState` delegates to this; the closure runs on every render.
+///
+/// First render at a given hook position: allocates a fresh
+/// `Signal<Value>` via `core_use_state`, mints a stable id, stores
+/// the signal in [`SIGNAL_REGISTRY`], maps `(node_id, hook_pos) → id`
+/// in [`SIGNAL_BY_HOOK_POS`], returns `{id, value: initial}`.
+///
+/// Subsequent renders: `core_use_state` returns the same `Signal`
+/// (state preserved by graphreact-core's hook slots); we look up the
+/// id from `SIGNAL_BY_HOOK_POS` and return `{id, value: current}`.
+///
+/// Verbatim shape from `pyruntime::build_host_state_callback`.
+fn build_host_state_callback() -> BoxCallback {
+    Box::new(|args| {
+        let initial: Value = args
+            .first()
+            .cloned()
+            .map(HostValue::into_json)
+            .unwrap_or(Value::Null);
+
+        let node_id = current_node_id()
+            .ok_or_else(|| EngineError::Internal("host_state: no active node".into()))?;
+        let hook_pos = next_go_hook_index();
+
+        let signal = core_use_state(initial.clone());
+
+        let key = (node_id, hook_pos);
+        let id = SIGNAL_BY_HOOK_POS.with(|map| {
+            if let Some(&id) = map.borrow().get(&key) {
+                return id;
+            }
+            let new_id = NEXT_SIGNAL_ID.with(|c| {
+                let id = c.get();
+                c.set(id + 1);
+                id
+            });
+            SIGNAL_REGISTRY.with(|reg| reg.borrow_mut().insert(new_id, signal));
+            map.borrow_mut().insert(key, new_id);
+            new_id
+        });
+
+        let current_value = SIGNAL_REGISTRY
+            .with(|reg| reg.borrow().get(&id).map(Signal::get))
+            .unwrap_or(initial);
+
+        #[allow(clippy::cast_precision_loss)]
+        Ok(HostValue::Object(vec![
+            ("id".into(), HostValue::Number(id as f64)),
+            ("value".into(), HostValue::from_json(current_value)),
+        ]))
+    })
+}
+
+/// Build the `host_state_set(id, value)` callback. Go-side setter
+/// closures route through this; looking up the Signal by id and
+/// calling `.set(v)` marks the owning node dirty. The next
+/// `Scheduler::process_batch` re-evaluates it.
+fn build_host_state_set_callback() -> BoxCallback {
+    Box::new(|args| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let id = match args.first() {
+            Some(HostValue::Number(n)) => *n as u64,
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_state_set: expected Number id, got {other:?}"
+                )))
+            }
+        };
+        let value: Value = args
+            .get(1)
+            .cloned()
+            .map(HostValue::into_json)
+            .unwrap_or(Value::Null);
+
+        SIGNAL_REGISTRY.with(|reg| {
+            let registry = reg.borrow();
+            let Some(signal) = registry.get(&id) else {
+                return Err(EngineError::Internal(format!(
+                    "host_state_set: no signal registered for id {id}"
+                )));
+            };
+            signal.set(value);
+            Ok(HostValue::Null)
+        })
+    })
+}
+
+/// Build the `host_effect(token, deps)` callback. Go-side `UseEffect`
+/// registers the effect closure under `token` in the prelude's
+/// `callbackRegistry` then calls this. The callback fires AFTER the
+/// body returns (via graphreact-core's `flush_effects`), so re-entry
+/// into Go is safe — the engine borrow held during `call_function`
+/// has been released by then.
+///
+/// On invocation, the inner closure calls
+/// [`GoEngine::invoke_callback`] with `token`. The Go side runs the
+/// effect, catches any panic, and returns an envelope
+/// `{kind: "value" | "cleanup" | "throw", token?, message?}`. We
+/// translate `cleanup` into an [`EffectCleanup`] closure that
+/// re-invokes the cleanup token + releases it when graphreact-core's
+/// flush triggers cleanup (deps changed or unmount).
+fn build_host_effect_callback() -> BoxCallback {
+    Box::new(|args| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let token = match args.first() {
+            Some(HostValue::Number(n)) => *n as u64,
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_effect: expected Number token, got {other:?}"
+                )))
+            }
+        };
+        let deps: Vec<Value> = match args.get(1) {
+            Some(HostValue::Array(arr)) => arr.iter().cloned().map(HostValue::into_json).collect(),
+            None | Some(HostValue::Null) => Vec::new(),
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_effect: expected Array deps, got {other:?}"
+                )))
+            }
+        };
+
+        let engine = current_engine()
+            .ok_or_else(|| EngineError::Internal("host_effect: engine TLS unset".into()))?;
+
+        core_use_effect(
+            move || -> Option<EffectCleanup> {
+                let envelope = match engine.borrow().invoke_callback(token) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[graphreact-cli] use_effect invocation failed: {e}");
+                        return None;
+                    }
+                };
+                let HostValue::Object(pairs) = envelope else {
+                    return None;
+                };
+                let mut kind: Option<String> = None;
+                let mut cleanup_token: Option<u64> = None;
+                let mut throw_message: Option<String> = None;
+                for (k, v) in &pairs {
+                    match (k.as_str(), v) {
+                        ("kind", HostValue::String(s)) => kind = Some(s.clone()),
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        ("token", HostValue::Number(t)) => cleanup_token = Some(*t as u64),
+                        ("message", HostValue::String(s)) => {
+                            throw_message = Some(s.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                let kind_str = kind.as_deref().unwrap_or("");
+                if kind_str == "throw" {
+                    eprintln!(
+                        "[graphreact-cli] use_effect callback threw: {}",
+                        throw_message.unwrap_or_default()
+                    );
+                    return None;
+                }
+                if kind_str != "cleanup" {
+                    return None;
+                }
+                let ct = cleanup_token?;
+                let engine_for_cleanup = Rc::clone(&engine);
+                let cleanup: EffectCleanup = Box::new(move || {
+                    let e = engine_for_cleanup.borrow();
+                    if let Err(err) = e.invoke_callback(ct) {
+                        eprintln!(
+                            "[graphreact-cli] use_effect cleanup invocation failed: {err}"
+                        );
+                    }
+                    if let Err(err) = e.release_callback(ct) {
+                        eprintln!(
+                            "[graphreact-cli] use_effect cleanup release failed: {err}"
+                        );
+                    }
+                });
+                Some(cleanup)
+            },
+            deps,
+        );
         Ok(HostValue::Null)
     })
 }
@@ -406,6 +687,15 @@ pub fn mount_with_scheduler(
             .map_err(RuntimeError::Engine)?;
         e.register_callback(iso, "host_message", build_host_message_callback())
             .map_err(RuntimeError::Engine)?;
+        // M17 phase 3b-complete: state + effect host callbacks.
+        // The Go side's UseState / UseEffect helpers invoke these
+        // through the prelude's `Invoke(name, args...)` helper.
+        e.register_callback(iso, "host_state", build_host_state_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_state_set", build_host_state_set_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_effect", build_host_effect_callback())
+            .map_err(RuntimeError::Engine)?;
         iso
     };
 
@@ -501,6 +791,10 @@ fn build_go_node_definition(
     fn_handle: FunctionHandle,
 ) -> NodeDefinition {
     NodeDefinition::new(name, move |ctx: &NodeContext| -> PermissionManifest {
+        // M17 phase 3b-complete: scope the per-render hook-index +
+        // node-id TLS so UseState / UseEffect resolve to the
+        // correct `(node_id, hook_pos)` slot.
+        let _eval_guard = ComponentEvalGuard::new(&ctx.id);
         let host_ctx = build_host_ctx(ctx);
         let result = engine
             .borrow_mut()
@@ -836,6 +1130,179 @@ mod tests {
         runtime.shutdown().ok();
     }
 
+    /// Phase 3b-complete acceptance: "state survives a message".
+    /// Counter body holds use_state(0); body observes the count on
+    /// every render via Invoke("host_observe", count). External
+    /// signal_set_external bumps the underlying Signal between
+    /// batches; second batch's render observes the new value.
+    /// Mirrors pyruntime::phase3b_use_state_preserves_value_across_renders.
+    fn scenario_use_state_preserves_value_across_renders() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-counter.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("counter-survive");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-counter.grx");
+
+        let observations: std::sync::Arc<parking_lot::Mutex<Vec<f64>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observations_for_cb = std::sync::Arc::clone(&observations);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe",
+                Box::new(move |args| {
+                    if let Some(HostValue::Number(n)) = args.first() {
+                        observations_for_cb.lock().push(*n);
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe");
+
+        // Initial mount: process_batch evaluates the body once.
+        runtime.process_batch().expect("batch 1");
+
+        // Externally bump the signal — marks the node dirty.
+        let id = signal_id_for("counter-1", 0).expect("signal id for counter-1 hook 0");
+        signal_set_external(id, Value::Number(7.into())).expect("set");
+
+        // Second batch re-renders the body; the observation should
+        // reflect the bumped value (state SURVIVED across renders).
+        runtime.process_batch().expect("batch 2");
+
+        let obs = observations.lock();
+        assert!(
+            obs.len() >= 2,
+            "expected at least 2 observations, got {obs:?}"
+        );
+        // First render observes the initial 0.0 (JSON marshalling
+        // round-trips integers as floats).
+        assert!(
+            (obs[0] - 0.0).abs() < f64::EPSILON,
+            "first render should observe initial 0; got {obs:?}"
+        );
+        // Second render observes the bumped 7.0 — proves the Signal
+        // survived the render boundary and the body picked up the
+        // new value via UseState's stable id lookup.
+        assert!(
+            (obs[1] - 7.0).abs() < f64::EPSILON,
+            "second render should observe bumped value 7; got {obs:?}"
+        );
+        drop(obs);
+    }
+
+    /// Phase 3b-complete acceptance: state survives a message
+    /// delivery. Counter's UseMessage("bump") handler invokes the
+    /// setter; the next batch observes the bumped value. Mirrors
+    /// pyruntime::phase3c_python_use_message_handler_re_renders_on_message.
+    fn scenario_use_state_survives_a_message() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-counter.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("counter-message");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-counter.grx");
+
+        let observations: std::sync::Arc<parking_lot::Mutex<Vec<f64>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observations_for_cb = std::sync::Arc::clone(&observations);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe",
+                Box::new(move |args| {
+                    if let Some(HostValue::Number(n)) = args.first() {
+                        observations_for_cb.lock().push(*n);
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe");
+
+        // Initial mount: process_batch evaluates the body once.
+        // Observation: 0.0.
+        runtime.process_batch().expect("batch 1");
+
+        // Inject an external "bump" message via the scheduler.
+        // Counter's UseMessage handler calls setCount(count + 1) →
+        // marks node dirty.
+        runtime.scheduler.send("counter-1", "bump", Value::Null);
+
+        // Second batch — the handler from batch 1 has registered;
+        // it runs on delivery, setter fires, node marked dirty,
+        // body re-renders.
+        runtime.process_batch().expect("batch 2");
+
+        let obs = observations.lock();
+        assert!(
+            obs.len() >= 2,
+            "expected at least 2 observations, got {obs:?}"
+        );
+        assert!(
+            (obs[0] - 0.0).abs() < f64::EPSILON,
+            "first render observes initial 0; got {obs:?}"
+        );
+        // The setter increments by 1.0 → second render observes 1.0.
+        assert!(
+            (obs[1] - 1.0).abs() < f64::EPSILON,
+            "after bump message, second render should observe 1; got {obs:?}"
+        );
+        drop(obs);
+    }
+
+    /// Phase 3b-complete: use_effect fires on mount when deps is
+    /// `[]` (only first render) + observable via host_observe.
+    fn scenario_use_effect_empty_deps_fires_once() {
+        // Inline body via a small builder — keeps the fixture
+        // surface focused on the regression we care about.
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-effect-once.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("effect-once");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-effect-once.grx");
+
+        let effect_fire_count: std::sync::Arc<parking_lot::Mutex<u32>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(0));
+        let counter_for_cb = std::sync::Arc::clone(&effect_fire_count);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_effect",
+                Box::new(move |_args| {
+                    *counter_for_cb.lock() += 1;
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_effect");
+
+        runtime.process_batch().expect("batch 1");
+
+        // Mark the node dirty via an external signal so the body
+        // re-renders without the effect re-firing.
+        let id = signal_id_for("effect-1", 0).expect("signal id for effect-1 hook 0");
+        signal_set_external(id, Value::Number(42.into())).expect("set");
+        runtime.process_batch().expect("batch 2");
+        signal_set_external(id, Value::Number(99.into())).expect("set");
+        runtime.process_batch().expect("batch 3");
+
+        let n = *effect_fire_count.lock();
+        assert_eq!(
+            n, 1,
+            "use_effect with deps=[] should fire exactly once across 3 renders; got {n}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -865,12 +1332,33 @@ mod tests {
         if skip_if_no_go() {
             return;
         }
-        eprintln!("[goruntime smoke 1/3] build_and_load + body dispatch");
+        // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
+        // between fixtures (each fresh mount expects to start at
+        // signal id 1 for assertion stability).
+        eprintln!("[goruntime smoke 1/6] build_and_load + body dispatch");
+        reset_global_state();
         scenario_build_and_load_body_dispatch();
-        eprintln!("[goruntime smoke 2/3] EngineMisroute rejects non-Go bodies");
+
+        eprintln!("[goruntime smoke 2/6] EngineMisroute rejects non-Go bodies");
+        reset_global_state();
         scenario_rejects_non_go_lang();
-        eprintln!("[goruntime smoke 3/3] mount_with_scheduler + emit/message round-trip");
+
+        eprintln!("[goruntime smoke 3/6] emit/message round-trip");
+        reset_global_state();
         scenario_emit_dispatches_to_neighbor();
+
+        eprintln!("[goruntime smoke 4/6] use_state preserves value across renders");
+        reset_global_state();
+        scenario_use_state_preserves_value_across_renders();
+
+        eprintln!("[goruntime smoke 5/6] state survives a message");
+        reset_global_state();
+        scenario_use_state_survives_a_message();
+
+        eprintln!("[goruntime smoke 6/6] use_effect with empty deps fires once");
+        reset_global_state();
+        scenario_use_effect_empty_deps_fires_once();
+
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup
         // hazard. We leak the GoRuntime instances on purpose; the

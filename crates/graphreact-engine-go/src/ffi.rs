@@ -131,3 +131,25 @@ pub type gr_go_invoke_handler_fn = unsafe extern "C" fn(
     args_json: *const c_char,
     args_len: usize,
 ) -> c_int;
+
+/// **M17 phase 3b-complete.** Rust → Go callback-invocation symbol
+/// for envelope-shaped callbacks (UseEffect bodies + their cleanup
+/// closures). Returns a JSON envelope describing the outcome:
+/// `{kind: "value"}` (no cleanup), `{kind: "cleanup", token: <ct>}`
+/// (cleanup closure registered under fresh token), or
+/// `{kind: "throw", message: <msg>}` (panic recovered).
+///
+/// Resolved optionally — older phase 3b-real / 3c artifacts that
+/// don't ship it stay loadable; `host_effect` delivery becomes a
+/// clean runtime error rather than dlopen-fail at load time.
+pub type gr_go_invoke_callback_fn = unsafe extern "C" fn(
+    token: u64,
+    out_result: *mut c_char,
+    out_result_cap: usize,
+    out_result_len: *mut usize,
+) -> c_int;
+
+/// **M17 phase 3b-complete.** Rust → Go callback-release symbol.
+/// The Rust-side `EffectCleanup` closure calls this after invoking
+/// a cleanup token so the Go-side closure GC's promptly. Optional.
+pub type gr_go_release_callback_fn = unsafe extern "C" fn(token: u64) -> c_int;

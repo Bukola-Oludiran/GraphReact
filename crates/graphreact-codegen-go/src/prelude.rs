@@ -10,12 +10,15 @@
 //! - **M17 phase 3c:** SHIPPED. `UseEmit` + `UseMessage` Go-side
 //!   helpers, message handler registry + token allocator,
 //!   `GrxInvokeHandler` ABI symbol for Rust → Go handler dispatch.
-//!   Bodies now drive emit/message semantics through the engine-go
-//!   trampoline.
+//! - **M17 phase 3b-complete:** SHIPPED. `UseState` + `UseEffect`
+//!   Go-side helpers, `callbackRegistry` + `GrxInvokeCallback` +
+//!   `GrxReleaseCallback` ABI symbols for envelope-shaped Rust → Go
+//!   callback dispatch (value / cleanup / throw). State preserved
+//!   across renders; effect cleanup runs on deps change + unmount.
 //!
-//! Future M17 phase 3d–h sessions add `UseState`, `UseEffect`,
-//! `UseNeighbors`, `UseGraphQuery`, supervision hooks, `UseSource`,
-//! and `UseEffectAsync` on top of this substrate.
+//! Future M17 phase 3d–h sessions add `UseNeighbors`,
+//! `UseGraphQuery`, supervision hooks, `UseSource`, and
+//! `UseEffectAsync` on top of this substrate.
 
 /// ABI version baked into the emitted prelude. Must match
 /// [`graphreact_engine_go::ffi::GRX_GO_ABI_VERSION`] (currently `1`).
@@ -81,6 +84,7 @@ import "C"
 
 import (
     "encoding/json"
+    "fmt"
     "sync"
     "sync/atomic"
     "unsafe"
@@ -215,6 +219,16 @@ var (
     handlerMu        sync.Mutex
     handlerRegistry  = map[uint64]func(map[string]interface{{}}){{}}
     nextHandlerToken uint64
+
+    // callbackRegistry holds generic Go closures keyed by token id.
+    // Used by UseEffect (and any future M17 phase 3d+ hook that needs
+    // envelope-shaped Rust → Go callback dispatch — cleanup tokens
+    // recursively land here too). Returns of nil → envelope kind
+    // "value"; a `func()` cleanup closure → envelope kind "cleanup"
+    // with a freshly minted token; a panic → envelope kind "throw".
+    callbackMu        sync.Mutex
+    callbackRegistry  = map[uint64]func() interface{{}}{{}}
+    nextCallbackToken uint64
 )
 
 // registerMessageHandler stores `handler` under a freshly allocated
@@ -319,6 +333,77 @@ func UseEmit() func(msgType string, payload interface{{}}, opts ...EmitOpts) {{
             args = append(args, opts[0])
         }}
         _, _ = invokeHostCallback(slot, args)
+    }}
+}}
+
+// StateResult is the JSON shape host_state returns. ID is decoded
+// as float64 because Rust's `serde_json::Number::from_f64(id as
+// f64)` serialises to "1.0" / "2.0" / etc. — decimal-form floats —
+// which Go's json.Unmarshal rejects when targeting a uint64. We
+// cast back to uint64 at the setter-closure site (id values are
+// always small positive integers minted by NEXT_SIGNAL_ID).
+type StateResult struct {{
+    ID    float64     `json:"id"`
+    Value interface{{}} `json:"value"`
+}}
+
+// UseState returns the current value + a setter closure. State is
+// preserved across renders by graphreact-core's hook slots; the
+// setter marks the owning node dirty when invoked.
+//
+// Mirrors React's signature shape; the M13-phase3b CPython surface
+// is identical modulo language conventions. The initial value is
+// only used on the first render at the body's hook position; later
+// renders observe whatever the setter has stamped into the Signal.
+//
+// Type system note: returns `interface{{}}` (Go's `any`). Bodies that
+// need a typed view should type-assert: `count, setCount :=
+// UseState(0); n := count.(float64)` (JSON marshalling normalises
+// integers to float64 across the FFI boundary).
+func UseState(initial interface{{}}) (interface{{}}, func(interface{{}})) {{
+    raw, status := Invoke("host_state", initial)
+    if status != GR_OK {{
+        // Defensive — outside an active render or before host_state
+        // was registered, fall back so the body doesn't panic. The
+        // no-op setter is acceptable because no scheduler render is
+        // pending.
+        return initial, func(interface{{}}) {{}}
+    }}
+    var sr StateResult
+    if err := json.Unmarshal(raw, &sr); err != nil {{
+        return initial, func(interface{{}}) {{}}
+    }}
+    id := uint64(sr.ID)
+    return sr.Value, func(newVal interface{{}}) {{
+        _, _ = Invoke("host_state_set", id, newVal)
+    }}
+}}
+
+// UseEffect registers `effect` to run after the body returns. If
+// `deps` is nil → fires on every render (no memoisation). If `deps`
+// is a (possibly empty) slice → fires only on first render + when
+// any element differs from the previous render's deps. If `effect`
+// returns a non-nil cleanup closure, it runs on the next deps change
+// + on unmount. Mirrors React's `useEffect` semantics.
+//
+// Cleanup convention: return either `nil` (no cleanup) or a closure
+// of type `func()`. Other return shapes are treated as "no cleanup"
+// by the envelope wrapper.
+func UseEffect(effect func() func(), deps []interface{{}}) {{
+    token := atomic.AddUint64(&nextCallbackToken, 1)
+    callbackMu.Lock()
+    callbackRegistry[token] = func() interface{{}} {{
+        cleanup := effect()
+        if cleanup == nil {{
+            return nil
+        }}
+        return cleanup
+    }}
+    callbackMu.Unlock()
+    if deps == nil {{
+        _, _ = Invoke("host_effect", token, nil)
+    }} else {{
+        _, _ = Invoke("host_effect", token, deps)
     }}
 }}
 
@@ -640,6 +725,106 @@ func GrxInvokeHandler(
         }}
     }}
     handler(msg)
+    return GR_OK
+}}
+
+// GrxInvokeCallback invokes a generic Go callback stored under
+// `token` in `callbackRegistry`. Returns an envelope JSON describing
+// the outcome: `{{kind: "value"}}` (no cleanup), `{{kind: "cleanup",
+// token: <ct>}}` (cleanup closure registered under fresh token), or
+// `{{kind: "throw", message: <msg>}}` (panic recovered).
+//
+// Used by the Rust-side `host_effect` callback's `core_use_effect`
+// closure to fire the user's effect after the body returns. Mirrors
+// pyruntime's `__invoke_callback(token, args)` envelope shape.
+//
+//export GrxInvokeCallback
+func GrxInvokeCallback(
+    token C.uint64_t,
+    outResult *C.char, outResultCap C.size_t,
+    outResultLen *C.size_t,
+) C.int {{
+    callbackMu.Lock()
+    cb, ok := callbackRegistry[uint64(token)]
+    callbackMu.Unlock()
+    if !ok {{
+        return GR_ERR_CALLBACK_NOT_FOUND
+    }}
+
+    var result interface{{}}
+    var panicMsg string
+    func() {{
+        defer func() {{
+            if r := recover(); r != nil {{
+                panicMsg = fmt.Sprintf("%v", r)
+            }}
+        }}()
+        result = cb()
+    }}()
+
+    envelope := map[string]interface{{}}{{}}
+    switch {{
+    case panicMsg != "":
+        envelope["kind"] = "throw"
+        envelope["message"] = panicMsg
+    case result == nil:
+        envelope["kind"] = "value"
+    default:
+        // Accept either `func()` (canonical UseEffect cleanup) or
+        // `func() interface{{}}` (nested cleanup tokens — rare; the
+        // engine wraps everything as the latter internally).
+        var cleanupFn func() interface{{}}
+        switch v := result.(type) {{
+        case func():
+            cleanupFn = func() interface{{}} {{
+                v()
+                return nil
+            }}
+        case func() interface{{}}:
+            cleanupFn = v
+        default:
+            envelope["kind"] = "value"
+        }}
+        if cleanupFn != nil {{
+            ct := atomic.AddUint64(&nextCallbackToken, 1)
+            callbackMu.Lock()
+            callbackRegistry[ct] = cleanupFn
+            callbackMu.Unlock()
+            envelope["kind"] = "cleanup"
+            envelope["token"] = ct
+        }}
+    }}
+
+    resultJson, err := json.Marshal(envelope)
+    if err != nil {{
+        return GR_ERR_INTERNAL
+    }}
+    resultLen := C.size_t(len(resultJson))
+    *outResultLen = resultLen
+    if resultLen > outResultCap {{
+        return GR_ERR_BUFFER_TOO_SMALL
+    }}
+    if resultLen > 0 {{
+        C.memcpy(unsafe.Pointer(outResult), unsafe.Pointer(&resultJson[0]), resultLen)
+    }}
+    return GR_OK
+}}
+
+// GrxReleaseCallback drops a token from `callbackRegistry`. The
+// Rust-side `EffectCleanup` closure calls this after invoking a
+// cleanup token so the closure GC's promptly.
+//
+//export GrxReleaseCallback
+func GrxReleaseCallback(token C.uint64_t) C.int {{
+    callbackMu.Lock()
+    _, ok := callbackRegistry[uint64(token)]
+    if ok {{
+        delete(callbackRegistry, uint64(token))
+    }}
+    callbackMu.Unlock()
+    if !ok {{
+        return GR_ERR_CALLBACK_NOT_FOUND
+    }}
     return GR_OK
 }}
 

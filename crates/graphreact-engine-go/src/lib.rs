@@ -309,6 +309,78 @@ impl GoEngine {
             Err(map_status(rc))
         }
     }
+
+    /// **M17 phase 3b-complete.** Invoke a Go-side callback by token
+    /// and return the envelope describing the outcome. The envelope
+    /// is one of:
+    ///
+    /// - `Object([("kind", String("value"))])` — callback returned
+    ///   nil / no cleanup.
+    /// - `Object([("kind", String("cleanup")), ("token", Number(ct))])`
+    ///   — callback returned a cleanup closure; the closure is
+    ///   registered under `ct` and can be invoked by a subsequent
+    ///   `invoke_callback(ct, ...)` then released via
+    ///   `release_callback(ct)`.
+    /// - `Object([("kind", String("throw")), ("message", String(m))])`
+    ///   — callback panicked; the panic message is captured.
+    ///
+    /// Used by `goruntime::build_host_effect_callback` to fire the
+    /// user's UseEffect after the body returns + drive its cleanup
+    /// lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Internal`] if the loaded artifact does not
+    ///   export `GrxInvokeCallback`.
+    /// - [`EngineError::CallbackNotFound`] if `token` was never
+    ///   registered (or was already released).
+    pub fn invoke_callback(&self, token: u64) -> EngineResult<HostValue> {
+        let runtime = self.runtime()?;
+        let invoke = runtime.invoke_callback.ok_or_else(|| {
+            EngineError::Internal(
+                "graphreact-engine-go: artifact missing GrxInvokeCallback — rebuild via codegen \
+                 with M17 phase 3b-complete+ (use_state / use_effect)"
+                    .into(),
+            )
+        })?;
+        let json = call_with_buffer(|out, cap, written| unsafe {
+            invoke(token, out, cap, written)
+        })?;
+        let value: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|e| EngineError::Internal(format!("invoke_callback envelope: {e}")))?;
+        Ok(json_to_host_value(value))
+    }
+
+    /// **M17 phase 3b-complete.** Release a Go-side callback token.
+    /// The Rust-side `EffectCleanup` closure calls this after firing
+    /// a cleanup token so the Go-side closure GC's promptly.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Internal`] if the loaded artifact does not
+    ///   export `GrxReleaseCallback`.
+    /// - [`EngineError::CallbackNotFound`] if `token` was never
+    ///   registered.
+    pub fn release_callback(&self, token: u64) -> EngineResult<()> {
+        let runtime = self.runtime()?;
+        let release = runtime.release_callback.ok_or_else(|| {
+            EngineError::Internal(
+                "graphreact-engine-go: artifact missing GrxReleaseCallback — rebuild via codegen \
+                 with M17 phase 3b-complete+"
+                    .into(),
+            )
+        })?;
+        let rc = unsafe { release(token) };
+        if rc == ffi::GR_OK {
+            Ok(())
+        } else if rc == ffi::GR_ERR_CALLBACK_NOT_FOUND {
+            Err(EngineError::CallbackNotFound {
+                name: format!("callback-token:{token}"),
+            })
+        } else {
+            Err(map_status(rc))
+        }
+    }
 }
 
 /// Map a Go-bridge status code to a typed `EngineError`. Mirrors

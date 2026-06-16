@@ -1,16 +1,32 @@
-<!-- M17-phase3b-real counter body — emits a placeholder manifest. The
-     full Use*-driven counter (state + effect) ships in M17 phase 3c-h.
-     Today's body returns the canonical accept/emit declarations so the
-     codegen-emitted dispatch.go compiles cleanly and the engine-go
-     LoadedRuntime can invoke it end-to-end. Mirrors python-counter.grx
-     for CPython. -->
+<!-- M17-phase3b-complete: the canonical "state survives a message"
+     acceptance fixture. Counter body holds a use_state(0); a
+     use_message("bump") handler invokes the setter to increment the
+     count; observation is surfaced via Invoke("host_observe",
+     count) on every render. The test drives an external bump
+     message and asserts the observation reflects the new value on
+     the next batch.
+
+     Convention: bodies receive ctx and return Manifest; Counter
+     declares it accepts "bump". -->
 
 <Counter lang="go">
 func CounterBody(ctx Ctx) Manifest {
+    countAny, setCount := UseState(0.0)
+    count, _ := countAny.(float64)
+
+    // Surface the current count on every render so the test can
+    // assert state-survival semantics.
+    _, _ = Invoke("host_observe", count)
+
+    // Bump the counter when the receiver sees a "bump" message.
+    UseMessage("bump", func(msg map[string]interface{}) {
+        setCount(count + 1.0)
+    })
+
     return Manifest{
         ID:      ctx.ID,
-        Accepts: []string{"increment"},
-        Emits:   []string{"count-updated"},
+        Accepts: []string{"bump"},
+        Emits:   []string{},
     }
 }
 </Counter>
