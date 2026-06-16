@@ -25,6 +25,13 @@ pub enum DebugEngine {
     /// (P9). P8 returns [`DebugFlagError::JscNotYetSupported`] when
     /// this variant is requested.
     Jsc,
+    /// Go Delve attach — Delve speaks DAP (Debug Adapter Protocol) on
+    /// TCP `:2345` by default. VS Code Go extension + IntelliJ Go
+    /// plugin both speak this protocol. Returns
+    /// [`DebugFlagError::GoNotYetSupported`] until M17 phase 1
+    /// closes; the parser accepts the variant so the flag surface is
+    /// stable.
+    Go,
 }
 
 impl DebugEngine {
@@ -35,6 +42,7 @@ impl DebugEngine {
         match self {
             DebugEngine::Cpython => 5678,
             DebugEngine::Jsc => 9229,
+            DebugEngine::Go => 2345,
         }
     }
 }
@@ -44,6 +52,7 @@ impl std::fmt::Display for DebugEngine {
         match self {
             DebugEngine::Cpython => write!(f, "cpython"),
             DebugEngine::Jsc => write!(f, "jsc"),
+            DebugEngine::Go => write!(f, "go"),
         }
     }
 }
@@ -59,7 +68,7 @@ pub struct DebugFlag {
 pub enum DebugFlagError {
     #[error("expected `<engine>:<port>` (got `{0}`)")]
     BadFormat(String),
-    #[error("unknown debug engine `{0}`; expected `cpython` or `jsc`")]
+    #[error("unknown debug engine `{0}`; expected `cpython`, `jsc`, or `go`")]
     UnknownEngine(String),
     #[error("port `{0}`: {1}")]
     BadPort(String, String),
@@ -67,6 +76,10 @@ pub enum DebugFlagError {
         "debug engine `jsc` not yet wired (P8 ships cpython only; JSC CDP lands in P9)"
     )]
     JscNotYetSupported,
+    #[error(
+        "debug engine `go` is parser-accepted but not yet wired (Delve DAP attach lands with M17 phase 1)"
+    )]
+    GoNotYetSupported,
 }
 
 impl FromStr for DebugFlag {
@@ -79,6 +92,7 @@ impl FromStr for DebugFlag {
         let engine = match engine_str {
             "cpython" => DebugEngine::Cpython,
             "jsc" => DebugEngine::Jsc,
+            "go" => DebugEngine::Go,
             other => return Err(DebugFlagError::UnknownEngine(other.to_string())),
         };
         let port: u16 = port_str
@@ -137,11 +151,20 @@ mod tests {
     fn default_ports_match_canonical() {
         assert_eq!(DebugEngine::Cpython.default_port(), 5678);
         assert_eq!(DebugEngine::Jsc.default_port(), 9229);
+        assert_eq!(DebugEngine::Go.default_port(), 2345);
     }
 
     #[test]
     fn display_round_trips_engine_name() {
         assert_eq!(format!("{}", DebugEngine::Cpython), "cpython");
         assert_eq!(format!("{}", DebugEngine::Jsc), "jsc");
+        assert_eq!(format!("{}", DebugEngine::Go), "go");
+    }
+
+    #[test]
+    fn parses_go_port() {
+        let f: DebugFlag = "go:2345".parse().unwrap();
+        assert_eq!(f.engine, DebugEngine::Go);
+        assert_eq!(f.port, 2345);
     }
 }

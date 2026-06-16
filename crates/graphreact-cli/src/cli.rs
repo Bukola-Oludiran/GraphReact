@@ -442,6 +442,11 @@ pub enum RuntimeArg {
     /// embedded Python sub-interpreters; callbacks + hook semantics
     /// land at M13-phase2.5+.
     Cpython,
+    /// Go engine (M17-phase1+2 PLANNED). Loads a cgo + c-shared
+    /// artifact produced by `graphreact-codegen-go` + `go build
+    /// -buildmode=c-shared`. Currently substrate-only — see
+    /// `EngineSelectError::GoNotLinked`.
+    Go,
 }
 
 impl std::fmt::Display for RuntimeArg {
@@ -451,6 +456,7 @@ impl std::fmt::Display for RuntimeArg {
             Self::Echo => write!(f, "echo"),
             Self::Jsc => write!(f, "jsc"),
             Self::Cpython => write!(f, "cpython"),
+            Self::Go => write!(f, "go"),
         }
     }
 }

@@ -1,0 +1,18 @@
+[package]
+name = "graphreact-engine-go"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Go runtime engine for GraphReact (M17 PLANNED, phase 1+2 substrate scaffold). Loads cgo + c-shared artifacts produced by graphreact-codegen-go and dispatches against the graphreact-engine-zig Engine trait."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+graphreact-engine-zig = { path = "../graphreact-engine-zig" }
+
+[lints]
+workspace = true

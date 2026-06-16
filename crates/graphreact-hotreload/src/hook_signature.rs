@@ -233,6 +233,14 @@ pub fn extract(source: &str, lang: ComponentLang) -> Result<HookSignature, HookS
     match lang {
         ComponentLang::Js => extract_js(source),
         ComponentLang::Python => extract_python(source),
+        // M17 Go bodies are pre-compiled via `graphreact-codegen-go`
+        // + `go build -buildmode=c-shared`; the daemon never sees the
+        // raw `.go` source as a string the way it sees `.js` / `.py`.
+        // The hot-reload hook-signature extractor falls through to
+        // `UnsupportedLang` for `Go`, which routes the caller to
+        // body-hash mode per M15's footgun-mitigation rule.
+        // Real Go hot-reload arrives no earlier than M17 phase 3g.
+        ComponentLang::Go => Err(HookSignatureError::UnsupportedLang(ComponentLang::Go)),
     }
 }
 

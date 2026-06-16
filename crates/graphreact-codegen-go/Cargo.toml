@@ -1,0 +1,19 @@
+[package]
+name = "graphreact-codegen-go"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Build-step codegen for Go bodies in .grx files (M17 phase 3b PLANNED, substrate-only scaffold). Emits typed _grx_prelude.go alongside each .grx file's Go body and orchestrates `go build -buildmode=c-shared` against the combined source set."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+graphreact-grx-parser = { path = "../graphreact-grx-parser" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

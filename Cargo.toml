@@ -11,6 +11,8 @@ members = [
     "crates/graphreact-engine-echo",
     "crates/graphreact-engine-jsc",
     "crates/graphreact-engine-cpython",
+    "crates/graphreact-engine-go",
+    "crates/graphreact-codegen-go",
     "crates/graphreact-dist",
     "crates/graphreact-hotreload",
     "crates/graphreact-observer",

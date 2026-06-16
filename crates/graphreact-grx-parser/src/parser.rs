@@ -215,7 +215,7 @@ impl Parser {
                 || GrxParseError::parse(
                     format!(
                         "unknown `lang` value `{s}` for definition `<{component}>` — \
-                         supported: \"js\" (default) / \"python\""
+                         supported: \"js\" (default) / \"python\" / \"go\""
                     ),
                     open.loc,
                 ),

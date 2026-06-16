@@ -1294,6 +1294,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphreact-codegen-go"
+version = "0.1.0"
+dependencies = [
+ "graphreact-grx-parser",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "graphreact-core"
 version = "0.1.0"
 dependencies = [
@@ -1364,6 +1372,13 @@ dependencies = [
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "graphreact-engine-go"
+version = "0.1.0"
+dependencies = [
+ "graphreact-engine-zig",
 ]
 
 [[package]]

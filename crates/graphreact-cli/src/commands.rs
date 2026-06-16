@@ -450,6 +450,18 @@ pub fn validate_debug_against_runtime(
     let want_engine = match d.engine {
         DebugEngine::Cpython => "cpython",
         DebugEngine::Jsc => "jsc",
+        // M17 phase 1 substrate scaffold — the flag accepts `go:2345`
+        // but the engine has no Delve attach wired yet. Fail loudly
+        // until M17 phase 1 closes; the message routes the operator
+        // at the plan file.
+        DebugEngine::Go => {
+            return Err(CommandError::ClusterArg(
+                "--debug=go:<port> is parser-accepted but not yet wired. \
+                 The Go engine ships its Delve DAP attach in M17 phase 1. \
+                 See ~/.claude/plans/graphreact-rust-later-milestones.md §M17."
+                    .into(),
+            ));
+        }
     };
     let runtime_str = match runtime {
         RuntimeArg::Cpython => "cpython",

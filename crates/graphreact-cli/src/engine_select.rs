@@ -10,6 +10,12 @@ pub enum EngineKind {
     Echo,
     Jsc,
     Cpython,
+    /// Go body engine. Loads a cgo + c-shared artifact compiled by
+    /// `graphreact-codegen-go` and dispatches against the Engine
+    /// trait. M17 (PLANNED) — phase 1 ships the stub; phase 2 wires
+    /// real lifecycle. Until phase 1 closes, select() returns
+    /// `GoNotLinked`.
+    Go,
 }
 
 #[derive(Debug, Error)]
@@ -32,6 +38,16 @@ pub enum EngineSelectError {
          Install python@3.12 / 3.13 / 3.14 and ensure pkg-config sees it."
     )]
     CpythonNotLinked,
+    /// Returned when the Go engine has not yet shipped its phase 1
+    /// Engine-trait implementation. The crate exists as a skeleton
+    /// (M17 phase 1 substrate scaffold) but does not yet construct a
+    /// working Engine.
+    #[error(
+        "engine `go` is scaffolded but not yet implemented (M17 phase 1 substrate-only). \n\
+         The `graphreact-engine-go` crate exists; the Engine trait impl ships in M17 phase 1+2. \n\
+         Track progress in ~/.claude/plans/graphreact-rust-later-milestones.md §M17."
+    )]
+    GoNotLinked,
 }
 
 /// Construct a boxed engine from a CLI selection.
@@ -67,6 +83,7 @@ pub fn select(kind: EngineKind) -> Result<Box<dyn Engine>, EngineSelectError> {
                 Err(EngineSelectError::CpythonNotLinked)
             }
         }
+        EngineKind::Go => Err(EngineSelectError::GoNotLinked),
     }
 }
 
@@ -77,6 +94,7 @@ impl From<crate::cli::RuntimeArg> for EngineKind {
             crate::cli::RuntimeArg::Echo => Self::Echo,
             crate::cli::RuntimeArg::Jsc => Self::Jsc,
             crate::cli::RuntimeArg::Cpython => Self::Cpython,
+            crate::cli::RuntimeArg::Go => Self::Go,
         }
     }
 }
@@ -126,5 +144,15 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(msg.contains("M13"));
+    }
+
+    #[test]
+    fn go_returns_clear_not_linked_error() {
+        let result = select(EngineKind::Go);
+        let Err(err) = result else {
+            panic!("expected NotLinked error — Go engine is substrate-scaffolded only");
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("M17"), "error message should cite M17: {msg}");
     }
 }

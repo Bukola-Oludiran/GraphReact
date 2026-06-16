@@ -148,6 +148,12 @@ pub enum ComponentLang {
     /// Python body. Routed to the CPython engine via the PyRuntime
     /// composition layer (M13-phase3+).
     Python,
+    /// Go body. Routed to the Go engine via the GoRuntime
+    /// composition layer (M17-phase3+). Bodies are pre-compiled via
+    /// `graphreact-codegen-go` + `go build -buildmode=c-shared`; the
+    /// daemon loads the artifact through `libloading` and dispatches
+    /// against the `Engine` trait.
+    Go,
 }
 
 impl ComponentLang {
@@ -158,6 +164,7 @@ impl ComponentLang {
         match self {
             Self::Js => "js",
             Self::Python => "python",
+            Self::Go => "go",
         }
     }
 
@@ -169,6 +176,7 @@ impl ComponentLang {
         match value {
             "js" | "javascript" | "ts" | "typescript" => Some(Self::Js),
             "python" | "py" => Some(Self::Python),
+            "go" | "golang" => Some(Self::Go),
             _ => None,
         }
     }

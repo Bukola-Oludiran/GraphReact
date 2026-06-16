@@ -62,6 +62,20 @@ pub fn validate_watch_runtime(runtime: RuntimeArg) -> Result<(), CommandError> {
                  The {runtime} engine has no body to swap.",
             ))),
         )),
+        // M17 Go bodies are pre-compiled to c-shared artifacts —
+        // hot-reload of Go bodies needs the M17 phase 3g
+        // dynamic-reload story (recompile + dlopen the new
+        // artifact) before `--watch --runtime=go` makes sense.
+        // Reject early with a clear message until then.
+        RuntimeArg::Go => Err(CommandError::Runtime(
+            RuntimeError::Engine(graphreact_engine_zig::EngineError::Internal(
+                "`--watch --runtime=go` is not yet supported. M17 Go bodies are pre-compiled \
+                 via `go build -buildmode=c-shared`; dynamic reload of c-shared artifacts lands in \
+                 M17 phase 3g. Until then, rebuild and restart the daemon to pick up Go body \
+                 changes."
+                    .into(),
+            )),
+        )),
     }
 }
 
@@ -99,7 +113,9 @@ pub fn run_watch_blocking(
                 "JSC plus CPython engines are macOS-only in M12.3a/M13. Linux plus Windows land at M12.3b.".into(),
             )),
         )),
-        RuntimeArg::Null | RuntimeArg::Echo => unreachable!("validated above"),
+        RuntimeArg::Null | RuntimeArg::Echo | RuntimeArg::Go => {
+            unreachable!("validated above")
+        }
     }
 }
 
