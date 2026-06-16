@@ -51,9 +51,18 @@
 //!   HeuristicTrustAttenuated / HeuristicPrerequisiteDistance) ride
 //!   on `Tier2Opts.Heuristic`. Two reachability flavors (structural
 //!   default; `DirectoryShortcuts` opt-in).
+//! - **M17 phase 3d-ζ:** SHIPPED. `UseEdgeAcceptHandler(predicate)`
+//!   installs a per-target accept/veto closure; the scheduler invokes
+//!   it from both AcceptEdge mutation paths (3d-β) and Tier 3 queries.
+//!   `g.Tier3(msgType, opts?)` opens a Tier 3 view that filters Tier 2
+//!   candidacy through `predicates[u](s, msgType)`. 12 accessors
+//!   layered onto a `Tier3Query` handle — same surface as Tier2Query.
+//!   Default-accept whenever a predicate is absent or panics, so
+//!   Tier 3 ⊆ Tier 2 monotonically and `Tier 3 == Tier 2` when no
+//!   predicates are registered. Closes the M17 phase 3d arc.
 //!
-//! Future M17 phase 3d-ζ–h sessions add Tier 3 / supervision /
-//! `UseSource` / `UseEffectAsync` on top of this substrate.
+//! Future M17 phase 3e–h sessions add supervision hooks,
+//! `UseSource`, and `UseEffectAsync` on top of this substrate.
 
 /// ABI version baked into the emitted prelude. Must match
 /// [`graphreact_engine_go::ffi::GRX_GO_ABI_VERSION`] (currently `1`).
@@ -264,6 +273,15 @@ var (
     callbackMu        sync.Mutex
     callbackRegistry  = map[uint64]func() interface{{}}{{}}
     nextCallbackToken uint64
+
+    // predicateRegistry holds edge-accept predicates (3d-ζ) keyed by
+    // token id. Each predicate is `func(source, msgType string) bool`.
+    // The Rust scheduler invokes them via the GrxInvokePredicate ABI
+    // from both AcceptEdge mutation commit-time (3d-β) and Tier 3
+    // dry-run query paths.
+    predicateMu        sync.Mutex
+    predicateRegistry  = map[uint64]func(source, msgType string) bool{{}}
+    nextPredicateToken uint64
 )
 
 // registerMessageHandler stores `handler` under a freshly allocated
@@ -1514,6 +1532,308 @@ func (q Tier2Query) ConnectedComponents() [][]string {{
 func (q Tier2Query) CycleDetection() CycleDetectionResult {{
     raw, status := Invoke(
         "host_tier2_cycle_detection",
+        q.msgType,
+        q.directoryShortcuts,
+    )
+    if status != GR_OK {{
+        return CycleDetectionResult{{}}
+    }}
+    var result CycleDetectionResult
+    if err := json.Unmarshal(raw, &result); err != nil {{
+        return CycleDetectionResult{{}}
+    }}
+    return result
+}}
+
+// ----- M17 phase 3d-ζ: edge-accept handler + Tier 3 surface -----
+
+// registerPredicate stores `handler` under a freshly allocated token
+// and returns it. UseEdgeAcceptHandler forwards the token to the
+// Rust side via host_edge_accept_handler; the Rust scheduler invokes
+// GrxInvokePredicate with the same token whenever it needs to ask
+// "would this node accept an edge from `source` for `msgType`?"
+func registerPredicate(handler func(source, msgType string) bool) uint64 {{
+    token := atomic.AddUint64(&nextPredicateToken, 1)
+    predicateMu.Lock()
+    predicateRegistry[token] = handler
+    predicateMu.Unlock()
+    return token
+}}
+
+// UseEdgeAcceptHandler installs `handler` as the per-target edge-
+// accept predicate for the active node. The scheduler invokes the
+// predicate from two paths:
+//
+// - **AcceptEdge mutation veto** (3d-β): when `UseAcceptEdge()`
+//   enqueues a pending mutation, the scheduler consults this
+//   handler before committing the edge.
+// - **Tier 3 query** (3d-ζ): `g.Tier3(msgType, opts?).Neighbors(s)`
+//   etc. filter Tier 2 candidacy through this predicate.
+//
+// Convention: return `true` to accept, `false` to veto. A panic
+// inside the handler is recovered and treated as default-accept,
+// matching the Rust-side `invoke_predicate_static` safe-default.
+func UseEdgeAcceptHandler(handler func(source, msgType string) bool) {{
+    token := registerPredicate(handler)
+    _, _ = Invoke("host_edge_accept_handler", token)
+}}
+
+// GrxInvokePredicate dispatches a Rust-delivered (source, msgType)
+// query to the Go-side edge-accept predicate registered under
+// `token`. Returns: 1 = accept, 0 = veto, -1 = token not found,
+// -2 = panic during invocation. The Rust side treats negative
+// returns as default-accept.
+//
+//export GrxInvokePredicate
+func GrxInvokePredicate(
+    token C.uint64_t,
+    src *C.char, srcLen C.size_t,
+    mt *C.char, mtLen C.size_t,
+) C.int {{
+    predicateMu.Lock()
+    handler, ok := predicateRegistry[uint64(token)]
+    predicateMu.Unlock()
+    if !ok {{
+        return -1
+    }}
+    source := C.GoStringN(src, C.int(srcLen))
+    msgType := C.GoStringN(mt, C.int(mtLen))
+
+    result := true
+    panicked := false
+    func() {{
+        defer func() {{
+            if r := recover(); r != nil {{
+                panicked = true
+            }}
+        }}()
+        result = handler(source, msgType)
+    }}()
+    if panicked {{
+        return -2
+    }}
+    if result {{
+        return 1
+    }}
+    return 0
+}}
+
+// Tier3Opts customises the Tier 3 view returned by g.Tier3. Same
+// shape as Tier2Opts; the heuristic is forwarded for AStarPath.
+type Tier3Opts struct {{
+    DirectoryShortcuts bool
+    Heuristic          string
+}}
+
+// Tier3Query is a Tier 2 view with each candidate target filtered
+// through `predicates[u](s, msgType)`. Tier 3 ⊆ Tier 2; when no
+// predicates are installed, Tier 3 == Tier 2.
+type Tier3Query struct {{
+    msgType            string
+    directoryShortcuts bool
+    heuristic          string
+}}
+
+// Tier3 returns a Tier 3 view for `msgType`. Optional `opts`
+// customise the flavor + A* heuristic. Multiple Tier3Query handles
+// for different message types may coexist within a single render —
+// each is cheap (a small struct, no allocation).
+func (GraphQuery) Tier3(msgType string, opts ...Tier3Opts) Tier3Query {{
+    var o Tier3Opts
+    if len(opts) > 0 {{
+        o = opts[0]
+    }}
+    return Tier3Query{{
+        msgType:            msgType,
+        directoryShortcuts: o.DirectoryShortcuts,
+        heuristic:          o.Heuristic,
+    }}
+}}
+
+// NodeCount returns the total number of nodes that have a registered
+// PermissionManifest. Flavor doesn't affect this.
+func (q Tier3Query) NodeCount() int {{
+    raw, status := Invoke("host_tier3_node_count", q.msgType, q.directoryShortcuts)
+    if status != GR_OK {{
+        return 0
+    }}
+    var n float64
+    if err := json.Unmarshal(raw, &n); err != nil {{
+        return 0
+    }}
+    return int(n)
+}}
+
+// HasNode returns true iff `id` has a registered manifest.
+func (q Tier3Query) HasNode(id string) bool {{
+    raw, status := Invoke("host_tier3_has_node", q.msgType, id, q.directoryShortcuts)
+    if status != GR_OK {{
+        return false
+    }}
+    var b bool
+    if err := json.Unmarshal(raw, &b); err != nil {{
+        return false
+    }}
+    return b
+}}
+
+// Neighbors returns the Tier 3 (predicate-filtered Tier 2) directed
+// neighbours of `id` for `q.msgType`. Sorted.
+func (q Tier3Query) Neighbors(id string) []string {{
+    raw, status := Invoke("host_tier3_neighbors", q.msgType, id, q.directoryShortcuts)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// HasEdge returns true iff the directed Tier 3 edge `(u, v)` exists.
+func (q Tier3Query) HasEdge(u, v string) bool {{
+    raw, status := Invoke("host_tier3_has_edge", q.msgType, u, v, q.directoryShortcuts)
+    if status != GR_OK {{
+        return false
+    }}
+    var b bool
+    if err := json.Unmarshal(raw, &b); err != nil {{
+        return false
+    }}
+    return b
+}}
+
+// BFS returns nodes reachable from `from` in breadth-first order
+// over the Tier 3 adjacency. `depthLimit=0` removes the bound.
+func (q Tier3Query) BFS(from string, depthLimit int) []string {{
+    raw, status := Invoke("host_tier3_bfs", q.msgType, from, depthLimit, q.directoryShortcuts)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// DFS returns nodes reachable from `from` in depth-first order over
+// the Tier 3 adjacency. `depthLimit=0` removes the bound.
+func (q Tier3Query) DFS(from string, depthLimit int) []string {{
+    raw, status := Invoke("host_tier3_dfs", q.msgType, from, depthLimit, q.directoryShortcuts)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// ShortestPath returns the BFS shortest path from `from` to `to`
+// over the Tier 3 adjacency, or nil if no path exists.
+func (q Tier3Query) ShortestPath(from, to string) []string {{
+    raw, status := Invoke("host_tier3_shortest_path", q.msgType, from, to, q.directoryShortcuts)
+    if status != GR_OK {{
+        return nil
+    }}
+    if len(raw) == 4 && string(raw) == "null" {{
+        return nil
+    }}
+    var path []string
+    if err := json.Unmarshal(raw, &path); err != nil {{
+        return nil
+    }}
+    return path
+}}
+
+// TopologicalSort returns a Kahn's topological order of the Tier 3
+// directed adjacency, or nil if it contains a directed cycle.
+func (q Tier3Query) TopologicalSort() []string {{
+    raw, status := Invoke("host_tier3_topological_sort", q.msgType, q.directoryShortcuts)
+    if status != GR_OK {{
+        return nil
+    }}
+    if len(raw) == 4 && string(raw) == "null" {{
+        return nil
+    }}
+    var order []string
+    if err := json.Unmarshal(raw, &order); err != nil {{
+        return nil
+    }}
+    return order
+}}
+
+// AStarPath returns the cost-from-policy A* path from `from` to
+// `to` over the Tier 3 adjacency.
+func (q Tier3Query) AStarPath(from, to string) []string {{
+    raw, status := Invoke(
+        "host_tier3_a_star_path",
+        q.msgType,
+        from,
+        to,
+        q.heuristic,
+        q.directoryShortcuts,
+    )
+    if status != GR_OK {{
+        return nil
+    }}
+    if len(raw) == 4 && string(raw) == "null" {{
+        return nil
+    }}
+    var path []string
+    if err := json.Unmarshal(raw, &path); err != nil {{
+        return nil
+    }}
+    return path
+}}
+
+// AllPaths returns every simple directed path from `from` to `to`
+// over the Tier 3 adjacency. `maxDepth=0` removes the bound.
+func (q Tier3Query) AllPaths(from, to string, maxDepth int) [][]string {{
+    raw, status := Invoke(
+        "host_tier3_all_paths",
+        q.msgType,
+        from,
+        to,
+        maxDepth,
+        q.directoryShortcuts,
+    )
+    if status != GR_OK {{
+        return [][]string{{}}
+    }}
+    var paths [][]string
+    if err := json.Unmarshal(raw, &paths); err != nil {{
+        return [][]string{{}}
+    }}
+    return paths
+}}
+
+// ConnectedComponents returns Tarjan's strongly-connected components
+// of the Tier 3 directed adjacency.
+func (q Tier3Query) ConnectedComponents() [][]string {{
+    raw, status := Invoke(
+        "host_tier3_connected_components",
+        q.msgType,
+        q.directoryShortcuts,
+    )
+    if status != GR_OK {{
+        return [][]string{{}}
+    }}
+    var comps [][]string
+    if err := json.Unmarshal(raw, &comps); err != nil {{
+        return [][]string{{}}
+    }}
+    return comps
+}}
+
+// CycleDetection returns directed-cycle detection over the Tier 3
+// adjacency.
+func (q Tier3Query) CycleDetection() CycleDetectionResult {{
+    raw, status := Invoke(
+        "host_tier3_cycle_detection",
         q.msgType,
         q.directoryShortcuts,
     )

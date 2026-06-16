@@ -132,6 +132,24 @@ pub type gr_go_invoke_handler_fn = unsafe extern "C" fn(
     args_len: usize,
 ) -> c_int;
 
+/// **M17 phase 3d-ζ.** Rust → Go edge-accept-predicate invocation
+/// symbol. The scheduler asks "would this node accept an edge from
+/// `source` for `msg_type`?" — both AcceptEdge mutations (3d-β
+/// commit-time) and Tier 3 queries (3d-ζ dry-run) trigger this. Go
+/// predicate handlers are registered under `token` in the prelude's
+/// `predicateRegistry`. Returns: 1 = accept, 0 = veto, -1 = token
+/// not found in the registry, -2 = internal error / panic during
+/// invocation. On any negative return, the host-side closure
+/// default-accepts so a buggy predicate doesn't silently sever
+/// reachability.
+pub type gr_go_invoke_predicate_fn = unsafe extern "C" fn(
+    token: u64,
+    source: *const c_char,
+    source_len: usize,
+    msg_type: *const c_char,
+    msg_type_len: usize,
+) -> c_int;
+
 /// **M17 phase 3b-complete.** Rust → Go callback-invocation symbol
 /// for envelope-shaped callbacks (UseEffect bodies + their cleanup
 /// closures). Returns a JSON envelope describing the outcome:

@@ -67,6 +67,11 @@ pub struct LoadedRuntime {
     /// load time.
     pub invoke_handler: Option<ffi::gr_go_invoke_handler_fn>,
 
+    /// **M17 phase 3d-ζ.** Rust → Go edge-accept-predicate invocation
+    /// symbol. Optional; if absent, edge-accept predicates default-
+    /// accept and Tier 3 == Tier 2.
+    pub invoke_predicate: Option<ffi::gr_go_invoke_predicate_fn>,
+
     /// **M17 phase 3b-complete.** Rust → Go envelope-shaped callback
     /// invocation symbol. Optional; older phase 3c artifacts that
     /// don't ship it stay loadable but `host_effect` cleanup will
@@ -181,6 +186,10 @@ impl LoadedRuntime {
         let release_callback =
             resolve_optional::<ffi::gr_go_release_callback_fn>(&lib, "GrxReleaseCallback");
 
+        // M17 phase 3d-ζ — optional. Older artifacts default-accept.
+        let invoke_predicate =
+            resolve_optional::<ffi::gr_go_invoke_predicate_fn>(&lib, "GrxInvokePredicate");
+
         Ok(Self {
             abi_version,
             engine_initialize,
@@ -196,6 +205,7 @@ impl LoadedRuntime {
             invoke_handler,
             invoke_callback,
             release_callback,
+            invoke_predicate,
             _lib: lib,
         })
     }

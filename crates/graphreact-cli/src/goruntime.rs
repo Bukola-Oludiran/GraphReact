@@ -42,15 +42,17 @@ use serde_json::Value;
 
 use graphreact_codegen_go::{BuildArtifact, Codegen};
 use graphreact_core::{
-    use_accept_edge as core_use_accept_edge, use_effect as core_use_effect,
-    use_emit as core_use_emit, use_memo as core_use_memo, use_message as core_use_message,
-    use_neighbors as core_use_neighbors, use_state as core_use_state,
-    use_topology as core_use_topology, Attrs, CommunicationGraph, EdgeAcceptPredicate,
-    EffectCleanup, EmitOptions, GraphDirectory, IncomingMessage, NodeContext, NodeDefinition,
-    PermissionManifest, Scheduler, Signal, TopologyEvent, TopologyEventKind,
+    use_accept_edge as core_use_accept_edge, use_edge_accept_handler as core_use_edge_accept_handler,
+    use_effect as core_use_effect, use_emit as core_use_emit, use_memo as core_use_memo,
+    use_message as core_use_message, use_neighbors as core_use_neighbors,
+    use_state as core_use_state, use_topology as core_use_topology, Attrs, CommunicationGraph,
+    EdgeAcceptPredicate, EffectCleanup, EmitOptions, GraphDirectory, IncomingMessage, NodeContext,
+    NodeDefinition, PermissionManifest, Scheduler, Signal, TopologyEvent, TopologyEventKind,
     TopologyFilterOptions,
 };
-use graphreact_engine_go::GoEngine;
+use std::sync::Arc;
+
+use graphreact_engine_go::{invoke_predicate_static, GoEngine, LoadedRuntime};
 use graphreact_engine_zig::{
     BoxCallback, Engine, EngineError, FunctionHandle, HostValue, IsolateHandle, IsolateOptions,
 };
@@ -142,6 +144,16 @@ thread_local! {
     /// 3d-ζ) can borrow them without bringing the full scheduler
     /// into the TLS slot. Mirrors `pyruntime::CURRENT_GRAPH_SNAPSHOT`.
     static CURRENT_GRAPH_SNAPSHOT: RefCell<Option<Rc<GraphSnapshot>>> =
+        const { RefCell::new(None) };
+
+    /// **M17 phase 3d-ζ.** `Arc<LoadedRuntime>` cloned out of the
+    /// engine at GoEngineGuard setup time, BEFORE any body's
+    /// `engine.borrow_mut().call_function(...)` borrow opens. The
+    /// edge-accept-handler closure captures this so it can call
+    /// `invoke_predicate_static(&runtime, token, source, msg_type)`
+    /// without re-entering the engine's RefCell mid-borrow — same
+    /// shape as `pyruntime::invoke_global_static`.
+    static CURRENT_LOADED_RUNTIME: RefCell<Option<Arc<LoadedRuntime>>> =
         const { RefCell::new(None) };
 }
 
@@ -254,6 +266,7 @@ fn reset_global_state() {
     PENDING_MEMO_KEY.with(|p| *p.borrow_mut() = None);
     CURRENT_DIRECTORY.with(|c| *c.borrow_mut() = None);
     CURRENT_GRAPH_SNAPSHOT.with(|c| *c.borrow_mut() = None);
+    CURRENT_LOADED_RUNTIME.with(|c| *c.borrow_mut() = None);
 }
 
 /// RAII guard that installs `(engine, iso)` into the TLS slots for
@@ -287,11 +300,13 @@ impl GoEngineGuard {
         iso: IsolateHandle,
         directory: Rc<RefCell<GraphDirectory>>,
         graph_snapshot: Rc<GraphSnapshot>,
+        loaded: Option<Arc<LoadedRuntime>>,
     ) -> Self {
         CURRENT_ENGINE.with(|c| *c.borrow_mut() = Some(engine));
         CURRENT_ISO.with(|c| c.set(Some(iso)));
         CURRENT_DIRECTORY.with(|c| *c.borrow_mut() = Some(directory));
         CURRENT_GRAPH_SNAPSHOT.with(|c| *c.borrow_mut() = Some(graph_snapshot));
+        CURRENT_LOADED_RUNTIME.with(|c| *c.borrow_mut() = loaded);
         Self { _phantom: () }
     }
 }
@@ -302,7 +317,12 @@ impl Drop for GoEngineGuard {
         CURRENT_ISO.with(|c| c.set(None));
         CURRENT_DIRECTORY.with(|c| *c.borrow_mut() = None);
         CURRENT_GRAPH_SNAPSHOT.with(|c| *c.borrow_mut() = None);
+        CURRENT_LOADED_RUNTIME.with(|c| *c.borrow_mut() = None);
     }
+}
+
+fn current_loaded_runtime() -> Option<Arc<LoadedRuntime>> {
+    CURRENT_LOADED_RUNTIME.with(|c| c.borrow().clone())
 }
 
 // ---------------------------------------------------------------------
@@ -2184,6 +2204,480 @@ fn build_host_tier2_cycle_detection_callback() -> BoxCallback {
     })
 }
 
+// ---------------------------------------------------------------------
+// M17 phase 3d-ζ — Tier 3 directed adjacency + use_edge_accept_handler
+// ---------------------------------------------------------------------
+//
+// Tier 3 layers a per-target accept/veto predicate on top of Tier 2.
+// Bodies install a predicate via `UseEdgeAcceptHandler(fn)`; the
+// scheduler stores it in `Scheduler::edge_accept_predicates` (keyed
+// by the target node's id). Predicates fire from two paths:
+//
+// (a) **Mutation veto** — when `UseAcceptEdge('target')` enqueues a
+//     `PendingMutation::AcceptEdge`, the scheduler consults
+//     `predicates[target](source, "")` before committing the edge.
+//     Outside any active engine borrow → safe to invoke via the
+//     active GoEngineGuard's TLS.
+//
+// (b) **Tier 3 query** — `g.Tier3(msgType, opts?).Neighbors(s)` etc.
+//     filter Tier 2 candidacy through `predicates[u](s, msgType)`.
+//     Runs INSIDE the querying body's `engine.borrow_mut().
+//     call_function(...)` borrow → re-entering the engine's RefCell
+//     would double-borrow. Solution: capture `Arc<LoadedRuntime>` at
+//     registration time and dispatch via `invoke_predicate_static`.
+//
+// Tier3Adj implements the same `DirectedAdj` trait shipped in 3d-ε so
+// every `tier2_*` algorithm helper (bfs / dfs / shortest_path /
+// topological_sort / a_star_path / all_paths /
+// strongly_connected_components / directed_cycle_detection) is reused
+// without duplication.
+
+/// Tier 3 directed adjacency for `msg_type`. Same shape as
+/// [`Tier2Adj`] but built by [`build_tier3_adj`] which consults each
+/// candidate target's edge-accept predicate before including the
+/// `(s, u)` pair.
+struct Tier3Adj {
+    nodes: Vec<String>,
+    out: FxHashMap<String, Vec<String>>,
+}
+
+impl DirectedAdj for Tier3Adj {
+    fn nodes_slice(&self) -> &[String] {
+        &self.nodes
+    }
+    fn neighbors(&self, id: &str) -> &[String] {
+        self.out.get(id).map(Vec::as_slice).unwrap_or(&[])
+    }
+    fn has_node(&self, id: &str) -> bool {
+        self.out.contains_key(id)
+    }
+    fn has_edge(&self, u: &str, v: &str) -> bool {
+        self.out.get(u).is_some_and(|outs| outs.iter().any(|t| t == v))
+    }
+}
+
+/// Build the Tier 3 directed adjacency for `msg_type`. Tier 3 =
+/// Tier 2 ∪ {(s, u) where target u's edge-accept predicate accepts
+/// (s, msg_type)}. The flavor flag is forwarded to the Tier 2
+/// candidacy step.
+///
+/// **Negotiation semantics**: For each Tier 2 candidate `(s, u)`,
+/// invoke `predicates[u](s, msg_type)`. If the predicate is
+/// registered AND returns `false`, exclude the pair. If the
+/// predicate is absent, default-accept — preserves backward
+/// compatibility and makes Tier 3 ≥ vetoed-Tier 2 monotonically
+/// (no predicates installed → Tier 3 == Tier 2). Pure dry-run: the
+/// AcceptEdge mutation is NOT triggered.
+fn build_tier3_adj(
+    graph: &CommunicationGraph,
+    manifests: &FxHashMap<String, PermissionManifest>,
+    predicates: &FxHashMap<String, EdgeAcceptPredicate>,
+    msg_type: &str,
+    include_directory_shortcuts: bool,
+) -> Tier3Adj {
+    let tier2 = build_tier2_adj(graph, manifests, msg_type, include_directory_shortcuts);
+    let mut out: FxHashMap<String, Vec<String>> = FxHashMap::default();
+    for s in &tier2.nodes {
+        let candidates = tier2.out.get(s).cloned().unwrap_or_default();
+        let filtered: Vec<String> = candidates
+            .into_iter()
+            .filter(|u| match predicates.get(u) {
+                Some(predicate) => predicate(s, msg_type),
+                None => true, // Default-accept.
+            })
+            .collect();
+        out.insert(s.clone(), filtered);
+    }
+    Tier3Adj {
+        nodes: tier2.nodes,
+        out,
+    }
+}
+
+fn build_tier3_adj_from_snapshot(
+    snapshot: &GraphSnapshot,
+    msg_type: &str,
+    include_directory_shortcuts: bool,
+) -> Tier3Adj {
+    let graph = snapshot.graph.borrow();
+    let manifests = snapshot.manifests.borrow();
+    let predicates = snapshot.edge_accept_predicates.borrow();
+    build_tier3_adj(
+        &graph,
+        &manifests,
+        &predicates,
+        msg_type,
+        include_directory_shortcuts,
+    )
+}
+
+fn tier3_directory_shortcuts_flag(args: &[HostValue]) -> bool {
+    matches!(args.last(), Some(HostValue::Bool(true)))
+}
+
+/// `host_edge_accept_handler(token)` — called from
+/// `UseEdgeAcceptHandler(predicate)` Go-side wrapper after
+/// registering the predicate as a `predicateRegistry` token. Builds
+/// an `EdgeAcceptPredicate` closure that dispatches into Go via
+/// `invoke_predicate_static` whenever the runtime asks "would this
+/// node accept (s, msgType)?" — both AcceptEdge mutation paths
+/// (outside engine borrow) and Tier 3 queries (inside engine borrow)
+/// trigger it. The static FFI bypass avoids the
+/// `Rc<RefCell<GoEngine>>` double-borrow the in-body path would hit.
+fn build_host_edge_accept_handler_callback() -> BoxCallback {
+    Box::new(|args| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let token = match args.first() {
+            Some(HostValue::Number(n)) => *n as u64,
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_edge_accept_handler: expected Number token, got {other:?}"
+                )));
+            }
+        };
+
+        let runtime = current_loaded_runtime().ok_or_else(|| {
+            EngineError::Internal(
+                "host_edge_accept_handler: loaded-runtime TLS unset (predicate dispatch \
+                 needs an Arc<LoadedRuntime> stashed by GoEngineGuard::with_directory)"
+                    .into(),
+            )
+        })?;
+
+        core_use_edge_accept_handler(move |source_id: &str, msg_type: &str| -> bool {
+            invoke_predicate_static(&runtime, token, source_id, msg_type)
+        });
+        Ok(HostValue::Null)
+    })
+}
+
+// --- 12 host_tier3_* callbacks ---
+//
+// Mirror host_tier2_* signatures verbatim; differ only in
+// constructing `Tier3Adj` (via `build_tier3_adj_from_snapshot`)
+// instead of `Tier2Adj`. All 8 algorithm helpers (`tier2_bfs`,
+// `tier2_dfs`, `tier2_shortest_path`, `tier2_topological_sort`,
+// `tier2_astar_path`, `tier2_all_paths`,
+// `tier2_strongly_connected_components`,
+// `tier2_directed_cycle_detection`) are reused as-is via the
+// `DirectedAdj` trait — that's the load-bearing benefit of the
+// trait-based design from 3d-ε.
+
+fn build_host_tier3_node_count_callback() -> BoxCallback {
+    Box::new(|args| {
+        let _msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Number(0.0)),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Number(0.0));
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let count = snapshot.manifests.borrow().len() as f64;
+        Ok(HostValue::Number(count))
+    })
+}
+
+fn build_host_tier3_has_node_callback() -> BoxCallback {
+    Box::new(|args| {
+        let _msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let id: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Bool(false));
+        };
+        let has = snapshot.manifests.borrow().contains_key(&id);
+        Ok(HostValue::Bool(has))
+    })
+}
+
+fn build_host_tier3_neighbors_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let id: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        Ok(HostValue::Array(
+            adj.neighbors(&id)
+                .iter()
+                .cloned()
+                .map(HostValue::String)
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier3_has_edge_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let u: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let v: String = match args.get(2) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Bool(false));
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        Ok(HostValue::Bool(adj.has_edge(&u, &v)))
+    })
+}
+
+fn build_host_tier3_bfs_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let depth_limit = match args.get(2) {
+            Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as usize),
+            _ => None,
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        Ok(HostValue::Array(
+            tier2_bfs(&adj, &from, depth_limit)
+                .into_iter()
+                .map(HostValue::String)
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier3_dfs_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let depth_limit = match args.get(2) {
+            Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as usize),
+            _ => None,
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        Ok(HostValue::Array(
+            tier2_dfs(&adj, &from, depth_limit)
+                .into_iter()
+                .map(HostValue::String)
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier3_shortest_path_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let to: String = match args.get(2) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Null);
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        match tier2_shortest_path(&adj, &from, &to) {
+            Some(path) => Ok(HostValue::Array(
+                path.into_iter().map(HostValue::String).collect(),
+            )),
+            None => Ok(HostValue::Null),
+        }
+    })
+}
+
+fn build_host_tier3_topological_sort_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Null);
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        match tier2_topological_sort(&adj) {
+            Some(order) => Ok(HostValue::Array(
+                order.into_iter().map(HostValue::String).collect(),
+            )),
+            None => Ok(HostValue::Null),
+        }
+    })
+}
+
+fn build_host_tier3_a_star_path_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let to: String = match args.get(2) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let heuristic: AStarHeuristic = match args.get(3) {
+            Some(HostValue::String(s)) => {
+                AStarHeuristic::from_str(s).unwrap_or(AStarHeuristic::Uniform)
+            }
+            _ => AStarHeuristic::Uniform,
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Null);
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        let dir_handle = current_directory();
+        match tier2_astar_path(&adj, &snapshot, dir_handle.as_ref(), &from, &to, heuristic) {
+            Some(path) => Ok(HostValue::Array(
+                path.into_iter().map(HostValue::String).collect(),
+            )),
+            None => Ok(HostValue::Null),
+        }
+    })
+}
+
+fn build_host_tier3_all_paths_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let from: String = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let to: String = match args.get(2) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max_depth = match args.get(3) {
+            Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as usize),
+            _ => None,
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        let paths = tier2_all_paths(&adj, &from, &to, max_depth);
+        Ok(HostValue::Array(
+            paths
+                .into_iter()
+                .map(|p| HostValue::Array(p.into_iter().map(HostValue::String).collect()))
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier3_connected_components_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        let components = tier2_strongly_connected_components(&adj);
+        Ok(HostValue::Array(
+            components
+                .into_iter()
+                .map(|c| HostValue::Array(c.into_iter().map(HostValue::String).collect()))
+                .collect(),
+        ))
+    })
+}
+
+fn build_host_tier3_cycle_detection_callback() -> BoxCallback {
+    Box::new(|args| {
+        let msg_type: String = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => {
+                return Ok(HostValue::Object(vec![
+                    ("hasCycle".to_string(), HostValue::Bool(false)),
+                    ("cycle".to_string(), HostValue::Null),
+                ]));
+            }
+        };
+        let dir_shortcuts = tier3_directory_shortcuts_flag(args);
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Object(vec![
+                ("hasCycle".to_string(), HostValue::Bool(false)),
+                ("cycle".to_string(), HostValue::Null),
+            ]));
+        };
+        let adj = build_tier3_adj_from_snapshot(&snapshot, &msg_type, dir_shortcuts);
+        let (has, cycle) = tier2_directed_cycle_detection(&adj);
+        let cycle_value = match cycle {
+            Some(edges) => HostValue::Array(
+                edges
+                    .into_iter()
+                    .map(|(u, v)| {
+                        HostValue::Array(vec![HostValue::String(u), HostValue::String(v)])
+                    })
+                    .collect(),
+            ),
+            None => HostValue::Null,
+        };
+        Ok(HostValue::Object(vec![
+            ("hasCycle".to_string(), HostValue::Bool(has)),
+            ("cycle".to_string(), cycle_value),
+        ]))
+    })
+}
+
 /// Parse the third argument of `host_emit` into [`EmitOptions`].
 /// Recognised keys mirror JSC + CPython: `to` (Array of String),
 /// `ttl` (Number), `edgeKey` (String), `direct` (String). Unknown
@@ -2295,11 +2789,20 @@ impl GoRuntime {
         // M17 phase 3d-γ: install directory + graph snapshot TLS so
         // `host_directory_*` + `host_graph_*` callbacks see the live
         // handles for the duration of the batch.
+        //
+        // M17 phase 3d-ζ: pre-extract `Arc<LoadedRuntime>` BEFORE any
+        // body runs (no engine borrow active yet) so the edge-accept
+        // predicate closure can dispatch into Go from inside a body's
+        // active mutable engine borrow without double-borrowing the
+        // RefCell. The same shape pyruntime uses for predicate
+        // dispatch (its `invoke_global_static`).
+        let loaded = self.engine.borrow().loaded_runtime();
         let _engine_guard = GoEngineGuard::with_directory(
             Rc::clone(&self.engine),
             self.iso,
             Rc::clone(&self.directory),
             Rc::clone(&self.graph_snapshot),
+            loaded,
         );
         self.scheduler.process_batch()
     }
@@ -2597,6 +3100,77 @@ pub fn mount_with_scheduler(
             iso,
             "host_tier2_cycle_detection",
             build_host_tier2_cycle_detection_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        // M17 phase 3d-ζ: edge-accept handler + 12 Tier 3 accessors.
+        e.register_callback(
+            iso,
+            "host_edge_accept_handler",
+            build_host_edge_accept_handler_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_node_count",
+            build_host_tier3_node_count_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_has_node",
+            build_host_tier3_has_node_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_neighbors",
+            build_host_tier3_neighbors_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_has_edge",
+            build_host_tier3_has_edge_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_tier3_bfs", build_host_tier3_bfs_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_tier3_dfs", build_host_tier3_dfs_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_shortest_path",
+            build_host_tier3_shortest_path_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_topological_sort",
+            build_host_tier3_topological_sort_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_a_star_path",
+            build_host_tier3_a_star_path_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_all_paths",
+            build_host_tier3_all_paths_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_connected_components",
+            build_host_tier3_connected_components_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_tier3_cycle_detection",
+            build_host_tier3_cycle_detection_callback(),
         )
         .map_err(RuntimeError::Engine)?;
         iso
@@ -4195,6 +4769,159 @@ mod tests {
         );
     }
 
+    /// Phase 3d-ζ: Tier 3 predicate-filtered adjacency. Same
+    /// fixture shape as Tier 2 but relay installs a
+    /// UseEdgeAcceptHandler that vetoes incoming edges from
+    /// producer for "metric". Tier 2 baseline still includes relay
+    /// in producer's neighbours; Tier 3 strictly excludes it.
+    fn scenario_use_graph_query_tier_3_accessors() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-tier3.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("tier3");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-tier3.grx");
+
+        let baseline: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let baseline_cb = std::sync::Arc::clone(&baseline);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_tier3_baseline",
+                Box::new(move |args| {
+                    let row: Vec<String> = match args.first() {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    baseline_cb.lock().push(row);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_tier3_baseline");
+
+        let filtered: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let filtered_cb = std::sync::Arc::clone(&filtered);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_tier3_filtered",
+                Box::new(move |args| {
+                    let row: Vec<String> = match args.first() {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    filtered_cb.lock().push(row);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_tier3_filtered");
+
+        let has_edge_t2: std::sync::Arc<parking_lot::Mutex<Vec<bool>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let has_edge_t2_cb = std::sync::Arc::clone(&has_edge_t2);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_tier3_has_edge_t2",
+                Box::new(move |args| {
+                    if let Some(HostValue::Bool(b)) = args.first() {
+                        has_edge_t2_cb.lock().push(*b);
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_tier3_has_edge_t2");
+
+        let has_edge_t3: std::sync::Arc<parking_lot::Mutex<Vec<bool>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let has_edge_t3_cb = std::sync::Arc::clone(&has_edge_t3);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_tier3_has_edge_t3",
+                Box::new(move |args| {
+                    if let Some(HostValue::Bool(b)) = args.first() {
+                        has_edge_t3_cb.lock().push(*b);
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_tier3_has_edge_t3");
+
+        // Render 1: every body returns its Manifest + installs its
+        // edge-accept predicate. Producer's observations on this
+        // render see incomplete state.
+        runtime.process_batch().expect("batch 1");
+
+        // Bump producer's UseState(0) to re-render with the fully-
+        // populated snapshot + predicate registry.
+        let signal = signal_id_for("producer", 0)
+            .expect("producer should have a use_state(0) signal at hook position 0");
+        signal_set_external(signal, Value::Number(serde_json::Number::from(1)))
+            .expect("bump producer signal to trigger re-render");
+        runtime.process_batch().expect("batch 2");
+
+        let baseline_ns = baseline.lock();
+        let saw_baseline = baseline_ns.iter().any(|row| {
+            row.len() == 2
+                && row.iter().any(|x| x == "observer")
+                && row.iter().any(|x| x == "relay")
+        });
+        assert!(
+            saw_baseline,
+            "expected Tier 2 baseline Neighbors(producer) for 'metric' = [observer, relay]; got {baseline_ns:?}"
+        );
+
+        let filtered_ns = filtered.lock();
+        let saw_filtered = filtered_ns.iter().any(|row| {
+            row.len() == 1 && row[0] == "observer"
+        });
+        assert!(
+            saw_filtered,
+            "expected Tier 3 (predicate-filtered) Neighbors(producer) for 'metric' = [observer]; got {filtered_ns:?}"
+        );
+
+        let t2 = has_edge_t2.lock();
+        let t3 = has_edge_t3.lock();
+        assert!(
+            t2.iter().any(|b| *b),
+            "expected Tier 2 HasEdge(producer, relay) = true; got {t2:?}"
+        );
+        assert!(
+            t3.iter().any(|b| !*b),
+            "expected Tier 3 HasEdge(producer, relay) = false (vetoed); got {t3:?}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -4227,65 +4954,69 @@ mod tests {
         // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
         // between fixtures (each fresh mount expects to start at
         // signal id 1 for assertion stability).
-        eprintln!("[goruntime smoke 1/15] build_and_load + body dispatch");
+        eprintln!("[goruntime smoke 1/16] build_and_load + body dispatch");
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/15] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/16] EngineMisroute rejects non-Go bodies");
         reset_global_state();
         scenario_rejects_non_go_lang();
 
-        eprintln!("[goruntime smoke 3/15] emit/message round-trip");
+        eprintln!("[goruntime smoke 3/16] emit/message round-trip");
         reset_global_state();
         scenario_emit_dispatches_to_neighbor();
 
-        eprintln!("[goruntime smoke 4/15] use_state preserves value across renders");
+        eprintln!("[goruntime smoke 4/16] use_state preserves value across renders");
         reset_global_state();
         scenario_use_state_preserves_value_across_renders();
 
-        eprintln!("[goruntime smoke 5/15] state survives a message");
+        eprintln!("[goruntime smoke 5/16] state survives a message");
         reset_global_state();
         scenario_use_state_survives_a_message();
 
-        eprintln!("[goruntime smoke 6/15] use_effect with empty deps fires once");
+        eprintln!("[goruntime smoke 6/16] use_effect with empty deps fires once");
         reset_global_state();
         scenario_use_effect_empty_deps_fires_once();
 
-        eprintln!("[goruntime smoke 7/15] use_memo single-render fires factory once");
+        eprintln!("[goruntime smoke 7/16] use_memo single-render fires factory once");
         reset_global_state();
         scenario_use_memo_caches_when_deps_unchanged();
 
-        eprintln!("[goruntime smoke 8/15] use_memo recomputes on dep change");
+        eprintln!("[goruntime smoke 8/16] use_memo recomputes on dep change");
         reset_global_state();
         scenario_use_memo_caches_and_recomputes();
 
-        eprintln!("[goruntime smoke 9/15] use_reducer dispatch updates state");
+        eprintln!("[goruntime smoke 9/16] use_reducer dispatch updates state");
         reset_global_state();
         scenario_use_reducer_dispatch_updates_state();
 
-        eprintln!("[goruntime smoke 10/15] use_neighbors returns structural ids");
+        eprintln!("[goruntime smoke 10/16] use_neighbors returns structural ids");
         reset_global_state();
         scenario_use_neighbors_returns_structural_ids();
 
-        eprintln!("[goruntime smoke 11/15] use_accept_edge fires topology event");
+        eprintln!("[goruntime smoke 11/16] use_accept_edge fires topology event");
         reset_global_state();
         scenario_accept_edge_fires_topology_event();
 
-        eprintln!("[goruntime smoke 12/15] use_graph_query Tier 1 accessors");
+        eprintln!("[goruntime smoke 12/16] use_graph_query Tier 1 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_1_accessors();
 
-        eprintln!("[goruntime smoke 13/15] use_directory find_by_id");
+        eprintln!("[goruntime smoke 13/16] use_directory find_by_id");
         reset_global_state();
         scenario_use_directory_find_by_id();
 
-        eprintln!("[goruntime smoke 14/15] use_graph_query Tier 1 algorithms");
+        eprintln!("[goruntime smoke 14/16] use_graph_query Tier 1 algorithms");
         reset_global_state();
         scenario_use_graph_query_tier_1_algorithms();
 
-        eprintln!("[goruntime smoke 15/15] use_graph_query Tier 2 accessors");
+        eprintln!("[goruntime smoke 15/16] use_graph_query Tier 2 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_2_accessors();
+
+        eprintln!("[goruntime smoke 16/16] use_edge_accept_handler + Tier 3 accessors");
+        reset_global_state();
+        scenario_use_graph_query_tier_3_accessors();
 
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup

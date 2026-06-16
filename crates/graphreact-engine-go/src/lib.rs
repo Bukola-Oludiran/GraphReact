@@ -112,6 +112,53 @@ use graphreact_engine_zig::{
 
 pub use loader::LoadedRuntime;
 
+/// **M17 phase 3d-ζ.** Free-function variant of edge-accept predicate
+/// invocation. Takes a `&LoadedRuntime` directly so callers can
+/// dispatch without holding any `GoEngine` borrow — same shape as
+/// `pyruntime::invoke_global_static`. Used by `goruntime::
+/// build_host_edge_accept_handler` for the Tier 3 query path that
+/// runs INSIDE the querying body's `call_function` borrow.
+///
+/// Returns the predicate's boolean verdict (`true` = accept, `false` =
+/// veto). Defaults to `true` ("default-accept") whenever:
+/// - the loaded artifact doesn't export `GrxInvokePredicate`
+///   (older codegen pass),
+/// - the predicate token isn't registered Go-side,
+/// - or the underlying invocation panics on the Go side.
+///
+/// This default-accept policy mirrors pyruntime — a buggy or absent
+/// predicate must not silently sever Tier 3 reachability.
+#[must_use]
+pub fn invoke_predicate_static(
+    runtime: &LoadedRuntime,
+    token: u64,
+    source: &str,
+    msg_type: &str,
+) -> bool {
+    let Some(invoke) = runtime.invoke_predicate else {
+        return true;
+    };
+    let src_bytes = source.as_bytes();
+    let mt_bytes = msg_type.as_bytes();
+    // SAFETY: `src_bytes` and `mt_bytes` are borrowed slices that
+    // live for the duration of this call. The callee reads at most
+    // `src_bytes.len()` / `mt_bytes.len()` bytes and dispatches
+    // synchronously to the registered Go predicate before returning.
+    let rc = unsafe {
+        invoke(
+            token,
+            src_bytes.as_ptr().cast::<c_char>(),
+            src_bytes.len(),
+            mt_bytes.as_ptr().cast::<c_char>(),
+            mt_bytes.len(),
+        )
+    };
+    // 0 = veto; 1 = accept; -1 = token not found, -2 = panic — for
+    // both negative codes, default-accept so a buggy or absent
+    // predicate doesn't silently sever Tier 3 reachability.
+    rc != 0
+}
+
 const RESULT_BUFFER_INITIAL: usize = 4096;
 const RESULT_BUFFER_MAX: usize = 1 << 20; // 1 MiB
 
@@ -257,6 +304,18 @@ impl GoEngine {
             .get()
             .cloned()
             .ok_or_else(|| EngineError::Internal("graphreact-engine-go: not initialised".into()))
+    }
+
+    /// **M17 phase 3d-ζ.** Return a clone of the loaded runtime
+    /// handle. Used by `goruntime::build_host_edge_accept_handler`
+    /// to extract the runtime once at registration time so the
+    /// predicate closure can dispatch into Go without re-entering
+    /// the engine's RefCell (which would double-borrow during a
+    /// Tier 3 query that fires inside the querying body's
+    /// `call_function`).
+    #[must_use]
+    pub fn loaded_runtime(&self) -> Option<Arc<LoadedRuntime>> {
+        self.runtime.get().cloned()
     }
 
     /// **M17 phase 3c.** Dispatch a marshalled message envelope to

@@ -1,0 +1,101 @@
+<!-- M17-phase3d-ζ: Tier 3 predicate-filtered adjacency acceptance.
+
+     Same producer/relay/sink/observer policy graph as go-tier2.grx,
+     but relay installs an UseEdgeAcceptHandler that VETOES incoming
+     edges from `producer` for msg-type "metric".
+
+     STRUCTURAL Tier 2 view for "metric":
+       producer's neighbours = [observer, relay]
+
+     STRUCTURAL Tier 3 view for "metric" (relay's predicate vetoes
+     the producer→relay edge):
+       producer's neighbours = [observer]
+       relay's neighbours    = [sink] (still — relay's predicate
+                                       only governs edges INTO relay)
+
+     The probe asserts Tier 3 ⊊ Tier 2 — vetoing removes relay from
+     producer's reachable set. -->
+
+<Producer lang="go">
+func ProducerBody(ctx Ctx) Manifest {
+    // use_state(0) so the test can bump producer between batches
+    // after every body's manifest + predicate has been installed.
+    _, _ = UseState(0.0)
+
+    g := UseGraphQuery()
+
+    // STRUCTURAL Tier 2 (baseline).
+    nsTier2 := g.Tier2("metric").Neighbors("producer")
+    nsTier2Payload := make([]interface{}, len(nsTier2))
+    for i, id := range nsTier2 {
+        nsTier2Payload[i] = id
+    }
+    _, _ = Invoke("host_observe_tier3_baseline", nsTier2Payload)
+
+    // STRUCTURAL Tier 3 (after relay's predicate vetoes producer).
+    nsTier3 := g.Tier3("metric").Neighbors("producer")
+    nsTier3Payload := make([]interface{}, len(nsTier3))
+    for i, id := range nsTier3 {
+        nsTier3Payload[i] = id
+    }
+    _, _ = Invoke("host_observe_tier3_filtered", nsTier3Payload)
+
+    // HasEdge probes both views.
+    _, _ = Invoke("host_observe_tier3_has_edge_t2", g.Tier2("metric").HasEdge("producer", "relay"))
+    _, _ = Invoke("host_observe_tier3_has_edge_t3", g.Tier3("metric").HasEdge("producer", "relay"))
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{"metric"},
+    }
+}
+</Producer>
+
+<Relay lang="go">
+func RelayBody(ctx Ctx) Manifest {
+    // VETO any "metric" edge from producer; accept everything else.
+    UseEdgeAcceptHandler(func(source, msgType string) bool {
+        if source == "producer" && msgType == "metric" {
+            return false
+        }
+        return true
+    })
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"metric"},
+        Emits:   []string{"metric"},
+    }
+}
+</Relay>
+
+<Sink lang="go">
+func SinkBody(ctx Ctx) Manifest {
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"metric"},
+        Emits:   []string{},
+    }
+}
+</Sink>
+
+<Observer lang="go">
+func ObserverBody(ctx Ctx) Manifest {
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"metric"},
+        Emits:   []string{},
+    }
+}
+</Observer>
+
+<Graph id="go-tier3">
+  <Producer id="producer" />
+  <Relay id="relay" />
+  <Sink id="sink" />
+  <Observer id="observer" />
+  <edge source="producer" target="relay" />
+  <edge source="relay" target="sink" />
+  <edge source="producer" target="observer" />
+</Graph>

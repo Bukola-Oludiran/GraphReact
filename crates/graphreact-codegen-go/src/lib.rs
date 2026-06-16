@@ -538,6 +538,29 @@ mod tests {
                 "prelude missing required M17 phase 3d-ε hook surface: {sym}"
             );
         }
+        // M17 phase 3d-ζ surface: edge-accept handler + Tier 3
+        // predicate-filtered adjacency view + 12 accessors +
+        // GrxInvokePredicate ABI symbol.
+        for sym in [
+            "func UseEdgeAcceptHandler(",
+            "predicateRegistry",
+            "registerPredicate",
+            "GrxInvokePredicate",
+            "type Tier3Opts",
+            "type Tier3Query",
+            "func (GraphQuery) Tier3(",
+            "host_tier3_node_count",
+            "host_tier3_neighbors",
+            "host_tier3_topological_sort",
+            "host_tier3_a_star_path",
+            "host_tier3_connected_components",
+            "host_tier3_cycle_detection",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3d-ζ hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();
