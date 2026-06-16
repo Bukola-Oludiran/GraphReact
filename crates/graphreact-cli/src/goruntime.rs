@@ -156,6 +156,7 @@ mod tests {
     //! end-to-end Go-runtime coverage).
 
     use super::*;
+    use graphreact_engine_zig::HostValue;
 
     #[test]
     fn build_and_load_rejects_missing_file() {
@@ -167,8 +168,14 @@ mod tests {
 
     /// End-to-end happy path: parse `tests/fixtures/go-smoke.grx`,
     /// run codegen-go, run `go build -buildmode=c-shared`, load via
-    /// libloading, initialize, create an isolate. Skipped on systems
-    /// without the `go` toolchain on PATH.
+    /// libloading, initialize, create an isolate, **invoke the
+    /// `<Counter>Body` registered via the codegen-emitted
+    /// dispatch.go**, and assert the returned `Manifest` carries the
+    /// fields the body produced. This is the M17 phase 3b-real
+    /// gating proof: body dispatch is no longer the `null` stub —
+    /// real user-authored Go functions execute end-to-end.
+    ///
+    /// Skipped on systems without the `go` toolchain on PATH.
     ///
     /// Wrapped in `std::process::exit(0)` on success because the Go
     /// runtime's TSD cleanup deadlocks on `pthread_exit` on macOS —
@@ -195,7 +202,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&out_dir);
 
-        let runtime = GoRuntime::build_and_load(&fixture, &out_dir)
+        let mut runtime = GoRuntime::build_and_load(&fixture, &out_dir)
             .expect("build_and_load should succeed for go-smoke.grx");
 
         assert!(!runtime.graph_id.is_empty(), "graph_id empty");
@@ -209,6 +216,51 @@ mod tests {
             runtime.artifact_path.exists(),
             "artifact missing at {}",
             runtime.artifact_path.display()
+        );
+
+        // M17 phase 3b-real gating check — invoke the body and verify
+        // the registered CounterBody function ran end-to-end through
+        // the FFI + dispatch table.
+        let module = runtime
+            .engine
+            .eval_module(runtime.iso, "Counter", "")
+            .expect("eval_module Counter");
+        let body_fn = runtime
+            .engine
+            .resolve_function(runtime.iso, module, "body")
+            .expect("resolve body");
+        let ctx = HostValue::Object(vec![
+            ("id".into(), HostValue::String("counter-1".into())),
+            ("props".into(), HostValue::Object(Vec::new())),
+            ("neighbors".into(), HostValue::Array(Vec::new())),
+        ]);
+        let manifest = runtime
+            .engine
+            .call_function(runtime.iso, body_fn, &[ctx])
+            .expect("call body");
+
+        // The fixture's CounterBody returns `Manifest{ID: ctx.ID, Accepts: [], Emits: []}`.
+        // Real user-authored code ran and we observe its ID round-tripping back from Go.
+        let HostValue::Object(pairs) = &manifest else {
+            panic!("expected Manifest object, got {manifest:?}");
+        };
+        let id = pairs
+            .iter()
+            .find_map(|(k, v)| {
+                if k == "id" {
+                    if let HostValue::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .expect("manifest missing id");
+        assert_eq!(
+            id, "counter-1",
+            "CounterBody should round-trip ctx.ID; got manifest {manifest:?}"
         );
 
         // Exit fast — see module-level docs on the Go TSD-cleanup

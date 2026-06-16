@@ -27,11 +27,23 @@
 //!
 //! - **Phase 3a (parser-side):** SHIPPED — [`graphreact_grx_parser::ast::ComponentLang::Go`]
 //!   recognises `lang="go" | "golang"` bodies.
-//! - **Phase 3b v1 (this crate):** SHIPPED — codegen emits a
-//!   substrate-only prelude with the full `//export Grx*` symbol
-//!   surface. `GrxFunctionCall` returns `null` for every body call;
-//!   the dispatch table that maps `<Component>.<Function>` to real
-//!   Go body code lands in M17 phase 3c–h.
+//! - **Phase 3b-real (this crate):** SHIPPED — codegen emits the
+//!   prelude + per-component `body_<C>.go` + a `dispatch.go` that
+//!   populates a process-global `bodyRegistry` from `init()`.
+//!   `GrxFunctionCall` routes by `(component, fn_name)` into the
+//!   registry; user bodies authored as `func <C>Body(ctx Ctx) Manifest`
+//!   actually execute end-to-end. The hook surface (`UseState` /
+//!   `UseEffect` / `UseEmit` / `UseMessage` / etc.) layers on top in
+//!   M17 phase 3c–h.
+//!
+//! # Author convention
+//!
+//! For each `<C lang="go">…</C>` definition, the user MUST export a
+//! Go function named `<C>Body(ctx Ctx) Manifest`. The codegen-emitted
+//! `dispatch.go` registers it under the component name via
+//! `RegisterBody`. A component without the matching function will
+//! surface a Go compile error from `go build`, naming the missing
+//! identifier.
 //!
 //! [`graphreact-engine-go`]: ../../graphreact-engine-go/
 
@@ -114,15 +126,18 @@ impl Codegen {
         Self
     }
 
-    /// Emit the prelude + per-body source files into `out_dir`.
+    /// Emit the prelude + per-body source files + dispatch.go into
+    /// `out_dir`.
     ///
     /// Files written:
     /// - `<out_dir>/grx_prelude.go` — canonical FFI scaffold from
     ///   [`prelude::render`].
     /// - `<out_dir>/body_<safe_name>.go` for each Go body — wraps the
     ///   `<X lang="go">...</X>` source in a `package main`
-    ///   declaration. Note: bodies share the prelude's package
-    ///   namespace by design.
+    ///   declaration. Bodies share the prelude's package namespace.
+    /// - `<out_dir>/dispatch.go` — codegen-emitted `init()` that
+    ///   registers each component's `<C>Body` function in the
+    ///   prelude's `bodyRegistry`. See [`prelude::render_dispatch`].
     /// - `<out_dir>/go.mod` — minimal module file so `go build` runs
     ///   without `GOPATH` configuration.
     ///
@@ -151,11 +166,18 @@ impl Codegen {
         write_file(&out_dir.join("grx_prelude.go"), &prelude::render())?;
         write_file(&out_dir.join("go.mod"), &prelude::render_go_mod())?;
 
-        for def in go_defs {
+        for def in &go_defs {
             let safe = sanitize_filename(&def.component);
             let body_path = out_dir.join(format!("body_{safe}.go"));
             write_file(&body_path, &wrap_body(&def.component, &def.code))?;
         }
+
+        let component_names: Vec<String> =
+            go_defs.iter().map(|d| d.component.clone()).collect();
+        write_file(
+            &out_dir.join("dispatch.go"),
+            &prelude::render_dispatch(&component_names),
+        )?;
 
         Ok(())
     }
@@ -340,19 +362,21 @@ mod tests {
     }
 
     #[test]
-    fn emit_writes_prelude_and_body_and_go_mod() {
+    fn emit_writes_prelude_and_body_and_dispatch_and_go_mod() {
         let cg = Codegen::new();
-        let body = "// Counter body\nfunc CounterBody(ctx Ctx) {}\n";
+        let body = "// Counter body\nfunc CounterBody(ctx Ctx) Manifest { return Manifest{} }\n";
         let ir = ir_with_go_body("Counter", body);
         let out = tempdir();
         cg.emit_prelude(&ir, out.path()).expect("emit_prelude");
 
         let prelude_path = out.path().join("grx_prelude.go");
         let body_path = out.path().join("body_Counter.go");
+        let dispatch_path = out.path().join("dispatch.go");
         let mod_path = out.path().join("go.mod");
 
         assert!(prelude_path.exists(), "prelude missing");
         assert!(body_path.exists(), "body missing");
+        assert!(dispatch_path.exists(), "dispatch.go missing");
         assert!(mod_path.exists(), "go.mod missing");
 
         let prelude_src = fs::read_to_string(&prelude_path).unwrap();
@@ -377,11 +401,24 @@ mod tests {
                 "prelude missing required symbol: {sym}"
             );
         }
+        // The substrate types + body-dispatch surface must be present:
+        // a regression that strips RegisterBody or bodyRegistry would
+        // silently break user-authored body dispatch.
+        for sym in ["type Ctx", "type Manifest", "RegisterBody", "bodyRegistry"] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required body-dispatch surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();
         assert!(body_src.contains("CounterBody"));
         assert!(body_src.contains("package main"));
+
+        let dispatch_src = fs::read_to_string(&dispatch_path).unwrap();
+        assert!(dispatch_src.contains("RegisterBody(\"Counter\", CounterBody)"));
+        assert!(dispatch_src.contains("func init()"));
 
         let mod_src = fs::read_to_string(&mod_path).unwrap();
         assert!(mod_src.contains("module grxbody"));
@@ -479,8 +516,12 @@ mod tests {
         }
 
         let cg = Codegen::new();
-        // A trivial body that's syntactically valid Go.
-        let body = "// Trivial body for the build smoke test.\n";
+        // Phase 3b-real convention: the codegen-emitted dispatch.go
+        // calls `RegisterBody("Smoke", SmokeBody)`, so the body MUST
+        // define `SmokeBody(ctx Ctx) Manifest` or `go build` rejects
+        // the undefined identifier. Keeps the build-smoke aligned
+        // with the production author convention.
+        let body = "func SmokeBody(ctx Ctx) Manifest { return Manifest{ID: ctx.ID} }\n";
         let ir = ir_with_go_body("Smoke", body);
 
         let src = tempdir();
