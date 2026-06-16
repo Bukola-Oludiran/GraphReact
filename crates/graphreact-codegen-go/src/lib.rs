@@ -459,6 +459,21 @@ mod tests {
                 "prelude missing required M17 phase 3d-α hook surface: {sym}"
             );
         }
+        // M17 phase 3d-β surface: neighbors + topology +
+        // accept_edge hooks. Stripping any of these breaks the
+        // structural-graph navigation acceptance.
+        for sym in [
+            "func UseNeighbors(",
+            "func UseTopology(",
+            "func UseAcceptEdge()",
+            "type TopologyEvent",
+            "type TopologyFilter",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3d-β hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();

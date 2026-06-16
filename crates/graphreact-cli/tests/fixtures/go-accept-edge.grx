@@ -1,0 +1,43 @@
+<!-- M17-phase3d-β: UseAcceptEdge → topology event round-trip.
+     Acceptor enqueues AcceptEdge("listener") via UseEffect once on
+     mount; Listener registers a UseTopology handler that surfaces
+     every event it observes via Invoke("host_observe_topology", ...).
+     After process_batch the AcceptEdge mutation drains and fires
+     an "edge-added" event the Listener captures. -->
+
+<Acceptor lang="go">
+func AcceptorBody(ctx Ctx) Manifest {
+    accept := UseAcceptEdge()
+    UseEffect(func() func() {
+        accept("listener")
+        return nil
+    }, []interface{}{})
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Acceptor>
+
+<Listener lang="go">
+func ListenerBody(ctx Ctx) Manifest {
+    UseTopology(func(event TopologyEvent) {
+        // Surface kind + u + v so the test can match the
+        // "edge-added: acceptor -> listener" round-trip.
+        _, _ = Invoke("host_observe_topology", event.Kind, event.U, event.V)
+    })
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Listener>
+
+<Graph id="go-accept-edge">
+  <Acceptor id="acceptor" />
+  <Listener id="listener" />
+</Graph>

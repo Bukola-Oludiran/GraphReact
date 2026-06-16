@@ -21,10 +21,16 @@
 //!   on hit they return the cached value, on miss they run the
 //!   factory + call `Invoke("host_memo_store", value)`. Avoids
 //!   re-entering Go from inside a held engine borrow.
+//! - **M17 phase 3d-β:** SHIPPED. `UseNeighbors` + `UseTopology` +
+//!   `UseAcceptEdge` Go-side helpers. Neighbors is a pure
+//!   HOOK_CTX read; UseTopology piggybacks on the handler-registry
+//!   substrate from `UseMessage` (same envelope shape); UseAcceptEdge
+//!   enqueues a `PendingMutation::AcceptEdge` via the host callback
+//!   that fires an `EdgeAdded` topology event on the next cascade.
 //!
-//! Future M17 phase 3d-β–h sessions add `UseNeighbors`,
-//! `UseGraphQuery`, supervision hooks, `UseSource`, and
-//! `UseEffectAsync` on top of this substrate.
+//! Future M17 phase 3d-γ–h sessions add `UseGraphQuery`,
+//! supervision hooks, `UseSource`, and `UseEffectAsync` on top of
+//! this substrate.
 
 /// ABI version baked into the emitted prelude. Must match
 /// [`graphreact_engine_go::ffi::GRX_GO_ABI_VERSION`] (currently `1`).
@@ -849,6 +855,94 @@ func GrxInvokeHandler(
     }}
     handler(msg)
     return GR_OK
+}}
+
+// ----- M17 phase 3d-β: neighbors / topology / accept_edge -----
+
+// UseNeighbors returns the structural neighbour IDs of the active
+// node, optionally filtered Go-side. Pure HOOK_CTX read — no
+// scheduler mutation, no engine re-entry. The filter, when present,
+// runs against each id and only `true` returns are kept.
+//
+// Mirrors React's `useNeighbors` shape modulo Go conventions.
+func UseNeighbors(filter ...func(id string) bool) []string {{
+    raw, status := Invoke("host_neighbors")
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var all []string
+    if err := json.Unmarshal(raw, &all); err != nil {{
+        return []string{{}}
+    }}
+    if len(filter) == 0 || filter[0] == nil {{
+        return all
+    }}
+    pred := filter[0]
+    out := make([]string, 0, len(all))
+    for _, id := range all {{
+        if pred(id) {{
+            out = append(out, id)
+        }}
+    }}
+    return out
+}}
+
+// TopologyEvent is the JSON shape the scheduler emits when nodes /
+// edges are added or removed. Mirrors `graphreact_core::TopologyEvent`
+// modulo Go conventions (`Kind` = lowercase-hyphenated string).
+type TopologyEvent struct {{
+    Kind   string `json:"kind"`
+    NodeID string `json:"nodeId,omitempty"`
+    U      string `json:"u,omitempty"`
+    V      string `json:"v,omitempty"`
+    Key    string `json:"key,omitempty"`
+}}
+
+// TopologyFilter narrows which events the handler observes. `Kinds`
+// (when non-empty) is the inclusive list; `NeighborsOnly` restricts
+// to events touching the active node's structural neighbours.
+type TopologyFilter struct {{
+    Kinds         []string `json:"kinds,omitempty"`
+    NeighborsOnly bool     `json:"neighborsOnly,omitempty"`
+}}
+
+// UseTopology registers a handler that fires on topology mutations
+// (node added/removed, edge added/removed/updated). The Rust-side
+// scheduler dispatches events through the same handler-registry
+// substrate UseMessage uses, so the handler is keyed by token and
+// looked up via GrxInvokeHandler on each fire.
+//
+// Re-entrancy: the handler runs from the scheduler's topology
+// dispatch (well outside any body's call_function), so it can call
+// other UseState setters / UseEmit closures without engine-borrow
+// contention.
+func UseTopology(handler func(event TopologyEvent), filter ...TopologyFilter) {{
+    // Marshal the typed handler into the map[string]interface{{}}
+    // shape the shared handlerRegistry expects.
+    wrapped := func(msg map[string]interface{{}}) {{
+        var ev TopologyEvent
+        raw, err := json.Marshal(msg)
+        if err == nil {{
+            _ = json.Unmarshal(raw, &ev)
+        }}
+        handler(ev)
+    }}
+    token := registerMessageHandler(wrapped)
+    if len(filter) > 0 {{
+        _, _ = Invoke("host_topology", token, filter[0])
+    }} else {{
+        _, _ = Invoke("host_topology", token, nil)
+    }}
+}}
+
+// UseAcceptEdge returns a closure that enqueues an
+// `AcceptEdge(target)` mutation against the scheduler. The mutation
+// drains at the next cascade round and fires an `EdgeAdded` topology
+// event automatically. Mirrors the M13-phase3d-β + JSC semantics.
+func UseAcceptEdge() func(target string) {{
+    return func(target string) {{
+        _, _ = Invoke("host_accept_edge", target)
+    }}
 }}
 
 // GrxInvokeCallback invokes a generic Go callback stored under

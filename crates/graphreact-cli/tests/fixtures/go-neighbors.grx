@@ -1,0 +1,30 @@
+<!-- M17-phase3d-β: UseNeighbors observation. NeighborNode reads its
+     structural neighbour ids on every render via UseNeighbors() and
+     surfaces them via Invoke("host_observe_neighbors", ...). The
+     graph wires A->B + A->C so neighbour(A) = [B, C]. The test
+     asserts the observation contains both ids. -->
+
+<NeighborNode lang="go">
+func NeighborNodeBody(ctx Ctx) Manifest {
+    ns := UseNeighbors()
+    payload := make([]interface{}, len(ns))
+    for i, id := range ns {
+        payload[i] = id
+    }
+    _, _ = Invoke("host_observe_neighbors", payload)
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</NeighborNode>
+
+<Graph id="go-neighbors">
+  <NeighborNode id="a" />
+  <NeighborNode id="b" />
+  <NeighborNode id="c" />
+  <edge source="a" target="b" />
+  <edge source="a" target="c" />
+</Graph>

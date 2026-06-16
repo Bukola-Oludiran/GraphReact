@@ -42,10 +42,12 @@ use serde_json::Value;
 
 use graphreact_codegen_go::{BuildArtifact, Codegen};
 use graphreact_core::{
-    use_effect as core_use_effect, use_emit as core_use_emit, use_memo as core_use_memo,
-    use_message as core_use_message, use_state as core_use_state, Attrs, CommunicationGraph,
-    EffectCleanup, EmitOptions, IncomingMessage, NodeContext, NodeDefinition, PermissionManifest,
-    Scheduler, Signal,
+    use_accept_edge as core_use_accept_edge, use_effect as core_use_effect,
+    use_emit as core_use_emit, use_memo as core_use_memo, use_message as core_use_message,
+    use_neighbors as core_use_neighbors, use_state as core_use_state,
+    use_topology as core_use_topology, Attrs, CommunicationGraph, EffectCleanup, EmitOptions,
+    IncomingMessage, NodeContext, NodeDefinition, PermissionManifest, Scheduler, Signal,
+    TopologyEvent, TopologyEventKind, TopologyFilterOptions,
 };
 use graphreact_engine_go::GoEngine;
 use graphreact_engine_zig::{
@@ -599,6 +601,161 @@ fn build_host_memo_store_callback() -> BoxCallback {
     })
 }
 
+// ----- M17 phase 3d-β: neighbors / topology / accept_edge -----
+
+/// Build the `host_neighbors()` callback. Pure HOOK_CTX read — no
+/// engine borrow needed. Returns the active node's structural
+/// neighbour IDs as `HostValue::Array(String...)`. The Go-side
+/// `UseNeighbors(filter?)` applies any predicate Go-side to avoid
+/// per-element FFI hops.
+fn build_host_neighbors_callback() -> BoxCallback {
+    Box::new(|_args| {
+        let neighbors: Vec<String> = core_use_neighbors::<fn(&str) -> bool>(None);
+        Ok(HostValue::Array(
+            neighbors.into_iter().map(HostValue::String).collect(),
+        ))
+    })
+}
+
+/// Build the `host_topology(token, filter?)` callback. Go-side
+/// `UseTopology(handler, filter?)` registers `handler` under a token
+/// in the shared message-handler registry, then forwards the token
+/// here. Each topology mutation marshals the event into the
+/// `{kind, nodeId? | u, v, key?}` shape and invokes the registered
+/// Go handler via `GoEngine::invoke_handler` — same path
+/// `host_message` uses.
+fn build_host_topology_callback() -> BoxCallback {
+    Box::new(|args| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let token = match args.first() {
+            Some(HostValue::Number(n)) => *n as u64,
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_topology: expected Number token, got {other:?}"
+                )))
+            }
+        };
+        let filter = parse_topology_filter(args.get(1));
+
+        let engine = current_engine()
+            .ok_or_else(|| EngineError::Internal("host_topology: engine TLS unset".into()))?;
+
+        core_use_topology(
+            move |event: &TopologyEvent| {
+                let host_event = topology_event_to_host_value(event);
+                if let Err(e) = engine.borrow().invoke_handler(token, &host_event) {
+                    eprintln!("[graphreact-cli] use_topology handler invocation failed: {e}");
+                }
+            },
+            filter,
+        );
+        Ok(HostValue::Null)
+    })
+}
+
+/// Build the `host_accept_edge(target)` callback. Go-side
+/// `UseAcceptEdge()` returns a closure that forwards a target id
+/// here. We route through `core_use_accept_edge()` which returns the
+/// `Rc<dyn Fn(&str)>` from HOOK_CTX. Read-only HOOK_CTX access — no
+/// engine borrow held during the body's call_function path; safe to
+/// call inline from a render.
+fn build_host_accept_edge_callback() -> BoxCallback {
+    Box::new(|args| {
+        let target = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_accept_edge: expected String target, got {other:?}"
+                )))
+            }
+        };
+        let accept_edge = core_use_accept_edge();
+        accept_edge(&target);
+        Ok(HostValue::Null)
+    })
+}
+
+/// Decode a Go-shape `TopologyFilter` from the `host_topology` call's
+/// second arg. Go shape: `{"kinds": ["node-added", ...],
+/// "neighborsOnly": true}`. Mirrors pyruntime's `parse_topology_filter`
+/// verbatim — same key recognition, same kind-string mapping.
+fn parse_topology_filter(arg: Option<&HostValue>) -> Option<TopologyFilterOptions> {
+    let HostValue::Object(pairs) = arg? else {
+        return None;
+    };
+    let mut kinds: Option<Vec<TopologyEventKind>> = None;
+    let mut neighbors_only = false;
+    for (k, v) in pairs {
+        match (k.as_str(), v) {
+            ("kinds", HostValue::Array(arr)) => {
+                let parsed: Vec<TopologyEventKind> = arr
+                    .iter()
+                    .filter_map(|x| match x {
+                        HostValue::String(s) => match s.as_str() {
+                            "node-added" | "NodeAdded" => Some(TopologyEventKind::NodeAdded),
+                            "node-removed" | "NodeRemoved" => Some(TopologyEventKind::NodeRemoved),
+                            "edge-added" | "EdgeAdded" => Some(TopologyEventKind::EdgeAdded),
+                            "edge-removed" | "EdgeRemoved" => Some(TopologyEventKind::EdgeRemoved),
+                            "edge-updated" | "EdgeUpdated" => Some(TopologyEventKind::EdgeUpdated),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                kinds = Some(parsed);
+            }
+            ("neighborsOnly", HostValue::Bool(b)) => neighbors_only = *b,
+            _ => {}
+        }
+    }
+    Some(TopologyFilterOptions {
+        kinds,
+        neighbors_only,
+    })
+}
+
+/// Marshal a [`TopologyEvent`] into the Go-shape envelope mirroring
+/// pyruntime's `topology_event_to_host_value` (`{kind, nodeId? | u, v, key?}`).
+fn topology_event_to_host_value(event: &TopologyEvent) -> HostValue {
+    match event {
+        TopologyEvent::NodeAdded { node_id } => HostValue::Object(vec![
+            ("kind".to_string(), HostValue::String("node-added".into())),
+            ("nodeId".to_string(), HostValue::String(node_id.clone())),
+        ]),
+        TopologyEvent::NodeRemoved { node_id } => HostValue::Object(vec![
+            (
+                "kind".to_string(),
+                HostValue::String("node-removed".into()),
+            ),
+            ("nodeId".to_string(), HostValue::String(node_id.clone())),
+        ]),
+        TopologyEvent::EdgeAdded { u, v, key } => HostValue::Object(vec![
+            ("kind".to_string(), HostValue::String("edge-added".into())),
+            ("u".to_string(), HostValue::String(u.clone())),
+            ("v".to_string(), HostValue::String(v.clone())),
+            ("key".to_string(), HostValue::String(key.clone())),
+        ]),
+        TopologyEvent::EdgeRemoved { u, v, key } => HostValue::Object(vec![
+            (
+                "kind".to_string(),
+                HostValue::String("edge-removed".into()),
+            ),
+            ("u".to_string(), HostValue::String(u.clone())),
+            ("v".to_string(), HostValue::String(v.clone())),
+            ("key".to_string(), HostValue::String(key.clone())),
+        ]),
+        TopologyEvent::EdgeUpdated { u, v, key } => HostValue::Object(vec![
+            (
+                "kind".to_string(),
+                HostValue::String("edge-updated".into()),
+            ),
+            ("u".to_string(), HostValue::String(u.clone())),
+            ("v".to_string(), HostValue::String(v.clone())),
+            ("key".to_string(), HostValue::String(key.clone())),
+        ]),
+    }
+}
+
 /// Parse the third argument of `host_emit` into [`EmitOptions`].
 /// Recognised keys mirror JSC + CPython: `to` (Array of String),
 /// `ttl` (Number), `edgeKey` (String), `direct` (String). Unknown
@@ -814,6 +971,18 @@ pub fn mount_with_scheduler(
             .map_err(RuntimeError::Engine)?;
         e.register_callback(iso, "host_memo_store", build_host_memo_store_callback())
             .map_err(RuntimeError::Engine)?;
+        // M17 phase 3d-β: structural-graph navigation + topology
+        // events + edge-acceptance mutation.
+        e.register_callback(iso, "host_neighbors", build_host_neighbors_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_topology", build_host_topology_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_accept_edge",
+            build_host_accept_edge_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
         iso
     };
 
@@ -1625,6 +1794,135 @@ mod tests {
         );
     }
 
+    /// Phase 3d-β: UseNeighbors returns the active node's structural
+    /// neighbours. The fixture wires a → b and a → c so the body of
+    /// node "a" observes both ids on its render.
+    fn scenario_use_neighbors_returns_structural_ids() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-neighbors.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("neighbors");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-neighbors.grx");
+
+        // Capture neighbour observations keyed by node id. The
+        // fixture passes the list as the args slice itself (Invoke
+        // builds args from each varargs entry) — first arg is the
+        // first neighbour id, etc. Per-node observations land via
+        // the test-side observer keyed by call order.
+        let observations: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observations_for_cb = std::sync::Arc::clone(&observations);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_neighbors",
+                Box::new(move |args| {
+                    // The Go side calls Invoke("host_observe_neighbors",
+                    // payload) where payload is []interface{} of ids;
+                    // the args slice's first element IS the payload
+                    // array. Extract the inner string list.
+                    let row: Vec<String> = match args.first() {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    observations_for_cb.lock().push(row);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_neighbors");
+
+        runtime.process_batch().expect("batch 1");
+
+        let obs = observations.lock();
+        // a sees [b, c]; b and c see [] each (root-to-leaves edges
+        // mean only a has outgoing neighbours in the structural
+        // sense the hook reads).
+        let has_two_id_row = obs.iter().any(|row| {
+            row.len() == 2
+                && row.iter().any(|x| x == "b")
+                && row.iter().any(|x| x == "c")
+        });
+        assert!(
+            has_two_id_row,
+            "expected at least one row with both b and c neighbours; got obs={obs:?}"
+        );
+    }
+
+    /// Phase 3d-β: UseAcceptEdge enqueues an AcceptEdge mutation;
+    /// the scheduler drains it and fires an EdgeAdded topology
+    /// event the UseTopology handler observes. End-to-end test for
+    /// both `host_accept_edge` and `host_topology`.
+    fn scenario_accept_edge_fires_topology_event() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-accept-edge.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("accept-edge");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-accept-edge.grx");
+
+        let observations: std::sync::Arc<parking_lot::Mutex<Vec<(String, String, String)>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observations_for_cb = std::sync::Arc::clone(&observations);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_topology",
+                Box::new(move |args| {
+                    let kind = match args.first() {
+                        Some(HostValue::String(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    let u = match args.get(1) {
+                        Some(HostValue::String(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    let v = match args.get(2) {
+                        Some(HostValue::String(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    observations_for_cb.lock().push((kind, u, v));
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_topology");
+
+        // Batch 1: Acceptor's effect fires post-render, enqueueing
+        // AcceptEdge("listener"). The scheduler drains the mutation
+        // at the next cascade round and fires EdgeAdded.
+        runtime.process_batch().expect("batch 1");
+        // Batch 2 ensures any deferred topology dispatch propagates
+        // (the listener's UseTopology handler runs from the
+        // scheduler's dispatch queue).
+        runtime.process_batch().expect("batch 2");
+
+        let obs = observations.lock();
+        // The handler should have observed an "edge-added" event
+        // with u=acceptor, v=listener.
+        let saw = obs.iter().any(|(kind, u, v)| {
+            kind == "edge-added" && u == "acceptor" && v == "listener"
+        });
+        assert!(
+            saw,
+            "expected edge-added(acceptor -> listener) in topology stream; got obs={obs:?}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -1657,41 +1955,49 @@ mod tests {
         // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
         // between fixtures (each fresh mount expects to start at
         // signal id 1 for assertion stability).
-        eprintln!("[goruntime smoke 1/9] build_and_load + body dispatch");
+        eprintln!("[goruntime smoke 1/11] build_and_load + body dispatch");
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/9] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/11] EngineMisroute rejects non-Go bodies");
         reset_global_state();
         scenario_rejects_non_go_lang();
 
-        eprintln!("[goruntime smoke 3/9] emit/message round-trip");
+        eprintln!("[goruntime smoke 3/11] emit/message round-trip");
         reset_global_state();
         scenario_emit_dispatches_to_neighbor();
 
-        eprintln!("[goruntime smoke 4/9] use_state preserves value across renders");
+        eprintln!("[goruntime smoke 4/11] use_state preserves value across renders");
         reset_global_state();
         scenario_use_state_preserves_value_across_renders();
 
-        eprintln!("[goruntime smoke 5/9] state survives a message");
+        eprintln!("[goruntime smoke 5/11] state survives a message");
         reset_global_state();
         scenario_use_state_survives_a_message();
 
-        eprintln!("[goruntime smoke 6/9] use_effect with empty deps fires once");
+        eprintln!("[goruntime smoke 6/11] use_effect with empty deps fires once");
         reset_global_state();
         scenario_use_effect_empty_deps_fires_once();
 
-        eprintln!("[goruntime smoke 7/9] use_memo single-render fires factory once");
+        eprintln!("[goruntime smoke 7/11] use_memo single-render fires factory once");
         reset_global_state();
         scenario_use_memo_caches_when_deps_unchanged();
 
-        eprintln!("[goruntime smoke 8/9] use_memo recomputes on dep change");
+        eprintln!("[goruntime smoke 8/11] use_memo recomputes on dep change");
         reset_global_state();
         scenario_use_memo_caches_and_recomputes();
 
-        eprintln!("[goruntime smoke 9/9] use_reducer dispatch updates state");
+        eprintln!("[goruntime smoke 9/11] use_reducer dispatch updates state");
         reset_global_state();
         scenario_use_reducer_dispatch_updates_state();
+
+        eprintln!("[goruntime smoke 10/11] use_neighbors returns structural ids");
+        reset_global_state();
+        scenario_use_neighbors_returns_structural_ids();
+
+        eprintln!("[goruntime smoke 11/11] use_accept_edge fires topology event");
+        reset_global_state();
+        scenario_accept_edge_fires_topology_event();
 
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup
