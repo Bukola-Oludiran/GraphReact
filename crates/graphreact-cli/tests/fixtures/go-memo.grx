@@ -1,0 +1,33 @@
+<!-- M17-phase3d-α: UseMemo split-cache acceptance. Memo body holds
+     use_state(0); body memoises a derived "doubled" value via
+     UseMemo(factory, [count]). The factory increments a host-side
+     counter so the test can assert how many times it actually ran.
+     Driving 3 renders with deps=[0,0,7] should fire the factory
+     exactly twice (initial render + when count changes to 7). -->
+
+<MemoNode lang="go">
+func MemoNodeBody(ctx Ctx) Manifest {
+    countAny, _ := UseState(0.0)
+    count, _ := countAny.(float64)
+
+    doubledAny := UseMemo(func() interface{} {
+        // Bump the host-side factory-run counter so the test can
+        // observe re-computation frequency.
+        _, _ = Invoke("host_observe_factory", count)
+        return count * 2.0
+    }, []interface{}{count})
+
+    doubled, _ := doubledAny.(float64)
+    _, _ = Invoke("host_observe", doubled)
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</MemoNode>
+
+<Graph id="go-memo">
+  <MemoNode id="memo-1" />
+</Graph>

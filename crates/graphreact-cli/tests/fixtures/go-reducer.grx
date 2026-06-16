@@ -1,0 +1,42 @@
+<!-- M17-phase3d-α: UseReducer acceptance. ReducerNode holds a counter
+     via UseReducer(reducer, 0); UseMessage("inc") delivers actions
+     to dispatch. After one external "inc" message, the next render
+     observes count==1. UseReducer is pure user-land over UseState
+     so this also doubly verifies UseState + UseMessage still work. -->
+
+<ReducerNode lang="go">
+func ReducerNodeBody(ctx Ctx) Manifest {
+    stateAny, dispatch := UseReducer(
+        func(state interface{}, action interface{}) interface{} {
+            cur, _ := state.(float64)
+            actStr, _ := action.(string)
+            switch actStr {
+            case "inc":
+                return cur + 1.0
+            case "dec":
+                return cur - 1.0
+            default:
+                return cur
+            }
+        },
+        0.0,
+    )
+
+    cur, _ := stateAny.(float64)
+    _, _ = Invoke("host_observe", cur)
+
+    UseMessage("inc", func(msg map[string]interface{}) {
+        dispatch("inc")
+    })
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"inc"},
+        Emits:   []string{},
+    }
+}
+</ReducerNode>
+
+<Graph id="go-reducer">
+  <ReducerNode id="reducer-1" />
+</Graph>

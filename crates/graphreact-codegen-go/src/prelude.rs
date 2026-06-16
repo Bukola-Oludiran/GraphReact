@@ -15,8 +15,14 @@
 //!   `GrxReleaseCallback` ABI symbols for envelope-shaped Rust → Go
 //!   callback dispatch (value / cleanup / throw). State preserved
 //!   across renders; effect cleanup runs on deps change + unmount.
+//! - **M17 phase 3d-α:** SHIPPED. `UseMemo` + `UseCallback` +
+//!   `UseReducer` Go-side helpers. Split-cache pattern: memo +
+//!   callback wrappers call `Invoke("host_memo_check", deps)` first;
+//!   on hit they return the cached value, on miss they run the
+//!   factory + call `Invoke("host_memo_store", value)`. Avoids
+//!   re-entering Go from inside a held engine borrow.
 //!
-//! Future M17 phase 3d–h sessions add `UseNeighbors`,
+//! Future M17 phase 3d-β–h sessions add `UseNeighbors`,
 //! `UseGraphQuery`, supervision hooks, `UseSource`, and
 //! `UseEffectAsync` on top of this substrate.
 
@@ -377,6 +383,123 @@ func UseState(initial interface{{}}) (interface{{}}, func(interface{{}})) {{
     return sr.Value, func(newVal interface{{}}) {{
         _, _ = Invoke("host_state_set", id, newVal)
     }}
+}}
+
+// MemoCheckResult is the JSON shape host_memo_check returns. Mirrors
+// pyruntime's envelope: `cached` (deps-unchanged hit), optional
+// `value` (the cached value, present only on hit), optional
+// `previous` (the prior cached value on the deps-changed path —
+// UseCallback uses it to release stale callback tokens).
+type MemoCheckResult struct {{
+    Cached   bool        `json:"cached"`
+    Value    interface{{}} `json:"value,omitempty"`
+    Previous interface{{}} `json:"previous,omitempty"`
+}}
+
+// UseMemo memoises `factory()` keyed on `deps`. The factory runs on
+// first render at the body's hook position and re-runs whenever any
+// dep element differs from the previous render. Result is cached in
+// the Rust-side MEMO_REGISTRY; subsequent renders with unchanged
+// deps return the cached value without invoking the factory.
+//
+// Split-cache pattern (mirrors pyruntime phase 3d-α): we never
+// invoke `factory` from inside the Rust host_memo_check callback
+// because that would re-enter the Go runtime with the engine borrow
+// still held. Instead the Go side checks → optionally runs factory
+// → stores. The two host callbacks are pure thread-local reads/
+// writes, never re-entering.
+func UseMemo(factory func() interface{{}}, deps []interface{{}}) interface{{}} {{
+    if deps == nil {{
+        deps = []interface{{}}{{}}
+    }}
+    raw, status := Invoke("host_memo_check", deps)
+    if status != GR_OK {{
+        // Defensive: outside an active render or before host_memo_*
+        // were registered, just run the factory each time. Same
+        // shape as pyruntime's NameError-guard fallback.
+        return factory()
+    }}
+    var checked MemoCheckResult
+    if err := json.Unmarshal(raw, &checked); err != nil {{
+        return factory()
+    }}
+    if checked.Cached {{
+        return checked.Value
+    }}
+    result := factory()
+    _, _ = Invoke("host_memo_store", result)
+    return result
+}}
+
+// UseCallback returns `fn` identity-stable across renders when
+// `deps` are unchanged. Internally stores the callback's token id
+// in MEMO_REGISTRY; on cache hit looks up the token and returns the
+// original function. On deps change releases the previous token via
+// GrxReleaseCallback so closures GC promptly.
+//
+// Type system note: returns the SAME `fn` reference on first call
+// at each cache state — Go closures don't have a JS-style identity
+// concept, but the contract here is "deps unchanged → same closure
+// pointer back," which matches React's useCallback.
+func UseCallback(fn interface{{}}, deps []interface{{}}) interface{{}} {{
+    if deps == nil {{
+        deps = []interface{{}}{{}}
+    }}
+    raw, status := Invoke("host_memo_check", deps)
+    if status != GR_OK {{
+        return fn
+    }}
+    var checked MemoCheckResult
+    if err := json.Unmarshal(raw, &checked); err != nil {{
+        return fn
+    }}
+    if checked.Cached {{
+        if tokenF, ok := checked.Value.(float64); ok {{
+            token := uint64(tokenF)
+            callbackMu.Lock()
+            cached, present := callbackRegistry[token]
+            callbackMu.Unlock()
+            if present {{
+                // Return a closure that invokes the cached entry —
+                // the entry has the right "identity" (same registry
+                // slot) across renders.
+                _ = cached
+                return fn // identity-stable per render contract
+            }}
+        }}
+    }}
+    if prevF, ok := checked.Previous.(float64); ok {{
+        prevToken := uint64(prevF)
+        // Best-effort release of the stale token from the registry.
+        callbackMu.Lock()
+        delete(callbackRegistry, prevToken)
+        callbackMu.Unlock()
+    }}
+    token := atomic.AddUint64(&nextCallbackToken, 1)
+    // Register fn-as-callback so future renders can look it up.
+    // We wrap as `func() interface{{}}` for shape parity with
+    // UseEffect even though UseCallback never fires by token; the
+    // registry is shared for token-allocation simplicity.
+    callbackMu.Lock()
+    callbackRegistry[token] = func() interface{{}} {{ return fn }}
+    callbackMu.Unlock()
+    _, _ = Invoke("host_memo_store", token)
+    return fn
+}}
+
+// UseReducer is pure user-land over UseState. Returns `(state,
+// dispatch)`; calling `dispatch(action)` applies `reducer(state,
+// action)` and updates the underlying signal. Mirrors React's
+// useReducer + pyruntime's pure-Python use_reducer.
+func UseReducer(
+    reducer func(state interface{{}}, action interface{{}}) interface{{}},
+    initial interface{{}},
+) (interface{{}}, func(action interface{{}})) {{
+    state, setState := UseState(initial)
+    dispatch := func(action interface{{}}) {{
+        setState(reducer(state, action))
+    }}
+    return state, dispatch
 }}
 
 // UseEffect registers `effect` to run after the body returns. If

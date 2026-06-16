@@ -446,6 +446,19 @@ mod tests {
                 "prelude missing required M17 phase 3b-complete hook surface: {sym}"
             );
         }
+        // M17 phase 3d-α surface: split-cache memo helpers +
+        // identity-stable callback + pure-userland reducer.
+        for sym in [
+            "func UseMemo(",
+            "func UseCallback(",
+            "func UseReducer(",
+            "type MemoCheckResult",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3d-α hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();
