@@ -6,13 +6,14 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Build-step codegen for Go bodies in .grx files (M17 phase 3b PLANNED, substrate-only scaffold). Emits typed _grx_prelude.go alongside each .grx file's Go body and orchestrates `go build -buildmode=c-shared` against the combined source set."
+description = "Build-step codegen for Go bodies in .grx files (M17 phase 3b). Emits a typed grx_prelude.go (NB: no leading underscore — Go's build tool skips files starting with `_`) alongside each .grx file's Go body and orchestrates `go build -buildmode=c-shared` against the combined source set."
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
 graphreact-grx-parser = { path = "../graphreact-grx-parser" }
+sha2.workspace = true
 thiserror.workspace = true
 
 [lints]

@@ -1,0 +1,19 @@
+<!-- M17-phase3a: simplest possible Go body. The body source is a
+     trivial Go file with `package main`; the body codegen + go build
+     pipeline produces a c-shared artifact the engine-go runtime can
+     load. Mirrors python-smoke-mixed-rejected.grx's role for
+     CPython. -->
+
+<Counter lang="go">
+// M17-phase3a-v1 trivial Counter body. No hook calls yet — the full
+// Use* surface lands at M17 phase 3c-h. The build path is what's
+// being smoke-tested here.
+//
+// func CounterBody(ctx Ctx) Manifest {
+//     return Manifest{}
+// }
+</Counter>
+
+<Graph id="go-smoke">
+  <Counter id="counter-1" />
+</Graph>

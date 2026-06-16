@@ -1,0 +1,41 @@
+<!-- M17-phase3a two Go components exchanging messages via UseMessage
+     + UseEmit. Documents the canonical author-facing surface for the
+     M22 mixed-runtime work — same .grx shape will host JS + Python +
+     Go bodies once phase 3c-h ships the hook surface. Mirrors
+     python-pingpong.grx for CPython. -->
+
+<Pinger lang="go">
+// M17-phase3a-v1 sketch — Pinger emits "ping" on mount and again
+// every time it receives "pong" from Ponger.
+//
+// func PingerBody(ctx Ctx) Manifest {
+//     emit := UseEmit("ping")
+//     UseEffect(func() { emit(nil) }, []any{})
+//     UseMessage("pong", func(payload any) {
+//         emit(nil)
+//     })
+//     return Manifest{
+//         Accepts: []string{"pong"},
+//         Emits:   []string{"ping"},
+//     }
+// }
+</Pinger>
+
+<Ponger lang="go">
+// M17-phase3a-v1 sketch — Ponger replies "pong" whenever it
+// receives "ping".
+//
+// func PongerBody(ctx Ctx) Manifest {
+//     emit := UseEmit("pong")
+//     UseMessage("ping", func(payload any) { emit(nil) })
+//     return Manifest{
+//         Accepts: []string{"ping"},
+//         Emits:   []string{"pong"},
+//     }
+// }
+</Ponger>
+
+<Graph id="go-pingpong">
+  <Pinger id="pinger-1" />
+  <Ponger id="ponger-1" />
+</Graph>

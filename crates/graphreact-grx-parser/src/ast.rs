@@ -136,10 +136,13 @@ pub struct NodeDefinitionBlock {
 }
 
 /// Body language for a [`NodeDefinitionBlock`]. M13-phase3a introduces
-/// Python; future engines (V8 native at M17, JVM at M17+, etc.) extend
-/// this enum. Selecting a `lang` other than what the active runtime
-/// supports surfaces as a runtime error at mount time, not parse time
-/// (the parser is engine-agnostic).
+/// Python; Go was added at M17 per ADR-0005 (Java→Go pivot supersedes the
+/// earlier JVM/V8-at-M17 wording). Future engines extend
+/// this enum (M17-phase3a added `Go` per ADR-0005's Java→Go pivot;
+/// V8 stays soft-demoted per ADR-0001). Selecting a `lang` other
+/// than what the active runtime supports surfaces as a runtime
+/// error at mount time, not parse time (the parser is
+/// engine-agnostic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum ComponentLang {
     /// JavaScript / TypeScript body. Routed to the JSC engine.

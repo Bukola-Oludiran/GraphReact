@@ -1263,10 +1263,12 @@ dependencies = [
  "crossterm",
  "futures",
  "graphreact-algorithms",
+ "graphreact-codegen-go",
  "graphreact-core",
  "graphreact-dist",
  "graphreact-engine-cpython",
  "graphreact-engine-echo",
+ "graphreact-engine-go",
  "graphreact-engine-jsc",
  "graphreact-engine-null",
  "graphreact-engine-zig",
@@ -1298,6 +1300,7 @@ name = "graphreact-codegen-go"
 version = "0.1.0"
 dependencies = [
  "graphreact-grx-parser",
+ "sha2",
  "thiserror 2.0.18",
 ]
 
@@ -1378,7 +1381,13 @@ dependencies = [
 name = "graphreact-engine-go"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "graphreact-engine-zig",
+ "libloading",
+ "parking_lot",
+ "rustc-hash 2.1.2",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

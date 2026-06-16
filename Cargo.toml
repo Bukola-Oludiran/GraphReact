@@ -81,6 +81,13 @@ sha2 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 subtle = "2"
 dashmap = "6"
+
+# M17 phase 1 — Go runtime engine. libloading dlopens the c-shared
+# artifact produced by `grx build` (`go build -buildmode=c-shared`)
+# and looks up the GrxXxx exported symbols. (sha2 was already in
+# workspace deps for M14 — codegen-go's BuildArtifact.library_sha256_hex
+# reuses that workspace pin.)
+libloading = "0.8"
 rcgen = "0.13"  # dev-only — self-signed certs for transport tests
 
 # M16-Backend P2 — observer HTTP server (Prometheus exporter + healthz).

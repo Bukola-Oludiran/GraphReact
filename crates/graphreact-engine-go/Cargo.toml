@@ -6,13 +6,19 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Go runtime engine for GraphReact (M17 PLANNED, phase 1+2 substrate scaffold). Loads cgo + c-shared artifacts produced by graphreact-codegen-go and dispatches against the graphreact-engine-zig Engine trait."
+description = "Go runtime engine for GraphReact (M17). Loads cgo + c-shared artifacts produced by graphreact-codegen-go and dispatches against the graphreact-engine-zig Engine trait."
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
 graphreact-engine-zig = { path = "../graphreact-engine-zig" }
+libloading = { workspace = true }
+parking_lot.workspace = true
+rustc-hash.workspace = true
+dashmap.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

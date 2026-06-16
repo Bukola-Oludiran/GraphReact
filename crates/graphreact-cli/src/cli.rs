@@ -442,10 +442,13 @@ pub enum RuntimeArg {
     /// embedded Python sub-interpreters; callbacks + hook semantics
     /// land at M13-phase2.5+.
     Cpython,
-    /// Go engine (M17-phase1+2 PLANNED). Loads a cgo + c-shared
-    /// artifact produced by `graphreact-codegen-go` + `go build
-    /// -buildmode=c-shared`. Currently substrate-only — see
-    /// `EngineSelectError::GoNotLinked`.
+    /// Go engine (M17-phase1+2+3a+3b SHIPPED). Loads a cgo +
+    /// c-shared artifact produced by `graphreact-codegen-go` +
+    /// `go build -buildmode=c-shared`. The bare `--runtime=go` path
+    /// constructs a `GoEngine` without an artifact wired; production
+    /// use should route through `goruntime::GoRuntime::build_and_load`
+    /// instead. Full hook surface (M6.6 parity) lands at M17 phase
+    /// 3c-h per the later-milestone plan.
     Go,
 }
 

@@ -1,0 +1,11 @@
+<!-- M17-phase3a external Go body fixture. The <Counter> body lives
+     in a sibling .go file rather than inline, proving the parser →
+     resolver → IR → codegen-go path works identically to the
+     inline-body case. Mirrors python-external-body.grx + .py for
+     the M13 CPython equivalent. -->
+
+<Counter src="./go-external-body.go" lang="go" />
+
+<Graph id="go-external-body">
+  <Counter id="counter-1" />
+</Graph>

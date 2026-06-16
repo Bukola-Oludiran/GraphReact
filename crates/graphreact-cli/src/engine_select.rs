@@ -38,14 +38,17 @@ pub enum EngineSelectError {
          Install python@3.12 / 3.13 / 3.14 and ensure pkg-config sees it."
     )]
     CpythonNotLinked,
-    /// Returned when the Go engine has not yet shipped its phase 1
-    /// Engine-trait implementation. The crate exists as a skeleton
-    /// (M17 phase 1 substrate scaffold) but does not yet construct a
-    /// working Engine.
+    /// Reserved for cross-platform builds where the Go engine isn't
+    /// wired (currently unused — the engine is platform-agnostic
+    /// since cgo + c-shared works on Linux/macOS/Windows). Kept as a
+    /// variant so the error surface is stable if a future build
+    /// gates the Go engine off (e.g., a future `--no-go` feature
+    /// flag).
+    #[allow(dead_code)]
     #[error(
-        "engine `go` is scaffolded but not yet implemented (M17 phase 1 substrate-only). \n\
-         The `graphreact-engine-go` crate exists; the Engine trait impl ships in M17 phase 1+2. \n\
-         Track progress in ~/.claude/plans/graphreact-rust-later-milestones.md §M17."
+        "engine `go` is not linked into this build of `grx`. \n\
+         The `graphreact-engine-go` crate is built by default — see \n\
+         ~/.claude/plans/graphreact-rust-later-milestones.md §M17 for details."
     )]
     GoNotLinked,
 }
@@ -83,7 +86,16 @@ pub fn select(kind: EngineKind) -> Result<Box<dyn Engine>, EngineSelectError> {
                 Err(EngineSelectError::CpythonNotLinked)
             }
         }
-        EngineKind::Go => Err(EngineSelectError::GoNotLinked),
+        EngineKind::Go => {
+            // M17 phase 3a: construct a fresh GoEngine. The caller
+            // is responsible for calling `set_artifact` (or using
+            // [`crate::goruntime::GoRuntime::build_and_load`]) before
+            // `initialize`. The bare `select()` path is mostly
+            // useful for substrate composition; production callers
+            // route through `goruntime`.
+            let engine = graphreact_engine_go::GoEngine::new();
+            Ok(Box::new(engine))
+        }
     }
 }
 
@@ -147,12 +159,8 @@ mod tests {
     }
 
     #[test]
-    fn go_returns_clear_not_linked_error() {
-        let result = select(EngineKind::Go);
-        let Err(err) = result else {
-            panic!("expected NotLinked error — Go engine is substrate-scaffolded only");
-        };
-        let msg = format!("{err}");
-        assert!(msg.contains("M17"), "error message should cite M17: {msg}");
+    fn go_engine_is_constructible() {
+        let e = select(EngineKind::Go).expect("ok");
+        assert_eq!(e.engine_name(), "go");
     }
 }

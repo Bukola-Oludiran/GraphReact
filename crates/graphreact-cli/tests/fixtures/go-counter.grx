@@ -1,0 +1,30 @@
+<!-- M17-phase3a: counter body shape for the future hook surface
+     (phase 3c-h). The body sketches how a Go-side UseState +
+     UseEffect pair will look once the codegen-go prelude wires the
+     M6.6 hooks. Today's emit_prelude produces stubs; this fixture
+     documents the canonical author-facing shape. Mirrors
+     python-counter.grx's role for CPython. -->
+
+<Counter lang="go">
+// M17-phase3a-v1 sketch of the Counter body shape. The Use* calls
+// will resolve once M17 phase 3c-h ships the hook surface in
+// graphreact-codegen-go::prelude. Until then this body compiles as a
+// no-op stub.
+//
+// func CounterBody(ctx Ctx) Manifest {
+//     count, setCount := UseState(0)
+//     _ = setCount
+//     UseEffect(func() {
+//         // first-render effect placeholder
+//     }, []any{})
+//     return Manifest{
+//         Accepts: []string{},
+//         Emits:   []string{"count-updated"},
+//         Extras:  map[string]any{"count": count},
+//     }
+// }
+</Counter>
+
+<Graph id="go-counter">
+  <Counter id="counter-1" />
+</Graph>

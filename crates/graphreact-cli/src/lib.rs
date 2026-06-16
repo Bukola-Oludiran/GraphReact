@@ -33,6 +33,13 @@ pub mod observer_tui;
 pub mod jsruntime;
 #[cfg(target_os = "macos")]
 pub mod pyruntime;
+/// Go body runtime — **M17 phase 3a skeleton**. Mirrors `pyruntime`
+/// (M13 CPython) and `jsruntime` (M12.3 JSC) for `lang="go"`
+/// definitions. Currently ships `GoRuntime::build_and_load` which
+/// drives the codegen + build + load + initialize round-trip; full
+/// scheduler integration lands at M17 phase 3a follow-on (alongside
+/// the hook surface 3c–h).
+pub mod goruntime;
 pub mod runtime;
 pub mod sources;
 pub mod watch_mode;
