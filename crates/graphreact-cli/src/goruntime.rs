@@ -1012,6 +1012,207 @@ fn build_host_graph_node_count_callback() -> BoxCallback {
     })
 }
 
+// ----- M17 phase 3d-δ: Tier 1 algorithm accessor callbacks -----
+//
+// Seven callbacks ported verbatim from pyruntime. Each reads
+// `current_graph_snapshot()`, borrows `snapshot.graph`, and delegates
+// to the matching `graphreact_algorithms` function. A* heuristic
+// kinds (latency / compliance / hierarchy / trust-attenuated /
+// prerequisite-distance) live with Tier 2 in phase 3d-ε; Tier 1's
+// `a_star_path` is heuristic-free and degenerates to BFS shortest-
+// path with uniform edge cost. Errors collapse to neutral returns
+// (Null / empty Array / hasCycle=false) — Go callers see safe defaults
+// rather than thrown exceptions, since the typical pattern is
+// `g := UseGraphQuery(); path := g.ShortestPath(a, b)` over a live
+// snapshot where a missing source just means the path doesn't exist.
+
+fn build_host_graph_shortest_path_callback() -> BoxCallback {
+    Box::new(|args| {
+        let from = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let to = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Null);
+        };
+        let g = snapshot.graph.borrow();
+        match graphreact_algorithms::shortest_path(
+            &g,
+            &from,
+            &to,
+            &graphreact_algorithms::PathOptions::default(),
+        ) {
+            Ok(Some(path)) => Ok(HostValue::Array(
+                path.into_iter().map(HostValue::String).collect(),
+            )),
+            Ok(None) | Err(_) => Ok(HostValue::Null),
+        }
+    })
+}
+
+fn build_host_graph_all_paths_callback() -> BoxCallback {
+    Box::new(|args| {
+        let from = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let to = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max_depth = match args.get(2) {
+            Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as usize),
+            _ => None,
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let opts = graphreact_algorithms::AllPathsOptions {
+            edge_filter: None,
+            max_depth,
+        };
+        let g = snapshot.graph.borrow();
+        match graphreact_algorithms::all_paths(&g, &from, &to, &opts) {
+            Ok(paths) => Ok(HostValue::Array(
+                paths
+                    .into_iter()
+                    .map(|p| HostValue::Array(p.into_iter().map(HostValue::String).collect()))
+                    .collect(),
+            )),
+            Err(_) => Ok(HostValue::Array(vec![])),
+        }
+    })
+}
+
+fn build_host_graph_a_star_path_callback() -> BoxCallback {
+    Box::new(|args| {
+        let from = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let to = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Null);
+        };
+        let opts = graphreact_algorithms::AStarOptions::default();
+        let g = snapshot.graph.borrow();
+        match graphreact_algorithms::astar_path(&g, &from, &to, &opts, None) {
+            Ok(Some(path)) => Ok(HostValue::Array(
+                path.into_iter().map(HostValue::String).collect(),
+            )),
+            Ok(None) | Err(_) => Ok(HostValue::Null),
+        }
+    })
+}
+
+fn build_host_graph_bfs_callback() -> BoxCallback {
+    Box::new(|args| {
+        let from = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let depth_limit = match args.get(1) {
+            Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as usize),
+            _ => None,
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let g = snapshot.graph.borrow();
+        match graphreact_algorithms::bfs_nodes(&g, &from, depth_limit) {
+            Ok(nodes) => Ok(HostValue::Array(
+                nodes.into_iter().map(HostValue::String).collect(),
+            )),
+            Err(_) => Ok(HostValue::Array(vec![])),
+        }
+    })
+}
+
+fn build_host_graph_dfs_callback() -> BoxCallback {
+    Box::new(|args| {
+        let from = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let depth_limit = match args.get(1) {
+            Some(HostValue::Number(n)) if *n > 0.0 => Some(*n as usize),
+            _ => None,
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let g = snapshot.graph.borrow();
+        match graphreact_algorithms::dfs_nodes(&g, &from, depth_limit) {
+            Ok(nodes) => Ok(HostValue::Array(
+                nodes.into_iter().map(HostValue::String).collect(),
+            )),
+            Err(_) => Ok(HostValue::Array(vec![])),
+        }
+    })
+}
+
+fn build_host_graph_connected_components_callback() -> BoxCallback {
+    Box::new(|_args| {
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let g = snapshot.graph.borrow();
+        match graphreact_algorithms::connected_components(&g) {
+            Ok(components) => {
+                let mut out: Vec<HostValue> = Vec::with_capacity(components.len());
+                for component in components {
+                    // FxHashSet → sorted Vec<String> for stable
+                    // Go-side ordering across renders.
+                    let mut members: Vec<String> = component.into_iter().collect();
+                    members.sort();
+                    out.push(HostValue::Array(
+                        members.into_iter().map(HostValue::String).collect(),
+                    ));
+                }
+                Ok(HostValue::Array(out))
+            }
+            Err(_) => Ok(HostValue::Array(vec![])),
+        }
+    })
+}
+
+fn build_host_graph_cycle_detection_callback() -> BoxCallback {
+    Box::new(|_args| {
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Object(vec![
+                ("hasCycle".to_string(), HostValue::Bool(false)),
+                ("cycle".to_string(), HostValue::Null),
+            ]));
+        };
+        let g = snapshot.graph.borrow();
+        let has = graphreact_algorithms::has_cycle(&g).unwrap_or(false);
+        let cycle = graphreact_algorithms::find_cycle(&g).ok().flatten();
+        let cycle_value = match cycle {
+            Some(edges) => HostValue::Array(
+                edges
+                    .into_iter()
+                    .map(|(u, v)| HostValue::Array(vec![HostValue::String(u), HostValue::String(v)]))
+                    .collect(),
+            ),
+            None => HostValue::Null,
+        };
+        Ok(HostValue::Object(vec![
+            ("hasCycle".to_string(), HostValue::Bool(has)),
+            ("cycle".to_string(), cycle_value),
+        ]))
+    })
+}
+
 /// Parse the third argument of `host_emit` into [`EmitOptions`].
 /// Recognised keys mirror JSC + CPython: `to` (Array of String),
 /// `ttl` (Number), `edgeKey` (String), `direct` (String). Unknown
@@ -1325,6 +1526,41 @@ pub fn mount_with_scheduler(
             iso,
             "host_graph_node_count",
             build_host_graph_node_count_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        // M17 phase 3d-δ: Tier 1 algorithm accessors.
+        e.register_callback(
+            iso,
+            "host_graph_shortest_path",
+            build_host_graph_shortest_path_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_graph_all_paths",
+            build_host_graph_all_paths_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_graph_a_star_path",
+            build_host_graph_a_star_path_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_graph_bfs", build_host_graph_bfs_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_graph_dfs", build_host_graph_dfs_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_graph_connected_components",
+            build_host_graph_connected_components_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_graph_cycle_detection",
+            build_host_graph_cycle_detection_callback(),
         )
         .map_err(RuntimeError::Engine)?;
         iso
@@ -2484,6 +2720,260 @@ mod tests {
         );
     }
 
+    /// Phase 3d-δ: Tier 1 algorithm accessors. Probe body exercises
+    /// ShortestPath / AllPaths / AStarPath / BFS / DFS /
+    /// ConnectedComponents / CycleDetection over a 4-node DAG.
+    fn scenario_use_graph_query_tier_1_algorithms() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-algorithms.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("algorithms");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-algorithms.grx");
+
+        let shortest: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let shortest_for_cb = std::sync::Arc::clone(&shortest);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_algo_shortest_path",
+                Box::new(move |args| {
+                    let row: Vec<String> = match args.first() {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    shortest_for_cb.lock().push(row);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_algo_shortest_path");
+
+        let all_paths: std::sync::Arc<parking_lot::Mutex<Vec<Vec<Vec<String>>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let all_paths_for_cb = std::sync::Arc::clone(&all_paths);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_algo_all_paths",
+                Box::new(move |args| {
+                    let rows: Vec<Vec<String>> = match args.first() {
+                        Some(HostValue::Array(outer)) => outer
+                            .iter()
+                            .map(|inner| match inner {
+                                HostValue::Array(path) => path
+                                    .iter()
+                                    .filter_map(|x| {
+                                        if let HostValue::String(s) = x {
+                                            Some(s.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect(),
+                                _ => Vec::new(),
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    all_paths_for_cb.lock().push(rows);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_algo_all_paths");
+
+        let astar: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let astar_for_cb = std::sync::Arc::clone(&astar);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_algo_astar",
+                Box::new(move |args| {
+                    let row: Vec<String> = match args.first() {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    astar_for_cb.lock().push(row);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_algo_astar");
+
+        let bfs: std::sync::Arc<parking_lot::Mutex<Vec<Vec<String>>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let bfs_for_cb = std::sync::Arc::clone(&bfs);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_algo_bfs",
+                Box::new(move |args| {
+                    let row: Vec<String> = match args.first() {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    bfs_for_cb.lock().push(row);
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_algo_bfs");
+
+        let dfs_sizes: std::sync::Arc<parking_lot::Mutex<Vec<f64>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let dfs_for_cb = std::sync::Arc::clone(&dfs_sizes);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_algo_dfs_size",
+                Box::new(move |args| {
+                    if let Some(HostValue::Number(n)) = args.first() {
+                        dfs_for_cb.lock().push(*n);
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_algo_dfs_size");
+
+        let components_max: std::sync::Arc<parking_lot::Mutex<Vec<f64>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let components_for_cb = std::sync::Arc::clone(&components_max);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_algo_components_max",
+                Box::new(move |args| {
+                    if let Some(HostValue::Number(n)) = args.first() {
+                        components_for_cb.lock().push(*n);
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_algo_components_max");
+
+        let cycle_obs: std::sync::Arc<parking_lot::Mutex<Vec<bool>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let cycle_for_cb = std::sync::Arc::clone(&cycle_obs);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_algo_cycle",
+                Box::new(move |args| {
+                    if let Some(HostValue::Bool(b)) = args.first() {
+                        cycle_for_cb.lock().push(*b);
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_algo_cycle");
+
+        runtime.process_batch().expect("batch 1");
+
+        let sp = shortest.lock();
+        // a -> c is direct; shortest path is [a, c].
+        let sp_ac = sp.iter().any(|row| row == &vec!["a".to_string(), "c".to_string()]);
+        assert!(sp_ac, "expected ShortestPath(a, c) = [a, c]; got {sp:?}");
+
+        let ap = all_paths.lock();
+        // Two simple paths from a to c: [a, c] and [a, b, c].
+        let two_paths = ap.iter().any(|rows| {
+            let has_direct = rows.iter().any(|p| p == &vec!["a".to_string(), "c".to_string()]);
+            let has_indirect = rows
+                .iter()
+                .any(|p| p == &vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+            has_direct && has_indirect
+        });
+        assert!(
+            two_paths,
+            "expected AllPaths(a, c) to contain [a,c] and [a,b,c]; got {ap:?}"
+        );
+
+        let as_ = astar.lock();
+        // Tier 1 AStarPath is heuristic-free → degenerates to
+        // shortest path of length 2.
+        let astar_len_2 = as_.iter().any(|row| row.len() == 2 && row[0] == "a" && row[1] == "c");
+        assert!(astar_len_2, "expected AStarPath(a, c) = [a, c]; got {as_:?}");
+
+        let bfs_ = bfs.lock();
+        // BFS(a) reaches a, b, c, d. Order may vary by neighbour
+        // enumeration; assert membership.
+        let bfs_full = bfs_.iter().any(|row| {
+            row.len() >= 4
+                && row.iter().any(|x| x == "a")
+                && row.iter().any(|x| x == "b")
+                && row.iter().any(|x| x == "c")
+                && row.iter().any(|x| x == "d")
+        });
+        assert!(bfs_full, "expected BFS(a) to reach all 4 nodes; got {bfs_:?}");
+
+        let dfs_s = dfs_sizes.lock();
+        // DFS(a) reaches all 4 nodes.
+        assert!(
+            dfs_s.iter().any(|n| (*n - 4.0).abs() < f64::EPSILON),
+            "expected DFS(a) size = 4; got {dfs_s:?}"
+        );
+
+        let cm = components_max.lock();
+        // The 4-node weakly-connected graph has one component of size 4.
+        assert!(
+            cm.iter().any(|n| (*n - 4.0).abs() < f64::EPSILON),
+            "expected max component size = 4; got {cm:?}"
+        );
+
+        let cy = cycle_obs.lock();
+        // `graphreact_algorithms::cycles` is explicitly **undirected**
+        // ("Cycle detection on undirected graphs via DFS" — cycles.rs
+        // module docstring). The fixture's directed edges a→b, b→c,
+        // a→c, a→d form an undirected triangle a-b-c-a, so cycle
+        // detection correctly reports HasCycle=true. Directed-cycle
+        // variants land in M17 phase 3d-ε / 3d-ζ Tier 2/3 surfaces.
+        assert!(
+            cy.iter().any(|b| *b),
+            "expected CycleDetection.HasCycle = true on undirected-triangle fixture; got {cy:?}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -2516,57 +3006,61 @@ mod tests {
         // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
         // between fixtures (each fresh mount expects to start at
         // signal id 1 for assertion stability).
-        eprintln!("[goruntime smoke 1/13] build_and_load + body dispatch");
+        eprintln!("[goruntime smoke 1/14] build_and_load + body dispatch");
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/13] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/14] EngineMisroute rejects non-Go bodies");
         reset_global_state();
         scenario_rejects_non_go_lang();
 
-        eprintln!("[goruntime smoke 3/13] emit/message round-trip");
+        eprintln!("[goruntime smoke 3/14] emit/message round-trip");
         reset_global_state();
         scenario_emit_dispatches_to_neighbor();
 
-        eprintln!("[goruntime smoke 4/13] use_state preserves value across renders");
+        eprintln!("[goruntime smoke 4/14] use_state preserves value across renders");
         reset_global_state();
         scenario_use_state_preserves_value_across_renders();
 
-        eprintln!("[goruntime smoke 5/13] state survives a message");
+        eprintln!("[goruntime smoke 5/14] state survives a message");
         reset_global_state();
         scenario_use_state_survives_a_message();
 
-        eprintln!("[goruntime smoke 6/13] use_effect with empty deps fires once");
+        eprintln!("[goruntime smoke 6/14] use_effect with empty deps fires once");
         reset_global_state();
         scenario_use_effect_empty_deps_fires_once();
 
-        eprintln!("[goruntime smoke 7/13] use_memo single-render fires factory once");
+        eprintln!("[goruntime smoke 7/14] use_memo single-render fires factory once");
         reset_global_state();
         scenario_use_memo_caches_when_deps_unchanged();
 
-        eprintln!("[goruntime smoke 8/13] use_memo recomputes on dep change");
+        eprintln!("[goruntime smoke 8/14] use_memo recomputes on dep change");
         reset_global_state();
         scenario_use_memo_caches_and_recomputes();
 
-        eprintln!("[goruntime smoke 9/13] use_reducer dispatch updates state");
+        eprintln!("[goruntime smoke 9/14] use_reducer dispatch updates state");
         reset_global_state();
         scenario_use_reducer_dispatch_updates_state();
 
-        eprintln!("[goruntime smoke 10/13] use_neighbors returns structural ids");
+        eprintln!("[goruntime smoke 10/14] use_neighbors returns structural ids");
         reset_global_state();
         scenario_use_neighbors_returns_structural_ids();
 
-        eprintln!("[goruntime smoke 11/13] use_accept_edge fires topology event");
+        eprintln!("[goruntime smoke 11/14] use_accept_edge fires topology event");
         reset_global_state();
         scenario_accept_edge_fires_topology_event();
 
-        eprintln!("[goruntime smoke 12/13] use_graph_query Tier 1 accessors");
+        eprintln!("[goruntime smoke 12/14] use_graph_query Tier 1 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_1_accessors();
 
-        eprintln!("[goruntime smoke 13/13] use_directory find_by_id");
+        eprintln!("[goruntime smoke 13/14] use_directory find_by_id");
         reset_global_state();
         scenario_use_directory_find_by_id();
+
+        eprintln!("[goruntime smoke 14/14] use_graph_query Tier 1 algorithms");
+        reset_global_state();
+        scenario_use_graph_query_tier_1_algorithms();
 
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup

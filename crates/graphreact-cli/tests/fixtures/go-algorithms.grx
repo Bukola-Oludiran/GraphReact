@@ -1,0 +1,93 @@
+<!-- M17-phase3d-δ: Tier 1 algorithm accessor acceptance. Probe body
+     exercises ShortestPath / AllPaths / AStarPath / BFS / DFS /
+     ConnectedComponents / CycleDetection over a 4-node DAG fixture:
+
+         a → b → c
+         a → c
+         a → d
+
+     ShortestPath(a, c) = [a, c] (direct edge wins)
+     AllPaths(a, c)     = [[a, c], [a, b, c]] (two simple paths)
+     AStarPath(a, c)    = [a, c] (heuristic-free → BFS)
+     BFS(a)             = [a, b, c, d] (BFS order; outgoing
+                          neighbours)
+     DFS(a)             = nodes reachable from a (set; ordering
+                          algorithm-dependent so we just check size)
+     ConnectedComponents → at least one component containing all
+                           four nodes
+     CycleDetection     = {HasCycle: true, ...} — graphreact-algorithms
+                          cycle detection is UNDIRECTED, so the
+                          directed DAG forms an undirected triangle
+                          a-b-c-a that the algorithm reports.
+
+     The test surfaces each result via host_observe_* callbacks. -->
+
+<AlgoProbe lang="go">
+func AlgoProbeBody(ctx Ctx) Manifest {
+    g := UseGraphQuery()
+
+    sp := g.ShortestPath("a", "c")
+    spPayload := make([]interface{}, len(sp))
+    for i, id := range sp {
+        spPayload[i] = id
+    }
+    _, _ = Invoke("host_observe_algo_shortest_path", spPayload)
+
+    ap := g.AllPaths("a", "c", 0)
+    apPayload := make([]interface{}, len(ap))
+    for i, path := range ap {
+        row := make([]interface{}, len(path))
+        for j, id := range path {
+            row[j] = id
+        }
+        apPayload[i] = row
+    }
+    _, _ = Invoke("host_observe_algo_all_paths", apPayload)
+
+    astar := g.AStarPath("a", "c")
+    astarPayload := make([]interface{}, len(astar))
+    for i, id := range astar {
+        astarPayload[i] = id
+    }
+    _, _ = Invoke("host_observe_algo_astar", astarPayload)
+
+    bfs := g.BFS("a", 0)
+    bfsPayload := make([]interface{}, len(bfs))
+    for i, id := range bfs {
+        bfsPayload[i] = id
+    }
+    _, _ = Invoke("host_observe_algo_bfs", bfsPayload)
+
+    dfs := g.DFS("a", 0)
+    _, _ = Invoke("host_observe_algo_dfs_size", float64(len(dfs)))
+
+    cc := g.ConnectedComponents()
+    maxSize := 0
+    for _, comp := range cc {
+        if len(comp) > maxSize {
+            maxSize = len(comp)
+        }
+    }
+    _, _ = Invoke("host_observe_algo_components_max", float64(maxSize))
+
+    cycle := g.CycleDetection()
+    _, _ = Invoke("host_observe_algo_cycle", cycle.HasCycle)
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</AlgoProbe>
+
+<Graph id="go-algorithms">
+  <AlgoProbe id="a" />
+  <AlgoProbe id="b" />
+  <AlgoProbe id="c" />
+  <AlgoProbe id="d" />
+  <edge source="a" target="b" />
+  <edge source="b" target="c" />
+  <edge source="a" target="c" />
+  <edge source="a" target="d" />
+</Graph>

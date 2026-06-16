@@ -35,10 +35,16 @@
 //!   `CURRENT_DIRECTORY` + `CURRENT_GRAPH_SNAPSHOT` TLS slots
 //!   installed by `GoEngineGuard::with_directory` around every
 //!   `process_batch`.
+//! - **M17 phase 3d-δ:** SHIPPED. `GraphQuery` widens with seven
+//!   algorithm accessors (ShortestPath / AllPaths / AStarPath / BFS
+//!   / DFS / ConnectedComponents / CycleDetection) backed by
+//!   `graphreact_algorithms` against the live snapshot. Tier 1
+//!   AStarPath is heuristic-free; per-message-type variants land in
+//!   3d-ε via `g.Tier2(msgType).AStarPath(...)`.
 //!
-//! Future M17 phase 3d-δ–h sessions add algorithm accessors,
-//! Tier 2/3 graph queries, supervision hooks, `UseSource`, and
-//! `UseEffectAsync` on top of this substrate.
+//! Future M17 phase 3d-ε–h sessions add Tier 2/3 graph queries,
+//! supervision hooks, `UseSource`, and `UseEffectAsync` on top of
+//! this substrate.
 
 /// ABI version baked into the emitted prelude. Must match
 /// [`graphreact_engine_go::ffi::GRX_GO_ABI_VERSION`] (currently `1`).
@@ -1129,6 +1135,128 @@ func (GraphQuery) NodeCount() int {{
         return 0
     }}
     return int(n)
+}}
+
+// ----- M17 phase 3d-δ: GraphQuery Tier 1 algorithm accessors -----
+
+// ShortestPath returns the shortest path from `from` to `to` (a slice
+// of node ids including both endpoints), or nil if no path exists.
+// Uses BFS over the live snapshot with uniform edge cost.
+func (GraphQuery) ShortestPath(from, to string) []string {{
+    raw, status := Invoke("host_graph_shortest_path", from, to)
+    if status != GR_OK {{
+        return nil
+    }}
+    if len(raw) == 4 && string(raw) == "null" {{
+        return nil
+    }}
+    var path []string
+    if err := json.Unmarshal(raw, &path); err != nil {{
+        return nil
+    }}
+    return path
+}}
+
+// AllPaths returns every simple path from `from` to `to`. Each path
+// is a slice of node ids (endpoints included). `maxDepth=0` removes
+// the depth cap; positive values bound the search.
+func (GraphQuery) AllPaths(from, to string, maxDepth int) [][]string {{
+    raw, status := Invoke("host_graph_all_paths", from, to, maxDepth)
+    if status != GR_OK {{
+        return [][]string{{}}
+    }}
+    var paths [][]string
+    if err := json.Unmarshal(raw, &paths); err != nil {{
+        return [][]string{{}}
+    }}
+    return paths
+}}
+
+// AStarPath returns an A* path from `from` to `to` over the live
+// snapshot. Tier 1 is heuristic-free and degenerates to BFS shortest-
+// path; per-message-type heuristics (latency / compliance / hierarchy
+// / trust-attenuated / prerequisite-distance) land at M17 phase 3d-ε
+// via `g.Tier2(msgType).AStarPath(...)`.
+func (GraphQuery) AStarPath(from, to string) []string {{
+    raw, status := Invoke("host_graph_a_star_path", from, to)
+    if status != GR_OK {{
+        return nil
+    }}
+    if len(raw) == 4 && string(raw) == "null" {{
+        return nil
+    }}
+    var path []string
+    if err := json.Unmarshal(raw, &path); err != nil {{
+        return nil
+    }}
+    return path
+}}
+
+// BFS returns nodes reachable from `from` in breadth-first order.
+// `depthLimit=0` removes the bound; positive values truncate.
+func (GraphQuery) BFS(from string, depthLimit int) []string {{
+    raw, status := Invoke("host_graph_bfs", from, depthLimit)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// DFS returns nodes reachable from `from` in depth-first order.
+// `depthLimit=0` removes the bound; positive values truncate.
+func (GraphQuery) DFS(from string, depthLimit int) []string {{
+    raw, status := Invoke("host_graph_dfs", from, depthLimit)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// ConnectedComponents returns every weakly-connected component as a
+// sorted slice of node ids. Outer slice is unsorted by design — the
+// scheduler's component-iteration order is stable across renders
+// modulo topology mutations.
+func (GraphQuery) ConnectedComponents() [][]string {{
+    raw, status := Invoke("host_graph_connected_components")
+    if status != GR_OK {{
+        return [][]string{{}}
+    }}
+    var comps [][]string
+    if err := json.Unmarshal(raw, &comps); err != nil {{
+        return [][]string{{}}
+    }}
+    return comps
+}}
+
+// CycleDetectionResult is the JSON shape host_graph_cycle_detection
+// returns. `Cycle` is the chain of `(u, v)` edges that form the
+// detected cycle, or nil if `HasCycle == false`.
+type CycleDetectionResult struct {{
+    HasCycle bool       `json:"hasCycle"`
+    Cycle    [][]string `json:"cycle"`
+}}
+
+// CycleDetection returns whether the graph contains a directed
+// cycle + the edge chain that comprises it. Empty snapshot →
+// {{HasCycle: false, Cycle: nil}}.
+func (GraphQuery) CycleDetection() CycleDetectionResult {{
+    raw, status := Invoke("host_graph_cycle_detection")
+    if status != GR_OK {{
+        return CycleDetectionResult{{}}
+    }}
+    var result CycleDetectionResult
+    if err := json.Unmarshal(raw, &result); err != nil {{
+        return CycleDetectionResult{{}}
+    }}
+    return result
 }}
 
 // GrxInvokeCallback invokes a generic Go callback stored under

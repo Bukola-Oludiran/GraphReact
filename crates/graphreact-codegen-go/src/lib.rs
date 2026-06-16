@@ -498,6 +498,23 @@ mod tests {
                 "prelude missing required M17 phase 3d-γ hook surface: {sym}"
             );
         }
+        // M17 phase 3d-δ surface: 7 algorithm accessors layered onto
+        // GraphQuery + the CycleDetectionResult envelope type.
+        for sym in [
+            "ShortestPath",
+            "AllPaths",
+            "AStarPath",
+            "BFS",
+            "DFS",
+            "ConnectedComponents",
+            "CycleDetection",
+            "type CycleDetectionResult",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3d-δ hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();
