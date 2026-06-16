@@ -45,9 +45,10 @@ use graphreact_core::{
     use_accept_edge as core_use_accept_edge, use_effect as core_use_effect,
     use_emit as core_use_emit, use_memo as core_use_memo, use_message as core_use_message,
     use_neighbors as core_use_neighbors, use_state as core_use_state,
-    use_topology as core_use_topology, Attrs, CommunicationGraph, EffectCleanup, EmitOptions,
-    IncomingMessage, NodeContext, NodeDefinition, PermissionManifest, Scheduler, Signal,
-    TopologyEvent, TopologyEventKind, TopologyFilterOptions,
+    use_topology as core_use_topology, Attrs, CommunicationGraph, EdgeAcceptPredicate,
+    EffectCleanup, EmitOptions, GraphDirectory, IncomingMessage, NodeContext, NodeDefinition,
+    PermissionManifest, Scheduler, Signal, TopologyEvent, TopologyEventKind,
+    TopologyFilterOptions,
 };
 use graphreact_engine_go::GoEngine;
 use graphreact_engine_zig::{
@@ -122,6 +123,64 @@ thread_local! {
     /// `pyruntime::PENDING_MEMO_KEY`.
     static PENDING_MEMO_KEY: RefCell<Option<(String, usize)>> =
         const { RefCell::new(None) };
+
+    // ----- M17 phase 3d-γ: directory + graph snapshot TLS -----
+
+    /// Scheduler directory handle. Installed by
+    /// [`GoEngineGuard::with_directory`] around each
+    /// `process_batch`; read by `host_directory_*` callbacks.
+    /// Cleared between batches; callbacks return safe defaults
+    /// (null / empty arrays / false) when unset. Mirrors
+    /// `pyruntime::CURRENT_DIRECTORY`.
+    static CURRENT_DIRECTORY: RefCell<Option<Rc<RefCell<GraphDirectory>>>> =
+        const { RefCell::new(None) };
+
+    /// Live graph snapshot. Bundles the scheduler's
+    /// `Rc<RefCell<CommunicationGraph>>` + `manifests` +
+    /// `edge_accept_predicates` so the `host_graph_*` Tier 1
+    /// accessors (and Tier 2/3 callbacks landing in M17 phase 3d-ε /
+    /// 3d-ζ) can borrow them without bringing the full scheduler
+    /// into the TLS slot. Mirrors `pyruntime::CURRENT_GRAPH_SNAPSHOT`.
+    static CURRENT_GRAPH_SNAPSHOT: RefCell<Option<Rc<GraphSnapshot>>> =
+        const { RefCell::new(None) };
+}
+
+// ---------------------------------------------------------------------
+// M17 phase 3d-γ: GraphSnapshot
+// ---------------------------------------------------------------------
+
+/// Live snapshot of the scheduler's graph + manifest + edge-accept
+/// predicate state. Cheap to clone via `Rc::clone` — each field is
+/// already an `Rc<RefCell<...>>` cloned out of the scheduler at mount
+/// time, so subsequent mutations applied through the scheduler are
+/// visible to subsequent borrows. Verbatim port of
+/// `pyruntime::GraphSnapshot`.
+pub struct GraphSnapshot {
+    pub graph: Rc<RefCell<CommunicationGraph>>,
+    pub manifests: Rc<RefCell<FxHashMap<String, PermissionManifest>>>,
+    pub edge_accept_predicates: Rc<RefCell<FxHashMap<String, EdgeAcceptPredicate>>>,
+}
+
+impl GraphSnapshot {
+    pub fn from_live(
+        graph: Rc<RefCell<CommunicationGraph>>,
+        manifests: Rc<RefCell<FxHashMap<String, PermissionManifest>>>,
+        edge_accept_predicates: Rc<RefCell<FxHashMap<String, EdgeAcceptPredicate>>>,
+    ) -> Self {
+        Self {
+            graph,
+            manifests,
+            edge_accept_predicates,
+        }
+    }
+}
+
+fn current_directory() -> Option<Rc<RefCell<GraphDirectory>>> {
+    CURRENT_DIRECTORY.with(|c| c.borrow().clone())
+}
+
+fn current_graph_snapshot() -> Option<Rc<GraphSnapshot>> {
+    CURRENT_GRAPH_SNAPSHOT.with(|c| c.borrow().clone())
 }
 
 fn current_engine() -> Option<Rc<RefCell<GoEngine>>> {
@@ -193,6 +252,8 @@ fn reset_global_state() {
     GO_HOOK_INDEX.with(|i| i.set(0));
     MEMO_REGISTRY.with(|r| r.borrow_mut().clear());
     PENDING_MEMO_KEY.with(|p| *p.borrow_mut() = None);
+    CURRENT_DIRECTORY.with(|c| *c.borrow_mut() = None);
+    CURRENT_GRAPH_SNAPSHOT.with(|c| *c.borrow_mut() = None);
 }
 
 /// RAII guard that installs `(engine, iso)` into the TLS slots for
@@ -205,9 +266,32 @@ struct GoEngineGuard {
 }
 
 impl GoEngineGuard {
+    /// Engine + iso only. Equivalent to `with_directory(..., default,
+    /// default)`. Kept for tests + edge cases that don't exercise
+    /// the directory / graph snapshot accessors; production
+    /// `process_batch` always uses [`Self::with_directory`].
+    #[allow(dead_code)]
     fn new(engine: Rc<RefCell<GoEngine>>, iso: IsolateHandle) -> Self {
         CURRENT_ENGINE.with(|c| *c.borrow_mut() = Some(engine));
         CURRENT_ISO.with(|c| c.set(Some(iso)));
+        Self { _phantom: () }
+    }
+
+    /// M17 phase 3d-γ variant: install the engine + iso AND the
+    /// directory + graph snapshot. `process_batch` uses this so the
+    /// `host_directory_*` + `host_graph_*` callbacks see the live
+    /// handles for the duration of the batch. Mirrors
+    /// `pyruntime::PyEngineGuard::with_directory`.
+    fn with_directory(
+        engine: Rc<RefCell<GoEngine>>,
+        iso: IsolateHandle,
+        directory: Rc<RefCell<GraphDirectory>>,
+        graph_snapshot: Rc<GraphSnapshot>,
+    ) -> Self {
+        CURRENT_ENGINE.with(|c| *c.borrow_mut() = Some(engine));
+        CURRENT_ISO.with(|c| c.set(Some(iso)));
+        CURRENT_DIRECTORY.with(|c| *c.borrow_mut() = Some(directory));
+        CURRENT_GRAPH_SNAPSHOT.with(|c| *c.borrow_mut() = Some(graph_snapshot));
         Self { _phantom: () }
     }
 }
@@ -216,6 +300,8 @@ impl Drop for GoEngineGuard {
     fn drop(&mut self) {
         CURRENT_ENGINE.with(|c| *c.borrow_mut() = None);
         CURRENT_ISO.with(|c| c.set(None));
+        CURRENT_DIRECTORY.with(|c| *c.borrow_mut() = None);
+        CURRENT_GRAPH_SNAPSHOT.with(|c| *c.borrow_mut() = None);
     }
 }
 
@@ -756,6 +842,176 @@ fn topology_event_to_host_value(event: &TopologyEvent) -> HostValue {
     }
 }
 
+// ----- M17 phase 3d-γ: directory + graph_query Tier 1 callbacks -----
+
+/// Build the `host_directory_find_by_id(id)` callback. Returns
+/// `{id, role, depth, path}` for the matching entry or null.
+fn build_host_directory_find_by_id_callback() -> BoxCallback {
+    Box::new(|args| {
+        let id = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(directory) = current_directory() else {
+            return Ok(HostValue::Null);
+        };
+        let directory_borrow = directory.borrow();
+        match directory_borrow.find_by_id(&id) {
+            Some(entry) => Ok(HostValue::Object(vec![
+                ("id".to_string(), HostValue::String(entry.id.clone())),
+                ("role".to_string(), HostValue::String(entry.role.clone())),
+                ("depth".to_string(), HostValue::Number(f64::from(entry.depth))),
+                (
+                    "path".to_string(),
+                    HostValue::Array(
+                        entry
+                            .path
+                            .iter()
+                            .map(|s| HostValue::String(s.clone()))
+                            .collect(),
+                    ),
+                ),
+            ])),
+            None => Ok(HostValue::Null),
+        }
+    })
+}
+
+/// Build the `host_directory_find_by_role(role)` callback.
+fn build_host_directory_find_by_role_callback() -> BoxCallback {
+    Box::new(|args| {
+        let role = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let Some(directory) = current_directory() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let ids = directory.borrow().find_by_role(&role);
+        Ok(HostValue::Array(
+            ids.into_iter().map(HostValue::String).collect(),
+        ))
+    })
+}
+
+/// Build the `host_directory_find_by_depth(depth)` callback.
+fn build_host_directory_find_by_depth_callback() -> BoxCallback {
+    Box::new(|args| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let depth = match args.first() {
+            Some(HostValue::Number(n)) => *n as u32,
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let Some(directory) = current_directory() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let ids = directory.borrow().find_by_depth(depth);
+        Ok(HostValue::Array(
+            ids.into_iter().map(HostValue::String).collect(),
+        ))
+    })
+}
+
+/// Build the `host_directory_find_in_subtree(ancestor)` callback.
+fn build_host_directory_find_in_subtree_callback() -> BoxCallback {
+    Box::new(|args| {
+        let ancestor = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let Some(directory) = current_directory() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let ids = directory.borrow().find_in_subtree(&ancestor);
+        Ok(HostValue::Array(
+            ids.into_iter().map(HostValue::String).collect(),
+        ))
+    })
+}
+
+/// Build the `host_directory_is_ancestor(ancestor, descendant)` callback.
+fn build_host_directory_is_ancestor_callback() -> BoxCallback {
+    Box::new(|args| {
+        let ancestor = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let descendant = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let Some(directory) = current_directory() else {
+            return Ok(HostValue::Bool(false));
+        };
+        let result = directory.borrow().is_ancestor(&ancestor, &descendant);
+        Ok(HostValue::Bool(result))
+    })
+}
+
+/// Build the `host_graph_neighbors(id)` callback. Tier 1 accessor
+/// — reads the live `GraphSnapshot.graph` for outgoing neighbours
+/// of any node. Empty list outside an active batch.
+fn build_host_graph_neighbors_callback() -> BoxCallback {
+    Box::new(|args| {
+        let id = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Array(vec![])),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Array(vec![]));
+        };
+        let neighbors = snapshot.graph.borrow().neighbors(&id).unwrap_or_default();
+        Ok(HostValue::Array(
+            neighbors.into_iter().map(HostValue::String).collect(),
+        ))
+    })
+}
+
+/// Build the `host_graph_has_node(id)` callback.
+fn build_host_graph_has_node_callback() -> BoxCallback {
+    Box::new(|args| {
+        let id = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Bool(false));
+        };
+        let has = snapshot.graph.borrow().has_node(&id);
+        Ok(HostValue::Bool(has))
+    })
+}
+
+/// Build the `host_graph_has_edge(u, v)` callback.
+fn build_host_graph_has_edge_callback() -> BoxCallback {
+    Box::new(|args| {
+        let u = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let v = match args.get(1) {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        let Some(snapshot) = current_graph_snapshot() else {
+            return Ok(HostValue::Bool(false));
+        };
+        let has = snapshot.graph.borrow().has_edge(&u, &v, None);
+        Ok(HostValue::Bool(has))
+    })
+}
+
+/// Build the `host_graph_node_count()` callback.
+fn build_host_graph_node_count_callback() -> BoxCallback {
+    Box::new(|_args| {
+        #[allow(clippy::cast_precision_loss)]
+        let count = current_graph_snapshot()
+            .map(|s| s.graph.borrow().nodes().count() as f64)
+            .unwrap_or(0.0);
+        Ok(HostValue::Number(count))
+    })
+}
+
 /// Parse the third argument of `host_emit` into [`EmitOptions`].
 /// Recognised keys mirror JSC + CPython: `to` (Array of String),
 /// `ttl` (Number), `edgeKey` (String), `direct` (String). Unknown
@@ -831,6 +1087,19 @@ pub struct GoRuntime {
     pub component_handles: FxHashMap<String, FunctionHandle>,
     /// Node ids that were successfully registered with the scheduler.
     pub mounted: Vec<String>,
+    /// **M17 phase 3d-γ.** Scheduler directory handle cloned at
+    /// mount time. `process_batch` installs this into the
+    /// `CURRENT_DIRECTORY` TLS slot via
+    /// [`GoEngineGuard::with_directory`] so the `host_directory_*`
+    /// callbacks see the live tree for the duration of the batch.
+    /// Empty (`Rc::new(RefCell::new(GraphDirectory::new()))`) when
+    /// produced by [`build_and_load`].
+    pub directory: Rc<RefCell<GraphDirectory>>,
+    /// **M17 phase 3d-γ.** Live graph snapshot bundling the
+    /// scheduler's `graph` + `manifests` + `edge_accept_predicates`
+    /// handles. Phase 3d-δ / 3d-ε / 3d-ζ algorithm + Tier 2 / Tier 3
+    /// accessors all read this snapshot.
+    pub graph_snapshot: Rc<GraphSnapshot>,
 }
 
 impl std::fmt::Debug for GoRuntime {
@@ -851,7 +1120,15 @@ impl GoRuntime {
     /// engine + iso TLS so deferred host callbacks (message handlers)
     /// can re-enter Go via [`GoEngine::invoke_handler`].
     pub fn process_batch(&mut self) -> Result<(), graphreact_core::RuntimeError> {
-        let _engine_guard = GoEngineGuard::new(Rc::clone(&self.engine), self.iso);
+        // M17 phase 3d-γ: install directory + graph snapshot TLS so
+        // `host_directory_*` + `host_graph_*` callbacks see the live
+        // handles for the duration of the batch.
+        let _engine_guard = GoEngineGuard::with_directory(
+            Rc::clone(&self.engine),
+            self.iso,
+            Rc::clone(&self.directory),
+            Rc::clone(&self.graph_snapshot),
+        );
         self.scheduler.process_batch()
     }
 
@@ -891,6 +1168,12 @@ pub fn build_and_load(grx_path: &Path, out_dir: &Path) -> Result<GoRuntime, Runt
         .filter(|d| d.lang == ComponentLang::Go)
         .count();
 
+    let empty_graph: Rc<RefCell<CommunicationGraph>> =
+        Rc::new(RefCell::new(CommunicationGraph::new()));
+    let empty_manifests: Rc<RefCell<FxHashMap<String, PermissionManifest>>> =
+        Rc::new(RefCell::new(FxHashMap::default()));
+    let empty_predicates: Rc<RefCell<FxHashMap<String, EdgeAcceptPredicate>>> =
+        Rc::new(RefCell::new(FxHashMap::default()));
     Ok(GoRuntime {
         engine: Rc::new(RefCell::new(engine)),
         iso,
@@ -903,6 +1186,12 @@ pub fn build_and_load(grx_path: &Path, out_dir: &Path) -> Result<GoRuntime, Runt
         scheduler: Scheduler::new(CommunicationGraph::new()),
         component_handles: FxHashMap::default(),
         mounted: Vec::new(),
+        directory: Rc::new(RefCell::new(GraphDirectory::new())),
+        graph_snapshot: Rc::new(GraphSnapshot::from_live(
+            empty_graph,
+            empty_manifests,
+            empty_predicates,
+        )),
     })
 }
 
@@ -983,6 +1272,61 @@ pub fn mount_with_scheduler(
             build_host_accept_edge_callback(),
         )
         .map_err(RuntimeError::Engine)?;
+        // M17 phase 3d-γ: directory finders + graph_query Tier 1.
+        e.register_callback(
+            iso,
+            "host_directory_find_by_id",
+            build_host_directory_find_by_id_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_directory_find_by_role",
+            build_host_directory_find_by_role_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_directory_find_by_depth",
+            build_host_directory_find_by_depth_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_directory_find_in_subtree",
+            build_host_directory_find_in_subtree_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_directory_is_ancestor",
+            build_host_directory_is_ancestor_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_graph_neighbors",
+            build_host_graph_neighbors_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_graph_has_node",
+            build_host_graph_has_node_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_graph_has_edge",
+            build_host_graph_has_edge_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_graph_node_count",
+            build_host_graph_node_count_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
         iso
     };
 
@@ -1051,6 +1395,18 @@ pub fn mount_with_scheduler(
     let n_edges = ir.edges.len();
     let n_definitions = ir.definitions.len();
 
+    // M17 phase 3d-γ: clone the scheduler's directory handle + build
+    // a graph snapshot bundling the live `Rc<RefCell<...>>` handles
+    // the `host_graph_*` accessors borrow under TLS. The snapshot
+    // sees subsequent scheduler mutations because the fields are
+    // shared `Rc`s, not by-value copies.
+    let directory = Rc::clone(&scheduler.directory);
+    let graph_snapshot = Rc::new(GraphSnapshot::from_live(
+        Rc::clone(&scheduler.graph),
+        Rc::clone(&scheduler.manifests),
+        Rc::clone(&scheduler.edge_accept_predicates),
+    ));
+
     Ok(GoRuntime {
         engine: engine_rc,
         iso,
@@ -1063,6 +1419,8 @@ pub fn mount_with_scheduler(
         scheduler,
         component_handles,
         mounted,
+        directory,
+        graph_snapshot,
     })
 }
 
@@ -1923,6 +2281,209 @@ mod tests {
         );
     }
 
+    /// Phase 3d-γ: UseGraphQuery Tier 1 accessors surface the live
+    /// snapshot. Probe body reads NodeCount / HasNode / HasEdge /
+    /// Neighbors and the test asserts each result is what we
+    /// expect from a 2-node, 1-edge fixture.
+    fn scenario_use_graph_query_tier_1_accessors() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-graph-query.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("graph-query");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-graph-query.grx");
+
+        // Capture each accessor observation.
+        let node_counts: std::sync::Arc<parking_lot::Mutex<Vec<f64>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let node_counts_for_cb = std::sync::Arc::clone(&node_counts);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_node_count",
+                Box::new(move |args| {
+                    if let Some(HostValue::Number(n)) = args.first() {
+                        node_counts_for_cb.lock().push(*n);
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_node_count");
+
+        let has_node_obs: std::sync::Arc<parking_lot::Mutex<Vec<(String, bool)>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let has_node_for_cb = std::sync::Arc::clone(&has_node_obs);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_has_node",
+                Box::new(move |args| {
+                    let id = match args.first() {
+                        Some(HostValue::String(s)) => s.clone(),
+                        _ => return Ok(HostValue::Null),
+                    };
+                    let present = matches!(args.get(1), Some(HostValue::Bool(true)));
+                    has_node_for_cb.lock().push((id, present));
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_has_node");
+
+        let has_edge_obs: std::sync::Arc<parking_lot::Mutex<Vec<(String, String, bool)>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let has_edge_for_cb = std::sync::Arc::clone(&has_edge_obs);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_has_edge",
+                Box::new(move |args| {
+                    let u = match args.first() {
+                        Some(HostValue::String(s)) => s.clone(),
+                        _ => return Ok(HostValue::Null),
+                    };
+                    let v = match args.get(1) {
+                        Some(HostValue::String(s)) => s.clone(),
+                        _ => return Ok(HostValue::Null),
+                    };
+                    let present = matches!(args.get(2), Some(HostValue::Bool(true)));
+                    has_edge_for_cb.lock().push((u, v, present));
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_has_edge");
+
+        let neighbours_obs: std::sync::Arc<parking_lot::Mutex<Vec<(String, Vec<String>)>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let neighbours_for_cb = std::sync::Arc::clone(&neighbours_obs);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_neighbors_of",
+                Box::new(move |args| {
+                    let of = match args.first() {
+                        Some(HostValue::String(s)) => s.clone(),
+                        _ => return Ok(HostValue::Null),
+                    };
+                    let row: Vec<String> = match args.get(1) {
+                        Some(HostValue::Array(arr)) => arr
+                            .iter()
+                            .filter_map(|x| {
+                                if let HostValue::String(s) = x {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    neighbours_for_cb.lock().push((of, row));
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_neighbors_of");
+
+        runtime.process_batch().expect("batch 1");
+
+        let counts = node_counts.lock();
+        assert!(
+            counts.iter().any(|n| (*n - 2.0).abs() < f64::EPSILON),
+            "expected NodeCount=2; got {counts:?}"
+        );
+
+        let nodes = has_node_obs.lock();
+        let alpha_present = nodes.iter().any(|(id, p)| id == "alpha" && *p);
+        let zzz_absent = nodes.iter().any(|(id, p)| id == "zzz" && !*p);
+        assert!(alpha_present, "expected HasNode(alpha)=true; got {nodes:?}");
+        assert!(zzz_absent, "expected HasNode(zzz)=false; got {nodes:?}");
+
+        let edges = has_edge_obs.lock();
+        let alpha_beta = edges.iter().any(|(u, v, p)| u == "alpha" && v == "beta" && *p);
+        let alpha_gamma = edges
+            .iter()
+            .any(|(u, v, p)| u == "alpha" && v == "gamma" && !*p);
+        assert!(
+            alpha_beta,
+            "expected HasEdge(alpha, beta)=true; got {edges:?}"
+        );
+        assert!(
+            alpha_gamma,
+            "expected HasEdge(alpha, gamma)=false; got {edges:?}"
+        );
+
+        let ns = neighbours_obs.lock();
+        let alpha_neighbours_correct = ns
+            .iter()
+            .any(|(of, row)| of == "alpha" && row.len() == 1 && row[0] == "beta");
+        assert!(
+            alpha_neighbours_correct,
+            "expected Neighbors(alpha)=[beta]; got {ns:?}"
+        );
+    }
+
+    /// Phase 3d-γ: UseDirectory FindByID surfaces the scheduler's
+    /// GraphDirectory. Probe body looks up an existing id + a
+    /// missing one; the test asserts the entry presence pattern.
+    fn scenario_use_directory_find_by_id() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-directory.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("directory");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-directory.grx");
+
+        let observations: std::sync::Arc<parking_lot::Mutex<Vec<(String, bool, String)>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observations_for_cb = std::sync::Arc::clone(&observations);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_directory_find_by_id",
+                Box::new(move |args| {
+                    let asked = match args.first() {
+                        Some(HostValue::String(s)) => s.clone(),
+                        _ => return Ok(HostValue::Null),
+                    };
+                    let found = matches!(args.get(1), Some(HostValue::Bool(true)));
+                    let id = match args.get(2) {
+                        Some(HostValue::String(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    observations_for_cb.lock().push((asked, found, id));
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_directory_find_by_id");
+
+        runtime.process_batch().expect("batch 1");
+
+        let obs = observations.lock();
+        let saw_a = obs
+            .iter()
+            .any(|(asked, found, id)| asked == "a" && *found && id == "a");
+        let missed_zzz = obs.iter().any(|(asked, found, _)| asked == "zzz" && !*found);
+        assert!(
+            saw_a,
+            "expected FindByID(a) to return entry with id=a; got obs={obs:?}"
+        );
+        assert!(
+            missed_zzz,
+            "expected FindByID(zzz) to return nil; got obs={obs:?}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -1955,49 +2516,57 @@ mod tests {
         // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
         // between fixtures (each fresh mount expects to start at
         // signal id 1 for assertion stability).
-        eprintln!("[goruntime smoke 1/11] build_and_load + body dispatch");
+        eprintln!("[goruntime smoke 1/13] build_and_load + body dispatch");
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/11] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/13] EngineMisroute rejects non-Go bodies");
         reset_global_state();
         scenario_rejects_non_go_lang();
 
-        eprintln!("[goruntime smoke 3/11] emit/message round-trip");
+        eprintln!("[goruntime smoke 3/13] emit/message round-trip");
         reset_global_state();
         scenario_emit_dispatches_to_neighbor();
 
-        eprintln!("[goruntime smoke 4/11] use_state preserves value across renders");
+        eprintln!("[goruntime smoke 4/13] use_state preserves value across renders");
         reset_global_state();
         scenario_use_state_preserves_value_across_renders();
 
-        eprintln!("[goruntime smoke 5/11] state survives a message");
+        eprintln!("[goruntime smoke 5/13] state survives a message");
         reset_global_state();
         scenario_use_state_survives_a_message();
 
-        eprintln!("[goruntime smoke 6/11] use_effect with empty deps fires once");
+        eprintln!("[goruntime smoke 6/13] use_effect with empty deps fires once");
         reset_global_state();
         scenario_use_effect_empty_deps_fires_once();
 
-        eprintln!("[goruntime smoke 7/11] use_memo single-render fires factory once");
+        eprintln!("[goruntime smoke 7/13] use_memo single-render fires factory once");
         reset_global_state();
         scenario_use_memo_caches_when_deps_unchanged();
 
-        eprintln!("[goruntime smoke 8/11] use_memo recomputes on dep change");
+        eprintln!("[goruntime smoke 8/13] use_memo recomputes on dep change");
         reset_global_state();
         scenario_use_memo_caches_and_recomputes();
 
-        eprintln!("[goruntime smoke 9/11] use_reducer dispatch updates state");
+        eprintln!("[goruntime smoke 9/13] use_reducer dispatch updates state");
         reset_global_state();
         scenario_use_reducer_dispatch_updates_state();
 
-        eprintln!("[goruntime smoke 10/11] use_neighbors returns structural ids");
+        eprintln!("[goruntime smoke 10/13] use_neighbors returns structural ids");
         reset_global_state();
         scenario_use_neighbors_returns_structural_ids();
 
-        eprintln!("[goruntime smoke 11/11] use_accept_edge fires topology event");
+        eprintln!("[goruntime smoke 11/13] use_accept_edge fires topology event");
         reset_global_state();
         scenario_accept_edge_fires_topology_event();
+
+        eprintln!("[goruntime smoke 12/13] use_graph_query Tier 1 accessors");
+        reset_global_state();
+        scenario_use_graph_query_tier_1_accessors();
+
+        eprintln!("[goruntime smoke 13/13] use_directory find_by_id");
+        reset_global_state();
+        scenario_use_directory_find_by_id();
 
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup

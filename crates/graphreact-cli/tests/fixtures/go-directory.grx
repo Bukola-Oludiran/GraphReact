@@ -1,0 +1,32 @@
+<!-- M17-phase3d-γ: UseDirectory acceptance. ProbeNode reads the
+     scheduler-side GraphDirectory via UseDirectory() and surfaces:
+       - FindByID("a") → entry with id="a"
+       - FindByID("zzz") → nil (entry absent)
+     The test asserts each observation matches the expected shape. -->
+
+<ProbeNode lang="go">
+func ProbeNodeBody(ctx Ctx) Manifest {
+    d := UseDirectory()
+
+    if entry := d.FindByID("a"); entry != nil {
+        _, _ = Invoke("host_observe_directory_find_by_id", "a", true, entry.ID)
+    } else {
+        _, _ = Invoke("host_observe_directory_find_by_id", "a", false, "")
+    }
+    if entry := d.FindByID("zzz"); entry != nil {
+        _, _ = Invoke("host_observe_directory_find_by_id", "zzz", true, entry.ID)
+    } else {
+        _, _ = Invoke("host_observe_directory_find_by_id", "zzz", false, "")
+    }
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</ProbeNode>
+
+<Graph id="go-directory">
+  <ProbeNode id="a" />
+</Graph>

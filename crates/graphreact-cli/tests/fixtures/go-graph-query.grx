@@ -1,0 +1,43 @@
+<!-- M17-phase3d-γ: UseGraphQuery Tier 1 acceptance. Probe body reads
+     the live GraphSnapshot via UseGraphQuery() and surfaces:
+       - NodeCount() (total nodes in the graph)
+       - HasNode("alpha") (true)
+       - HasNode("zzz")   (false — does not exist)
+       - HasEdge("alpha", "beta") (true)
+       - HasEdge("alpha", "gamma") (false — not wired)
+       - Neighbors("alpha") (= ["beta"])
+     The test asserts each observation matches the expected value.
+
+     Convention: every result is surfaced via Invoke("host_observe_*",
+     ...) callbacks the test registers before driving process_batch. -->
+
+<Probe lang="go">
+func ProbeBody(ctx Ctx) Manifest {
+    g := UseGraphQuery()
+
+    _, _ = Invoke("host_observe_node_count", float64(g.NodeCount()))
+    _, _ = Invoke("host_observe_has_node", "alpha", g.HasNode("alpha"))
+    _, _ = Invoke("host_observe_has_node", "zzz", g.HasNode("zzz"))
+    _, _ = Invoke("host_observe_has_edge", "alpha", "beta", g.HasEdge("alpha", "beta"))
+    _, _ = Invoke("host_observe_has_edge", "alpha", "gamma", g.HasEdge("alpha", "gamma"))
+
+    ns := g.Neighbors("alpha")
+    payload := make([]interface{}, len(ns))
+    for i, id := range ns {
+        payload[i] = id
+    }
+    _, _ = Invoke("host_observe_neighbors_of", "alpha", payload)
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Probe>
+
+<Graph id="go-graph-query">
+  <Probe id="alpha" />
+  <Probe id="beta" />
+  <edge source="alpha" target="beta" />
+</Graph>

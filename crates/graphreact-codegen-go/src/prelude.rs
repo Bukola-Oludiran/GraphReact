@@ -27,10 +27,18 @@
 //!   substrate from `UseMessage` (same envelope shape); UseAcceptEdge
 //!   enqueues a `PendingMutation::AcceptEdge` via the host callback
 //!   that fires an `EdgeAdded` topology event on the next cascade.
+//! - **M17 phase 3d-γ:** SHIPPED. `UseDirectory` exposes the
+//!   scheduler's `GraphDirectory` (FindByID / FindByRole /
+//!   FindByDepth / FindInSubtree / IsAncestor); `UseGraphQuery`
+//!   Tier 1 surfaces the live `GraphSnapshot` over four accessors
+//!   (Neighbors / HasNode / HasEdge / NodeCount). Both share the
+//!   `CURRENT_DIRECTORY` + `CURRENT_GRAPH_SNAPSHOT` TLS slots
+//!   installed by `GoEngineGuard::with_directory` around every
+//!   `process_batch`.
 //!
-//! Future M17 phase 3d-γ–h sessions add `UseGraphQuery`,
-//! supervision hooks, `UseSource`, and `UseEffectAsync` on top of
-//! this substrate.
+//! Future M17 phase 3d-δ–h sessions add algorithm accessors,
+//! Tier 2/3 graph queries, supervision hooks, `UseSource`, and
+//! `UseEffectAsync` on top of this substrate.
 
 /// ABI version baked into the emitted prelude. Must match
 /// [`graphreact_engine_go::ffi::GRX_GO_ABI_VERSION`] (currently `1`).
@@ -943,6 +951,184 @@ func UseAcceptEdge() func(target string) {{
     return func(target string) {{
         _, _ = Invoke("host_accept_edge", target)
     }}
+}}
+
+// ----- M17 phase 3d-γ: directory + graph-query Tier 1 -----
+
+// DirectoryEntry is the JSON shape returned by FindByID. Mirrors
+// `graphreact_core::DirectoryEntry`. `Path` is the chain of
+// ancestor IDs leading from the root to (but excluding) the entry.
+type DirectoryEntry struct {{
+    ID    string   `json:"id"`
+    Role  string   `json:"role"`
+    Depth float64  `json:"depth"`
+    Path  []string `json:"path"`
+}}
+
+// Directory exposes the scheduler's GraphDirectory finders. Each
+// method routes through a dedicated host callback (no engine
+// re-entry — directories are pure HOOK_CTX-shaped reads via the
+// CURRENT_DIRECTORY TLS slot installed by GoEngineGuard).
+//
+// Calling Directory methods outside an active `process_batch`
+// returns zero values (nil entry, empty slice, false). The hooks
+// substrate inside graphreact-core never panics on missing context;
+// the returns degrade gracefully.
+type Directory struct{{}}
+
+// UseDirectory returns a Directory handle that drives the host
+// callback finders against the scheduler's GraphDirectory. The
+// handle is cheap (zero-sized) and may be cached for the body's
+// lifetime.
+func UseDirectory() Directory {{
+    return Directory{{}}
+}}
+
+// FindByID returns the directory entry for `id`, or nil if no entry
+// exists. Surfaces the node's role + depth + ancestor path.
+func (Directory) FindByID(id string) *DirectoryEntry {{
+    raw, status := Invoke("host_directory_find_by_id", id)
+    if status != GR_OK {{
+        return nil
+    }}
+    // host_directory_find_by_id encodes "no entry" as JSON `null`.
+    if len(raw) == 4 && string(raw) == "null" {{
+        return nil
+    }}
+    var entry DirectoryEntry
+    if err := json.Unmarshal(raw, &entry); err != nil {{
+        return nil
+    }}
+    return &entry
+}}
+
+// FindByRole returns every node id whose entry's `role` matches.
+// Order follows directory iteration order — stable across renders
+// modulo topology mutations.
+func (Directory) FindByRole(role string) []string {{
+    raw, status := Invoke("host_directory_find_by_role", role)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// FindByDepth returns every node id whose entry's `depth` equals
+// `depth`. Depth 0 = the root subgraph; depth 1 = first-level
+// children; etc.
+func (Directory) FindByDepth(depth uint32) []string {{
+    raw, status := Invoke("host_directory_find_by_depth", depth)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// FindInSubtree returns every descendant id of `ancestor` (inclusive
+// of the ancestor itself in the canonical pyruntime / JSC shape).
+func (Directory) FindInSubtree(ancestor string) []string {{
+    raw, status := Invoke("host_directory_find_in_subtree", ancestor)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// IsAncestor returns true iff `ancestor` is an ancestor of
+// `descendant` in the directory tree. Always false outside an
+// active batch.
+func (Directory) IsAncestor(ancestor, descendant string) bool {{
+    raw, status := Invoke("host_directory_is_ancestor", ancestor, descendant)
+    if status != GR_OK {{
+        return false
+    }}
+    var b bool
+    if err := json.Unmarshal(raw, &b); err != nil {{
+        return false
+    }}
+    return b
+}}
+
+// GraphQuery exposes Tier 1 accessors over the live GraphSnapshot:
+// Neighbors / HasNode / HasEdge / NodeCount. Mutations applied
+// through the scheduler are visible to subsequent calls.
+//
+// Tier 2 / Tier 3 accessors layer onto this surface in M17 phase
+// 3d-ε / 3d-ζ via `g.Tier2(msgType)` / `g.Tier3(msgType)` methods.
+type GraphQuery struct{{}}
+
+// UseGraphQuery returns a GraphQuery handle. Cheap zero-sized
+// handle; ok to cache per render.
+func UseGraphQuery() GraphQuery {{
+    return GraphQuery{{}}
+}}
+
+// Neighbors returns the structural neighbour ids of `id` (every
+// node reachable by one outgoing edge). Differs from UseNeighbors()
+// which reads the ACTIVE node's neighbours from HOOK_CTX; this
+// reads any node's neighbours from the snapshot.
+func (GraphQuery) Neighbors(id string) []string {{
+    raw, status := Invoke("host_graph_neighbors", id)
+    if status != GR_OK {{
+        return []string{{}}
+    }}
+    var ids []string
+    if err := json.Unmarshal(raw, &ids); err != nil {{
+        return []string{{}}
+    }}
+    return ids
+}}
+
+// HasNode returns true iff `id` exists in the snapshot.
+func (GraphQuery) HasNode(id string) bool {{
+    raw, status := Invoke("host_graph_has_node", id)
+    if status != GR_OK {{
+        return false
+    }}
+    var b bool
+    if err := json.Unmarshal(raw, &b); err != nil {{
+        return false
+    }}
+    return b
+}}
+
+// HasEdge returns true iff there exists a (u -> v) edge in the
+// snapshot (any key).
+func (GraphQuery) HasEdge(u, v string) bool {{
+    raw, status := Invoke("host_graph_has_edge", u, v)
+    if status != GR_OK {{
+        return false
+    }}
+    var b bool
+    if err := json.Unmarshal(raw, &b); err != nil {{
+        return false
+    }}
+    return b
+}}
+
+// NodeCount returns the total number of nodes in the snapshot.
+func (GraphQuery) NodeCount() int {{
+    raw, status := Invoke("host_graph_node_count")
+    if status != GR_OK {{
+        return 0
+    }}
+    var n float64
+    if err := json.Unmarshal(raw, &n); err != nil {{
+        return 0
+    }}
+    return int(n)
 }}
 
 // GrxInvokeCallback invokes a generic Go callback stored under

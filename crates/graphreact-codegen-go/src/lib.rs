@@ -474,6 +474,30 @@ mod tests {
                 "prelude missing required M17 phase 3d-β hook surface: {sym}"
             );
         }
+        // M17 phase 3d-γ surface: directory finders + graph_query
+        // Tier 1. A regression that strips any of these breaks the
+        // ctx.directory + UseGraphQuery acceptance.
+        for sym in [
+            "type DirectoryEntry",
+            "type Directory ",
+            "func UseDirectory()",
+            "FindByID",
+            "FindByRole",
+            "FindByDepth",
+            "FindInSubtree",
+            "IsAncestor",
+            "type GraphQuery",
+            "func UseGraphQuery()",
+            "Neighbors",
+            "HasNode",
+            "HasEdge",
+            "NodeCount",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3d-γ hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();
