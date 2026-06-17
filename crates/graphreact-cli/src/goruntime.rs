@@ -42,6 +42,7 @@ use serde_json::Value;
 
 use graphreact_codegen_go::{BuildArtifact, Codegen};
 use graphreact_core::{
+    delay_source as core_delay_source, timer_source as core_timer_source,
     use_accept_edge as core_use_accept_edge, use_compose as core_use_compose,
     use_demonitor as core_use_demonitor,
     use_edge_accept_handler as core_use_edge_accept_handler, use_effect as core_use_effect,
@@ -49,12 +50,13 @@ use graphreact_core::{
     use_group_leave as core_use_group_leave, use_link as core_use_link,
     use_memo as core_use_memo, use_message as core_use_message,
     use_monitor as core_use_monitor, use_neighbors as core_use_neighbors,
-    use_spawn_child as core_use_spawn_child, use_state as core_use_state,
-    use_topology as core_use_topology, use_unlink as core_use_unlink,
-    use_unmount_self as core_use_unmount_self, Attrs, CommunicationGraph, ComposeChildSpec,
-    EdgeAcceptPredicate, EffectCleanup, EmitOptions, GraphDirectory, IncomingMessage,
-    MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest, Scheduler,
-    Signal, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
+    use_source as core_use_source, use_spawn_child as core_use_spawn_child,
+    use_state as core_use_state, use_topology as core_use_topology,
+    use_unlink as core_use_unlink, use_unmount_self as core_use_unmount_self, Attrs,
+    CommunicationGraph, ComposeChildSpec, EdgeAcceptPredicate, EffectCleanup, EmitOptions,
+    EventSource, GraphDirectory, IncomingMessage, MonitorRef as CoreMonitorRef, NodeContext,
+    NodeDefinition, PermissionManifest, Scheduler, Signal, TopologyEvent, TopologyEventKind,
+    TopologyFilterOptions,
 };
 use std::sync::Arc;
 
@@ -2968,6 +2970,100 @@ fn build_host_group_leave_callback() -> BoxCallback {
     })
 }
 
+// ---------------------------------------------------------------------
+// M17 phase 3e-γ: use_source + 4 source kinds (timer/delay/http/watch)
+// ---------------------------------------------------------------------
+//
+// External-event substrate. Go-side `UseSource(factory, deps)` ships
+// an EventSource descriptor envelope `{kind, intervalMs?, delayMs?,
+// opts?: {port?, path?}}` through this callback. The kind dispatches
+// to graphreact-core's `timer_source` / `delay_source` or to
+// `crate::sources::http_source` / `crate::sources::watch_source` (the
+// followon-A real-firing tokio + notify ports). `core_use_source`
+// then registers the factory + deps as a hook slot; the scheduler
+// instantiates the source on first mount (or deps change) and routes
+// its events through the scheduler's external inbox as messages
+// caught by UseMessage.
+//
+// Verbatim port of `pyruntime::build_host_use_source_callback`.
+
+/// Build the `host_use_source(descriptor, deps)` callback. Decodes
+/// the descriptor's kind + payload and routes to the matching
+/// `Arc<dyn EventSource>` constructor.
+fn build_host_use_source_callback() -> BoxCallback {
+    Box::new(|args| {
+        let descriptor = match args.first() {
+            Some(HostValue::Object(pairs)) => pairs.clone(),
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_use_source: expected Object descriptor, got {other:?}"
+                )));
+            }
+        };
+        let deps: Vec<Value> = match args.get(1) {
+            Some(HostValue::Array(arr)) => {
+                arr.iter().cloned().map(HostValue::into_json).collect()
+            }
+            None | Some(HostValue::Null) => Vec::new(),
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_use_source: expected Array deps, got {other:?}"
+                )));
+            }
+        };
+
+        let mut kind: Option<String> = None;
+        let mut interval_ms: u64 = 0;
+        let mut delay_ms: u64 = 0;
+        let mut http_port: u16 = 0;
+        let mut watch_path: String = String::new();
+        for (k, v) in descriptor {
+            match (k.as_str(), v) {
+                ("kind", HostValue::String(s)) => kind = Some(s),
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                ("intervalMs", HostValue::Number(n)) => interval_ms = n as u64,
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                ("delayMs", HostValue::Number(n)) => delay_ms = n as u64,
+                ("opts", HostValue::Object(opts_pairs)) => {
+                    for (ok, ov) in opts_pairs {
+                        match (ok.as_str(), ov) {
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                clippy::cast_sign_loss
+                            )]
+                            ("port", HostValue::Number(n)) => {
+                                http_port = (n as u64).min(u64::from(u16::MAX)) as u16;
+                            }
+                            ("path", HostValue::String(s)) => watch_path = s,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let kind_str = kind.unwrap_or_default();
+        let factory: Box<dyn FnOnce() -> std::sync::Arc<dyn EventSource>> = match kind_str.as_str()
+        {
+            "timer" => Box::new(move || core_timer_source(interval_ms)),
+            "delay" => Box::new(move || core_delay_source(delay_ms)),
+            // followon-A infrastructure: http needs the binary to run
+            // inside a tokio runtime context (grx main() installs
+            // one); watch uses notify's own thread and is runtime-
+            // agnostic.
+            "http" => Box::new(move || crate::sources::http_source(http_port)),
+            "watch" => Box::new(move || crate::sources::watch_source(watch_path)),
+            // Unknown-kind placeholder — a timer with u64::MAX
+            // interval never fires.
+            _ => Box::new(|| core_timer_source(u64::MAX)),
+        };
+
+        core_use_source(move || factory(), deps);
+        Ok(HostValue::Null)
+    })
+}
+
 /// Parse the third argument of `host_emit` into [`EmitOptions`].
 /// Recognised keys mirror JSC + CPython: `to` (Array of String),
 /// `ttl` (Number), `edgeKey` (String), `direct` (String). Unknown
@@ -3492,6 +3588,9 @@ pub fn mount_with_scheduler(
             build_host_group_leave_callback(),
         )
         .map_err(RuntimeError::Engine)?;
+        // M17 phase 3e-γ: external-event source substrate.
+        e.register_callback(iso, "host_use_source", build_host_use_source_callback())
+            .map_err(RuntimeError::Engine)?;
         iso
     };
 
@@ -5383,6 +5482,120 @@ mod tests {
         );
     }
 
+    /// Phase 3e-γ: UseSource + 4 source kinds wiring-only test.
+    ///
+    /// Uses the bare `build_and_load` path so the production
+    /// `host_use_source` registration never runs — we install a
+    /// capture callback that records the descriptor envelope. The
+    /// body invokes UseSource four times (timer / delay / http /
+    /// watch), each with a distinct payload, and the test asserts
+    /// the four descriptors decoded with the expected (kind, value,
+    /// path) tuple.
+    ///
+    /// Why wiring-only: real source firing is async + needs a
+    /// multi-threaded tokio runtime; the sync end_to_end harness
+    /// can't observe events. graphreact-core's source tests cover
+    /// the production firing path. Verbatim port of
+    /// `pyruntime::phase3e_gamma_use_source_*`.
+    fn scenario_use_source_dispatches_descriptors() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/go-source.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("source");
+        let runtime = build_and_load(&fixture, &out_dir)
+            .expect("build_and_load should succeed for go-source.grx");
+
+        // (kind, intervalMs|delayMs|port, path) tuples — value field
+        // is stored as u64 for uniform shape, path empty when the
+        // descriptor doesn't carry one.
+        let captured: std::sync::Arc<parking_lot::Mutex<Vec<(String, u64, String)>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured_cb = std::sync::Arc::clone(&captured);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_use_source",
+                Box::new(move |args| {
+                    let HostValue::Object(pairs) =
+                        args.first().cloned().unwrap_or(HostValue::Null)
+                    else {
+                        return Ok(HostValue::Null);
+                    };
+                    let mut kind = String::new();
+                    let mut value: u64 = 0;
+                    let mut path = String::new();
+                    for (k, v) in pairs {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss
+                        )]
+                        match (k.as_str(), v) {
+                            ("kind", HostValue::String(s)) => kind = s,
+                            ("intervalMs" | "delayMs", HostValue::Number(n)) => {
+                                value = n as u64;
+                            }
+                            ("opts", HostValue::Object(opts_pairs)) => {
+                                for (ok, ov) in opts_pairs {
+                                    match (ok.as_str(), ov) {
+                                        #[allow(
+                                            clippy::cast_possible_truncation,
+                                            clippy::cast_sign_loss
+                                        )]
+                                        ("port", HostValue::Number(n)) => {
+                                            value = n as u64;
+                                        }
+                                        ("path", HostValue::String(s)) => path = s,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    captured_cb.lock().push((kind, value, path));
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_use_source");
+
+        // Drive the body manually via the bare-runtime path.
+        let module = runtime
+            .engine
+            .borrow_mut()
+            .eval_module(runtime.iso, "Ticker", "")
+            .expect("eval_module Ticker");
+        let body_fn = runtime
+            .engine
+            .borrow_mut()
+            .resolve_function(runtime.iso, module, "body")
+            .expect("resolve body");
+        let ctx = HostValue::Object(vec![
+            ("id".into(), HostValue::String("ticker".into())),
+            ("props".into(), HostValue::Object(Vec::new())),
+            ("neighbors".into(), HostValue::Array(Vec::new())),
+        ]);
+        runtime
+            .engine
+            .borrow_mut()
+            .call_function(runtime.iso, body_fn, &[ctx])
+            .expect("call ticker body");
+
+        let descriptors = captured.lock();
+        assert_eq!(
+            descriptors.as_slice(),
+            &[
+                ("timer".to_string(), 50_u64, String::new()),
+                ("delay".to_string(), 120_u64, String::new()),
+                ("http".to_string(), 8080_u64, String::new()),
+                ("watch".to_string(), 0_u64, "/tmp/grx-watch".to_string()),
+            ],
+            "UseSource dispatched all four descriptors in order; captured: {descriptors:?}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -5415,77 +5628,81 @@ mod tests {
         // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
         // between fixtures (each fresh mount expects to start at
         // signal id 1 for assertion stability).
-        eprintln!("[goruntime smoke 1/18] build_and_load + body dispatch");
+        eprintln!("[goruntime smoke 1/19] build_and_load + body dispatch");
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/18] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/19] EngineMisroute rejects non-Go bodies");
         reset_global_state();
         scenario_rejects_non_go_lang();
 
-        eprintln!("[goruntime smoke 3/18] emit/message round-trip");
+        eprintln!("[goruntime smoke 3/19] emit/message round-trip");
         reset_global_state();
         scenario_emit_dispatches_to_neighbor();
 
-        eprintln!("[goruntime smoke 4/18] use_state preserves value across renders");
+        eprintln!("[goruntime smoke 4/19] use_state preserves value across renders");
         reset_global_state();
         scenario_use_state_preserves_value_across_renders();
 
-        eprintln!("[goruntime smoke 5/18] state survives a message");
+        eprintln!("[goruntime smoke 5/19] state survives a message");
         reset_global_state();
         scenario_use_state_survives_a_message();
 
-        eprintln!("[goruntime smoke 6/18] use_effect with empty deps fires once");
+        eprintln!("[goruntime smoke 6/19] use_effect with empty deps fires once");
         reset_global_state();
         scenario_use_effect_empty_deps_fires_once();
 
-        eprintln!("[goruntime smoke 7/18] use_memo single-render fires factory once");
+        eprintln!("[goruntime smoke 7/19] use_memo single-render fires factory once");
         reset_global_state();
         scenario_use_memo_caches_when_deps_unchanged();
 
-        eprintln!("[goruntime smoke 8/18] use_memo recomputes on dep change");
+        eprintln!("[goruntime smoke 8/19] use_memo recomputes on dep change");
         reset_global_state();
         scenario_use_memo_caches_and_recomputes();
 
-        eprintln!("[goruntime smoke 9/18] use_reducer dispatch updates state");
+        eprintln!("[goruntime smoke 9/19] use_reducer dispatch updates state");
         reset_global_state();
         scenario_use_reducer_dispatch_updates_state();
 
-        eprintln!("[goruntime smoke 10/18] use_neighbors returns structural ids");
+        eprintln!("[goruntime smoke 10/19] use_neighbors returns structural ids");
         reset_global_state();
         scenario_use_neighbors_returns_structural_ids();
 
-        eprintln!("[goruntime smoke 11/18] use_accept_edge fires topology event");
+        eprintln!("[goruntime smoke 11/19] use_accept_edge fires topology event");
         reset_global_state();
         scenario_accept_edge_fires_topology_event();
 
-        eprintln!("[goruntime smoke 12/18] use_graph_query Tier 1 accessors");
+        eprintln!("[goruntime smoke 12/19] use_graph_query Tier 1 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_1_accessors();
 
-        eprintln!("[goruntime smoke 13/18] use_directory find_by_id");
+        eprintln!("[goruntime smoke 13/19] use_directory find_by_id");
         reset_global_state();
         scenario_use_directory_find_by_id();
 
-        eprintln!("[goruntime smoke 14/18] use_graph_query Tier 1 algorithms");
+        eprintln!("[goruntime smoke 14/19] use_graph_query Tier 1 algorithms");
         reset_global_state();
         scenario_use_graph_query_tier_1_algorithms();
 
-        eprintln!("[goruntime smoke 15/18] use_graph_query Tier 2 accessors");
+        eprintln!("[goruntime smoke 15/19] use_graph_query Tier 2 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_2_accessors();
 
-        eprintln!("[goruntime smoke 16/18] use_edge_accept_handler + Tier 3 accessors");
+        eprintln!("[goruntime smoke 16/19] use_edge_accept_handler + Tier 3 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_3_accessors();
 
-        eprintln!("[goruntime smoke 17/18] use_spawn_child + use_compose + use_unmount_self");
+        eprintln!("[goruntime smoke 17/19] use_spawn_child + use_compose + use_unmount_self");
         reset_global_state();
         scenario_use_spawn_child_use_compose_use_unmount_self();
 
-        eprintln!("[goruntime smoke 18/18] supervision hooks (monitor/demonitor/link/unlink/group)");
+        eprintln!("[goruntime smoke 18/19] supervision hooks (monitor/demonitor/link/unlink/group)");
         reset_global_state();
         scenario_supervision_hooks_round_trip();
+
+        eprintln!("[goruntime smoke 19/19] use_source dispatches timer/delay/http/watch descriptors");
+        reset_global_state();
+        scenario_use_source_dispatches_descriptors();
 
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup

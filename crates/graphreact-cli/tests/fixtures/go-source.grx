@@ -1,0 +1,42 @@
+<!-- M17-phase3e-γ: use_source descriptor marshalling acceptance.
+
+     Ticker calls UseSource four times — once per source kind — to
+     dispatch a {timer / delay / http / watch} descriptor through
+     host_use_source. The test installs a capture-only
+     host_use_source callback (via the build_and_load path so the
+     production callback never registers) and asserts the four
+     descriptors decoded with the right kind + payload.
+
+     Why wiring-only: real timer/delay/http/watch sources push events
+     asynchronously via tokio::spawn (and notify's own thread for
+     watch). Observing them via UseMessage requires a multi-threaded
+     tokio runtime + sleep, incompatible with the sync end_to_end
+     harness. graphreact-core's existing source tests cover the
+     production firing path; this scenario verifies only the Go-to-
+     Rust descriptor marshalling boundary. -->
+
+<Ticker lang="go">
+func TickerBody(ctx Ctx) Manifest {
+    UseSource(func() EventSource {
+        return TimerSource(50)
+    }, []interface{}{})
+    UseSource(func() EventSource {
+        return DelaySource(120)
+    }, []interface{}{})
+    UseSource(func() EventSource {
+        return HttpSource(map[string]interface{}{"port": 8080.0})
+    }, []interface{}{})
+    UseSource(func() EventSource {
+        return WatchSource(map[string]interface{}{"path": "/tmp/grx-watch"})
+    }, []interface{}{})
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"tick", "timeout", "http", "watch-event"},
+        Emits:   []string{},
+    }
+}
+</Ticker>
+
+<Graph id="go-source">
+  <Ticker id="ticker" />
+</Graph>

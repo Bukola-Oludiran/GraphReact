@@ -2148,6 +2148,103 @@ func UseGroupLeave(group string) {{
     _, _ = Invoke("host_group_leave", group)
 }}
 
+// ----- M17 phase 3e-γ: use_source + 4 source kinds -----
+//
+// External-event substrate. `UseSource(factory, deps)` invokes the
+// factory thunk to produce an `EventSource` descriptor, then ships
+// the descriptor through `host_use_source(descriptor, deps)`. Rust
+// decodes the kind + decodes opts and constructs the matching
+// `Arc<dyn EventSource>` via graphreact-core's `timer_source` /
+// `delay_source` or `crate::sources::http_source` /
+// `crate::sources::watch_source`.
+//
+// Events flow asynchronously through the scheduler's external
+// inbox and reach the active node as messages — catch them via
+// `UseMessage(msgType, handler)`. Source kinds and their message
+// types: timer→"tick", delay→"timeout", http→"http", watch→
+// "watch-event".
+
+// EventSource is the descriptor a source factory thunk returns.
+// The four canonical kinds (timer/delay/http/watch) are the only
+// values `host_use_source` accepts; unknown kinds round-trip to
+// graphreact-core's never-firing placeholder. Mirrors pyruntime's
+// `{{kind: ..., intervalMs?: ..., delayMs?: ..., opts?: {{...}}}}`
+// dict shape.
+type EventSource struct {{
+    Kind       string                 `json:"kind"`
+    IntervalMs uint64                 `json:"intervalMs,omitempty"`
+    DelayMs    uint64                 `json:"delayMs,omitempty"`
+    Opts       map[string]interface{{}} `json:"opts,omitempty"`
+}}
+
+// TimerSource builds a periodic-tick descriptor. The Rust-side
+// `timer_source(intervalMs)` fires a `"tick"` message every
+// `intervalMs` milliseconds.
+func TimerSource(intervalMs uint64) EventSource {{
+    return EventSource{{Kind: "timer", IntervalMs: intervalMs}}
+}}
+
+// DelaySource builds a single-shot delay descriptor. The Rust-side
+// `delay_source(delayMs)` fires a single `"timeout"` message after
+// `delayMs` milliseconds.
+func DelaySource(delayMs uint64) EventSource {{
+    return EventSource{{Kind: "delay", DelayMs: delayMs}}
+}}
+
+// HttpSource builds an HTTP-listener descriptor. The Rust-side
+// `http_source(port)` opens a TCP listener at the given port and
+// delivers each accepted request as an `"http"` message.
+func HttpSource(opts map[string]interface{{}}) EventSource {{
+    if opts == nil {{
+        opts = map[string]interface{{}}{{}}
+    }}
+    return EventSource{{Kind: "http", Opts: opts}}
+}}
+
+// WatchSource builds a filesystem-watch descriptor. The Rust-side
+// `watch_source(path)` registers a `notify`-backed watcher and
+// delivers each change event as a `"watch-event"` message.
+func WatchSource(opts map[string]interface{{}}) EventSource {{
+    if opts == nil {{
+        opts = map[string]interface{{}}{{}}
+    }}
+    return EventSource{{Kind: "watch", Opts: opts}}
+}}
+
+// UseSource registers an EventSource factory + dependency list with
+// the scheduler. The factory thunk runs once (or whenever `deps`
+// change) and produces an EventSource descriptor that the Rust side
+// uses to instantiate a real `Arc<dyn EventSource>`. Source events
+// land as messages on the active node; catch with UseMessage.
+//
+// A nil factory or a factory that returns a zero-Kind descriptor is
+// a no-op (no host call dispatched).
+func UseSource(factory func() EventSource, deps []interface{{}}) {{
+    if factory == nil {{
+        return
+    }}
+    descriptor := factory()
+    if descriptor.Kind == "" {{
+        return
+    }}
+    if deps == nil {{
+        deps = []interface{{}}{{}}
+    }}
+    payload := map[string]interface{{}}{{
+        "kind": descriptor.Kind,
+    }}
+    if descriptor.IntervalMs > 0 {{
+        payload["intervalMs"] = descriptor.IntervalMs
+    }}
+    if descriptor.DelayMs > 0 {{
+        payload["delayMs"] = descriptor.DelayMs
+    }}
+    if descriptor.Opts != nil {{
+        payload["opts"] = descriptor.Opts
+    }}
+    _, _ = Invoke("host_use_source", payload, deps)
+}}
+
 // GrxInvokeCallback invokes a generic Go callback stored under
 // `token` in `callbackRegistry`. Returns an envelope JSON describing
 // the outcome: `{{kind: "value"}}` (no cleanup), `{{kind: "cleanup",

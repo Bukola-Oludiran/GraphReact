@@ -601,6 +601,22 @@ mod tests {
                 "prelude missing required M17 phase 3e-β hook surface: {sym}"
             );
         }
+        // M17 phase 3e-γ surface: UseSource + 4 source-kind factories
+        // + EventSource descriptor + host_use_source dispatch.
+        for sym in [
+            "type EventSource",
+            "func UseSource(",
+            "func TimerSource(",
+            "func DelaySource(",
+            "func HttpSource(",
+            "func WatchSource(",
+            "host_use_source",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3e-γ hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();
