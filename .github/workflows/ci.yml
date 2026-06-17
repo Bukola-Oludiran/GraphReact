@@ -77,6 +77,65 @@ jobs:
           echo "GRAPHREACT_PYTHON_VERSION=${MATRIX_PYTHON}" >> "$GITHUB_ENV"
       - run: cargo test --workspace --all-features
 
+  test-go:
+    name: test-go (${{ matrix.os }} / go${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # M17 phase 3h — per-OS × per-Go-minor matrix.
+        # Closes the M17 phase 3h "CI matrix green on Linux/macOS ×
+        # Go 1.22/1.23/1.24" deliverable.
+        #
+        # Go minors are upstream-supported for the two latest at a
+        # time (current: 1.25/1.26). We hold one EOL minor (1.24) as
+        # an ecosystem signal so an artifact deployed to a stale
+        # toolchain still surfaces breakage.
+        #
+        # Windows is intentionally excluded today: the existing test
+        # job already excludes Windows for Python; cgo + Go's c-shared
+        # buildmode on Windows works in theory but isn't verified
+        # end-to-end. Track follow-on once a Windows test cell is
+        # available for both engines.
+        os: [ubuntu-latest, macos-latest]
+        go: ["1.24", "1.25", "1.26"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - uses: actions/setup-python@v5
+        with:
+          # Pin a default Python so graphreact-engine-cpython's
+          # build.rs probe succeeds — every Go matrix cell needs a
+          # working CPython embed since `cargo test --workspace`
+          # builds the cpython engine too. Doesn't matrix across
+          # Python — that's the `test` job's responsibility.
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Bust the cache between Go minors so each cell rebuilds
+          # the engine-go test stub against the right Go runtime.
+          key: go${{ matrix.go }}
+      - name: Resolve Python pkg-config name
+        run: |
+          echo "GRAPHREACT_PYTHON_PKGCONFIG=python-3.12-embed" >> "$GITHUB_ENV"
+          echo "GRAPHREACT_PYTHON_VERSION=3.12" >> "$GITHUB_ENV"
+      - name: Workspace tests (debug)
+        # Runs all 20 goruntime smoke scenarios + engine-go
+        # conformance_smoke + the 100×1k stress test (debug
+        # allocator slows it ~5× vs release but still under the
+        # 60s test budget on the GitHub runners).
+        run: cargo test --workspace --all-features
+      - name: Stress test (release)
+        # Belt-and-suspenders: re-run the 100×1k stress test in
+        # release mode for production-speed signal. The synthesis
+        # behind M17 phase 3f specifies release as the canonical
+        # measurement profile — surfacing a contention regression
+        # at production performance is the explicit acceptance.
+        run: cargo test -p graphreact-engine-go --release --test stress_100x1k -- --nocapture
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

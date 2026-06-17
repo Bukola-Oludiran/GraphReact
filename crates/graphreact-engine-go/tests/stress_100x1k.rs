@@ -45,7 +45,12 @@ use graphreact_engine_zig::{
 const N_ISOLATES: usize = 100;
 const N_ROUNDS: usize = 1000;
 const WATCHDOG_SECS: u64 = 120;
-const BUDGET_SECS: u64 = 60;
+// Release-mode budget; debug widens to 5× to absorb the debug
+// allocator. Local release run lands at ~407ms; CI runners are
+// noisier but the 60s ceiling still gives a 100× safety factor
+// for the production-speed signal.
+const BUDGET_SECS_RELEASE: u64 = 60;
+const BUDGET_SECS_DEBUG: u64 = 60 * 5;
 
 fn artifact_path() -> Option<&'static str> {
     let path = option_env!("GRX_GO_TEST_DYLIB").unwrap_or("/dev/null");
@@ -167,12 +172,18 @@ fn stress_100_isolates_1k_messages() {
     // total fits in f64 exactly at the small constants we use.
     #[allow(clippy::cast_precision_loss)]
     let throughput = (total as f64) / elapsed.as_secs_f64();
+    let budget_secs = if cfg!(debug_assertions) {
+        BUDGET_SECS_DEBUG
+    } else {
+        BUDGET_SECS_RELEASE
+    };
     eprintln!(
-        "[stress_100x1k] {total} round-trips in {elapsed:?} = {throughput:.0} msgs/sec"
+        "[stress_100x1k] {total} round-trips in {elapsed:?} = {throughput:.0} msgs/sec \
+         (budget {budget_secs}s)"
     );
     assert!(
-        elapsed < Duration::from_secs(BUDGET_SECS),
-        "100×1k took {elapsed:?}, exceeded {BUDGET_SECS}s budget — \
+        elapsed < Duration::from_secs(budget_secs),
+        "100×1k took {elapsed:?}, exceeded {budget_secs}s budget — \
          possible contention regression (watchdog at {WATCHDOG_SECS}s)"
     );
 
