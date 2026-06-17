@@ -1,0 +1,7 @@
+<Graph id="counter-net">
+  <Counter id="a" period={1000} />
+  <Counter id="b" period={500} />
+  <Logger id="log" />
+  <edge source="a" target="log" />
+  <edge source="b" target="log" />
+</Graph>

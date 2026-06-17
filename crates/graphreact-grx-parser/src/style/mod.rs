@@ -29,3 +29,28 @@ mod units;
 pub use desugar::desugar_style;
 pub use error::StyleError;
 pub use resugar::{resugar_attrs, Resugared};
+
+/// M23 LSP shared-catalog accessor — returns the full set of CSS
+/// property names that the `style="…"` desugarer recognises. The LSP
+/// completion provider uses this to populate property-name completions
+/// inside `style=` strings without duplicating the catalog.
+#[must_use]
+pub fn recognized_style_properties() -> &'static [&'static str] {
+    desugar::RECOGNIZED_PROPS
+}
+
+/// M23 LSP shared-catalog accessor — returns the names of supported
+/// `clip-path` shape functions. Pulled from the grammar comments in
+/// [`clip_path`]; if a new shape lands there it should be added here
+/// too.
+#[must_use]
+pub fn clip_path_shape_names() -> &'static [&'static str] {
+    &[
+        "inset",
+        "circle",
+        "ellipse",
+        "polygon",
+        "path",
+        "kicad-shape",
+    ]
+}

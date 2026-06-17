@@ -1,0 +1,50 @@
+[package]
+name = "graphreact-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "M23 — Language Server Protocol implementation for `.grx` files. Outer-shell MVP: initialize/shutdown handshake, document sync, diagnostics from typed parser errors, hover, goto-definition, and tag/attr/style completion."
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "graphreact-lsp"
+path = "src/bin/server.rs"
+
+[dependencies]
+# `tower-lsp-server` is the community-maintained fork of `tower-lsp`
+# (original by ebkalderon, maintenance stalled). The fork tracks
+# modern `tower 0.5` (matching the workspace pin via axum), bumps to
+# `lsp-types` (renamed `ls-types`) >= 0.97 which exposes
+# `PositionEncodingKind::UTF8` so we avoid the UTF-16 column
+# conversion tax that the risks list flagged.
+tower-lsp-server = "0.23"
+# Workspace tokio doesn't pull `io-std` because none of the runtime
+# crates need stdin/stdout adapters; the LSP bin does for the stdio
+# transport, so we re-enable it locally without forcing the feature
+# on every workspace member.
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+graphreact-grx-parser = { path = "../graphreact-grx-parser" }
+# Percent-decoding for `file://` URIs. LSP clients percent-encode
+# reserved characters (spaces, non-ASCII, `#`, `?`) in `DocumentUri`
+# per RFC 3986. A literal `strip_prefix("file://")` leaves `%20` etc.
+# in the path string, which then fails `fs::canonicalize`; cross-file
+# goto-definition silently breaks on any project path containing
+# a space or non-ASCII character. Already in tower-lsp-server's
+# transitive closure, so adding it directly is free in compile graph.
+percent-encoding = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+<Subgraph name="Bandpass">
+  <Component id="L1" footprint="0402" />
+  <Component id="C1" footprint="0402" />
+  <edge source="L1" target="C1" />
+</Subgraph>

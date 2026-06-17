@@ -34,6 +34,7 @@ GraphReact (Backend) ships first. GraphReactDB starts materializing after the Ba
 | [`m13-phases.md`](m13-phases.md) | M13 living document — CPython engine bridge for backend Python authoring; phases 1+2 / 2.5 / 3a / 3b shipped, 3c–3h roadmap |
 | [`m12.3b-webkit-vendoring.md`](m12.3b-webkit-vendoring.md) | M12.3b living document — vendored WebKit for cross-platform JSC linkage |
 | [`m6.6-engine-parity.md`](m6.6-engine-parity.md) | M6.6 living document — TS feature parity audit; per-engine sign-off matrix |
+| [`m23-lsp.md`](m23-lsp.md) | M23 milestone narrative — `.grx` Language Server outer-shell MVP (initialize / diagnostics / hover / goto-definition / completion); shipped 2026-06-17 |
 
 ## Key milestones for the Backend product
 
@@ -51,7 +52,7 @@ GraphReact (Backend) ships first. GraphReactDB starts materializing after the Ba
 | M-Ingress (M16.5) | [Backend] | External HTTP ingress substrate — POST `/v1/nodes/:id/{messages,call}` + bulk NDJSON; default-deny via manifest |
 | **M17** | [Backend] | **Go runtime engine bridge — third in-process language host (replaces JVM per Java→Go pivot 2026-06-15)** |
 | **M22** | [Backend] | **Mixed-runtime systems — JS + Python + Go in same `.grx`** |
-| **M23** | [Shared] | **LSP server for `.grx` (outer-shell MVP per locked Q10)** |
+| **M23** | [Shared] | **LSP server for `.grx` — outer-shell MVP shipped 2026-06-17 (see [`m23-lsp.md`](m23-lsp.md)); semantic tokens / VS Code extension publishing / in-body completions deferred to M23.next** |
 | **Cleanup-Pass** | [Backend / Shared] | **Pre-M-Prod deferred-cleanup slice (13 named residuals)** |
 | **M-Prod** | [Production-hardening] | **Production-readiness milestone — 9 sub-tracks (auth / TLS / secrets / lifecycle (incl. M14.11) / observability / rate limiting / supply-chain / packaging / chaos+fuzz). STARTED 2026-06-17 with the safest 2 slices: #5 observability (`/v1/readyz` + `OBSERVER_SHUTDOWN_DEADLINE`, see [`m-prod-observability.md`](m-prod-observability.md)) and #7 supply chain (CycloneDX SBOM in CI, see [`m-prod-supply-chain.md`](m-prod-supply-chain.md)).** |
 | **M19** | [DB] | **`graphreact-persistence` — own segment log + snapshot + replay** |
