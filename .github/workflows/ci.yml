@@ -144,3 +144,58 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses bans sources
+
+  sbom:
+    # **M-Prod sub-track #7 (supply chain) safest slice.** Emits a
+    # CycloneDX JSON SBOM of the workspace dependency tree on every
+    # push to main AND on every release tag. Artifact retention is
+    # 90 days (GitHub default); release-tag runs additionally upload
+    # to the GitHub Release (added once the M-Prod #8 release
+    # pipeline lands — sub-track #7 v1 ships the SBOM as a CI
+    # artifact only).
+    #
+    # cargo-cyclonedx is installed via `cargo install` rather than
+    # added to workspace dev-dependencies because (a) it is a CI
+    # tool, not a runtime / test dependency, (b) keeping it out of
+    # workspace deps means deny.toml's license allowlist need not
+    # be updated for the cyclonedx transitive closure (the tool
+    # only runs in CI), and (c) future Sigstore-keyless signing
+    # (sub-track #7 v2) will sign the artifact path here without
+    # mutating any source-level Cargo manifest.
+    name: cyclonedx-sbom
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache key separate from the test / clippy jobs so
+          # the SBOM run doesn't bust their caches and vice versa.
+          key: sbom
+      - name: Install cargo-cyclonedx
+        # Pin a tested version to keep the SBOM schema stable
+        # across CI runs; bump via deliberate PR rather than
+        # tracking latest.
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Generate CycloneDX SBOM (JSON)
+        # `--format json` emits CycloneDX 1.4 JSON. `--all`
+        # walks every workspace member so the SBOM is a single
+        # tree describing the full `grx` artifact's dependency
+        # closure (matters because per-engine slices ship per-
+        # crate binaries).
+        run: cargo cyclonedx --format json --all
+      - name: Collect SBOM artifacts
+        # cargo-cyclonedx writes one `<crate>.cdx.json` per
+        # workspace member next to its Cargo.toml. Gather them
+        # all under a single `sbom/` directory so the upload
+        # step ships them as one bundle.
+        run: |
+          mkdir -p sbom
+          find . -name '*.cdx.json' -not -path './sbom/*' -exec cp {} sbom/ \;
+          ls -la sbom/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx-${{ github.sha }}
+          path: sbom/
+          retention-days: 90
+          if-no-files-found: error
