@@ -996,6 +996,47 @@ use rustls::pki_types::{
     pem::PemObject, CertificateDer, PrivateKeyDer,
 };
 
+/// **M-Prod sub-track #5 safest slice.** Default upper bound on
+/// the OTel `SdkTracerProvider::shutdown()` call during daemon
+/// teardown.
+///
+/// Rationale: 5 seconds is well under typical k8s
+/// `terminationGracePeriodSeconds` (30s) and well above the
+/// expected drain time of an OTel BatchSpanProcessor with a healthy
+/// collector (sub-second). If the collector is unreachable, the
+/// SDK's internal export retry can otherwise block for the full
+/// `terminationGracePeriodSeconds` budget — silent loss of any
+/// SIGTERM-arrival audit-log line that would otherwise let
+/// operators tell "graceful drain" apart from "SIGKILL'd by
+/// kubelet".
+///
+/// Overridable via the `OBSERVER_SHUTDOWN_DEADLINE` env var
+/// (seconds; integer; ≤0 or unparseable falls back to default).
+pub const DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS: u64 = 5;
+
+/// Read the `OBSERVER_SHUTDOWN_DEADLINE` env var (seconds) and
+/// return the resulting `Duration`. Falls back to
+/// [`DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS`] on missing /
+/// unparseable / zero values (zero would race the OTel join to
+/// instant timeout, which surfaces as a guaranteed audit-log
+/// noise line; safer to fall back).
+///
+/// `pub(crate)` rather than private so the M-Prod test
+/// `observer_shutdown_deadline_env_var` can verify the env-var
+/// contract without spinning the whole daemon. `allow(dead_code)`
+/// because the only production caller is gated on `feature = "otel"`,
+/// but the env-var contract + tests must be reachable in every
+/// feature configuration.
+#[allow(dead_code)]
+pub(crate) fn observer_shutdown_deadline() -> Duration {
+    let secs = std::env::var("OBSERVER_SHUTDOWN_DEADLINE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS);
+    Duration::from_secs(secs)
+}
+
 /// Daemon CLI knobs translated into structured form. Constructed
 /// from the [`crate::cli::ClusterOp::Daemon`] variant; consumed by
 /// [`start_daemon`].
@@ -1182,25 +1223,51 @@ impl DaemonHandle {
     /// cluster tears down so the collector receives the final batch.
     /// Async because the observer shutdown + OTel provider flush
     /// both await background tasks.
+    ///
+    /// **M-Prod sub-track #5 safest slice.** The OTel provider's
+    /// `shutdown()` is bounded by the `OBSERVER_SHUTDOWN_DEADLINE`
+    /// env var (seconds; default
+    /// [`DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS`]). A collector
+    /// that's gone away (network-partitioned, OOM-killed,
+    /// node-drained ahead of us) MUST NOT hang the daemon's
+    /// shutdown — k8s SIGKILLs at `terminationGracePeriodSeconds`
+    /// anyway, and we want to surface the timeout in the audit
+    /// log rather than be murdered silently.
     pub async fn shutdown(self) {
-        // **M16-Backend P10.** Flush the OTel span batch processor
-        // FIRST so any buffered spans hit the collector before the
-        // scheduler/cluster teardown drops in-flight context. The
-        // SDK's `shutdown()` is synchronous (blocking on the export
-        // task's join); we call it via spawn_blocking to keep the
-        // async runtime cooperative.
+        // **M16-Backend P10 + M-Prod #5.** Flush the OTel span
+        // batch processor FIRST so any buffered spans hit the
+        // collector before the scheduler/cluster teardown drops
+        // in-flight context. The SDK's `shutdown()` is synchronous
+        // (blocking on the export task's join); we call it via
+        // spawn_blocking to keep the async runtime cooperative,
+        // AND we race the join against `OBSERVER_SHUTDOWN_DEADLINE`
+        // so an unreachable collector can't wedge teardown.
         #[cfg(feature = "otel")]
         if let Some(provider) = self.otel_provider {
-            // SdkTracerProvider::shutdown() is sync + blocking; the
-            // batch processor's export task is already a tokio
-            // task on the runtime, so the join doesn't deadlock.
-            // Wrap in spawn_blocking to keep the caller's runtime
-            // cooperative.
-            tokio::task::spawn_blocking(move || {
+            let deadline = observer_shutdown_deadline();
+            let join = tokio::task::spawn_blocking(move || {
                 let _ = provider.shutdown();
-            })
-            .await
-            .ok();
+            });
+            match tokio::time::timeout(deadline, join).await {
+                Ok(_) => {}
+                Err(_) => {
+                    // Audit-log convention: emit on the same
+                    // `graphreact::observer::audit` target the bind
+                    // / accept / handshake-fail trail uses, so
+                    // operators see "OTel shutdown exceeded
+                    // deadline" in the same JSON-log stream as the
+                    // rest of the lifecycle events. Don't propagate
+                    // — we still want the cluster + engine teardown
+                    // to run, and re-trying the shutdown wouldn't
+                    // change the outcome (the collector is gone).
+                    tracing::warn!(
+                        target: "graphreact::observer::audit",
+                        event = "otel_shutdown_timeout",
+                        deadline_ms = deadline.as_millis() as u64,
+                        "OTel provider shutdown exceeded OBSERVER_SHUTDOWN_DEADLINE",
+                    );
+                }
+            }
         }
         // Stop the observer server FIRST so any in-flight scrape
         // serializes a final consistent view of the metrics
@@ -1864,6 +1931,64 @@ fn _arc_kept_alive() -> Arc<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **M-Prod sub-track #5 safest slice.** Verify the
+    /// `OBSERVER_SHUTDOWN_DEADLINE` env var contract: unset / empty
+    /// / unparseable / zero all fall through to the default, a
+    /// positive integer is accepted as seconds.
+    ///
+    /// The env var is set + cleared inside `std::sync::Mutex`
+    /// because cargo runs unit tests in-process on parallel threads
+    /// by default and we don't want test-to-test cross-contamination.
+    #[test]
+    fn observer_shutdown_deadline_env_var() {
+        // Run all env-var probes under a single mutex so concurrent
+        // unit tests in this crate don't race the
+        // `OBSERVER_SHUTDOWN_DEADLINE` env mutation. Cargo runs
+        // unit tests in-process and env vars are process-global.
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::remove_var("OBSERVER_SHUTDOWN_DEADLINE");
+        assert_eq!(
+            observer_shutdown_deadline(),
+            Duration::from_secs(DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS),
+            "unset falls through to default",
+        );
+
+        std::env::set_var("OBSERVER_SHUTDOWN_DEADLINE", "");
+        assert_eq!(
+            observer_shutdown_deadline(),
+            Duration::from_secs(DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS),
+            "empty falls through to default",
+        );
+
+        std::env::set_var("OBSERVER_SHUTDOWN_DEADLINE", "not-a-number");
+        assert_eq!(
+            observer_shutdown_deadline(),
+            Duration::from_secs(DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS),
+            "unparseable falls through to default",
+        );
+
+        std::env::set_var("OBSERVER_SHUTDOWN_DEADLINE", "0");
+        assert_eq!(
+            observer_shutdown_deadline(),
+            Duration::from_secs(DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS),
+            "zero falls through to default (would race join to instant timeout)",
+        );
+
+        std::env::set_var("OBSERVER_SHUTDOWN_DEADLINE", "12");
+        assert_eq!(
+            observer_shutdown_deadline(),
+            Duration::from_secs(12),
+            "positive integer is accepted as seconds",
+        );
+
+        // Leave the env clean for any other test running on this
+        // binary.
+        std::env::remove_var("OBSERVER_SHUTDOWN_DEADLINE");
+    }
 
     /// **M15 Phase 9.** `grx reload <path>` returns an error today —
     /// remote-daemon reload requires M16-Backend's management API.

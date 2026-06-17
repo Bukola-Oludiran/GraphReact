@@ -12,7 +12,8 @@ Endpoints under `/v1/*` are **stable + documented + versioned** from day one. Co
 
 | Endpoint | Auth | Notes |
 |---|---|---|
-| `GET /v1/healthz` | **Bypassed** | Liveness probe; intentionally auth-free so k8s readiness probes don't need the bearer token. |
+| `GET /v1/healthz` | **Bypassed** | Liveness probe; intentionally auth-free so k8s liveness probes don't need the bearer token. |
+| `GET /v1/readyz` | **Bypassed** | Kubernetes-shaped readiness probe; M-Prod #5 safest slice. See [`m-prod-observability.md`](m-prod-observability.md). |
 | `GET /v1/identity` | Required | Returns process_start_id; ops tooling uses this for crash-detection (changes on daemon restart). |
 | All other `/v1/*` | Required | Bearer token via `Authorization: Bearer <token>` header. |
 
@@ -24,13 +25,25 @@ Default bind: `127.0.0.1:9090`. Non-loopback bind requires all of `--observer-to
 
 ### `GET /v1/healthz`
 
-Liveness probe. Always returns `200 OK` with empty body.
+Liveness probe. Always returns `200 OK` with body `ok` (Content-Type `text/plain`).
 
 ```
 $ curl http://127.0.0.1:9090/v1/healthz
-$ echo $?
-0
+ok
 ```
+
+### `GET /v1/readyz`
+
+**M-Prod sub-track #5 safest slice.** Kubernetes-shaped readiness probe. Distinct from `/v1/healthz` (which is liveness: process is up + can serve HTTP). Readiness answers: "should the load balancer / k8s control plane route traffic here YET?".
+
+Predicate (200 OK iff all hold):
+
+1. Scheduler has completed ≥1 `process_batch` round.
+2. Snapshot bridge has capacity (`snapshot_tx.capacity() > 0`).
+
+`503 Service Unavailable` with body naming the reason (`scheduler_first_batch_pending` or `bridge_saturated`) and `Retry-After: 1` header otherwise.
+
+Auth-bypassed identically to `/v1/healthz`. Full design + k8s YAML snippet in [`m-prod-observability.md`](m-prod-observability.md).
 
 ### `GET /v1/identity`
 

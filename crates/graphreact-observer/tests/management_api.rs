@@ -107,6 +107,98 @@ async fn healthz_bypasses_auth_and_returns_ok() {
     server.shutdown().await;
 }
 
+/// **M-Prod sub-track #5 safest slice.** Before the scheduler has
+/// completed its first batch, `/readyz` must surface 503 +
+/// `Retry-After: 1`. The fixture spawns the management API with a
+/// fresh `MetricsInner` (process_batch_duration.count == 0) and no
+/// scheduler thread driving ticks, so readiness can never flip
+/// green here without a manual `observe()` call below.
+#[tokio::test]
+async fn readyz_503_before_first_batch_tick() {
+    let (server, _drain) = spawn_with_fixture(Some(b"top-secret")).await;
+    let (status, body) = http_get_with_headers(
+        &format!("http://{}/v1/readyz", server.local_addr),
+        None,
+    )
+    .await;
+    assert_eq!(status.code, 503);
+    assert!(
+        body.contains("scheduler_first_batch_pending"),
+        "body should name the not-ready reason, got: {body:?}"
+    );
+    // Retry-After is mandatory for k8s/load-balancer back-off.
+    assert_eq!(
+        status.retry_after.as_deref(),
+        Some("1"),
+        "expected Retry-After: 1, got {:?}",
+        status.retry_after
+    );
+    server.shutdown().await;
+}
+
+/// Once the scheduler has emitted at least one `tick_end` event —
+/// modeled here by a direct `process_batch_duration.observe(...)`
+/// call on the shared `MetricsInner` — `/readyz` must flip to 200.
+#[tokio::test]
+async fn readyz_200_after_first_batch_tick() {
+    let metrics = Arc::new(MetricsInner::new());
+    let bind = BindConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        token: None,
+        tls: None,
+    };
+    let mut server = spawn_management_api(bind, metrics.clone(), 0)
+        .await
+        .expect("spawn");
+    // Drain isn't needed for readyz; readyz reads MetricsInner
+    // directly, not the snapshot bridge. Still install a noop
+    // drainer so the bridge channel doesn't fill up under any
+    // accidental upstream request.
+    let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
+    let _drain: JoinHandle<()> = tokio::spawn(async move {
+        while snapshot_rx.recv().await.is_some() {}
+    });
+
+    // 503 before any tick.
+    let (status, _) = http_get_with_headers(
+        &format!("http://{}/v1/readyz", server.local_addr),
+        None,
+    )
+    .await;
+    assert_eq!(status.code, 503);
+
+    // Simulate the first scheduler tick_end (any duration > 0 works).
+    metrics.process_batch_duration.observe(100_000);
+
+    let (status, body) = http_get_with_headers(
+        &format!("http://{}/v1/readyz", server.local_addr),
+        None,
+    )
+    .await;
+    assert_eq!(status.code, 200);
+    assert!(body.contains("ready"));
+    server.shutdown().await;
+}
+
+/// `/readyz` bypasses the bearer-token middleware the same way
+/// `/healthz` does: k8s readiness probes ride a sidecar without
+/// access to the operator secret store.
+#[tokio::test]
+async fn readyz_bypasses_auth_when_token_required() {
+    let (server, _drain) = spawn_with_fixture(Some(b"the-token")).await;
+    // No Authorization header — protected routes return 401 here
+    // (verified by `protected_routes_return_401_when_token_missing`);
+    // /readyz must still return a probe response (503 because no
+    // tick has fired in this fixture).
+    let (status, _body) = http_get_with_headers(
+        &format!("http://{}/v1/readyz", server.local_addr),
+        None,
+    )
+    .await;
+    assert_eq!(status.code, 503, "expected 503-not-401: auth must bypass");
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn identity_returns_process_start_id_and_version() {
     let (server, _drain) = spawn_with_fixture(None).await;
@@ -233,6 +325,69 @@ async fn fifty_parallel_gets_complete_under_2s() {
         "50 parallel GETs took {elapsed:?} (gate: <2s)"
     );
     server.shutdown().await;
+}
+
+/// Extended status info exposed by [`http_get_with_headers`] — used
+/// by the M-Prod `/readyz` tests to assert the `Retry-After` header
+/// shape on the 503 path.
+struct StatusWithRetry {
+    code: u16,
+    retry_after: Option<String>,
+}
+
+/// HTTP/1.1 GET that also returns selected response headers
+/// (currently `Retry-After`). Distinct from [`http_get`] so
+/// existing callers stay simple; readiness probe tests need the
+/// header to gate on the operator-facing back-off contract.
+async fn http_get_with_headers(
+    url: &str,
+    authorization: Option<&str>,
+) -> (StatusWithRetry, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let after_scheme = url.strip_prefix("http://").expect("http:// scheme");
+    let (host_port, path) = after_scheme
+        .split_once('/')
+        .map(|(hp, p)| (hp, format!("/{p}")))
+        .unwrap_or((after_scheme, "/".into()));
+
+    let mut stream = TcpStream::connect(host_port).await.expect("tcp connect");
+    let auth_line = match authorization {
+        Some(a) => format!("Authorization: {a}\r\n"),
+        None => String::new(),
+    };
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{auth_line}\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.expect("send req");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read response");
+    let response = String::from_utf8(response).expect("utf-8");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .expect("HTTP/1.1 framing missing CRLF CRLF");
+    let mut lines = head.lines();
+    let status_line = lines.next().expect("status line");
+    let code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .expect("status code")
+        .parse()
+        .expect("u16 status");
+    let mut retry_after = None;
+    for h in lines {
+        if let Some((name, value)) = h.split_once(':') {
+            if name.eq_ignore_ascii_case("retry-after") {
+                retry_after = Some(value.trim().to_string());
+            }
+        }
+    }
+    (StatusWithRetry { code, retry_after }, body.to_string())
 }
 
 /// Bare HTTP/1.1 client. Mirrors P2's tests/auth_required.rs helper.
