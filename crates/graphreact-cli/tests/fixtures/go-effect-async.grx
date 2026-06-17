@@ -1,0 +1,59 @@
+<!-- M17-phase3g: UseEffectAsync cooperative-cancel acceptance.
+
+     The Effect body:
+       - Holds a UseState(0) at hook position 0, used as the
+         single deps element.
+       - Calls UseEffectAsync(func(ctx) func(), []interface{}{dep}).
+       - The effect closure signals 'mount' via host_observe_async,
+         spawns an inner goroutine that waits on ctx.Done() then
+         signals 'inner-exit' via host_observe_async, and returns
+         a cleanup that signals 'cleanup'.
+
+     Round-trip:
+       Batch 1: mount → 'mount' observed; worker goroutine spawns;
+                 inner goroutine sleeps on <-ctx.Done().
+       Batch 2 (after signal_set_external bumps the dep):
+                 core fires cleanup token → ctx cancelled →
+                 inner goroutine exits ('inner-exit' observed) →
+                 worker had already returned → user cleanup runs
+                 ('cleanup' observed). Then re-fires the effect →
+                 'mount' observed again.
+
+     The probe asserts the host_observe_async log contains, in
+     order: ['mount', 'inner-exit', 'cleanup', 'mount']. -->
+
+<Effect lang="go">
+import "context"
+
+func EffectBody(ctx Ctx) Manifest {
+    dep, _ := UseState(0.0)
+
+    UseEffectAsync(func(c context.Context) func() {
+        _, _ = Invoke("host_observe_async", "mount")
+
+        innerDone := make(chan struct{})
+        go func() {
+            <-c.Done()
+            _, _ = Invoke("host_observe_async", "inner-exit")
+            close(innerDone)
+        }()
+
+        return func() {
+            // Wait for the inner goroutine to acknowledge the
+            // cancel so 'inner-exit' is observed BEFORE 'cleanup'.
+            <-innerDone
+            _, _ = Invoke("host_observe_async", "cleanup")
+        }
+    }, []interface{}{dep})
+
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Effect>
+
+<Graph id="go-effect-async">
+  <Effect id="async-1" />
+</Graph>

@@ -617,6 +617,21 @@ mod tests {
                 "prelude missing required M17 phase 3e-γ hook surface: {sym}"
             );
         }
+        // M17 phase 3g surface: UseEffectAsync + cooperative-cancel
+        // worker substrate (context.Context lifetime bound to cleanup
+        // token). Reuses host_effect ABI verbatim — no new host
+        // callback assertion.
+        for sym in [
+            "func UseEffectAsync(",
+            "type asyncEffectSlot",
+            "func runAsyncEffect(",
+            "\"context\"",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3g hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();

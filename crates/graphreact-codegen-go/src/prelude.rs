@@ -127,8 +127,10 @@ static int grx_invoke_host_callback(
 import "C"
 
 import (
+    "context"
     "encoding/json"
     "fmt"
+    "os"
     "sync"
     "sync/atomic"
     "unsafe"
@@ -204,9 +206,19 @@ func lookupBody(name string) (BodyFn, bool) {{
     return fn, ok
 }}
 
+// cbData is stored as `uintptr` (not `unsafe.Pointer`) because we
+// encode the callback id as an integer-cast — a fake pointer value
+// like `unsafe.Pointer(uintptr(62))`. Go's goroutine stack-walker
+// (triggered on stack-growth at any goroutine boundary, including
+// goroutines spawned by UseEffectAsync) validates `unsafe.Pointer`
+// fields against the heap; an integer-encoded id like `0x3e` is not
+// a valid heap pointer and the validator aborts with "bad pointer
+// in frame ...". Storing as `uintptr` opts out of pointer scanning;
+// we convert to `unsafe.Pointer` only at the cgo call site, which
+// is the documented-safe boundary for the integer-id encoding.
 type callbackSlot struct {{
     cbFn   C.gr_host_callback_fn
-    cbData unsafe.Pointer
+    cbData uintptr
 }}
 
 // functionInfo records (component, fn_name) so GrxFunctionCall can
@@ -347,8 +359,11 @@ func invokeHostCallback(slot callbackSlot, args []interface{{}}) ([]byte, int) {
     defer func() {{ C.free(buf) }}()
     var written C.size_t
 
+    // Convert the integer-encoded id to `unsafe.Pointer` ONLY at the
+    // cgo boundary — see callbackSlot.cbData doc-comment.
+    cbDataPtr := unsafe.Pointer(slot.cbData) //nolint:gosec
     rc := C.grx_invoke_host_callback(
-        slot.cbFn, slot.cbData,
+        slot.cbFn, cbDataPtr,
         argsCStr, C.size_t(len(argsJson)),
         (*C.char)(buf), bufCap, &written,
     )
@@ -357,7 +372,7 @@ func invokeHostCallback(slot callbackSlot, args []interface{{}}) ([]byte, int) {
         C.free(buf)
         buf = C.malloc(bufCap)
         rc = C.grx_invoke_host_callback(
-            slot.cbFn, slot.cbData,
+            slot.cbFn, cbDataPtr,
             argsCStr, C.size_t(len(argsJson)),
             (*C.char)(buf), bufCap, &written,
         )
@@ -578,6 +593,150 @@ func UseEffect(effect func() func(), deps []interface{{}}) {{
             return nil
         }}
         return cleanup
+    }}
+    callbackMu.Unlock()
+    if deps == nil {{
+        _, _ = Invoke("host_effect", token, nil)
+    }} else {{
+        _, _ = Invoke("host_effect", token, deps)
+    }}
+}}
+
+// ----- M17 phase 3g: UseEffectAsync (cooperative-cancel async effect) -----
+//
+// The async sibling of UseEffect. Reuses the SYNC host_effect ABI
+// verbatim — from Rust's POV this is just another effect that returns
+// a cleanup token. The async-ness lives entirely Go-side:
+//
+//   1. Body calls UseEffectAsync(effect, deps).
+//   2. The wrapper registers an outer closure under `effectToken` and
+//      invokes `host_effect(effectToken, deps)`.
+//   3. The Rust scheduler fires the outer closure (via
+//      GrxInvokeCallback) on first mount or whenever deps change.
+//   4. The outer closure mints a context.WithCancel + an
+//      asyncEffectSlot, spawns a goroutine that runs `effect(ctx)`,
+//      and returns a `func()` cleanup closure to the envelope
+//      marshaller — same `kind:"cleanup"` envelope UseEffect emits.
+//   5. On deps-change or unmount, the Rust scheduler fires the
+//      cleanup token (via GrxInvokeCallback again). The cleanup
+//      closure calls `slot.cancel()` (signals ctx.Done()), waits on
+//      `slot.done` (the goroutine has stored the user's cleanup),
+//      then runs the user cleanup (if any). GrxReleaseCallback
+//      finally drops the cleanup-token registration.
+//
+// Cancellation contract: the goroutine MUST observe `ctx.Done()`
+// cooperatively — Go has no forcible goroutine kill. A user effect
+// that ignores ctx will hang the cleanup path indefinitely (same
+// hazard a sync UseEffect cleanup has if the user closure spins
+// forever). Deterministic ordering on cleanup:
+// `slot.cancel()` → `<-slot.done` → user cleanup.
+//
+// Panic handling: panics inside the worker goroutine or inside the
+// user cleanup are recovered with a stderr log line and never
+// propagate across the FFI boundary. The async path's `kind:"throw"`
+// envelope is intentionally not used — there is no caller to surface
+// the panic to once the body has returned.
+
+// asyncEffectSlot carries the per-fire cancel + goroutine-exit
+// synchronization + user-cleanup pointer for a single UseEffectAsync
+// invocation. Owned by the outer closure registered under the
+// effect token; passed to the worker goroutine + captured by the
+// cleanup closure.
+type asyncEffectSlot struct {{
+    cancel      context.CancelFunc
+    done        chan struct{{}}
+    userCleanup atomic.Value
+    once        sync.Once
+}}
+
+// runAsyncEffect is the worker goroutine entry point. Recovers panics
+// into a stderr log line, calls the user effect, stashes its returned
+// cleanup on the slot, then closes done.
+func runAsyncEffect(
+    ctx context.Context,
+    effect func(ctx context.Context) func(),
+    slot *asyncEffectSlot,
+) {{
+    defer func() {{
+        if r := recover(); r != nil {{
+            fmt.Fprintf(os.Stderr, "[graphreact-go] UseEffectAsync goroutine panic: %v\n", r)
+        }}
+        close(slot.done)
+    }}()
+    cleanup := effect(ctx)
+    if cleanup != nil {{
+        slot.userCleanup.Store(cleanup)
+    }}
+}}
+
+// UseEffectAsync registers a body-time `effect` closure that is
+// invoked on a fresh goroutine after the body returns. `effect`
+// receives a `ctx` whose `Done()` channel fires on the next deps-
+// change or on unmount; the effect should observe it for cooperative
+// cancellation (Go offers no forcible goroutine kill). Returning a
+// non-nil `func()` cleanup from `effect` registers a user cleanup
+// that runs AFTER `ctx` is cancelled AND AFTER the worker goroutine
+// has exited — deterministic ordering. Returning nil → no user
+// cleanup.
+//
+// Deps semantics identical to UseEffect: `nil` → fires every render;
+// empty (`[]interface{{}}{{}}`) → fires once; populated → React-style
+// shallow-equal re-fire only when an element differs.
+//
+// Token leak surface identical to UseEffect. Mirrors React's
+// `useEffect` with the canonical Go addition: ctx for cancel.
+//
+// HOOK-FROM-GOROUTINE CONSTRAINT: hook closures captured by `effect`
+// (UseEmit returns, UseSpawnChild returns, UseSource thunks, etc.)
+// reach into HOOK_CTX / per-isolate TLS that is ONLY valid on the
+// scheduler thread during a body render. Calling those from a
+// goroutine spawned inside `effect` will panic
+// (`hook called outside a node component evaluation`) because the
+// goroutine runs on a different OS thread with empty TLS slots.
+// Supported pattern: capture the closure on the scheduler thread,
+// then have the goroutine pipe results back to the next render via
+// channels + a UseState-triggered re-render. Pure-Go work
+// (file I/O, network calls, timers, syscalls) inside the goroutine
+// is fine.
+func UseEffectAsync(
+    effect func(ctx context.Context) func(),
+    deps []interface{{}},
+) {{
+    token := atomic.AddUint64(&nextCallbackToken, 1)
+    callbackMu.Lock()
+    callbackRegistry[token] = func() interface{{}} {{
+        ctx, cancel := context.WithCancel(context.Background())
+        slot := &asyncEffectSlot{{
+            cancel: cancel,
+            done:   make(chan struct{{}}),
+        }}
+        go runAsyncEffect(ctx, effect, slot)
+        // Returning a `func()` makes the envelope marshaller
+        // (GrxInvokeCallback) mint a fresh cleanup token, register
+        // the closure under it, and emit `{{kind:"cleanup",
+        // token:ct}}` — same path UseEffect uses. The Rust
+        // EffectCleanup will fire this closure on the next deps-
+        // change or on unmount.
+        return func() {{
+            slot.once.Do(func() {{
+                slot.cancel()
+                <-slot.done
+                if uc := slot.userCleanup.Load(); uc != nil {{
+                    if fn, ok := uc.(func()); ok {{
+                        defer func() {{
+                            if r := recover(); r != nil {{
+                                fmt.Fprintf(
+                                    os.Stderr,
+                                    "[graphreact-go] UseEffectAsync user cleanup panic: %v\n",
+                                    r,
+                                )
+                            }}
+                        }}()
+                        fn()
+                    }}
+                }}
+            }})
+        }}
     }}
     callbackMu.Unlock()
     if deps == nil {{
@@ -814,16 +973,19 @@ func GrxCallbackRegister(
     }}
     cbName := C.GoStringN(name, C.int(nameLen))
     id := atomic.AddUint64(&nextCallbackId, 1)
-    // Encode the id back as the cb_data pointer the trampoline
-    // reads. Match the Rust side's `cb_data as usize as u64`
-    // decoding shape.
-    idAsPointer := unsafe.Pointer(uintptr(id))
+    // Encode the id as an integer (uintptr). At the cgo call site
+    // (invokeHostCallback) we convert to `unsafe.Pointer` for the
+    // grx_invoke_host_callback signature — the Rust side decodes
+    // via `cb_data as usize as u64`. Storing as `uintptr` in
+    // callbackSlot avoids the goroutine-stack-walker false positive
+    // documented at the callbackSlot type. See also callbackSlot.cbData.
+    idAsUintptr := uintptr(id)
     is.mu.Lock()
     if _, exists := is.callbacksByName[cbName]; exists {{
         is.mu.Unlock()
         return GR_ERR_CALLBACK_DUPLICATE
     }}
-    slot := callbackSlot{{cbFn: cbFn, cbData: idAsPointer}}
+    slot := callbackSlot{{cbFn: cbFn, cbData: idAsUintptr}}
     is.callbacks[id] = slot
     is.callbacksByName[cbName] = id
     is.mu.Unlock()
