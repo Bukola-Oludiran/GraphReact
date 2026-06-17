@@ -575,7 +575,15 @@ pub fn build_router(state: ApiState) -> Router {
     use axum::middleware;
 
     // /v1/healthz bypasses auth (liveness probe-friendly).
-    let public_routes = Router::new().route("/v1/healthz", get(healthz));
+    // /v1/readyz also bypasses auth — readiness probes ride the same
+    // path-bypass shape as liveness; the readiness predicate is
+    // derived from MetricsInner (scheduler-batch progress) +
+    // snapshot bridge capacity, so neither leaks secrets nor
+    // requires per-probe authentication. **M-Prod sub-track #5
+    // safest slice.**
+    let public_routes = Router::new()
+        .route("/v1/healthz", get(healthz))
+        .route("/v1/readyz", get(readyz));
 
     // Auth-protected routes. The middleware fires before each
     // handler; missing/wrong token short-circuits with 401.
@@ -782,6 +790,83 @@ async fn healthz() -> Response {
         "ok",
     )
         .into_response()
+}
+
+/// **M-Prod sub-track #5 (observability completeness) safest slice.**
+///
+/// Kubernetes-shaped readiness probe. Distinct from `/v1/healthz`
+/// (which is liveness: process is up + can serve HTTP). Readiness
+/// answers: "should the load balancer / k8s control plane route
+/// traffic here YET?". A daemon that has bound its observer port
+/// but whose scheduler has not yet drained the initial mount batch
+/// is LIVE-but-NOT-READY — `/readyz` returns 503 + `Retry-After: 1`
+/// until the first batch completes, then flips to 200 permanently.
+///
+/// ## Predicate
+///
+/// Readiness is the conjunction of:
+///
+/// 1. **Scheduler has completed ≥1 `process_batch` round.** Sourced
+///    from `MetricsInner::process_batch_duration.snapshot().count`,
+///    which is incremented exactly once per `tick_end` event by
+///    the [`crate::PrometheusSink`]. A daemon that just bound its
+///    port has count=0; after the daemon's first
+///    [`drive_handle_until`] iteration emits a tick the count is
+///    ≥1 and stays ≥1 for the rest of the process lifetime.
+///
+/// 2. **Snapshot bridge has capacity.** Sourced from
+///    `snapshot_tx.capacity()`. A capacity-0 bridge means the
+///    scheduler thread is wedged / blocked behind a long
+///    `process_batch` round AND every channel slot is full —
+///    inbound HTTP would 503 anyway, so we pre-emptively de-route
+///    via readiness rather than serve a stale snapshot.
+///
+/// ## Failure modes documented for operators
+///
+/// - **503 with no batch tick yet**: daemon is still inside its
+///   first mount cascade; expected at process startup, should
+///   flip green within a few hundred ms on a healthy mount.
+/// - **503 with bridge at 0 capacity**: scheduler thread is
+///   wedged; LIVE probe still 200s (the axum task is alive) so
+///   k8s won't restart, but `/readyz` 503 keeps new traffic off.
+///
+/// ## Future predicate extensions (deferred inside #5)
+///
+/// - TLS cert loaded / not-in-rotation — needs sub-track #2 SIGHUP
+///   reload primitive.
+/// - OTel exporter reachable — needs the BatchSpanProcessor connect
+///   handle (currently the SDK absorbs the failure mode).
+/// - Drain-in-progress flag — needs sub-track #4 SIGTERM drain
+///   primitive; once shipped, readiness flips back to 503 at the
+///   start of drain so the load balancer de-routes BEFORE we stop
+///   accepting new calls.
+async fn readyz(State(state): State<ApiState>) -> Response {
+    let batches = state.metrics.process_batch_duration.snapshot().count;
+    let bridge_capacity = state.snapshot_tx.capacity();
+    let ready = batches > 0 && bridge_capacity > 0;
+    if ready {
+        (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "ready",
+        )
+            .into_response()
+    } else {
+        let reason: &str = if batches == 0 {
+            "scheduler_first_batch_pending"
+        } else {
+            "bridge_saturated"
+        };
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (axum::http::header::RETRY_AFTER, "1"),
+            ],
+            reason,
+        )
+            .into_response()
+    }
 }
 
 async fn identity(State(state): State<ApiState>) -> Json<Identity> {
