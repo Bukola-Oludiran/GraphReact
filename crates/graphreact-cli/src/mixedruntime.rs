@@ -533,4 +533,60 @@ mod tests {
         assert!(rt.cpython.is_some());
         rt.shutdown().expect("reverse-order shutdown ok");
     }
+
+    /// **Phase 3 acceptance.** The full mixed-runtime-supervisor
+    /// fixture (JS + Python + Go) brings up ALL three engines via
+    /// `mount_mixed` in deterministic JSC → CPython → Go order.
+    /// Each engine registers exactly one node with its scheduler;
+    /// the union across slots equals the IR's three Component
+    /// nodes. Reverse-order shutdown tears down Go → CPython →
+    /// JSC without leaking an engine.
+    ///
+    /// Gated on a Go toolchain being present. The Go engine's
+    /// `codegen_and_build` invokes `go build`; without Go on
+    /// PATH the mount errors out. Skip the test in that case so
+    /// CI without Go still passes (mirrors goruntime's
+    /// `skip_if_no_go` pattern).
+    #[test]
+    fn phase3_acceptance_full_mixed_supervisor_fixture() {
+        let go_present = std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if std::env::var("GRAPHREACT_SKIP_GO").is_ok() || !go_present {
+            eprintln!(
+                "[m22] skipping phase3_acceptance_full_mixed_supervisor_fixture — no `go` toolchain on PATH"
+            );
+            return;
+        }
+        let _g = engine_lock();
+        reset_global_state();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mixed-runtime-supervisor.grx");
+        let mut rt = mount_mixed(&fixture).expect("mount ok");
+        assert_eq!(
+            rt.init_order(),
+            &[EngineSlot::Jsc, EngineSlot::Cpython, EngineSlot::Go],
+            "init order must be jsc → cpython → go"
+        );
+        assert!(rt.jsc.is_some(), "jsc slot active");
+        assert!(rt.cpython.is_some(), "cpython slot active");
+        assert!(rt.go.is_some(), "go slot active");
+        assert_eq!(rt.graph_id, "mixed-runtime-supervisor");
+        let mounted = rt.mounted_components();
+        assert!(
+            mounted.contains(&"supervisor".to_string()),
+            "supervisor mounted via JSC; got {mounted:?}"
+        );
+        assert!(
+            mounted.contains(&"py-child".to_string()),
+            "py-child mounted via CPython; got {mounted:?}"
+        );
+        assert!(
+            mounted.contains(&"go-child".to_string()),
+            "go-child mounted via Go; got {mounted:?}"
+        );
+        rt.shutdown().expect("reverse-order shutdown ok");
+    }
 }

@@ -450,6 +450,16 @@ pub enum RuntimeArg {
     /// instead. Full hook surface (M6.6 parity) lands at M17 phase
     /// 3c-h per the later-milestone plan.
     Go,
+    /// **M22 — Mixed-runtime daemon.** Brings up every engine
+    /// (JSC + CPython + Go) whose `lang` appears in the `.grx`
+    /// IR. Engines whose lang is absent are not initialized so
+    /// pure-lang fixtures pay no cross-engine cost. Each engine
+    /// owns its own scheduler; per-component dispatch is closure-
+    /// based via the relaxed-mount path shipped in M22 phase 1.
+    /// `--debug` is currently rejected under `--runtime=mixed`
+    /// (debug attach picks one engine; multi-engine attach is
+    /// deferred to M22 phase 5+).
+    Mixed,
 }
 
 impl std::fmt::Display for RuntimeArg {
@@ -460,6 +470,7 @@ impl std::fmt::Display for RuntimeArg {
             Self::Jsc => write!(f, "jsc"),
             Self::Cpython => write!(f, "cpython"),
             Self::Go => write!(f, "go"),
+            Self::Mixed => write!(f, "mixed"),
         }
     }
 }

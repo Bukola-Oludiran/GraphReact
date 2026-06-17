@@ -16,6 +16,31 @@ pub enum EngineKind {
     /// real lifecycle. Until phase 1 closes, select() returns
     /// `GoNotLinked`.
     Go,
+    /// **M22.** Mixed-runtime kind: signals that the caller wants
+    /// every engine in the IR brought up via
+    /// [`crate::mixedruntime::mount_mixed`]. `select()` rejects this
+    /// kind explicitly because a Mixed daemon is composed of
+    /// multiple engines and has no single `Box<dyn Engine>` to
+    /// return — callers must dispatch through the mixed mount path.
+    Mixed,
+}
+
+impl EngineKind {
+    /// Static label string for Prometheus `engine="..."` labels +
+    /// log fields. Matches `MixedRuntime::EngineSlot::engine_label`
+    /// so downstream Grafana panels can pivot on a single label
+    /// vocabulary.
+    #[must_use]
+    pub const fn engine_label(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Echo => "echo",
+            Self::Jsc => "jsc",
+            Self::Cpython => "cpython",
+            Self::Go => "go",
+            Self::Mixed => "mixed",
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -51,6 +76,17 @@ pub enum EngineSelectError {
          ~/.claude/plans/graphreact-rust-later-milestones.md §M17 for details."
     )]
     GoNotLinked,
+    /// **M22.** `EngineKind::Mixed` has no single boxed [`Engine`] —
+    /// it composes JSC + CPython + Go through the mixed-runtime
+    /// orchestrator (`crate::mixedruntime`). Surface this variant
+    /// when a caller routes through `select(EngineKind::Mixed)`
+    /// expecting a single engine; the right dispatch target is
+    /// `mount_mixed`.
+    #[error(
+        "engine `mixed` is a multi-engine composition (M22). Use \
+         `crate::mixedruntime::mount_mixed` instead of `select()`."
+    )]
+    MixedNotABoxedEngine,
 }
 
 /// Construct a boxed engine from a CLI selection.
@@ -96,6 +132,13 @@ pub fn select(kind: EngineKind) -> Result<Box<dyn Engine>, EngineSelectError> {
             let engine = graphreact_engine_go::GoEngine::new();
             Ok(Box::new(engine))
         }
+        EngineKind::Mixed => {
+            // **M22.** Mixed-runtime kind has no single Engine to
+            // box — it composes JSC + CPython + Go via the
+            // mixedruntime module. Callers must dispatch through
+            // [`crate::mixedruntime::mount_mixed`] instead.
+            Err(EngineSelectError::MixedNotABoxedEngine)
+        }
     }
 }
 
@@ -107,6 +150,7 @@ impl From<crate::cli::RuntimeArg> for EngineKind {
             crate::cli::RuntimeArg::Jsc => Self::Jsc,
             crate::cli::RuntimeArg::Cpython => Self::Cpython,
             crate::cli::RuntimeArg::Go => Self::Go,
+            crate::cli::RuntimeArg::Mixed => Self::Mixed,
         }
     }
 }
