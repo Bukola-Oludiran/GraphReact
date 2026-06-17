@@ -1,0 +1,9 @@
+<Subgraph name="ShelfA">
+  <Box id="b1" />
+  <Box id="b2" />
+  <edge source="b1" target="b2" />
+</Subgraph>
+
+<Graph id="board">
+  <Subsystem ref="ShelfA" id="a" />
+</Graph>
