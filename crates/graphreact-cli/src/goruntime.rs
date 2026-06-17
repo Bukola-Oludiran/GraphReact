@@ -3196,7 +3196,18 @@ impl GoRuntime {
     /// Tear down — disposes the isolate and shuts the engine. Drains
     /// per-isolate callback ids on the Rust side; the Go runtime
     /// stays alive (single-runtime-per-process; ADR-0005).
+    ///
+    /// **M22 phase 1.** Shell-form runtimes produced by
+    /// `mount_with_scheduler` when the IR carries no Go definitions
+    /// have an uninitialized engine (`IsolateHandle(0)`, empty
+    /// `artifact_path`). Calling `dispose_isolate` on such a shell
+    /// would error; the early return short-circuits to a clean
+    /// no-op so callers (mostly the mixed-runtime orchestrator)
+    /// can `shutdown()` uniformly without per-shape branching.
     pub fn shutdown(&mut self) -> Result<(), EngineError> {
+        if self.artifact_path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let mut e = self.engine.borrow_mut();
         e.dispose_isolate(self.iso)?;
         e.shutdown()?;
@@ -3288,7 +3299,9 @@ pub fn mount_with_scheduler(
     // mixed mode).
     let original_def_count = ir.definitions.len();
     ir.definitions.retain(|def| {
-        if def.lang != ComponentLang::Go {
+        if def.lang == ComponentLang::Go {
+            true
+        } else {
             tracing::debug!(
                 target: "graphreact::m22::routing",
                 component = %def.component,
@@ -3296,8 +3309,6 @@ pub fn mount_with_scheduler(
                 "goruntime mount: skipping non-Go definition (mixed-runtime path)"
             );
             false
-        } else {
-            true
         }
     });
     let _filtered_def_count = original_def_count - ir.definitions.len();

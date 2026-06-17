@@ -591,9 +591,9 @@ mod tests {
     /// `grx_engine_mount_count{engine}` and
     /// `grx_engine_eval_count{engine}` carry one series per active
     /// engine slot. Pure-Python fixture yields exactly
-    /// `engine="cpython"`; mixed JS+Python yields `engine="jsc"`
-    /// + `engine="cpython"`. The full mixed fixture is
-    /// covered by the Phase 3 acceptance test below.
+    /// `engine="cpython"`; mixed JS+Python yields `engine="jsc"` +
+    /// `engine="cpython"`. The full mixed fixture is covered by
+    /// the Phase 3 acceptance test below.
     #[test]
     fn phase4_acceptance_engine_mount_count_populates_per_slot() {
         let _g = engine_lock();
