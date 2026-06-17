@@ -1,0 +1,93 @@
+<!-- M17-phase3e-α: dynamic node lifecycle acceptance.
+
+     Spawner mounts at boot with no children. On its first render its
+     UseEffect fires UseSpawnChild()(ChildSpec{ID:"dyn1", Body:...})
+     which enqueues an AddNodeAtRuntime mutation; on the next cascade
+     round `dyn1` mounts and its body observes `host_observe_dyn` with
+     its own id.
+
+     Composer mounts at boot with no children either. On its first
+     render its UseEffect fires UseCompose()([{ID:"compA"},
+     {ID:"compB"}]) which spawns two children. compA observes its id
+     and stays mounted; compB observes its id then calls
+     UseUnmountSelf()() to remove itself.
+
+     The probe asserts the test-installed `host_observe_dyn` callback
+     records [dyn1, compA, compB] (order-independent). -->
+
+<Spawner lang="go">
+func SpawnerBody(ctx Ctx) Manifest {
+    spawn := UseSpawnChild()
+    UseEffect(func() func() {
+        spawn(ChildSpec{
+            ID:   "dyn1",
+            Body: DynChildBody,
+            Props: map[string]interface{}{"label": "dynamic"},
+        })
+        return nil
+    }, []interface{}{})
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+
+// DynChildBody runs from a NodeDefinition closure built by
+// build_compose_spec_from_host_value on the Rust side; it dispatches
+// here via GrxInvokeChildBody on every render.
+func DynChildBody(ctx Ctx) Manifest {
+    _, _ = Invoke("host_observe_dyn", ctx.ID)
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Spawner>
+
+<Composer lang="go">
+func ComposerBody(ctx Ctx) Manifest {
+    compose := UseCompose()
+    UseEffect(func() func() {
+        compose([]ChildSpec{
+            {ID: "compA", Body: CompABody},
+            {ID: "compB", Body: CompBBody},
+        })
+        return nil
+    }, []interface{}{})
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+
+func CompABody(ctx Ctx) Manifest {
+    _, _ = Invoke("host_observe_dyn", ctx.ID)
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+
+func CompBBody(ctx Ctx) Manifest {
+    _, _ = Invoke("host_observe_dyn", ctx.ID)
+    unmount := UseUnmountSelf()
+    UseEffect(func() func() {
+        unmount()
+        return nil
+    }, []interface{}{})
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Composer>
+
+<Graph id="go-dynamic-lifecycle">
+  <Spawner id="spawner" />
+  <Composer id="composer" />
+</Graph>

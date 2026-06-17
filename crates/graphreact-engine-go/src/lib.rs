@@ -159,6 +159,51 @@ pub fn invoke_predicate_static(
     rc != 0
 }
 
+/// **M17 phase 3e-α.** Free-function variant of child-body
+/// invocation. Used by `goruntime`'s dynamically-spawned
+/// `NodeDefinition` closures (`use_spawn_child` + `use_compose`)
+/// to dispatch a render into a Go body fn registered under
+/// `token` in the prelude's `childBodyRegistry`.
+///
+/// The marshalled ctx JSON is the same `{id, props, neighbors}`
+/// envelope `GrxFunctionCall` consumes; the returned JSON is the
+/// child body's `Manifest` decoded into a `HostValue` for
+/// `goruntime::host_value_to_manifest`.
+///
+/// # Errors
+///
+/// - [`EngineError::Internal`] if the loaded artifact does not
+///   export `GrxInvokeChildBody` (older codegen pass).
+/// - [`EngineError::CallbackNotFound`] if `token` was never
+///   registered.
+/// - [`EngineError::Internal`] wrapping JSON / buffer errors.
+pub fn invoke_child_body_static(
+    runtime: &LoadedRuntime,
+    token: u64,
+    ctx_json: &str,
+) -> EngineResult<HostValue> {
+    let invoke = runtime.invoke_child_body.ok_or_else(|| {
+        EngineError::Internal(
+            "graphreact-engine-go: artifact missing GrxInvokeChildBody — rebuild via codegen \
+             with M17 phase 3e-α+ (use_spawn_child / use_compose)"
+                .into(),
+        )
+    })?;
+    let json = call_with_buffer(|out, cap, written| unsafe {
+        invoke(
+            token,
+            ctx_json.as_bytes().as_ptr().cast::<c_char>(),
+            ctx_json.len(),
+            out,
+            cap,
+            written,
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| EngineError::Internal(format!("invoke_child_body manifest: {e}")))?;
+    Ok(json_to_host_value(value))
+}
+
 const RESULT_BUFFER_INITIAL: usize = 4096;
 const RESULT_BUFFER_MAX: usize = 1 << 20; // 1 MiB
 

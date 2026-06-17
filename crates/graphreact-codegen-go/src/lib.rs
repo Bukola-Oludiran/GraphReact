@@ -561,6 +561,25 @@ mod tests {
                 "prelude missing required M17 phase 3d-ζ hook surface: {sym}"
             );
         }
+        // M17 phase 3e-α surface: dynamic node lifecycle hooks +
+        // childBodyRegistry + GrxInvokeChildBody ABI symbol.
+        for sym in [
+            "type ChildSpec",
+            "childBodyRegistry",
+            "registerChildBody",
+            "func UseSpawnChild()",
+            "func UseUnmountSelf()",
+            "func UseCompose()",
+            "GrxInvokeChildBody",
+            "host_spawn_child",
+            "host_unmount_self",
+            "host_compose",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3e-α hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();

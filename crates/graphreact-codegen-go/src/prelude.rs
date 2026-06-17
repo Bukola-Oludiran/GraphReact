@@ -282,6 +282,16 @@ var (
     predicateMu        sync.Mutex
     predicateRegistry  = map[uint64]func(source, msgType string) bool{{}}
     nextPredicateToken uint64
+
+    // childBodyRegistry holds the BodyFn for each dynamically-spawned
+    // child component (3e-α). Token allocated by registerChildBody and
+    // marshalled through host_spawn_child / host_compose as a
+    // `componentToken`; the Rust scheduler reaches back into Go via
+    // the GrxInvokeChildBody ABI symbol on every render of the
+    // spawned node.
+    childBodyMu        sync.Mutex
+    childBodyRegistry  = map[uint64]BodyFn{{}}
+    nextChildBodyToken uint64
 )
 
 // registerMessageHandler stores `handler` under a freshly allocated
@@ -1845,6 +1855,206 @@ func (q Tier3Query) CycleDetection() CycleDetectionResult {{
         return CycleDetectionResult{{}}
     }}
     return result
+}}
+
+// ----- M17 phase 3e-α: use_spawn_child / use_unmount_self / use_compose -----
+//
+// Dynamic node lifecycle. `UseSpawnChild` registers the user's BodyFn
+// in `childBodyRegistry` under a token, then asks the Rust scheduler
+// (via host_spawn_child) to enqueue an AddNodeAtRuntime mutation
+// whose NodeDefinition closure round-trips back into Go via the
+// GrxInvokeChildBody ABI symbol on every render. `UseUnmountSelf` is
+// a thin dispatch into `host_unmount_self`. `UseCompose` is the
+// multi-spec batch variant — registers each spec's BodyFn under a
+// fresh token then ships the whole list through `host_compose`.
+//
+// Token leak (bounded): each call mints a fresh token in
+// `childBodyRegistry`; the scheduler is idempotent on existing IDs
+// so duplicate-id calls don't double-mount, but their tokens linger.
+// Same shape as the leak documented in pyruntime + JSC 3e-α; the
+// future "token GC" sweep across all token-using hooks will reclaim.
+
+// ChildSpec describes a single child node to be spawned via
+// UseSpawnChild or declared via UseCompose. Mirrors the JSC
+// `ComposeChildSpec` shape modulo Go conventions — `Body` is the
+// child's component function (signature: `func(Ctx) Manifest`);
+// `Props` lands as the node's attrs map; `ConnectTo` is a list of
+// node ids the scheduler should wire as outgoing edges right after
+// the AddNodeAtRuntime mutation lands.
+type ChildSpec struct {{
+    ID        string
+    Body      BodyFn
+    Props     map[string]interface{{}}
+    ConnectTo []string
+}}
+
+// registerChildBody stores `fn` under a freshly allocated token in
+// `childBodyRegistry`. The token is returned + marshalled to the
+// Rust side as a `componentToken`; the scheduler invokes
+// GrxInvokeChildBody with the same token on every render of the
+// spawned node.
+func registerChildBody(fn BodyFn) uint64 {{
+    token := atomic.AddUint64(&nextChildBodyToken, 1)
+    childBodyMu.Lock()
+    childBodyRegistry[token] = fn
+    childBodyMu.Unlock()
+    return token
+}}
+
+// childSpecPayload marshals a ChildSpec into the JSON shape the
+// Rust-side `build_compose_spec_from_host_value` consumes. Props nil
+// becomes an empty object; ConnectTo nil becomes an empty array.
+func childSpecPayload(spec ChildSpec, token uint64) map[string]interface{{}} {{
+    props := spec.Props
+    if props == nil {{
+        props = map[string]interface{{}}{{}}
+    }}
+    connectTo := spec.ConnectTo
+    if connectTo == nil {{
+        connectTo = []string{{}}
+    }}
+    return map[string]interface{{}}{{
+        "id":             spec.ID,
+        "componentToken": token,
+        "props":          props,
+        "connectTo":      connectTo,
+    }}
+}}
+
+// UseSpawnChild returns a closure that, when invoked with a
+// `ChildSpec`, registers the child's Body under a fresh token and
+// dispatches `host_spawn_child(spec)`. The Rust scheduler enqueues
+// an AddNodeAtRuntime mutation; the child mounts on the next
+// cascade round. Specs with an empty ID or nil Body are no-ops.
+//
+// Mirrors JSC's `useSpawnChild()(spec)` and pyruntime's
+// `use_spawn_child()(spec)`. Re-entrancy is safe: the spawn closure
+// runs from a body's render but the host callback enqueues — actual
+// NodeDefinition closures fire later from the scheduler, outside
+// any held call_function borrow.
+func UseSpawnChild() func(spec ChildSpec) {{
+    return func(spec ChildSpec) {{
+        if spec.ID == "" || spec.Body == nil {{
+            return
+        }}
+        token := registerChildBody(spec.Body)
+        payload := childSpecPayload(spec, token)
+        _, status := Invoke("host_spawn_child", payload)
+        if status != GR_OK {{
+            // Best-effort: drop the token if the host call failed.
+            childBodyMu.Lock()
+            delete(childBodyRegistry, token)
+            childBodyMu.Unlock()
+        }}
+    }}
+}}
+
+// UseUnmountSelf returns a closure that asks the Rust scheduler to
+// unmount the active node. Subsequent renders of the active node
+// will not run. Mirrors JSC's `useUnmountSelf()()` and pyruntime's
+// `use_unmount_self()()`. Safe to call multiple times — the
+// scheduler dedupes UnmountNode mutations per node id.
+func UseUnmountSelf() func() {{
+    return func() {{
+        _, _ = Invoke("host_unmount_self")
+    }}
+}}
+
+// UseCompose returns a closure that declares the active node's
+// composed children. The multi-spec batch variant of UseSpawnChild;
+// the scheduler spawns any missing children and unmounts ones that
+// were composed by a prior render but absent in this one. Each
+// spec's Body is registered under a fresh token so the Rust side
+// can re-enter Go on every render of any spawned child.
+//
+// Empty ID or nil Body filters that entry out (matches JSC + Python
+// semantics). The full list is marshalled even if some entries are
+// dropped — the Rust side reconciles against the active node's prior
+// composition.
+func UseCompose() func(specs []ChildSpec) {{
+    return func(specs []ChildSpec) {{
+        marshalled := make([]interface{{}}, 0, len(specs))
+        leaked := make([]uint64, 0, len(specs))
+        for _, spec := range specs {{
+            if spec.ID == "" || spec.Body == nil {{
+                continue
+            }}
+            token := registerChildBody(spec.Body)
+            leaked = append(leaked, token)
+            marshalled = append(marshalled, childSpecPayload(spec, token))
+        }}
+        _, status := Invoke("host_compose", marshalled)
+        if status != GR_OK {{
+            childBodyMu.Lock()
+            for _, t := range leaked {{
+                delete(childBodyRegistry, t)
+            }}
+            childBodyMu.Unlock()
+        }}
+    }}
+}}
+
+// GrxInvokeChildBody dispatches a Rust-delivered ctx envelope to the
+// Go-side BodyFn registered under `token` in `childBodyRegistry`.
+// The ctx JSON shape is `{{id, props, neighbors}}` — same as the
+// `GrxFunctionCall` ctx for top-level bodies. The Manifest is
+// JSON-marshalled into the caller-owned `outResult` buffer with the
+// `GR_ERR_BUFFER_TOO_SMALL` grow-and-retry protocol.
+//
+// Panic policy: a panic in the body is recovered and surfaces as a
+// `GR_ERR_INTERNAL` return; the Rust side prints an eprintln + falls
+// back to a default manifest, matching the top-level body's
+// recovery path.
+//
+//export GrxInvokeChildBody
+func GrxInvokeChildBody(
+    token C.uint64_t,
+    ctxJson *C.char, ctxLen C.size_t,
+    outResult *C.char, outResultCap C.size_t,
+    outResultLen *C.size_t,
+) C.int {{
+    childBodyMu.Lock()
+    body, ok := childBodyRegistry[uint64(token)]
+    childBodyMu.Unlock()
+    if !ok {{
+        return GR_ERR_CALLBACK_NOT_FOUND
+    }}
+
+    ctxBytes := C.GoBytes(unsafe.Pointer(ctxJson), C.int(ctxLen))
+    var ctx Ctx
+    if len(ctxBytes) > 0 {{
+        if err := json.Unmarshal(ctxBytes, &ctx); err != nil {{
+            return GR_ERR_INTERNAL
+        }}
+    }}
+
+    var manifest Manifest
+    panicked := false
+    func() {{
+        defer func() {{
+            if r := recover(); r != nil {{
+                panicked = true
+            }}
+        }}()
+        manifest = body(ctx)
+    }}()
+    if panicked {{
+        return GR_ERR_INTERNAL
+    }}
+
+    resultJson, err := marshalManifest(&manifest)
+    if err != nil {{
+        return GR_ERR_INTERNAL
+    }}
+    resultLen := C.size_t(len(resultJson))
+    *outResultLen = resultLen
+    if resultLen > outResultCap {{
+        return GR_ERR_BUFFER_TOO_SMALL
+    }}
+    if resultLen > 0 {{
+        C.memcpy(unsafe.Pointer(outResult), unsafe.Pointer(&resultJson[0]), resultLen)
+    }}
+    return GR_OK
 }}
 
 // GrxInvokeCallback invokes a generic Go callback stored under

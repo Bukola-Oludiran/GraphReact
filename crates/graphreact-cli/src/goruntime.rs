@@ -42,17 +42,19 @@ use serde_json::Value;
 
 use graphreact_codegen_go::{BuildArtifact, Codegen};
 use graphreact_core::{
-    use_accept_edge as core_use_accept_edge, use_edge_accept_handler as core_use_edge_accept_handler,
-    use_effect as core_use_effect, use_emit as core_use_emit, use_memo as core_use_memo,
-    use_message as core_use_message, use_neighbors as core_use_neighbors,
-    use_state as core_use_state, use_topology as core_use_topology, Attrs, CommunicationGraph,
+    use_accept_edge as core_use_accept_edge, use_compose as core_use_compose,
+    use_edge_accept_handler as core_use_edge_accept_handler, use_effect as core_use_effect,
+    use_emit as core_use_emit, use_memo as core_use_memo, use_message as core_use_message,
+    use_neighbors as core_use_neighbors, use_spawn_child as core_use_spawn_child,
+    use_state as core_use_state, use_topology as core_use_topology,
+    use_unmount_self as core_use_unmount_self, Attrs, CommunicationGraph, ComposeChildSpec,
     EdgeAcceptPredicate, EffectCleanup, EmitOptions, GraphDirectory, IncomingMessage, NodeContext,
     NodeDefinition, PermissionManifest, Scheduler, Signal, TopologyEvent, TopologyEventKind,
     TopologyFilterOptions,
 };
 use std::sync::Arc;
 
-use graphreact_engine_go::{invoke_predicate_static, GoEngine, LoadedRuntime};
+use graphreact_engine_go::{invoke_child_body_static, invoke_predicate_static, GoEngine, LoadedRuntime};
 use graphreact_engine_zig::{
     BoxCallback, Engine, EngineError, FunctionHandle, HostValue, IsolateHandle, IsolateOptions,
 };
@@ -2678,6 +2680,184 @@ fn build_host_tier3_cycle_detection_callback() -> BoxCallback {
     })
 }
 
+// ---------------------------------------------------------------------
+// M17 phase 3e-α: use_spawn_child / use_unmount_self / use_compose
+// ---------------------------------------------------------------------
+//
+// Dynamic node lifecycle. Verbatim port of pyruntime's phase 3e-α
+// surface modulo Go conventions. The Go-side prelude's UseSpawnChild
+// / UseCompose register the child's BodyFn under a token in
+// `childBodyRegistry` and ship a `{id, componentToken, props,
+// connectTo}` envelope through `host_spawn_child` / `host_compose`.
+// `build_compose_spec_from_host_value` re-builds a
+// `graphreact_core::ComposeChildSpec` whose `NodeDefinition` closure
+// dispatches back into Go via `invoke_child_body_static` on every
+// render of the spawned node. `host_unmount_self` is a trivial
+// pass-through to `core_use_unmount_self()()`.
+//
+// Re-entrancy: the spawned NodeDefinition closure runs from
+// `Scheduler::evaluate_node` (driven by `process_batch`), OUTSIDE any
+// held engine `borrow_mut`. We deliberately use the static FFI bypass
+// (`invoke_child_body_static(&runtime, token, ctx_json)`) rather than
+// going through `engine.borrow_mut().call_function(...)` — symmetric
+// with `invoke_predicate_static` and avoids the `Rc<RefCell<GoEngine>>`
+// borrow that could collide with a host callback firing mid-render.
+//
+// Token leak (bounded): each `use_spawn_child` / `use_compose` call
+// mints a fresh token in `childBodyRegistry`; the scheduler is
+// idempotent on existing IDs so duplicate-id calls don't double-
+// mount, but their tokens linger. Same shape as pyruntime + JSC
+// 3e-α — token GC is deferred to the eventual "followon-D" sweep.
+
+/// Build the `host_spawn_child(spec)` callback. Go-side
+/// `UseSpawnChild()(spec)` registers the user's BodyFn under a token
+/// (in `childBodyRegistry`) and dispatches the spec envelope here.
+/// We rebuild a [`ComposeChildSpec`] whose [`NodeDefinition`] re-
+/// enters Go on every render via `invoke_child_body_static`, then
+/// hand it to [`graphreact_core::use_spawn_child`].
+fn build_host_spawn_child_callback() -> BoxCallback {
+    Box::new(|args| {
+        let spec_value = args.first().cloned().ok_or_else(|| {
+            EngineError::Internal("host_spawn_child: missing spec argument".into())
+        })?;
+        let spec = build_compose_spec_from_host_value(spec_value)?;
+        let spawn = core_use_spawn_child();
+        spawn(spec);
+        Ok(HostValue::Null)
+    })
+}
+
+/// Build the `host_unmount_self()` callback. Go-side
+/// `UseUnmountSelf()()` calls this; we route through
+/// [`graphreact_core::use_unmount_self`] which enqueues an
+/// `UnmountNode` mutation for the active node.
+fn build_host_unmount_self_callback() -> BoxCallback {
+    Box::new(|_args| {
+        let unmount = core_use_unmount_self();
+        unmount();
+        Ok(HostValue::Null)
+    })
+}
+
+/// Build the `host_compose(specs)` callback. Go-side
+/// `UseCompose()(specs)` registers each child's BodyFn under a token
+/// and dispatches the array here. We marshal the array into
+/// `Vec<ComposeChildSpec>` and call [`graphreact_core::use_compose`],
+/// which spawns missing children + tracks the active node's declared
+/// composition for the scheduler's reconciliation pass.
+fn build_host_compose_callback() -> BoxCallback {
+    Box::new(|args| {
+        let arr = match args.first() {
+            Some(HostValue::Array(arr)) => arr.clone(),
+            None | Some(HostValue::Null) => Vec::new(),
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_compose: expected Array specs, got {other:?}"
+                )));
+            }
+        };
+        let specs: Vec<ComposeChildSpec> = arr
+            .into_iter()
+            .filter_map(|s| build_compose_spec_from_host_value(s).ok())
+            .collect();
+        let compose = core_use_compose();
+        compose(specs);
+        Ok(HostValue::Null)
+    })
+}
+
+/// Decode a Go-side spec envelope (already marshalled to
+/// `HostValue::Object`) into a [`ComposeChildSpec`] backed by a
+/// [`NodeDefinition`] whose component closure re-enters Go via
+/// `invoke_child_body_static(&runtime, token, ctx_json)` on every
+/// render. The closure captures the `Arc<LoadedRuntime>` cloned from
+/// TLS — the SpawnChild / Compose mutations consuming this spec are
+/// applied at the start of the next cascade round, so the runtime
+/// handle is valid for the lifetime of the spawned node.
+///
+/// Verbatim Go port of `pyruntime::build_compose_spec_from_host_value`.
+fn build_compose_spec_from_host_value(
+    value: HostValue,
+) -> Result<ComposeChildSpec, EngineError> {
+    let HostValue::Object(pairs) = value else {
+        return Err(EngineError::Internal(format!(
+            "expected ComposeChildSpec object, got {value:?}"
+        )));
+    };
+
+    let mut id: Option<String> = None;
+    let mut component_token: Option<u64> = None;
+    let mut props: Attrs = Attrs::new();
+    let mut connect_to: Vec<String> = Vec::new();
+
+    for (k, v) in pairs {
+        match (k.as_str(), v) {
+            ("id", HostValue::String(s)) => id = Some(s),
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            ("componentToken", HostValue::Number(n)) => component_token = Some(n as u64),
+            ("props", HostValue::Object(prop_pairs)) => {
+                for (pk, pv) in prop_pairs {
+                    props.insert(pk, pv.into_json());
+                }
+            }
+            ("connectTo", HostValue::Array(arr)) => {
+                connect_to = arr
+                    .into_iter()
+                    .filter_map(|x| match x {
+                        HostValue::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+
+    let id = id.ok_or_else(|| EngineError::Internal("ComposeChildSpec: missing `id`".into()))?;
+    let component_token = component_token
+        .ok_or_else(|| EngineError::Internal("ComposeChildSpec: missing `componentToken`".into()))?;
+
+    let runtime = current_loaded_runtime().ok_or_else(|| {
+        EngineError::Internal(
+            "compose spec: loaded-runtime TLS unset (child-body dispatch needs an \
+             Arc<LoadedRuntime> stashed by GoEngineGuard::with_directory)"
+                .into(),
+        )
+    })?;
+
+    let definition_name = format!("GoChild::{id}");
+    let definition = NodeDefinition::new(
+        definition_name,
+        move |ctx: &NodeContext| -> PermissionManifest {
+            let _guard = ComponentEvalGuard::new(&ctx.id);
+            let host_ctx = build_host_ctx(ctx);
+            let ctx_json = match serde_json::to_string(&host_ctx.into_json()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[graphreact-cli] child-body ctx marshal failed: {e}");
+                    return PermissionManifest::default();
+                }
+            };
+            match invoke_child_body_static(&runtime, component_token, &ctx_json) {
+                Ok(manifest) => host_value_to_manifest(manifest),
+                Err(e) => {
+                    eprintln!(
+                        "[graphreact-cli] dynamically-spawned Go child invocation failed: {e}"
+                    );
+                    PermissionManifest::default()
+                }
+            }
+        },
+    );
+
+    Ok(ComposeChildSpec {
+        id,
+        definition,
+        props,
+        connect_to,
+    })
+}
+
 /// Parse the third argument of `host_emit` into [`EmitOptions`].
 /// Recognised keys mirror JSC + CPython: `to` (Array of String),
 /// `ttl` (Number), `edgeKey` (String), `direct` (String). Unknown
@@ -3173,6 +3353,17 @@ pub fn mount_with_scheduler(
             build_host_tier3_cycle_detection_callback(),
         )
         .map_err(RuntimeError::Engine)?;
+        // M17 phase 3e-α: dynamic node lifecycle.
+        e.register_callback(iso, "host_spawn_child", build_host_spawn_child_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_unmount_self",
+            build_host_unmount_self_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_compose", build_host_compose_callback())
+            .map_err(RuntimeError::Engine)?;
         iso
     };
 
@@ -4922,6 +5113,74 @@ mod tests {
         );
     }
 
+    /// Phase 3e-α: dynamic node lifecycle.
+    ///
+    /// Mounts `go-dynamic-lifecycle.grx` with a Spawner + Composer
+    /// pair. Spawner mounts → its UseEffect fires
+    /// `UseSpawnChild()(ChildSpec{ID:"dyn1", Body:DynChildBody})`;
+    /// Composer mounts → its UseEffect fires
+    /// `UseCompose()([{ID:"compA"}, {ID:"compB"}])`. After the
+    /// AddNodeAtRuntime mutations cascade, the three new bodies fire
+    /// and observe their own ids via `host_observe_dyn`. `compB`
+    /// additionally calls `UseUnmountSelf()()` so its first render
+    /// schedules an `UnmountNode` that removes it on the next
+    /// cascade round.
+    ///
+    /// Asserts the observation log contains `dyn1`, `compA`, and
+    /// `compB` (order-independent). Mirrors
+    /// `pyruntime::phase3e_alpha_*` family.
+    fn scenario_use_spawn_child_use_compose_use_unmount_self() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/go-dynamic-lifecycle.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("dynlife");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-dynamic-lifecycle.grx");
+
+        let observed: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observed_cb = std::sync::Arc::clone(&observed);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_dyn",
+                Box::new(move |args| {
+                    if let Some(HostValue::String(s)) = args.first() {
+                        observed_cb.lock().push(s.clone());
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_dyn");
+
+        // Batch 1: Spawner + Composer render; their UseEffect fires
+        // post-render and enqueues the spawn / compose mutations.
+        runtime.process_batch().expect("batch 1");
+        // Batch 2: AddNodeAtRuntime mutations apply; dyn1 / compA /
+        // compB mount and render → observe their ids. compB's
+        // UseEffect enqueues UnmountNode.
+        runtime.process_batch().expect("batch 2");
+        // Batch 3: UnmountNode mutation drains — compB is gone.
+        runtime.process_batch().expect("batch 3");
+
+        let log = observed.lock();
+        assert!(
+            log.iter().any(|s| s == "dyn1"),
+            "expected 'dyn1' observation from UseSpawnChild path; got {log:?}"
+        );
+        assert!(
+            log.iter().any(|s| s == "compA"),
+            "expected 'compA' observation from UseCompose path; got {log:?}"
+        );
+        assert!(
+            log.iter().any(|s| s == "compB"),
+            "expected 'compB' observation from UseCompose path; got {log:?}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -4954,69 +5213,73 @@ mod tests {
         // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
         // between fixtures (each fresh mount expects to start at
         // signal id 1 for assertion stability).
-        eprintln!("[goruntime smoke 1/16] build_and_load + body dispatch");
+        eprintln!("[goruntime smoke 1/17] build_and_load + body dispatch");
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/16] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/17] EngineMisroute rejects non-Go bodies");
         reset_global_state();
         scenario_rejects_non_go_lang();
 
-        eprintln!("[goruntime smoke 3/16] emit/message round-trip");
+        eprintln!("[goruntime smoke 3/17] emit/message round-trip");
         reset_global_state();
         scenario_emit_dispatches_to_neighbor();
 
-        eprintln!("[goruntime smoke 4/16] use_state preserves value across renders");
+        eprintln!("[goruntime smoke 4/17] use_state preserves value across renders");
         reset_global_state();
         scenario_use_state_preserves_value_across_renders();
 
-        eprintln!("[goruntime smoke 5/16] state survives a message");
+        eprintln!("[goruntime smoke 5/17] state survives a message");
         reset_global_state();
         scenario_use_state_survives_a_message();
 
-        eprintln!("[goruntime smoke 6/16] use_effect with empty deps fires once");
+        eprintln!("[goruntime smoke 6/17] use_effect with empty deps fires once");
         reset_global_state();
         scenario_use_effect_empty_deps_fires_once();
 
-        eprintln!("[goruntime smoke 7/16] use_memo single-render fires factory once");
+        eprintln!("[goruntime smoke 7/17] use_memo single-render fires factory once");
         reset_global_state();
         scenario_use_memo_caches_when_deps_unchanged();
 
-        eprintln!("[goruntime smoke 8/16] use_memo recomputes on dep change");
+        eprintln!("[goruntime smoke 8/17] use_memo recomputes on dep change");
         reset_global_state();
         scenario_use_memo_caches_and_recomputes();
 
-        eprintln!("[goruntime smoke 9/16] use_reducer dispatch updates state");
+        eprintln!("[goruntime smoke 9/17] use_reducer dispatch updates state");
         reset_global_state();
         scenario_use_reducer_dispatch_updates_state();
 
-        eprintln!("[goruntime smoke 10/16] use_neighbors returns structural ids");
+        eprintln!("[goruntime smoke 10/17] use_neighbors returns structural ids");
         reset_global_state();
         scenario_use_neighbors_returns_structural_ids();
 
-        eprintln!("[goruntime smoke 11/16] use_accept_edge fires topology event");
+        eprintln!("[goruntime smoke 11/17] use_accept_edge fires topology event");
         reset_global_state();
         scenario_accept_edge_fires_topology_event();
 
-        eprintln!("[goruntime smoke 12/16] use_graph_query Tier 1 accessors");
+        eprintln!("[goruntime smoke 12/17] use_graph_query Tier 1 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_1_accessors();
 
-        eprintln!("[goruntime smoke 13/16] use_directory find_by_id");
+        eprintln!("[goruntime smoke 13/17] use_directory find_by_id");
         reset_global_state();
         scenario_use_directory_find_by_id();
 
-        eprintln!("[goruntime smoke 14/16] use_graph_query Tier 1 algorithms");
+        eprintln!("[goruntime smoke 14/17] use_graph_query Tier 1 algorithms");
         reset_global_state();
         scenario_use_graph_query_tier_1_algorithms();
 
-        eprintln!("[goruntime smoke 15/16] use_graph_query Tier 2 accessors");
+        eprintln!("[goruntime smoke 15/17] use_graph_query Tier 2 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_2_accessors();
 
-        eprintln!("[goruntime smoke 16/16] use_edge_accept_handler + Tier 3 accessors");
+        eprintln!("[goruntime smoke 16/17] use_edge_accept_handler + Tier 3 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_3_accessors();
+
+        eprintln!("[goruntime smoke 17/17] use_spawn_child + use_compose + use_unmount_self");
+        reset_global_state();
+        scenario_use_spawn_child_use_compose_use_unmount_self();
 
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup

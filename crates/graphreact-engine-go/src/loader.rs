@@ -82,6 +82,11 @@ pub struct LoadedRuntime {
     /// Optional.
     pub release_callback: Option<ffi::gr_go_release_callback_fn>,
 
+    /// **M17 phase 3e-α.** Rust → Go child-body invocation symbol.
+    /// Optional; if absent, `host_spawn_child` / `host_compose`
+    /// dispatch surfaces a clear runtime error.
+    pub invoke_child_body: Option<ffi::gr_go_invoke_child_body_fn>,
+
     /// Owns the dlopen handle. Declared LAST so it drops LAST —
     /// any future non-Copy field pointing into the Library is
     /// safely outlived. The leading underscore documents that we
@@ -190,6 +195,11 @@ impl LoadedRuntime {
         let invoke_predicate =
             resolve_optional::<ffi::gr_go_invoke_predicate_fn>(&lib, "GrxInvokePredicate");
 
+        // M17 phase 3e-α — optional. Older artifacts surface a clear
+        // runtime error from host_spawn_child / host_compose dispatch.
+        let invoke_child_body =
+            resolve_optional::<ffi::gr_go_invoke_child_body_fn>(&lib, "GrxInvokeChildBody");
+
         Ok(Self {
             abi_version,
             engine_initialize,
@@ -206,6 +216,7 @@ impl LoadedRuntime {
             invoke_callback,
             release_callback,
             invoke_predicate,
+            invoke_child_body,
             _lib: lib,
         })
     }

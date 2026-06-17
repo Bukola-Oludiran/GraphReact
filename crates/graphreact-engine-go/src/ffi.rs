@@ -171,3 +171,22 @@ pub type gr_go_invoke_callback_fn = unsafe extern "C" fn(
 /// The Rust-side `EffectCleanup` closure calls this after invoking
 /// a cleanup token so the Go-side closure GC's promptly. Optional.
 pub type gr_go_release_callback_fn = unsafe extern "C" fn(token: u64) -> c_int;
+
+/// **M17 phase 3e-α.** Rust → Go child-body invocation symbol.
+/// Used by dynamically-spawned `NodeDefinition` closures
+/// (`use_spawn_child` + `use_compose`) to dispatch a render into the
+/// user's body fn that was registered under `token` in the prelude's
+/// `childBodyRegistry`. `ctx_json` is the marshalled
+/// `{id, props, neighbors}` envelope — same shape `GrxFunctionCall`
+/// consumes; `out_result` receives the JSON-marshalled `Manifest`.
+/// Resolved optionally — older artifacts (pre-3e-α) can still load;
+/// `host_spawn_child` / `host_compose` dispatch surfaces a clear
+/// runtime error rather than dlopen-fail.
+pub type gr_go_invoke_child_body_fn = unsafe extern "C" fn(
+    token: u64,
+    ctx_json: *const c_char,
+    ctx_len: usize,
+    out_result: *mut c_char,
+    out_result_cap: usize,
+    out_result_len: *mut usize,
+) -> c_int;
