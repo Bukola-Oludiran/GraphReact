@@ -1456,8 +1456,16 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     // `drive_handle_until` after each `process_batch`); axum
     // handlers send `SnapshotRequest` on the bridge sender. When
     // `opts.observer_bind` is `None`, none of this runs.
+    // **M22 phase 4.** Track the active MetricsInner arc so the
+    // per-engine mount counters can be populated after the
+    // observer is wired. `None` when no observer is configured
+    // (zero-overhead default).
+    #[allow(unused_assignments)]
+    let mut metrics_for_engine_counts: Option<std::sync::Arc<graphreact_observer::MetricsInner>> =
+        None;
     let observer = if let Some(bind_cfg) = opts.observer_bind {
         let metrics = std::sync::Arc::new(graphreact_observer::MetricsInner::new());
+        metrics_for_engine_counts = Some(metrics.clone());
         let prom_sink = std::sync::Arc::new(graphreact_observer::PrometheusSink::from_arc(
             metrics.clone(),
         ));
@@ -1525,6 +1533,16 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         None
     };
 
+    // **M22 phase 4.** Populate `grx_engine_mount_count{engine}`
+    // immediately after observer setup. The counters are bounded-
+    // cardinality (one entry per engine slot) and read by the
+    // `/v1/metrics` Prometheus scrape; recording here means the
+    // FIRST scrape (which may fire before any process_batch
+    // round) sees the correct mount counts.
+    if let Some(metrics) = &metrics_for_engine_counts {
+        record_engine_mount_metrics(&host, metrics);
+    }
+
     // M14.8.x: run one initial `process_batch` so the engine-
     // hosted bodies actually evaluate at boot — `mount_with_scheduler`
     // / `mount_python_definitions` register nodes but do NOT run
@@ -1541,6 +1559,14 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         CommandError::Runtime(crate::runtime::RuntimeError::from(e))
     })?;
 
+    // **M22 phase 4.** Record the first batch's body-evaluation
+    // counts. Subsequent `process_batch` rounds (driven by
+    // `drive_handle_until`) record via the same helper after each
+    // tick.
+    if let Some(metrics) = &metrics_for_engine_counts {
+        record_engine_eval_metrics(&host, metrics);
+    }
+
     // Dial each peer. `connect` waits for handshake completion;
     // any failure short-circuits the daemon boot (substrate-
     // not-MVP: ops would rather see the error early than have a
@@ -1556,6 +1582,67 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         #[cfg(feature = "otel")]
         otel_provider,
     })
+}
+
+/// **M22 phase 4.** Increment `grx_engine_mount_count{engine}`
+/// according to the engine slots active on `host`. Called once
+/// during `start_daemon` after the observer is wired so the first
+/// `/v1/metrics` scrape sees the mount counts. Pure-lang
+/// daemons emit one series; mixed daemons emit one per active
+/// engine slot.
+fn record_engine_mount_metrics(
+    host: &SchedulerHost,
+    metrics: &graphreact_observer::MetricsInner,
+) {
+    match host {
+        SchedulerHost::Empty(_) => {}
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Jsc(r) => {
+            for _ in &r.mounted {
+                metrics.engine_mount_count_inc("jsc");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Cpython(r) => {
+            for _ in &r.mounted {
+                metrics.engine_mount_count_inc("cpython");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Mixed(m) => {
+            m.record_mount_metrics(metrics);
+        }
+    }
+}
+
+/// **M22 phase 4.** Increment `grx_engine_eval_count{engine}`
+/// according to the engine slots active on `host`. Called after
+/// each `process_batch` round (initial boot batch + every
+/// `drive_handle_until` tick). The per-batch upper bound is one
+/// eval per mounted node per active engine.
+fn record_engine_eval_metrics(
+    host: &SchedulerHost,
+    metrics: &graphreact_observer::MetricsInner,
+) {
+    match host {
+        SchedulerHost::Empty(_) => {}
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Jsc(r) => {
+            for _ in &r.mounted {
+                metrics.engine_eval_count_inc("jsc");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Cpython(r) => {
+            for _ in &r.mounted {
+                metrics.engine_eval_count_inc("cpython");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Mixed(m) => {
+            m.record_eval_metrics(metrics);
+        }
+    }
 }
 
 /// Mount the engine for the daemon. Engine-free for `path: None`

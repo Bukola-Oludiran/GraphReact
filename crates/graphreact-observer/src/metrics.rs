@@ -315,6 +315,19 @@ pub struct MetricsInner {
     /// `grx_hot_reload_total{outcome}` — `"applied"` or `"rolled_back"`.
     pub hot_reload: DashMap<u64, Arc<LabeledCounter>>,
 
+    /// **M22 phase 4.** `grx_engine_mount_count{engine}` — total
+    /// mounts (= calls to `register_node` on each per-engine
+    /// scheduler) per engine slot. Bounded cardinality: one entry
+    /// per active engine `("jsc"|"cpython"|"go"|"null"|"echo")`.
+    pub engine_mount_count: DashMap<u64, Arc<LabeledCounter>>,
+
+    /// **M22 phase 4.** `grx_engine_eval_count{engine}` — total body
+    /// evaluations across `process_batch` rounds, per engine slot.
+    /// Increments once per call to `evaluate_node`-equivalent in
+    /// each per-engine runtime. Bounded cardinality identical to
+    /// `engine_mount_count`.
+    pub engine_eval_count: DashMap<u64, Arc<LabeledCounter>>,
+
     /// Queue-depth gauges — set by the `on_queue_depths` event.
     pub queue_depth_messages: Gauge,
     pub queue_depth_dirty: Gauge,
@@ -345,6 +358,8 @@ impl MetricsInner {
             supervisor_restarts: DashMap::new(),
             remote_messages_routed: DashMap::new(),
             hot_reload: DashMap::new(),
+            engine_mount_count: DashMap::new(),
+            engine_eval_count: DashMap::new(),
             queue_depth_messages: Gauge::new(),
             queue_depth_dirty: Gauge::new(),
             queue_depth_pending_topology: Gauge::new(),
@@ -352,6 +367,47 @@ impl MetricsInner {
             queue_depth_pending_mutations: Gauge::new(),
             process_batch_duration: Histogram::new(),
         }
+    }
+
+    /// **M22 phase 4.** Increment the per-engine mount counter. The
+    /// `engine` label is a `&'static str` to keep the cardinality
+    /// bounded (one of `"jsc"|"cpython"|"go"|"null"|"echo"`) — the
+    /// MixedRuntime + per-engine adapters pass their static slot
+    /// label here.
+    #[inline]
+    pub fn engine_mount_count_inc(&self, engine: &'static str) {
+        let key = hash1(engine);
+        if let Some(c) = self.engine_mount_count.get(&key) {
+            c.counter.inc();
+            return;
+        }
+        self.engine_mount_count
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledCounter::new(vec![("engine", engine.to_string())]))
+            })
+            .counter
+            .inc();
+    }
+
+    /// **M22 phase 4.** Increment the per-engine body-evaluation
+    /// counter. Same `engine` label vocabulary as
+    /// `engine_mount_count_inc`. Hot-path inline so the cost is
+    /// roughly identical to `node_renders_inc`.
+    #[inline]
+    pub fn engine_eval_count_inc(&self, engine: &'static str) {
+        let key = hash1(engine);
+        if let Some(c) = self.engine_eval_count.get(&key) {
+            c.counter.inc();
+            return;
+        }
+        self.engine_eval_count
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledCounter::new(vec![("engine", engine.to_string())]))
+            })
+            .counter
+            .inc();
     }
 
     /// Hot-path counter increment for `messages_delivered`.

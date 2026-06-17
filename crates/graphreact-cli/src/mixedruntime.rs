@@ -443,6 +443,59 @@ impl MixedRuntime {
         out
     }
 
+    /// **M22 phase 4.** Record per-engine mount counts into the
+    /// supplied [`graphreact_observer::MetricsInner`]. Called once
+    /// after `mount_mixed` returns so the
+    /// `grx_engine_mount_count{engine="..."}` series is populated
+    /// before the first scrape. Idempotent — calling twice double-
+    /// counts; callers wire this to mount, not to every batch.
+    ///
+    /// Per-engine `mounted` list length is the number of nodes
+    /// each engine's scheduler accepted; cluster-engine-agnostic
+    /// nodes (e.g. nodes whose component declaration is missing)
+    /// are not counted.
+    pub fn record_mount_metrics(&self, metrics: &graphreact_observer::MetricsInner) {
+        if let Some(r) = &self.jsc {
+            for _ in &r.mounted {
+                metrics.engine_mount_count_inc(EngineSlot::Jsc.engine_label());
+            }
+        }
+        if let Some(r) = &self.cpython {
+            for _ in &r.mounted {
+                metrics.engine_mount_count_inc(EngineSlot::Cpython.engine_label());
+            }
+        }
+        if let Some(r) = &self.go {
+            for _ in &r.mounted {
+                metrics.engine_mount_count_inc(EngineSlot::Go.engine_label());
+            }
+        }
+    }
+
+    /// **M22 phase 4.** Record per-engine body-evaluation counts.
+    /// Called after each `process_batch` round on the daemon's
+    /// driver loop. Increments
+    /// `grx_engine_eval_count{engine="..."}` by the number of
+    /// mounted nodes per engine slot — that's the per-batch
+    /// upper bound (one body-eval per mounted node per batch).
+    pub fn record_eval_metrics(&self, metrics: &graphreact_observer::MetricsInner) {
+        if let Some(r) = &self.jsc {
+            for _ in &r.mounted {
+                metrics.engine_eval_count_inc(EngineSlot::Jsc.engine_label());
+            }
+        }
+        if let Some(r) = &self.cpython {
+            for _ in &r.mounted {
+                metrics.engine_eval_count_inc(EngineSlot::Cpython.engine_label());
+            }
+        }
+        if let Some(r) = &self.go {
+            for _ in &r.mounted {
+                metrics.engine_eval_count_inc(EngineSlot::Go.engine_label());
+            }
+        }
+    }
+
     /// Engine-version banner across active slots. One line per
     /// active engine (`<engine>: <version>`). Empty when no
     /// engines are mounted.
@@ -532,6 +585,77 @@ mod tests {
         assert!(rt.jsc.is_some());
         assert!(rt.cpython.is_some());
         rt.shutdown().expect("reverse-order shutdown ok");
+    }
+
+    /// **Phase 4 acceptance.** The per-engine counters
+    /// `grx_engine_mount_count{engine}` and
+    /// `grx_engine_eval_count{engine}` carry one series per active
+    /// engine slot. Pure-Python fixture yields exactly
+    /// `engine="cpython"`; mixed JS+Python yields `engine="jsc"`
+    /// + `engine="cpython"`. The full mixed fixture is
+    /// covered by the Phase 3 acceptance test below.
+    #[test]
+    fn phase4_acceptance_engine_mount_count_populates_per_slot() {
+        let _g = engine_lock();
+        reset_global_state();
+        let metrics = graphreact_observer::MetricsInner::new();
+
+        let fixture_js = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/js-external-body.grx");
+        let mut rt = mount_mixed(&fixture_js).expect("mount js");
+        rt.record_mount_metrics(&metrics);
+        rt.shutdown().expect("shutdown ok");
+
+        // After a pure-JS mount, only the jsc series is populated.
+        assert!(
+            metrics.engine_mount_count.iter().any(|e| {
+                e.value()
+                    .labels
+                    .iter()
+                    .any(|(k, v)| *k == "engine" && v == "jsc")
+            }),
+            "jsc engine_mount_count series missing"
+        );
+        // Pure-JS mount must NOT have populated cpython or go.
+        assert!(
+            !metrics.engine_mount_count.iter().any(|e| {
+                e.value()
+                    .labels
+                    .iter()
+                    .any(|(k, v)| *k == "engine" && (v == "cpython" || v == "go"))
+            }),
+            "non-JS engine_mount_count series should not exist for pure-JS fixture"
+        );
+
+        reset_global_state();
+        // Now mount a pure-Python fixture into a SECOND metrics
+        // store + assert only cpython populates.
+        let metrics_py = graphreact_observer::MetricsInner::new();
+        let fixture_py = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/python-counter.grx");
+        let mut rt_py = mount_mixed(&fixture_py).expect("mount py");
+        rt_py.record_mount_metrics(&metrics_py);
+        rt_py.record_eval_metrics(&metrics_py);
+        rt_py.shutdown().expect("shutdown py");
+
+        assert!(
+            metrics_py.engine_mount_count.iter().any(|e| {
+                e.value()
+                    .labels
+                    .iter()
+                    .any(|(k, v)| *k == "engine" && v == "cpython")
+            }),
+            "cpython engine_mount_count series missing for pure-Python fixture"
+        );
+        assert!(
+            metrics_py.engine_eval_count.iter().any(|e| {
+                e.value()
+                    .labels
+                    .iter()
+                    .any(|(k, v)| *k == "engine" && v == "cpython")
+            }),
+            "cpython engine_eval_count series missing for pure-Python fixture"
+        );
     }
 
     /// **Phase 3 acceptance.** The full mixed-runtime-supervisor

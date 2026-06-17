@@ -110,6 +110,28 @@ pub fn encode_text(inner: &MetricsInner) -> String {
         &inner.hot_reload,
     );
 
+    // **M22 phase 4.** Per-engine mount + body-evaluation counters,
+    // labeled `engine="..."`. Bounded cardinality: one entry per
+    // active engine slot (`jsc|cpython|go|null|echo`). Mixed-runtime
+    // daemons emit multiple series simultaneously; pure-lang daemons
+    // emit one. Encoder skips the family entirely if no engine has
+    // yet incremented (Prometheus best practice).
+    encode_labeled_counter(
+        &mut s,
+        "grx_engine_mount_count",
+        "Total per-engine scheduler-registered node mounts. \
+         engine label is one of (jsc, cpython, go, null, echo).",
+        &inner.engine_mount_count,
+    );
+
+    encode_labeled_counter(
+        &mut s,
+        "grx_engine_eval_count",
+        "Total per-engine body evaluations across process_batch \
+         rounds. engine label vocabulary matches grx_engine_mount_count.",
+        &inner.engine_eval_count,
+    );
+
     encode_gauge(
         &mut s,
         "grx_queue_depth_messages",
