@@ -1,0 +1,5 @@
+<import src="./shelf.grx" as="rf" />
+
+<Graph id="board">
+  <Subsystem ref="rf:Bandpass" id="bp" />
+</Graph>
