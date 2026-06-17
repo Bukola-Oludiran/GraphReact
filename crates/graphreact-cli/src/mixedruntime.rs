@@ -79,6 +79,17 @@ pub struct MixedRuntime {
     pub n_edges: usize,
     /// Per-engine definition counts (after lang filtering).
     pub n_definitions: usize,
+    /// Empty fallback scheduler. Returned by [`Self::scheduler_mut`]
+    /// when no engine slot is active — only reachable when a
+    /// `--runtime=mixed` invocation targets a definitions-empty .grx
+    /// (the IR carries `<Graph>` nodes but no `<Component lang=...>`
+    /// definitions, so no engine is brought up). `Cluster::start` and
+    /// the observer's telemetry install paths both walk
+    /// `scheduler_mut()`; without this fallback they'd panic. The
+    /// scheduler is genuinely empty (no NodeDefinitions registered),
+    /// which is the correct degenerate behaviour for a
+    /// no-definitions fixture.
+    empty_fallback: graphreact_core::Scheduler,
 }
 
 /// Which engine slot is being addressed. Used by [`MixedRuntime`]'s
@@ -189,6 +200,9 @@ pub fn mount_mixed(path: &Path) -> Result<MixedRuntime, RuntimeError> {
         n_nodes: 0,
         n_edges: 0,
         n_definitions: 0,
+        empty_fallback: graphreact_core::Scheduler::new(
+            graphreact_core::CommunicationGraph::new(),
+        ),
     };
 
     // Pre-build a Go out_dir adjacent to the .grx so the codegen
@@ -335,6 +349,28 @@ impl MixedRuntime {
         &self.init_order
     }
 
+    /// Mutable reference to a representative engine's scheduler:
+    /// JSC if active, else CPython, else Go, else the
+    /// `empty_fallback` (a never-populated scheduler that exists
+    /// solely to give `Cluster::start` + observer-sink installation
+    /// a valid `&mut Scheduler` when the IR carries no per-engine
+    /// definitions). Pure-lang fixtures and mixed fixtures both see
+    /// a real engine's scheduler; the fallback is only reached on a
+    /// `--runtime=mixed` invocation against a definitions-empty
+    /// `.grx`, where panicking the daemon would be a worse failure
+    /// mode than degenerating to an empty cluster sink.
+    pub fn scheduler_mut(&mut self) -> &mut graphreact_core::Scheduler {
+        if let Some(r) = self.jsc.as_mut() {
+            &mut r.scheduler
+        } else if let Some(r) = self.cpython.as_mut() {
+            &mut r.scheduler
+        } else if let Some(r) = self.go.as_mut() {
+            &mut r.scheduler
+        } else {
+            &mut self.empty_fallback
+        }
+    }
+
     /// Drive every active engine's `process_batch` round in init
     /// order. Each engine's batch is independent — message
     /// delivery is local-to-engine in M22 phase 1-4. Cross-engine
@@ -373,21 +409,50 @@ impl MixedRuntime {
     /// opposite order they were initialized; errors are bubbled
     /// from the LAST engine to fail (others are logged but the
     /// shutdown chain continues so no engine leaks).
+    ///
+    /// **M22 verify fix — Go shutdown on macOS.** `GoRuntime::shutdown`
+    /// triggers the Go c-shared `_pthread_tsd_cleanup` deadlock
+    /// (golang/go#47100) on macOS during process teardown. The Phase 3
+    /// acceptance test sidesteps it via `std::process::exit(0)`; for
+    /// the production daemon `--runtime=mixed` carrying a `lang="go"`
+    /// definition would otherwise hang on SIGINT. We skip Go's
+    /// shutdown here on macOS so the OS reclaims the runtime's
+    /// threads and memory on process exit. Same posture as the
+    /// goruntime tests and the Phase 3 acceptance test.
     pub fn shutdown(&mut self) -> Result<(), EngineError> {
         let mut last_err: Option<EngineError> = None;
         let init_order = std::mem::take(&mut self.init_order);
         for slot in init_order.iter().rev() {
             match slot {
                 EngineSlot::Go => {
-                    if let Some(mut r) = self.go.take() {
-                        if let Err(e) = r.shutdown() {
+                    if let Some(r) = self.go.take() {
+                        #[cfg(target_os = "macos")]
+                        {
                             tracing::warn!(
                                 target: "graphreact::m22::lifecycle",
                                 engine = "go",
-                                error = %e,
-                                "MixedRuntime shutdown: Go shutdown error"
+                                "MixedRuntime shutdown: Go shutdown SKIPPED on macOS to dodge golang/go#47100 TSD-cleanup deadlock; OS process-exit reclaims the runtime"
                             );
-                            last_err = Some(e);
+                            // Drop the GoRuntime without calling its
+                            // shutdown(). `dispose_isolate` is also
+                            // skipped; the Go runtime's c-shared lib
+                            // holds the spawned goroutines until the
+                            // process exits, which is fine because
+                            // the daemon is itself terminating.
+                            std::mem::forget(r);
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let mut r = r;
+                            if let Err(e) = r.shutdown() {
+                                tracing::warn!(
+                                    target: "graphreact::m22::lifecycle",
+                                    engine = "go",
+                                    error = %e,
+                                    "MixedRuntime shutdown: Go shutdown error"
+                                );
+                                last_err = Some(e);
+                            }
                         }
                     }
                 }

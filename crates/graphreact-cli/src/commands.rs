@@ -1188,7 +1188,11 @@ impl SchedulerHost {
     /// scheduler when present, else CPython's, else Go's. Pure-lang
     /// fixtures see the correct engine's scheduler; mixed fixtures
     /// get the JSC scheduler (dist-sink installation across
-    /// multiple engines is M22 phase 5+).
+    /// multiple engines is M22 phase 5+). An empty Mixed (no engine
+    /// slots — possible for a `--runtime=mixed` invocation against
+    /// a definitions-empty .grx) falls through to the host's
+    /// `empty_fallback` scheduler so the daemon doesn't panic; see
+    /// `SchedulerHost::Mixed` field docs.
     pub fn scheduler_mut(&mut self) -> &mut Scheduler {
         match self {
             SchedulerHost::Empty(s) => s,
@@ -1197,21 +1201,7 @@ impl SchedulerHost {
             #[cfg(target_os = "macos")]
             SchedulerHost::Cpython(r) => &mut r.scheduler,
             #[cfg(target_os = "macos")]
-            SchedulerHost::Mixed(m) => {
-                if let Some(r) = m.jsc.as_mut() {
-                    &mut r.scheduler
-                } else if let Some(r) = m.cpython.as_mut() {
-                    &mut r.scheduler
-                } else if let Some(r) = m.go.as_mut() {
-                    &mut r.scheduler
-                } else {
-                    // Defensive: every active mixed runtime has
-                    // at least one engine slot. The mount_mixed
-                    // contract enforces this — the only way to
-                    // hit this branch is a logic bug.
-                    unreachable!("MixedRuntime with no active engine slot")
-                }
-            }
+            SchedulerHost::Mixed(m) => m.scheduler_mut(),
         }
     }
 
@@ -1245,6 +1235,15 @@ pub struct DaemonHandle {
     /// drained by [`drive_handle_until`] after each `process_batch`
     /// round.
     observer: Option<graphreact_observer::ApiServerHandle>,
+    /// **M22 verify fix.** Shared `MetricsInner` Arc parked here so
+    /// `drive_handle_until` can record per-tick
+    /// `grx_engine_eval_count{engine}` increments without
+    /// re-threading the metrics handle through every call site.
+    /// `None` when no `--observer-bind` was passed (no metrics
+    /// surface to populate). Same Arc the management API serves
+    /// `/v1/metrics` from, so the per-tick increments are visible
+    /// on the next scrape.
+    metrics: Option<std::sync::Arc<graphreact_observer::MetricsInner>>,
     /// **M16-Backend P10.** OTel `SdkTracerProvider` parked here so
     /// the daemon's shutdown can flush buffered spans via
     /// `provider.shutdown()` BEFORE the cluster tears down.
@@ -1274,6 +1273,15 @@ impl DaemonHandle {
     /// are installed for the duration of body evaluation.
     pub fn process_batch(&mut self) -> Result<(), graphreact_core::RuntimeError> {
         self.host.process_batch()
+    }
+
+    /// **M22 verify fix.** Read the shared `MetricsInner` Arc, if any
+    /// was set up during `start_daemon` (i.e. `--observer-bind` was
+    /// passed). Used by `drive_handle_until` to record per-tick
+    /// `grx_engine_eval_count{engine}` increments.
+    #[must_use]
+    pub fn observer_metrics(&self) -> Option<&graphreact_observer::MetricsInner> {
+        self.metrics.as_deref()
     }
 
     /// Drop the cluster and tear down the engine (if any).
@@ -1579,6 +1587,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         cluster,
         host,
         observer,
+        metrics: metrics_for_engine_counts,
         #[cfg(feature = "otel")]
         otel_provider,
     })
@@ -1784,6 +1793,11 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         cluster,
         host,
         observer: None,
+        // `grx connect` is a one-shot dial; no metrics surface is
+        // wired so per-tick `grx_engine_eval_count` recording is a
+        // no-op (drive_handle_until short-circuits when
+        // observer_metrics() is None).
+        metrics: None,
         // **M16-Backend P10.** `connect` is a one-shot dial; no
         // OTel sink is constructed for it (the OTel sink lives on
         // `start_daemon`'s daemon, not on connect's minimal
@@ -1826,9 +1840,32 @@ pub async fn drive_handle_until(
         let signal = tokio::signal::ctrl_c();
         tokio::select! {
             _ = tick.tick() => {
-                handle.scheduler().process_batch().map_err(|e| {
+                // **M22 verify fix.** Route the tick through
+                // `handle.process_batch()` (which dispatches via
+                // `SchedulerHost::process_batch`) instead of the
+                // raw `scheduler().process_batch()`. Under
+                // `--runtime=mixed` the latter would only tick
+                // the first engine slot's scheduler — CPython +
+                // Go bodies would never re-render after the boot
+                // batch. The `SchedulerHost::process_batch` arm
+                // for Mixed fans out across every active engine
+                // in init order via `MixedRuntime::process_batch`.
+                // Single-engine paths see identical behavior
+                // (same engine TLS guard install, same batch
+                // semantics).
+                handle.process_batch().map_err(|e| {
                     CommandError::Runtime(crate::runtime::RuntimeError::from(e))
                 })?;
+                // **M22 verify fix.** Per-tick increment of
+                // `grx_engine_eval_count{engine}` so the metric
+                // actually tracks evaluation throughput rather
+                // than reporting a one-shot boot snapshot. Matches
+                // the contract in `record_engine_eval_metrics`'s
+                // docstring. Cardinality stays bounded by the
+                // static `{jsc,cpython,go,null,echo}` label set.
+                if let Some(metrics) = handle.observer_metrics() {
+                    record_engine_eval_metrics(&handle.host, metrics);
+                }
                 // M16-Backend P4 — drain pending management-API
                 // snapshot requests. Each request was posted by
                 // an axum handler running on a tokio worker
