@@ -580,6 +580,27 @@ mod tests {
                 "prelude missing required M17 phase 3e-α hook surface: {sym}"
             );
         }
+        // M17 phase 3e-β surface: 6 supervision hooks + MonitorRef.
+        for sym in [
+            "type MonitorRef",
+            "func UseMonitor(",
+            "func UseDemonitor(",
+            "func UseLink(",
+            "func UseUnlink(",
+            "func UseGroupJoin(",
+            "func UseGroupLeave(",
+            "host_monitor",
+            "host_demonitor",
+            "host_link",
+            "host_unlink",
+            "host_group_join",
+            "host_group_leave",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M17 phase 3e-β hook surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();

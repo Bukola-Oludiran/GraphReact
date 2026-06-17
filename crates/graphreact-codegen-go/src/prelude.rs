@@ -2057,6 +2057,97 @@ func GrxInvokeChildBody(
     return GR_OK
 }}
 
+// ----- M17 phase 3e-β: supervision hooks (Tier A) -----
+//
+// All six hooks are Tier A: pure HOOK_CTX reads dispatched from the
+// Rust-side host callback into `graphreact-core::use_X(...)`. Zero
+// engine touch from the Go side; zero token registry interaction; no
+// NodeDefinition closure capture. Dramatically smaller than 3e-α.
+//
+// `MonitorRef` is marshalled across FFI as `{{id: number}}`. We
+// expose it as a typed Go struct mirroring JSC's `{{id}}` JS object.
+// `UseDemonitor(ref)` reads `ref.ID` and round-trips. `__DOWN__`
+// system message delivery is wired in graphreact-core's Scheduler
+// already — when a monitored target unmounts, all monitoring nodes
+// receive a `__DOWN__` message with payload `{{target, reason}}` and
+// catch it via `UseMessage("__DOWN__", handler)` (shipped 3c).
+
+// MonitorRef is the typed handle returned by UseMonitor. Mirrors
+// JSC's `{{id: number}}` JS object + pyruntime's
+// `_SimpleNamespace(id=...)`. ID 0 is reserved for "no monitor was
+// registered" (e.g. monitoring an unknown target id).
+type MonitorRef struct {{
+    ID uint64
+}}
+
+// UseMonitor registers the active node to receive a `__DOWN__`
+// system message when `targetID` unmounts. Returns a typed
+// `MonitorRef{{ID:...}}` on success or `nil` if the target id is
+// unknown to the scheduler. Catch the `__DOWN__` payload via
+// `UseMessage("__DOWN__", handler)`.
+func UseMonitor(targetID string) *MonitorRef {{
+    raw, status := Invoke("host_monitor", targetID)
+    if status != GR_OK {{
+        return nil
+    }}
+    if len(raw) == 0 || (len(raw) == 4 && string(raw) == "null") {{
+        return nil
+    }}
+    var result struct {{
+        ID float64 `json:"id"`
+    }}
+    if err := json.Unmarshal(raw, &result); err != nil {{
+        return nil
+    }}
+    return &MonitorRef{{ID: uint64(result.ID)}}
+}}
+
+// UseDemonitor cancels a previously-registered monitor. Pass the
+// typed `*MonitorRef` from `UseMonitor`. Nil refs are a no-op.
+func UseDemonitor(ref *MonitorRef) {{
+    if ref == nil {{
+        return
+    }}
+    _, _ = Invoke("host_demonitor", ref.ID)
+}}
+
+// UseLink establishes a bidirectional supervision link with
+// `targetID`. Returns `true` on success or `false` if the target
+// is unknown. Linked nodes exit together — when one unmounts
+// with a non-`normal` reason, the other receives a system
+// `__EXIT__` message and (by default) unmounts as well.
+func UseLink(targetID string) bool {{
+    raw, status := Invoke("host_link", targetID)
+    if status != GR_OK {{
+        return false
+    }}
+    var ok bool
+    if err := json.Unmarshal(raw, &ok); err != nil {{
+        return false
+    }}
+    return ok
+}}
+
+// UseUnlink removes a previously-registered link with `targetID`.
+// No-op on missing.
+func UseUnlink(targetID string) {{
+    _, _ = Invoke("host_unlink", targetID)
+}}
+
+// UseGroupJoin joins the active node into the named process group.
+// Idempotent at the scheduler level — multiple evaluations don't
+// create duplicate memberships. Group emit dispatches deliver a
+// single copy per group member.
+func UseGroupJoin(group string) {{
+    _, _ = Invoke("host_group_join", group)
+}}
+
+// UseGroupLeave removes the active node from the named process
+// group. No-op if the node isn't a member.
+func UseGroupLeave(group string) {{
+    _, _ = Invoke("host_group_leave", group)
+}}
+
 // GrxInvokeCallback invokes a generic Go callback stored under
 // `token` in `callbackRegistry`. Returns an envelope JSON describing
 // the outcome: `{{kind: "value"}}` (no cleanup), `{{kind: "cleanup",

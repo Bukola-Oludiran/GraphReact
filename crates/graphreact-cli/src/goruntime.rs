@@ -43,14 +43,18 @@ use serde_json::Value;
 use graphreact_codegen_go::{BuildArtifact, Codegen};
 use graphreact_core::{
     use_accept_edge as core_use_accept_edge, use_compose as core_use_compose,
+    use_demonitor as core_use_demonitor,
     use_edge_accept_handler as core_use_edge_accept_handler, use_effect as core_use_effect,
-    use_emit as core_use_emit, use_memo as core_use_memo, use_message as core_use_message,
-    use_neighbors as core_use_neighbors, use_spawn_child as core_use_spawn_child,
-    use_state as core_use_state, use_topology as core_use_topology,
+    use_emit as core_use_emit, use_group_join as core_use_group_join,
+    use_group_leave as core_use_group_leave, use_link as core_use_link,
+    use_memo as core_use_memo, use_message as core_use_message,
+    use_monitor as core_use_monitor, use_neighbors as core_use_neighbors,
+    use_spawn_child as core_use_spawn_child, use_state as core_use_state,
+    use_topology as core_use_topology, use_unlink as core_use_unlink,
     use_unmount_self as core_use_unmount_self, Attrs, CommunicationGraph, ComposeChildSpec,
-    EdgeAcceptPredicate, EffectCleanup, EmitOptions, GraphDirectory, IncomingMessage, NodeContext,
-    NodeDefinition, PermissionManifest, Scheduler, Signal, TopologyEvent, TopologyEventKind,
-    TopologyFilterOptions,
+    EdgeAcceptPredicate, EffectCleanup, EmitOptions, GraphDirectory, IncomingMessage,
+    MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest, Scheduler,
+    Signal, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
 };
 use std::sync::Arc;
 
@@ -2858,6 +2862,112 @@ fn build_compose_spec_from_host_value(
     })
 }
 
+// ---------------------------------------------------------------------
+// M17 phase 3e-β: supervision hooks (Tier A: pure HOOK_CTX reads)
+// ---------------------------------------------------------------------
+//
+// Verbatim Go port of pyruntime's phase 3e-β surface. All six are
+// pure HOOK_CTX-shaped reads (Tier A from 3d-β framing) — the host
+// callback dispatches directly to graphreact-core's `use_X(...)`
+// which reads from `with_ctx(|c| ...)` to dispatch through the
+// active node's HookCtx. Zero engine touch from the host side; zero
+// token registry interaction; no NodeDefinition closure capture.
+//
+// `MonitorRef` (Rust: `pub struct MonitorRef(pub u64)`) is marshalled
+// across FFI as `{id: u64}`. The Go prelude wraps it as a typed
+// `*MonitorRef{ID:...}` struct; `UseDemonitor(ref)` reads `ref.ID`
+// and round-trips. `__DOWN__` system message delivery is wired in
+// graphreact-core's Scheduler already — when a monitored target
+// unmounts, all monitoring nodes receive a `__DOWN__` message with
+// payload `{target, reason}` and catch it via `UseMessage` (3c).
+
+/// Build the `host_monitor(targetId) → {id} | null` callback. Go
+/// `UseMonitor(targetID)` returns the result wrapped as a typed
+/// `*MonitorRef{ID:...}` or `nil` on miss.
+fn build_host_monitor_callback() -> BoxCallback {
+    Box::new(|args| {
+        let target = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        match core_use_monitor(&target) {
+            #[allow(clippy::cast_precision_loss)]
+            Some(mref) => Ok(HostValue::Object(vec![(
+                "id".to_string(),
+                HostValue::Number(mref.0 as f64),
+            )])),
+            None => Ok(HostValue::Null),
+        }
+    })
+}
+
+/// Build the `host_demonitor(id)` callback. Go
+/// `UseDemonitor(ref)` reads `ref.ID` and dispatches the integer
+/// here.
+fn build_host_demonitor_callback() -> BoxCallback {
+    Box::new(|args| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let id = match args.first() {
+            Some(HostValue::Number(n)) => *n as u64,
+            _ => return Ok(HostValue::Null),
+        };
+        core_use_demonitor(CoreMonitorRef(id));
+        Ok(HostValue::Null)
+    })
+}
+
+/// Build the `host_link(targetId) → bool` callback. Go
+/// `UseLink(targetID)` returns the bool round-tripped from here.
+fn build_host_link_callback() -> BoxCallback {
+    Box::new(|args| {
+        let target = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Bool(false)),
+        };
+        Ok(HostValue::Bool(core_use_link(&target)))
+    })
+}
+
+/// Build the `host_unlink(targetId)` callback. No-op on missing
+/// link.
+fn build_host_unlink_callback() -> BoxCallback {
+    Box::new(|args| {
+        let target = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        core_use_unlink(&target);
+        Ok(HostValue::Null)
+    })
+}
+
+/// Build the `host_group_join(group)` callback. Idempotent at the
+/// scheduler level — multiple evaluations don't create duplicate
+/// memberships.
+fn build_host_group_join_callback() -> BoxCallback {
+    Box::new(|args| {
+        let group = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        core_use_group_join(&group);
+        Ok(HostValue::Null)
+    })
+}
+
+/// Build the `host_group_leave(group)` callback. No-op if the
+/// active node isn't in the group.
+fn build_host_group_leave_callback() -> BoxCallback {
+    Box::new(|args| {
+        let group = match args.first() {
+            Some(HostValue::String(s)) => s.clone(),
+            _ => return Ok(HostValue::Null),
+        };
+        core_use_group_leave(&group);
+        Ok(HostValue::Null)
+    })
+}
+
 /// Parse the third argument of `host_emit` into [`EmitOptions`].
 /// Recognised keys mirror JSC + CPython: `to` (Array of String),
 /// `ttl` (Number), `edgeKey` (String), `direct` (String). Unknown
@@ -3364,6 +3474,24 @@ pub fn mount_with_scheduler(
         .map_err(RuntimeError::Engine)?;
         e.register_callback(iso, "host_compose", build_host_compose_callback())
             .map_err(RuntimeError::Engine)?;
+        // M17 phase 3e-β: 6 supervision hooks (Tier A: pure HOOK_CTX
+        // reads dispatched into graphreact-core's `use_X(...)`).
+        e.register_callback(iso, "host_monitor", build_host_monitor_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_demonitor", build_host_demonitor_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_link", build_host_link_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_unlink", build_host_unlink_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_group_join", build_host_group_join_callback())
+            .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_group_leave",
+            build_host_group_leave_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
         iso
     };
 
@@ -5181,6 +5309,80 @@ mod tests {
         );
     }
 
+    /// Phase 3e-β: 6 supervision hooks.
+    ///
+    /// Mounts `go-supervision.grx`. Observer monitors Target; Target
+    /// unmounts itself on first render → graphreact-core delivers
+    /// `__DOWN__` to Observer with payload `{target, reason}`;
+    /// Observer's `UseMessage("__DOWN__", ...)` handler surfaces
+    /// `down:target:normal`. A calls `UseLink("b")`,
+    /// `UseGroupJoin("workers")`, then on its re-render
+    /// `UseUnlink("b")` + `UseGroupLeave("workers")` —
+    /// exercising every Tier A hook.
+    ///
+    /// Asserts the observation log contains `mref:set`,
+    /// `down:target:normal`, `linked:true`, `joined-workers`,
+    /// `left-workers`. Mirrors `pyruntime::phase3e_beta_*`.
+    fn scenario_supervision_hooks_round_trip() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/go-supervision.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("supervision");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-supervision.grx");
+
+        let observed: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observed_cb = std::sync::Arc::clone(&observed);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_sup",
+                Box::new(move |args| {
+                    if let Some(HostValue::String(s)) = args.first() {
+                        observed_cb.lock().push(s.clone());
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_sup");
+
+        // Batch 1: every body renders; Observer monitors Target +
+        // registers its __DOWN__ handler; Target schedules its own
+        // UnmountNode; A links B + joins "workers" + schedules a
+        // state bump via UseEffect.
+        runtime.process_batch().expect("batch 1");
+        // Batch 2: Target's UnmountNode drains → __DOWN__ delivered
+        // to Observer; A re-renders with phase=1 → UseUnlink +
+        // UseGroupLeave + observes `left-workers`.
+        runtime.process_batch().expect("batch 2");
+
+        let log = observed.lock();
+        assert!(
+            log.iter().any(|s| s == "mref:set"),
+            "expected 'mref:set' from UseMonitor; got {log:?}"
+        );
+        assert!(
+            log.iter().any(|s| s == "down:target:normal"),
+            "expected 'down:target:normal' from __DOWN__ handler; got {log:?}"
+        );
+        assert!(
+            log.iter().any(|s| s == "linked:true"),
+            "expected 'linked:true' from UseLink; got {log:?}"
+        );
+        assert!(
+            log.iter().any(|s| s == "joined-workers"),
+            "expected 'joined-workers' from UseGroupJoin; got {log:?}"
+        );
+        assert!(
+            log.iter().any(|s| s == "left-workers"),
+            "expected 'left-workers' from UseGroupLeave; got {log:?}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -5213,73 +5415,77 @@ mod tests {
         // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
         // between fixtures (each fresh mount expects to start at
         // signal id 1 for assertion stability).
-        eprintln!("[goruntime smoke 1/17] build_and_load + body dispatch");
+        eprintln!("[goruntime smoke 1/18] build_and_load + body dispatch");
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/17] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/18] EngineMisroute rejects non-Go bodies");
         reset_global_state();
         scenario_rejects_non_go_lang();
 
-        eprintln!("[goruntime smoke 3/17] emit/message round-trip");
+        eprintln!("[goruntime smoke 3/18] emit/message round-trip");
         reset_global_state();
         scenario_emit_dispatches_to_neighbor();
 
-        eprintln!("[goruntime smoke 4/17] use_state preserves value across renders");
+        eprintln!("[goruntime smoke 4/18] use_state preserves value across renders");
         reset_global_state();
         scenario_use_state_preserves_value_across_renders();
 
-        eprintln!("[goruntime smoke 5/17] state survives a message");
+        eprintln!("[goruntime smoke 5/18] state survives a message");
         reset_global_state();
         scenario_use_state_survives_a_message();
 
-        eprintln!("[goruntime smoke 6/17] use_effect with empty deps fires once");
+        eprintln!("[goruntime smoke 6/18] use_effect with empty deps fires once");
         reset_global_state();
         scenario_use_effect_empty_deps_fires_once();
 
-        eprintln!("[goruntime smoke 7/17] use_memo single-render fires factory once");
+        eprintln!("[goruntime smoke 7/18] use_memo single-render fires factory once");
         reset_global_state();
         scenario_use_memo_caches_when_deps_unchanged();
 
-        eprintln!("[goruntime smoke 8/17] use_memo recomputes on dep change");
+        eprintln!("[goruntime smoke 8/18] use_memo recomputes on dep change");
         reset_global_state();
         scenario_use_memo_caches_and_recomputes();
 
-        eprintln!("[goruntime smoke 9/17] use_reducer dispatch updates state");
+        eprintln!("[goruntime smoke 9/18] use_reducer dispatch updates state");
         reset_global_state();
         scenario_use_reducer_dispatch_updates_state();
 
-        eprintln!("[goruntime smoke 10/17] use_neighbors returns structural ids");
+        eprintln!("[goruntime smoke 10/18] use_neighbors returns structural ids");
         reset_global_state();
         scenario_use_neighbors_returns_structural_ids();
 
-        eprintln!("[goruntime smoke 11/17] use_accept_edge fires topology event");
+        eprintln!("[goruntime smoke 11/18] use_accept_edge fires topology event");
         reset_global_state();
         scenario_accept_edge_fires_topology_event();
 
-        eprintln!("[goruntime smoke 12/17] use_graph_query Tier 1 accessors");
+        eprintln!("[goruntime smoke 12/18] use_graph_query Tier 1 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_1_accessors();
 
-        eprintln!("[goruntime smoke 13/17] use_directory find_by_id");
+        eprintln!("[goruntime smoke 13/18] use_directory find_by_id");
         reset_global_state();
         scenario_use_directory_find_by_id();
 
-        eprintln!("[goruntime smoke 14/17] use_graph_query Tier 1 algorithms");
+        eprintln!("[goruntime smoke 14/18] use_graph_query Tier 1 algorithms");
         reset_global_state();
         scenario_use_graph_query_tier_1_algorithms();
 
-        eprintln!("[goruntime smoke 15/17] use_graph_query Tier 2 accessors");
+        eprintln!("[goruntime smoke 15/18] use_graph_query Tier 2 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_2_accessors();
 
-        eprintln!("[goruntime smoke 16/17] use_edge_accept_handler + Tier 3 accessors");
+        eprintln!("[goruntime smoke 16/18] use_edge_accept_handler + Tier 3 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_3_accessors();
 
-        eprintln!("[goruntime smoke 17/17] use_spawn_child + use_compose + use_unmount_self");
+        eprintln!("[goruntime smoke 17/18] use_spawn_child + use_compose + use_unmount_self");
         reset_global_state();
         scenario_use_spawn_child_use_compose_use_unmount_self();
+
+        eprintln!("[goruntime smoke 18/18] supervision hooks (monitor/demonitor/link/unlink/group)");
+        reset_global_state();
+        scenario_supervision_hooks_round_trip();
 
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup

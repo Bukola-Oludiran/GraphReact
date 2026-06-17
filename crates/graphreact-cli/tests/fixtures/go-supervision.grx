@@ -1,0 +1,112 @@
+<!-- M17-phase3e-β: supervision hooks acceptance.
+
+     Observer monitors Target and links A↔B (joining "workers").
+     Target unmounts itself on first render via UseUnmountSelf —
+     graphreact-core's Scheduler then delivers a `__DOWN__` system
+     message to every monitoring node carrying `{target, reason}`.
+     Observer's UseMessage("__DOWN__", handler) catches it and
+     surfaces `down:target:normal` to the test.
+
+     B is a noop node — it just needs a registered NodeDefinition so
+     A's `UseLink("b")` resolves through the scheduler's directory.
+     A also calls UseGroupJoin("workers") (idempotent), surfaces
+     `linked:true` + `joined-workers`, then UseGroupLeave +
+     UseUnlink on the next render (state-bumped) to exercise the
+     "no-op on missing" paths.
+
+     The probe asserts the host_observe_sup log contains:
+       - `mref:set`        (UseMonitor returned a non-nil handle)
+       - `down:target:normal` (Observer's __DOWN__ handler fired)
+       - `linked:true`     (UseLink returned true)
+       - `joined-workers`  (UseGroupJoin completed)
+       - `left-workers`    (UseGroupLeave completed)
+-->
+
+<Observer lang="go">
+func ObserverBody(ctx Ctx) Manifest {
+    _, _ = UseState(0.0)
+    mref := UseMonitor("target")
+    if mref == nil {
+        _, _ = Invoke("host_observe_sup", "mref:null")
+    } else {
+        _, _ = Invoke("host_observe_sup", "mref:set")
+    }
+    UseMessage("__DOWN__", func(msg map[string]interface{}) {
+        payload, _ := msg["payload"].(map[string]interface{})
+        if payload == nil {
+            payload = map[string]interface{}{}
+        }
+        target, _ := payload["target"].(string)
+        reason, _ := payload["reason"].(string)
+        _, _ = Invoke("host_observe_sup", "down:"+target+":"+reason)
+    })
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"__DOWN__"},
+        Emits:   []string{},
+    }
+}
+</Observer>
+
+<Target lang="go">
+func TargetBody(ctx Ctx) Manifest {
+    count, _ := UseState(0.0)
+    if count.(float64) == 0 {
+        UseUnmountSelf()()
+    }
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Target>
+
+<A lang="go">
+func ABody(ctx Ctx) Manifest {
+    phase, setPhase := UseState(0.0)
+    phaseF := phase.(float64)
+
+    linked := UseLink("b")
+    if linked {
+        _, _ = Invoke("host_observe_sup", "linked:true")
+    } else {
+        _, _ = Invoke("host_observe_sup", "linked:false")
+    }
+    UseGroupJoin("workers")
+    _, _ = Invoke("host_observe_sup", "joined-workers")
+
+    if phaseF == 0 {
+        UseEffect(func() func() {
+            setPhase(1.0)
+            return nil
+        }, []interface{}{})
+    } else {
+        UseUnlink("b")
+        UseGroupLeave("workers")
+        _, _ = Invoke("host_observe_sup", "left-workers")
+    }
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</A>
+
+<B lang="go">
+func BBody(ctx Ctx) Manifest {
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</B>
+
+<Graph id="go-supervision">
+  <Observer id="observer" />
+  <Target id="target" />
+  <A id="a" />
+  <B id="b" />
+</Graph>
