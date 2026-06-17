@@ -1,0 +1,44 @@
+<!-- M22 — mixed-runtime supervisor fixture.
+
+     Exercises the mixed-runtime daemon's three engine slots in one
+     .grx: a JS supervisor + Python child + Go child. Each body
+     returns its manifest from `body(ctx)` / `BodyFn(ctx)` — the
+     lang-appropriate convention per engine.
+
+     Cross-engine message routing is NOT yet wired through a unified
+     bus (M22 phase 5+); the fixture's intent is to prove ALL THREE
+     engines come up + each runs its own mount-time body in one
+     daemon process. -->
+
+<Supervisor lang="js">
+return {
+  accepts: ["report"],
+  emits: ["start"],
+};
+</Supervisor>
+
+<PyChild lang="python">
+def body(ctx):
+    return {
+        'accepts': ['start'],
+        'emits': ['report'],
+    }
+</PyChild>
+
+<GoChild lang="go">
+func GoChildBody(ctx Ctx) Manifest {
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{"start"},
+        Emits:   []string{"report"},
+    }
+}
+</GoChild>
+
+<Graph id="mixed-runtime-supervisor">
+  <Supervisor id="supervisor" />
+  <PyChild id="py-child" />
+  <GoChild id="go-child" />
+  <edge source="supervisor" target="py-child" />
+  <edge source="supervisor" target="go-child" />
+</Graph>

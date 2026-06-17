@@ -3196,7 +3196,18 @@ impl GoRuntime {
     /// Tear down — disposes the isolate and shuts the engine. Drains
     /// per-isolate callback ids on the Rust side; the Go runtime
     /// stays alive (single-runtime-per-process; ADR-0005).
+    ///
+    /// **M22 phase 1.** Shell-form runtimes produced by
+    /// `mount_with_scheduler` when the IR carries no Go definitions
+    /// have an uninitialized engine (`IsolateHandle(0)`, empty
+    /// `artifact_path`). Calling `dispose_isolate` on such a shell
+    /// would error; the early return short-circuits to a clean
+    /// no-op so callers (mostly the mixed-runtime orchestrator)
+    /// can `shutdown()` uniformly without per-shape branching.
     pub fn shutdown(&mut self) -> Result<(), EngineError> {
+        if self.artifact_path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let mut e = self.engine.borrow_mut();
         e.dispose_isolate(self.iso)?;
         e.shutdown()?;
@@ -3273,19 +3284,84 @@ pub fn mount_with_scheduler(
     grx_path: &Path,
     out_dir: &Path,
 ) -> Result<GoRuntime, RuntimeError> {
-    let ir = parse_grx_to_ir(grx_path)?;
+    let mut ir = parse_grx_to_ir(grx_path)?;
 
-    // Single-engine-per-system check BEFORE codegen + build, so authors
-    // get a clean error instead of a misleading "go build failed"
-    // when they accidentally route a Python body through --runtime=go.
-    for def in &ir.definitions {
-        if def.lang != ComponentLang::Go {
-            return Err(RuntimeError::EngineMisroute {
-                component: def.component.clone(),
-                lang: def.lang.as_attr_str().to_string(),
-                engine: "go".to_string(),
-            });
+    // **M22 phase 1.** Non-Go definitions are silently filtered out
+    // of the IR fed to codegen + build so this mount path is reusable
+    // from the mixed-runtime orchestrator (each engine sees the full
+    // IR and picks up only its own `lang` slice). Pre-M22 a stray
+    // JS/Python body here surfaced an `EngineMisroute` so authors
+    // wouldn't see a misleading "go build failed because of JS
+    // syntax". Post-M22 single-engine `--runtime=go` callers still
+    // succeed for pure-Go `.grx`; a stray JS body is now a no-op
+    // mount on the Go side (the node it tags will not register with
+    // the Go scheduler — the JSC runtime would pick it up under
+    // mixed mode).
+    let original_def_count = ir.definitions.len();
+    ir.definitions.retain(|def| {
+        if def.lang == ComponentLang::Go {
+            true
+        } else {
+            tracing::debug!(
+                target: "graphreact::m22::routing",
+                component = %def.component,
+                lang = %def.lang.as_attr_str(),
+                "goruntime mount: skipping non-Go definition (mixed-runtime path)"
+            );
+            false
         }
+    });
+    let _filtered_def_count = original_def_count - ir.definitions.len();
+
+    // Edge case: if every definition was filtered out (e.g. a pure-JS
+    // fixture fed to `--runtime=go`), codegen would emit an empty Go
+    // package; skip the whole codegen + engine bring-up and return a
+    // GoRuntime shell mirroring `build_and_load` so the caller still
+    // gets a valid handle they can `shutdown()`.
+    if ir.definitions.is_empty() {
+        tracing::debug!(
+            target: "graphreact::m22::routing",
+            "goruntime mount: no Go definitions present; returning empty Go runtime shell"
+        );
+        let mut graph = CommunicationGraph::new();
+        for ir_node in &ir.nodes {
+            let mut attrs = Attrs::new();
+            for (k, v) in &ir_node.attrs {
+                attrs.insert(k.clone(), v.clone());
+            }
+            graph.add_node(ir_node.id.clone(), attrs);
+        }
+        for ir_edge in &ir.edges {
+            let mut attrs = Attrs::new();
+            for (k, v) in &ir_edge.attrs {
+                attrs.insert(k.clone(), v.clone());
+            }
+            graph.add_edge(&ir_edge.source, &ir_edge.target, None, attrs);
+        }
+        let scheduler = Scheduler::new(graph);
+        let directory = Rc::clone(&scheduler.directory);
+        let graph_snapshot = Rc::new(GraphSnapshot::from_live(
+            Rc::clone(&scheduler.graph),
+            Rc::clone(&scheduler.manifests),
+            Rc::clone(&scheduler.edge_accept_predicates),
+        ));
+        // No artifact built; surface a sentinel path + sha so callers
+        // can detect this shape if they need to.
+        return Ok(GoRuntime {
+            engine: Rc::new(RefCell::new(GoEngine::new())),
+            iso: IsolateHandle(0),
+            artifact_path: PathBuf::new(),
+            artifact_sha256_hex: String::new(),
+            n_definitions: 0,
+            graph_id: ir.graph_id,
+            n_nodes: ir.nodes.len(),
+            n_edges: ir.edges.len(),
+            scheduler,
+            component_handles: FxHashMap::default(),
+            mounted: Vec::new(),
+            directory,
+            graph_snapshot,
+        });
     }
 
     let artifact = codegen_and_build(&ir, out_dir)?;
@@ -5789,25 +5865,29 @@ mod tests {
         );
     }
 
-    /// Phase 3c: feeding a `lang="js"` definition to the Go arm
-    /// surfaces a clean EngineMisroute diagnostic. Mirrors
-    /// pyruntime::phase3a_rejects_js_lang_definition.
-    fn scenario_rejects_non_go_lang() {
-        // Build an IR with a single js definition + run through
-        // mount_with_scheduler via a fixture that mixes langs.
+    /// **M22 phase 1.** Pre-M22 this returned `EngineMisroute` to
+    /// fail-fast on a JS body fed to the Go mount path; post-M22 the
+    /// strict gate is relaxed so the same mount path is reusable
+    /// from the mixed-runtime orchestrator. When the IR carries no
+    /// `lang="go"` definitions at all, the Go runtime now returns a
+    /// shell handle (empty scheduler, no artifact) without invoking
+    /// codegen — the JS body parses cleanly, the IR carries the
+    /// node, but the Go side mounts nothing. Under the mixed
+    /// orchestrator the JSC runtime would pick up the JS body.
+    fn scenario_skips_non_go_lang_under_mixed_relax() {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-mixed-rejected.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("misroute");
-        let result = mount_with_scheduler(&fixture, &out_dir);
-        match result {
-            Err(RuntimeError::EngineMisroute { engine, lang, .. }) => {
-                assert_eq!(engine, "go");
-                assert_eq!(lang, "js");
-            }
-            other => panic!("expected EngineMisroute, got {other:?}"),
-        }
+        let mut runtime =
+            mount_with_scheduler(&fixture, &out_dir).expect("mount ok under M22 relax");
+        assert_eq!(runtime.graph_id, "go-mixed-rejected");
+        assert_eq!(runtime.n_definitions, 0);
+        assert!(runtime.mounted.is_empty());
+        // No engine to shut down — empty shell. shutdown() returns Ok
+        // because the Go engine was never initialized.
+        let _ = runtime.shutdown();
     }
 
     /// Single-test runner — all goruntime end-to-end scenarios in
@@ -5825,9 +5905,9 @@ mod tests {
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/21] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/21] M22 relax: skips non-Go bodies under mixed-routing");
         reset_global_state();
-        scenario_rejects_non_go_lang();
+        scenario_skips_non_go_lang_under_mixed_relax();
 
         eprintln!("[goruntime smoke 3/21] emit/message round-trip");
         reset_global_state();

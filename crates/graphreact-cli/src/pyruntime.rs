@@ -5384,17 +5384,26 @@ pub fn mount_with_scheduler(path: &std::path::Path) -> Result<PyRuntime, Runtime
     };
 
     // Eval each Python definition + resolve its body callable.
+    //
+    // **M22 phase 1.** Non-Python definitions are silently skipped here
+    // so the mixed-runtime orchestrator can route the full IR through
+    // every engine (each picks up its own `lang` slice). Single-engine
+    // callers see the same shape as before for Python-only `.grx`
+    // (every definition gets a handle); a stray JS/Go body in a
+    // CPython-only run is now a no-op (the IR node referring to it
+    // gets no scheduler registration on the Python side). Mixed-mode
+    // composes by giving each lang its own engine; back-compat for
+    // existing pure-Python `.grx` is preserved.
     let mut component_handles: FxHashMap<String, FunctionHandle> = FxHashMap::default();
     for (origin, component, source, lang) in &definitions {
         if *lang != ComponentLang::Python {
-            // Tear down on the error path so the engine doesn't leak.
-            let _ = engine_rc.borrow_mut().dispose_isolate(iso);
-            let _ = engine_rc.borrow_mut().shutdown();
-            return Err(RuntimeError::EngineMisroute {
-                component: component.clone(),
-                lang: lang.as_attr_str().to_string(),
-                engine: "cpython".to_string(),
-            });
+            tracing::debug!(
+                target: "graphreact::m22::routing",
+                component = %component,
+                lang = %lang.as_attr_str(),
+                "pyruntime mount: skipping non-Python definition (mixed-runtime path)"
+            );
+            continue;
         }
         let module_name = format!("{origin}::{component}");
         // Phase 3d-γ: append the body-augmentation suffix so the
@@ -5797,7 +5806,7 @@ pub(crate) fn signal_id_for(node_id: &str, hook_pos: usize) -> Option<u64> {
 }
 
 #[cfg(test)]
-fn reset_global_state() {
+pub(crate) fn reset_global_state() {
     SIGNAL_REGISTRY.with(|r| r.borrow_mut().clear());
     SIGNAL_BY_HOOK_POS.with(|m| m.borrow_mut().clear());
     NEXT_SIGNAL_ID.with(|c| c.set(1));
@@ -5880,22 +5889,29 @@ mod tests {
         runtime.shutdown().expect("shutdown ok");
     }
 
-    /// Phase 3a routes `lang="js"` bodies away from the cpython arm
-    /// with an explicit error.
+    /// **M22 phase 1.** Pre-M22 this returned `EngineMisroute` to
+    /// fail-fast on a JS body fed to the CPython mount path; post-M22
+    /// the strict gate is relaxed so the same mount path is reusable
+    /// from the mixed-runtime orchestrator. The CPython runtime now
+    /// silently skips the JS definition (logs a debug event), evals
+    /// the Python definition normally, and registers only the Python
+    /// node with its scheduler. The JS-tagged node ("logger") parses
+    /// but has no Python body to mount, so `mounted` carries only
+    /// `sensor-a`.
     #[test]
-    fn phase3a_rejects_js_lang_definition() {
+    fn m22_phase1_skips_non_python_definitions_under_mixed_relax() {
         let _g = engine_lock();
         reset_global_state();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/python-smoke-mixed-rejected.grx");
-        let r = mount_python_definitions(&fixture);
-        match r {
-            Err(RuntimeError::EngineMisroute { lang, engine, .. }) => {
-                assert_eq!(lang, "js");
-                assert_eq!(engine, "cpython");
-            }
-            other => panic!("expected EngineMisroute, got {other:?}"),
-        }
+        let mut runtime = mount_python_definitions(&fixture).expect("mount ok under M22 relax");
+        assert_eq!(runtime.graph_id, "mixed");
+        // Both IR nodes are present in n_nodes (graph topology) but
+        // only the Python one was registered with the scheduler.
+        assert_eq!(runtime.n_nodes, 2);
+        assert_eq!(runtime.mounted.len(), 1);
+        assert_eq!(runtime.mounted[0], "sensor-a");
+        runtime.shutdown().expect("shutdown ok");
     }
 
     /// Phase 3b: `use_state` preserves value across renders. Build a

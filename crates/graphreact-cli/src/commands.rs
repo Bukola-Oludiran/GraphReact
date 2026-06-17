@@ -466,6 +466,18 @@ pub fn validate_debug_against_runtime(
     let runtime_str = match runtime {
         RuntimeArg::Cpython => "cpython",
         RuntimeArg::Jsc => "jsc",
+        // **M22.** `--debug` is rejected under `--runtime=mixed`:
+        // the flag picks a single engine slot to attach against,
+        // and a mixed daemon hosts multiple engines simultaneously.
+        // Multi-engine attach is deferred to M22 phase 5+.
+        RuntimeArg::Mixed => {
+            return Err(CommandError::ClusterArg(
+                "--debug is not supported under `--runtime=mixed`. Pin to a single engine \
+                 via `--runtime=cpython` or `--runtime=jsc` for debugger attach (M22 phase \
+                 5+ adds per-engine `--debug`)."
+                    .into(),
+            ));
+        }
         other => {
             return Err(CommandError::ClusterArg(format!(
                 "--debug requires `--runtime cpython` or `--runtime jsc`; got `{other}`"
@@ -776,6 +788,59 @@ pub fn run_run(
                 let _ = engine.shutdown();
                 report
             }
+        }
+        // **M22.** Mixed-runtime arm. Brings up every engine
+        // present in the IR via mount_mixed, runs one
+        // process_batch_async round so every active engine fires
+        // its mount-time bodies, then shuts down in reverse order.
+        // Pure-lang fixtures degenerate to a single-engine slot
+        // (back-compat).
+        #[cfg(target_os = "macos")]
+        EngineKind::Mixed => {
+            // --debug under mixed is rejected by
+            // validate_debug_against_runtime; debug_wait is then
+            // a no-op.
+            let _ = debug;
+            let _ = debug_wait;
+            let path_buf = path.to_path_buf();
+            let result =
+                std::thread::spawn(move || -> Result<crate::runtime::DryMountReport, CommandError> {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| {
+                            CommandError::Io(std::io::Error::other(format!(
+                                "build current_thread runtime: {e}"
+                            )))
+                        })?;
+                    let local = tokio::task::LocalSet::new();
+                    local.block_on(&rt, async move {
+                        let mut runtime = crate::mixedruntime::mount_mixed(&path_buf)?;
+                        runtime
+                            .process_batch_async()
+                            .await
+                            .map_err(crate::runtime::RuntimeError::from)?;
+                        let banner = runtime.engine_version_banner();
+                        let report = crate::runtime::DryMountReport {
+                            engine_name: "mixed".to_string(),
+                            engine_version: banner,
+                            graph_id: runtime.graph_id.clone(),
+                            n_nodes: runtime.n_nodes,
+                            n_edges: runtime.n_edges,
+                            n_definitions: runtime.n_definitions,
+                            mounted_components: runtime.mounted_components(),
+                        };
+                        let _ = runtime.shutdown();
+                        Ok::<_, CommandError>(report)
+                    })
+                })
+                .join()
+                .map_err(|_| {
+                    CommandError::Io(std::io::Error::other(
+                        "mixed-runtime localset thread panicked",
+                    ))
+                })??;
+            result
         }
         // Null + echo continue using the legacy IIFE-based
         // `eval_module` path. They do no real evaluation anyway —
@@ -1142,12 +1207,33 @@ pub enum SchedulerHost {
     /// duration of body evaluation. M14.8.x.
     #[cfg(target_os = "macos")]
     Cpython(Box<crate::pyruntime::PyRuntime>),
+    /// **M22.** Mixed-runtime host — co-owns JSC + CPython + Go
+    /// runtimes against the same `.grx` IR. `process_batch` drives
+    /// every active engine slot in init order; `scheduler_mut`
+    /// returns the FIRST active engine's scheduler so callers like
+    /// `Cluster::start` can still install dist sinks (the dist
+    /// crate's sink shape is per-Scheduler today — M22 phase 5+
+    /// extends the wiring to multiplex across engines). Pure-lang
+    /// fixtures fed through `--runtime=mixed` degenerate to a
+    /// single-engine slot (back-compat preserved).
+    #[cfg(target_os = "macos")]
+    Mixed(Box<crate::mixedruntime::MixedRuntime>),
 }
 
 impl SchedulerHost {
     /// Mutable reference to the underlying [`Scheduler`]. Used by
     /// `Cluster::start` (to install dist sinks) and by tests that
     /// drive `group_broadcast` / inspect monitor state directly.
+    ///
+    /// **M22.** For the Mixed variant this returns the JSC slot's
+    /// scheduler when present, else CPython's, else Go's. Pure-lang
+    /// fixtures see the correct engine's scheduler; mixed fixtures
+    /// get the JSC scheduler (dist-sink installation across
+    /// multiple engines is M22 phase 5+). An empty Mixed (no engine
+    /// slots — possible for a `--runtime=mixed` invocation against
+    /// a definitions-empty .grx) falls through to the host's
+    /// `empty_fallback` scheduler so the daemon doesn't panic; see
+    /// `SchedulerHost::Mixed` field docs.
     pub fn scheduler_mut(&mut self) -> &mut Scheduler {
         match self {
             SchedulerHost::Empty(s) => s,
@@ -1155,12 +1241,15 @@ impl SchedulerHost {
             SchedulerHost::Jsc(r) => &mut r.scheduler,
             #[cfg(target_os = "macos")]
             SchedulerHost::Cpython(r) => &mut r.scheduler,
+            #[cfg(target_os = "macos")]
+            SchedulerHost::Mixed(m) => m.scheduler_mut(),
         }
     }
 
     /// Drive one `process_batch` round. For JSC / CPython this
     /// installs the engine TLS guards via the runtime's own
-    /// `process_batch` entry point.
+    /// `process_batch` entry point. **M22.** Mixed drives every
+    /// active engine slot in init order.
     pub fn process_batch(&mut self) -> Result<(), graphreact_core::RuntimeError> {
         match self {
             SchedulerHost::Empty(s) => s.process_batch(),
@@ -1168,6 +1257,8 @@ impl SchedulerHost {
             SchedulerHost::Jsc(r) => r.process_batch(),
             #[cfg(target_os = "macos")]
             SchedulerHost::Cpython(r) => r.process_batch(),
+            #[cfg(target_os = "macos")]
+            SchedulerHost::Mixed(m) => m.process_batch(),
         }
     }
 }
@@ -1185,6 +1276,15 @@ pub struct DaemonHandle {
     /// drained by [`drive_handle_until`] after each `process_batch`
     /// round.
     observer: Option<graphreact_observer::ApiServerHandle>,
+    /// **M22 verify fix.** Shared `MetricsInner` Arc parked here so
+    /// `drive_handle_until` can record per-tick
+    /// `grx_engine_eval_count{engine}` increments without
+    /// re-threading the metrics handle through every call site.
+    /// `None` when no `--observer-bind` was passed (no metrics
+    /// surface to populate). Same Arc the management API serves
+    /// `/v1/metrics` from, so the per-tick increments are visible
+    /// on the next scrape.
+    metrics: Option<std::sync::Arc<graphreact_observer::MetricsInner>>,
     /// **M16-Backend P10.** OTel `SdkTracerProvider` parked here so
     /// the daemon's shutdown can flush buffered spans via
     /// `provider.shutdown()` BEFORE the cluster tears down.
@@ -1214,6 +1314,15 @@ impl DaemonHandle {
     /// are installed for the duration of body evaluation.
     pub fn process_batch(&mut self) -> Result<(), graphreact_core::RuntimeError> {
         self.host.process_batch()
+    }
+
+    /// **M22 verify fix.** Read the shared `MetricsInner` Arc, if any
+    /// was set up during `start_daemon` (i.e. `--observer-bind` was
+    /// passed). Used by `drive_handle_until` to record per-tick
+    /// `grx_engine_eval_count{engine}` increments.
+    #[must_use]
+    pub fn observer_metrics(&self) -> Option<&graphreact_observer::MetricsInner> {
+        self.metrics.as_deref()
     }
 
     /// Drop the cluster and tear down the engine (if any).
@@ -1287,6 +1396,14 @@ impl DaemonHandle {
             }
             #[cfg(target_os = "macos")]
             SchedulerHost::Cpython(mut runtime) => {
+                let _ = runtime.shutdown();
+            }
+            // **M22.** Mixed shutdown reverses init order across
+            // every active engine slot; errors are logged inside
+            // MixedRuntime::shutdown but never propagated past the
+            // daemon teardown.
+            #[cfg(target_os = "macos")]
+            SchedulerHost::Mixed(mut runtime) => {
                 let _ = runtime.shutdown();
             }
         }
@@ -1414,8 +1531,16 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     // `drive_handle_until` after each `process_batch`); axum
     // handlers send `SnapshotRequest` on the bridge sender. When
     // `opts.observer_bind` is `None`, none of this runs.
+    // **M22 phase 4.** Track the active MetricsInner arc so the
+    // per-engine mount counters can be populated after the
+    // observer is wired. `None` when no observer is configured
+    // (zero-overhead default).
+    #[allow(unused_assignments)]
+    let mut metrics_for_engine_counts: Option<std::sync::Arc<graphreact_observer::MetricsInner>> =
+        None;
     let observer = if let Some(bind_cfg) = opts.observer_bind {
         let metrics = std::sync::Arc::new(graphreact_observer::MetricsInner::new());
+        metrics_for_engine_counts = Some(metrics.clone());
         let prom_sink = std::sync::Arc::new(graphreact_observer::PrometheusSink::from_arc(
             metrics.clone(),
         ));
@@ -1483,6 +1608,16 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         None
     };
 
+    // **M22 phase 4.** Populate `grx_engine_mount_count{engine}`
+    // immediately after observer setup. The counters are bounded-
+    // cardinality (one entry per engine slot) and read by the
+    // `/v1/metrics` Prometheus scrape; recording here means the
+    // FIRST scrape (which may fire before any process_batch
+    // round) sees the correct mount counts.
+    if let Some(metrics) = &metrics_for_engine_counts {
+        record_engine_mount_metrics(&host, metrics);
+    }
+
     // M14.8.x: run one initial `process_batch` so the engine-
     // hosted bodies actually evaluate at boot — `mount_with_scheduler`
     // / `mount_python_definitions` register nodes but do NOT run
@@ -1499,6 +1634,14 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         CommandError::Runtime(crate::runtime::RuntimeError::from(e))
     })?;
 
+    // **M22 phase 4.** Record the first batch's body-evaluation
+    // counts. Subsequent `process_batch` rounds (driven by
+    // `drive_handle_until`) record via the same helper after each
+    // tick.
+    if let Some(metrics) = &metrics_for_engine_counts {
+        record_engine_eval_metrics(&host, metrics);
+    }
+
     // Dial each peer. `connect` waits for handshake completion;
     // any failure short-circuits the daemon boot (substrate-
     // not-MVP: ops would rather see the error early than have a
@@ -1511,9 +1654,71 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         cluster,
         host,
         observer,
+        metrics: metrics_for_engine_counts,
         #[cfg(feature = "otel")]
         otel_provider,
     })
+}
+
+/// **M22 phase 4.** Increment `grx_engine_mount_count{engine}`
+/// according to the engine slots active on `host`. Called once
+/// during `start_daemon` after the observer is wired so the first
+/// `/v1/metrics` scrape sees the mount counts. Pure-lang
+/// daemons emit one series; mixed daemons emit one per active
+/// engine slot.
+fn record_engine_mount_metrics(
+    host: &SchedulerHost,
+    metrics: &graphreact_observer::MetricsInner,
+) {
+    match host {
+        SchedulerHost::Empty(_) => {}
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Jsc(r) => {
+            for _ in &r.mounted {
+                metrics.engine_mount_count_inc("jsc");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Cpython(r) => {
+            for _ in &r.mounted {
+                metrics.engine_mount_count_inc("cpython");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Mixed(m) => {
+            m.record_mount_metrics(metrics);
+        }
+    }
+}
+
+/// **M22 phase 4.** Increment `grx_engine_eval_count{engine}`
+/// according to the engine slots active on `host`. Called after
+/// each `process_batch` round (initial boot batch + every
+/// `drive_handle_until` tick). The per-batch upper bound is one
+/// eval per mounted node per active engine.
+fn record_engine_eval_metrics(
+    host: &SchedulerHost,
+    metrics: &graphreact_observer::MetricsInner,
+) {
+    match host {
+        SchedulerHost::Empty(_) => {}
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Jsc(r) => {
+            for _ in &r.mounted {
+                metrics.engine_eval_count_inc("jsc");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Cpython(r) => {
+            for _ in &r.mounted {
+                metrics.engine_eval_count_inc("cpython");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        SchedulerHost::Mixed(m) => {
+            m.record_eval_metrics(metrics);
+        }
+    }
 }
 
 /// Mount the engine for the daemon. Engine-free for `path: None`
@@ -1585,9 +1790,29 @@ fn build_scheduler_host(
             "`--runtime null` requires no `--path`; remove the path or pick a real runtime"
                 .into(),
         )),
+        // **M22.** Mixed-runtime daemon arm. Brings up every
+        // engine present in the IR via `mount_mixed`. Debug attach
+        // is rejected by `validate_debug_against_runtime` above so
+        // `debug` is unconditionally None on this arm.
+        #[cfg(target_os = "macos")]
+        (Some(path), RuntimeArg::Mixed) => {
+            if debug.is_some() {
+                // Defensive — the validator should have rejected
+                // this combination already, but keep the
+                // belt-and-braces check so a future caller that
+                // bypasses validation doesn't silently drop the
+                // flag.
+                return Err(CommandError::ClusterArg(
+                    "--debug under `--runtime=mixed` is rejected; pin to a single engine."
+                        .into(),
+                ));
+            }
+            let runtime = crate::mixedruntime::mount_mixed(path)?;
+            Ok(SchedulerHost::Mixed(Box::new(runtime)))
+        }
         (Some(_), other) => Err(CommandError::ClusterArg(format!(
             "runtime `{other}` not wired under `grx cluster daemon` — \
-             use `--runtime jsc` or `--runtime cpython`"
+             use `--runtime jsc`, `--runtime cpython`, or `--runtime mixed`"
         ))),
     }
 }
@@ -1635,6 +1860,11 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         cluster,
         host,
         observer: None,
+        // `grx connect` is a one-shot dial; no metrics surface is
+        // wired so per-tick `grx_engine_eval_count` recording is a
+        // no-op (drive_handle_until short-circuits when
+        // observer_metrics() is None).
+        metrics: None,
         // **M16-Backend P10.** `connect` is a one-shot dial; no
         // OTel sink is constructed for it (the OTel sink lives on
         // `start_daemon`'s daemon, not on connect's minimal
@@ -1677,9 +1907,32 @@ pub async fn drive_handle_until(
         let signal = tokio::signal::ctrl_c();
         tokio::select! {
             _ = tick.tick() => {
-                handle.scheduler().process_batch().map_err(|e| {
+                // **M22 verify fix.** Route the tick through
+                // `handle.process_batch()` (which dispatches via
+                // `SchedulerHost::process_batch`) instead of the
+                // raw `scheduler().process_batch()`. Under
+                // `--runtime=mixed` the latter would only tick
+                // the first engine slot's scheduler — CPython +
+                // Go bodies would never re-render after the boot
+                // batch. The `SchedulerHost::process_batch` arm
+                // for Mixed fans out across every active engine
+                // in init order via `MixedRuntime::process_batch`.
+                // Single-engine paths see identical behavior
+                // (same engine TLS guard install, same batch
+                // semantics).
+                handle.process_batch().map_err(|e| {
                     CommandError::Runtime(crate::runtime::RuntimeError::from(e))
                 })?;
+                // **M22 verify fix.** Per-tick increment of
+                // `grx_engine_eval_count{engine}` so the metric
+                // actually tracks evaluation throughput rather
+                // than reporting a one-shot boot snapshot. Matches
+                // the contract in `record_engine_eval_metrics`'s
+                // docstring. Cardinality stays bounded by the
+                // static `{jsc,cpython,go,null,echo}` label set.
+                if let Some(metrics) = handle.observer_metrics() {
+                    record_engine_eval_metrics(&handle.host, metrics);
+                }
                 // M16-Backend P4 — drain pending management-API
                 // snapshot requests. Each request was posted by
                 // an axum handler running on a tokio worker

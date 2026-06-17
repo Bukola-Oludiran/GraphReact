@@ -76,6 +76,20 @@ pub fn validate_watch_runtime(runtime: RuntimeArg) -> Result<(), CommandError> {
                     .into(),
             )),
         )),
+        // **M22.** `--watch --runtime=mixed` requires per-lang diff
+        // classification so a Python body edit doesn't trigger a
+        // JSC remount (and vice-versa); the existing diff classifier
+        // keys on a single runtime. Reject early until M22 phase
+        // 5+ extends the classifier to lane edits per-engine.
+        RuntimeArg::Mixed => Err(CommandError::Runtime(
+            RuntimeError::Engine(graphreact_engine_zig::EngineError::Internal(
+                "`--watch --runtime=mixed` is not yet supported. The hot-reload diff \
+                 classifier keys on a single runtime; per-lang lane classification lands \
+                 in M22 phase 5+. Pin to `--runtime=jsc` or `--runtime=cpython` for watch \
+                 mode."
+                    .into(),
+            )),
+        )),
     }
 }
 
@@ -113,7 +127,7 @@ pub fn run_watch_blocking(
                 "JSC plus CPython engines are macOS-only in M12.3a/M13. Linux plus Windows land at M12.3b.".into(),
             )),
         )),
-        RuntimeArg::Null | RuntimeArg::Echo | RuntimeArg::Go => {
+        RuntimeArg::Null | RuntimeArg::Echo | RuntimeArg::Go | RuntimeArg::Mixed => {
             unreachable!("validated above")
         }
     }
