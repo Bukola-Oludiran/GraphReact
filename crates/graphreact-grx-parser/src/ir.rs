@@ -1128,8 +1128,10 @@ def init():
     #[test]
     fn part2_bad_unit_errors_with_loc() {
         // Bad unit on `left:` surfaces as a Parse error with the
-        // node's source location attached.
-        let src = "<Graph id=\"g\">\n  <Component id=\"x\" style=\"position:absolute; left:30px\" />\n</Graph>";
+        // node's source location attached. (`pt` is not on the
+        // accepted list mm/cm/in/px — see m115-css-units; `px` was
+        // historically rejected but now parses to a CSS reference px.)
+        let src = "<Graph id=\"g\">\n  <Component id=\"x\" style=\"position:absolute; left:30pt\" />\n</Graph>";
         let err = parse_to_ir(src).expect_err("must error");
         // Error type is GrxParseError::Parse with the style error
         // message embedded; loc points at the component.

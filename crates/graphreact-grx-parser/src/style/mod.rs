@@ -24,6 +24,7 @@ mod css_lexer;
 mod desugar;
 mod error;
 mod resugar;
+mod units;
 
 pub use desugar::desugar_style;
 pub use error::StyleError;

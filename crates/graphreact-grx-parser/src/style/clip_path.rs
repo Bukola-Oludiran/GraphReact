@@ -257,20 +257,14 @@ fn parse_kicad(body: &str) -> Result<ClipPath, StyleError> {
     Ok(ClipPath::Kicad { name, data })
 }
 
-/// Parse `Nmm` → f64. Rejects bare numbers and non-mm units.
+/// Parse a CSS length to mm. Accepts `mm` / `cm` / `in` / `px`
+/// suffixes (canonicalized to mm via [`super::units::parse_length_mm`]).
+/// Rejects bare numbers.
 fn parse_mm(s: &str, context: &'static str) -> Result<f64, StyleError> {
-    let s = s.trim();
-    if let Some(num) = s.strip_suffix("mm") {
-        num.trim().parse::<f64>().map_err(|_| StyleError::BadNumber {
-            property: context.to_string(),
-            value: s.to_string(),
-        })
-    } else {
-        Err(StyleError::BadUnit {
-            property: context.to_string(),
-            value: s.to_string(),
-        })
-    }
+    super::units::parse_length_mm(s).ok_or_else(|| StyleError::BadUnit {
+        property: context.to_string(),
+        value: s.trim().to_string(),
+    })
 }
 
 /// Parse `Xmm Ymm` → (x, y).
@@ -363,8 +357,23 @@ mod tests {
 
     #[test]
     fn rejects_bad_unit_in_circle() {
-        let err = parse_clip_path("circle(0.3px at 0mm 0mm)").expect_err("must reject");
+        // `pt` is not on the accepted list (mm/cm/in/px) — must reject.
+        let err = parse_clip_path("circle(0.3pt at 0mm 0mm)").expect_err("must reject");
         assert!(matches!(err, StyleError::BadUnit { .. }));
+    }
+
+    #[test]
+    fn accepts_cm_in_px_in_circle() {
+        // Mixing units canonicalizes to mm at parse time.
+        let cp = parse_clip_path("circle(1cm at 1in 96px)").expect("ok");
+        match cp {
+            ClipPath::Circle { r, cx, cy } => {
+                assert!((r - 10.0).abs() < 1e-9, "1cm = 10mm; got {r}");
+                assert!((cx - 25.4).abs() < 1e-9, "1in = 25.4mm; got {cx}");
+                assert!((cy - 25.4).abs() < 1e-9, "96px = 25.4mm; got {cy}");
+            }
+            other => panic!("expected Circle, got {other:?}"),
+        }
     }
 
     #[test]

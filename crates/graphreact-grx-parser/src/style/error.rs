@@ -15,7 +15,8 @@ pub enum StyleError {
     },
 
     #[error("CSS property `{property}` value `{value}` has unsupported unit \
-             — only `mm` is accepted in v1 (cm/inch/px are not supported)")]
+             — accepted suffixes are `mm`, `cm`, `in`, `px` (bare numbers \
+             without a unit are rejected to avoid silent unit confusion)")]
     BadUnit { property: String, value: String },
 
     #[error(

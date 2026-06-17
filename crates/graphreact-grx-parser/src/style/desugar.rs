@@ -364,18 +364,10 @@ pub fn desugar_style(tag_name: &str, attrs: &mut AttrMap) -> Result<(), StyleErr
 }
 
 fn parse_mm(prop: &str, value: &str) -> Result<f64, StyleError> {
-    let v = value.trim();
-    if let Some(num) = v.strip_suffix("mm") {
-        num.trim().parse::<f64>().map_err(|_| StyleError::BadNumber {
-            property: prop.to_string(),
-            value: value.to_string(),
-        })
-    } else {
-        Err(StyleError::BadUnit {
-            property: prop.to_string(),
-            value: value.to_string(),
-        })
-    }
+    super::units::parse_length_mm(value).ok_or_else(|| StyleError::BadUnit {
+        property: prop.to_string(),
+        value: value.to_string(),
+    })
 }
 
 fn parse_deg(prop: &str, value: &str) -> Result<f64, StyleError> {
@@ -591,13 +583,53 @@ mod tests {
 
     #[test]
     fn bad_unit_errors() {
+        // `pt` is not on the accepted list (mm/cm/in/px) — must reject.
         let mut attrs = AttrMap::new();
         attrs.insert(
             "style".into(),
-            JsonValue::String("position:absolute; left:30px".into()),
+            JsonValue::String("position:absolute; left:30pt".into()),
         );
         let err = desugar_style("Component", &mut attrs).expect_err("must reject");
         assert!(matches!(err, StyleError::BadUnit { property, .. } if property == "left"));
+    }
+
+    #[test]
+    fn css_units_cm_in_px_canonicalize_to_mm() {
+        // 1cm = 10mm
+        let a = run(
+            "Component",
+            "position:absolute; left:1cm; top:0mm",
+        );
+        assert!((a["at"]["x"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+
+        // 1in = 25.4mm
+        let b = run(
+            "Component",
+            "position:absolute; left:1in; top:0mm",
+        );
+        assert!((b["at"]["x"].as_f64().unwrap() - 25.4).abs() < 1e-9);
+
+        // 96px = 25.4mm (CSS reference px @ 96 DPI)
+        let c = run(
+            "Component",
+            "position:absolute; left:96px; top:0mm",
+        );
+        assert!((c["at"]["x"].as_f64().unwrap() - 25.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn css_units_clip_path_polygon_mixed_units() {
+        // The clip_path mini-grammar shares parse_length_mm — verify
+        // mixing cm + mm inside polygon coordinates works.
+        let attrs = run(
+            "Keepout",
+            "position:absolute; left:0mm; top:0mm; \
+             clip-path: polygon(0mm 0mm, 1cm 0mm, 1cm 5mm, 0mm 5mm)",
+        );
+        let pts = attrs["geometry"]["points"].as_array().unwrap();
+        assert_eq!(pts.len(), 4);
+        // Second point's x should be 10mm (canonicalized from 1cm).
+        assert!((pts[1]["x"].as_f64().unwrap() - 10.0).abs() < 1e-9);
     }
 
     #[test]
