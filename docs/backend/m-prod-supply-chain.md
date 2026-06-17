@@ -21,7 +21,11 @@ A new `sbom` job in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)
 
 **Why CycloneDX, not SPDX:** the OWASP CycloneDX project ships first-class Rust support via `cargo-cyclonedx`, the schema is supply-chain-shaped (component → dependency → hash + license + reference), and the JSON format integrates directly with downstream vulnerability scanners (Grype / Trivy / Dependency-Track) without intermediate conversion. SPDX is equally valid as a standard but its Rust ecosystem support is thinner and the file shape is documentation-shaped rather than supply-chain-shaped.
 
-**Pinning:** `cargo install cargo-cyclonedx --version 0.5.9 --locked` — version pinned so SBOM schema is stable across CI runs; bump via deliberate PR rather than tracking latest. 0.5.9 was the latest release as of 2026-06-17 (Apache-2.0).
+**Pinning:** `taiki-e/install-action@v2` with `tool: cargo-cyclonedx@0.5.9` — prebuilt-binary install (keeps the SBOM CI cell under the <1min M-Prod #5 budget; `cargo install`-from-source is multi-minute even with a warm registry cache). Version pinned so the SBOM schema is stable across CI runs; bump via deliberate PR rather than tracking latest. 0.5.9 was the latest release as of 2026-06-17 (Apache-2.0).
+
+**Schema version pinned:** `cargo cyclonedx --format json --spec-version 1.4 --all`. cargo-cyclonedx 0.5.x defaults to spec version 1.3 if `--spec-version` is omitted; explicitly pinning to 1.4 keeps the documented contract (this doc + downstream Grype / Trivy / Dependency-Track consumers configured for 1.4) from drifting away from the emitted artifact.
+
+**CI validation gate:** every emitted `*.cdx.json` is passed through `jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.4"'` before the upload-artifact step. Catches a future cargo-cyclonedx regression (malformed JSON, schema drift, missing bomFormat) that the upload-artifact step alone cannot detect — `if-no-files-found: error` only fires on empty output.
 
 **Not a workspace dependency:** `cargo-cyclonedx` is installed at CI time, not added to `[workspace.dev-dependencies]`. Three reasons:
 
@@ -31,10 +35,12 @@ A new `sbom` job in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)
 
 **Artifact retention:** 90 days (GitHub default). Once the M-Prod #8 release pipeline lands the SBOM will additionally upload to the GitHub Release for each tag, with cosign signature alongside.
 
+**Trigger:** `push` to `main` and any `v*` tag (configured via the workflow's top-level `on: push: tags: ['v*']`). Tag pushes ship under `sbom-cyclonedx-<tag>` (e.g. `sbom-cyclonedx-v0.1.0`); main pushes fall back to `sbom-cyclonedx-<sha>`. Per-tag artifacts are stable + dereferenceable for downstream consumers.
+
 **Artifact shape:**
 
 ```
-sbom-cyclonedx-<sha>/
+sbom-cyclonedx-<sha-or-tag>/
   graphreact-core.cdx.json
   graphreact-observer.cdx.json
   graphreact-cli.cdx.json
@@ -68,11 +74,13 @@ The CycloneDX SBOM rides on top of this: the SBOM describes the dep tree, `cargo
 Operators / contributors can replicate CI's SBOM generation:
 
 ```sh
-# One-time install (or upgrade)
+# One-time install (or upgrade) — CI uses taiki-e/install-action@v2
+# (prebuilt binary). Locally, cargo install is fine; --locked keeps
+# the resolver matching CI.
 cargo install cargo-cyclonedx --version 0.5.9 --locked
 
-# Generate per-workspace-member SBOMs
-cargo cyclonedx --format json --all
+# Generate per-workspace-member SBOMs, pinned to CycloneDX 1.4
+cargo cyclonedx --format json --spec-version 1.4 --all
 
 # Find them
 find . -name '*.cdx.json' -not -path './target/*'
