@@ -205,7 +205,7 @@ The cpython arm in `commands::run_run` checks whether ANY definition has `lang="
 
 ### Single-engine-per-system enforcement
 
-A `lang="js"` definition fed to the cpython arm — or a `lang="python"` definition fed to the JSC scheduler arm — surfaces as `RuntimeError::EngineMisroute` with a clear diagnostic ("component `<X>` declares `lang="python"` but the active engine is `jsc`. Use `--runtime=python` …"). Three call sites enforce this: `runtime::dry_mount_jsc`, `jsruntime::mount_with_scheduler`, `pyruntime::mount_python_definitions`. M22 unifies the multi-engine story; phase 3a is intentionally strict so authors get a clear error early.
+A `lang="js"` definition fed to the cpython arm — or a `lang="python"` definition fed to the JSC scheduler arm — historically surfaced as `RuntimeError::EngineMisroute` with a clear diagnostic ("component `<X>` declares `lang="python"` but the active engine is `jsc`. Use `--runtime=python` …"). Three call sites enforced this: `runtime::dry_mount_jsc`, `jsruntime::mount_with_scheduler`, `pyruntime::mount_python_definitions`. **M22 phase 1 (shipped 2026-06-17) relaxes the strict gate** — each engine's mount path now silently skips foreign-lang definitions so the mixed-runtime orchestrator can feed the same IR to every engine and let each pick up its own lang slice. Single-engine callers see the same end-to-end behavior on pure-lang `.grx` fixtures; a stray foreign-lang body is now a no-op on the wrong engine path rather than a hard error. See [`m22-mixed-runtime.md`](m22-mixed-runtime.md) for the full M22 story.
 
 ### Author convention
 

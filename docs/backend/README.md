@@ -34,6 +34,7 @@ GraphReact (Backend) ships first. GraphReactDB starts materializing after the Ba
 | [`m13-phases.md`](m13-phases.md) | M13 living document — CPython engine bridge for backend Python authoring; phases 1+2 / 2.5 / 3a / 3b shipped, 3c–3h roadmap |
 | [`m12.3b-webkit-vendoring.md`](m12.3b-webkit-vendoring.md) | M12.3b living document — vendored WebKit for cross-platform JSC linkage |
 | [`m6.6-engine-parity.md`](m6.6-engine-parity.md) | M6.6 living document — TS feature parity audit; per-engine sign-off matrix |
+| [`m22-mixed-runtime.md`](m22-mixed-runtime.md) | M22 milestone narrative — mixed-runtime daemon (JS + Python + Go in one `.grx`); phases 1-4 shipped 2026-06-17 |
 
 ## Key milestones for the Backend product
 
@@ -50,7 +51,7 @@ GraphReact (Backend) ships first. GraphReactDB starts materializing after the Ba
 | M16-Backend | [Backend] | Ops surface — Prometheus + OTel + JSON logs + management API + `grx observer` terminal CLI |
 | M-Ingress (M16.5) | [Backend] | External HTTP ingress substrate — POST `/v1/nodes/:id/{messages,call}` + bulk NDJSON; default-deny via manifest |
 | **M17** | [Backend] | **Go runtime engine bridge — third in-process language host (replaces JVM per Java→Go pivot 2026-06-15)** |
-| **M22** | [Backend] | **Mixed-runtime systems — JS + Python + Go in same `.grx`** |
+| **M22** | [Backend] | **Mixed-runtime systems — JS + Python + Go in same `.grx` (phases 1-4 SHIPPED 2026-06-17; phase 5+ cross-engine messaging open)** |
 | **M23** | [Shared] | **LSP server for `.grx` (outer-shell MVP per locked Q10)** |
 | **Cleanup-Pass** | [Backend / Shared] | **Pre-M-Prod deferred-cleanup slice (13 named residuals)** |
 | **M-Prod** | [Production-hardening] | **Production-readiness milestone — 9 sub-tracks (auth / TLS / secrets / lifecycle (incl. M14.11) / observability / rate limiting / supply-chain / packaging / chaos+fuzz)** |

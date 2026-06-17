@@ -55,7 +55,7 @@ The substrate is engine-agnostic and product-agnostic. Adding a feature to the s
 | `graphreact-hotreload` (M15) | compatible-change reload preserves state + queue; safe-point detection; rollback |
 | `graphreact-observer` (**M16-Backend**) | Prometheus exporter + OpenTelemetry traces + structured JSON logs + management/introspection HTTP API + terminal `grx observer` + per-body debug protocols (CDP/debugpy/JDWP, opt-in) |
 | Server-WASM target (M18) | Cloudflare Workers / Wasmtime / Wasmer / sandbox plugin scenarios |
-| Mixed-runtime systems (M22) | JS + Python + JVM in the same `.grx` system |
+| Mixed-runtime systems (M22) | JS + Python + Go in the same `.grx` system (JVM → Go per 2026-06-15 pivot; phases 1-4 SHIPPED 2026-06-17, see [`../backend/m22-mixed-runtime.md`](../backend/m22-mixed-runtime.md)) |
 
 ### GraphReactDB
 
