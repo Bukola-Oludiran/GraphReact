@@ -1,0 +1,79 @@
+<!-- M6.6 method-style ctx sibling API acceptance.
+
+     Mirrors the existing go-dynamic-lifecycle.grx fixture but uses
+     the method-style sugar (ctx.SpawnChild / ctx.Compose /
+     ctx.Unmount) instead of the use_x() hook-form accessors.
+     Mechanically identical — same HOOK_CTX TLS, same host
+     callbacks — so both should produce the same observation log. -->
+
+<Spawner lang="go">
+func SpawnerBody(ctx Ctx) Manifest {
+    UseEffect(func() func() {
+        ctx.SpawnChild(ChildSpec{
+            ID:   "dyn1",
+            Body: DynChildBody,
+            Props: map[string]interface{}{"label": "dynamic"},
+        })
+        return nil
+    }, []interface{}{})
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+
+func DynChildBody(ctx Ctx) Manifest {
+    _, _ = Invoke("host_observe_method_ctx", ctx.ID)
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Spawner>
+
+<Composer lang="go">
+func ComposerBody(ctx Ctx) Manifest {
+    UseEffect(func() func() {
+        ctx.Compose([]ChildSpec{
+            {ID: "compA", Body: CompABody},
+            {ID: "compB", Body: CompBBody},
+        })
+        return nil
+    }, []interface{}{})
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+
+func CompABody(ctx Ctx) Manifest {
+    _, _ = Invoke("host_observe_method_ctx", ctx.ID)
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+
+func CompBBody(ctx Ctx) Manifest {
+    _, _ = Invoke("host_observe_method_ctx", ctx.ID)
+    UseEffect(func() func() {
+        // Method-style ctx.Unmount — equivalent to UseUnmountSelf()().
+        ctx.Unmount()
+        return nil
+    }, []interface{}{})
+    return Manifest{
+        ID:      ctx.ID,
+        Accepts: []string{},
+        Emits:   []string{},
+    }
+}
+</Composer>
+
+<Graph id="go-method-style-ctx">
+  <Spawner id="spawner" />
+  <Composer id="composer" />
+</Graph>

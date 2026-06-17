@@ -1334,6 +1334,15 @@ def __augment_ctx(raw_ctx):
     if not isinstance(raw_ctx, dict):
         return raw_ctx
     raw_ctx['directory'] = _directory_proxy
+    # M6.6 method-style sibling API: ctx['spawn_child'] / ctx['compose']
+    # / ctx['unmount'] / ctx['accept_edge'] are thin delegations to the
+    # use_x() hook accessors. They exist for ergonomic parity with
+    # React-style ctx-as-prop bodies; mechanically identical to the
+    # hook-style accessors (same HOOK_CTX, same host callbacks).
+    raw_ctx['spawn_child'] = lambda spec: use_spawn_child()(spec)
+    raw_ctx['compose'] = lambda specs: use_compose()(specs)
+    raw_ctx['unmount'] = lambda: use_unmount_self()()
+    raw_ctx['accept_edge'] = lambda target_id: use_accept_edge()(target_id)
     return raw_ctx
 
 def use_graph_query(selector, deps=None):
@@ -9684,6 +9693,84 @@ def body(ctx):
         assert!(
             observed.iter().any(|s| s == "child:child-1"),
             "spawned child's body executed once with the right ctx.id; observations: {observed:?}"
+        );
+
+        drop(observed);
+        let mut e = engine_rc.borrow_mut();
+        e.dispose_isolate(iso).expect("dispose");
+        e.shutdown().expect("shutdown");
+    }
+
+    /// M6.6 Cleanup-Pass: method-style ctx parity. Same fixture shape
+    /// as `phase3e_alpha_use_spawn_child_creates_dynamic_node` but
+    /// drives the dynamic-child mount through `ctx['spawn_child']`
+    /// (the method-style sibling API installed by `__augment_ctx`)
+    /// instead of `use_spawn_child()`. Mechanically identical — same
+    /// HOOK_CTX, same host callbacks — confirms parity is one-line
+    /// thick: replacing `use_spawn_child()` with `ctx['spawn_child']`
+    /// produces the same observation log.
+    #[test]
+    fn m66_method_style_ctx_spawn_child_parity() {
+        let _g = engine_lock();
+        reset_global_state();
+
+        let mut graph = CommunicationGraph::new();
+        graph.add_node("parent".to_string(), Attrs::new());
+
+        let observations: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (engine_rc, iso) = boot_engine_with_observe(Arc::clone(&observations));
+
+        // Identical to phase3e_alpha but with `ctx['spawn_child'](spec)`
+        // in place of `use_spawn_child()(spec)`.
+        let body = r"
+def body(ctx):
+    count, set_count = use_state(0)
+    host_observe('parent:' + str(int(count)))
+    if int(count) == 0:
+        def child_body(child_ctx):
+            host_observe('child:' + str(child_ctx['id']))
+            return {'accepts': [], 'emits': []}
+        ctx['spawn_child']({
+            'id': 'child-1',
+            'component': child_body,
+            'props': {'label': 'first'},
+            'connectTo': ['parent'],
+        })
+        set_count(1)
+    return {'accepts': [], 'emits': []}
+";
+        let fn_handle = eval_python_body(&engine_rc, iso, "Parent", body);
+        let definition =
+            build_py_node_definition("Parent".into(), Rc::clone(&engine_rc), iso, fn_handle);
+        let mut scheduler = Scheduler::new(graph);
+        scheduler
+            .register_node(definition, "parent".to_string(), Attrs::new(), 0_u32)
+            .expect("register parent");
+
+        let snapshot = Rc::new(GraphSnapshot::from_live(
+            Rc::clone(&scheduler.graph),
+            Rc::clone(&scheduler.manifests),
+            Rc::clone(&scheduler.edge_accept_predicates),
+        ));
+        {
+            let _engine_guard = PyEngineGuard::with_directory(
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
+            );
+            scheduler.process_batch().expect("batch");
+        }
+
+        let observed = observations.lock();
+        assert!(
+            observed.iter().any(|s| s == "parent:0"),
+            "parent rendered; observations: {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|s| s == "child:child-1"),
+            "ctx['spawn_child'] mounted the dynamic child; observations: {observed:?}"
         );
 
         drop(observed);

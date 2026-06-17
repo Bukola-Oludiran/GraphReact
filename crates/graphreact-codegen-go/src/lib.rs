@@ -632,6 +632,18 @@ mod tests {
                 "prelude missing required M17 phase 3g hook surface: {sym}"
             );
         }
+        // M6.6 Cleanup-Pass method-style ctx sibling API.
+        for sym in [
+            "func (Ctx) SpawnChild(",
+            "func (Ctx) Compose(",
+            "func (Ctx) Unmount()",
+            "func (Ctx) AcceptEdge(",
+        ] {
+            assert!(
+                prelude_src.contains(sym),
+                "prelude missing required M6.6 method-style ctx surface: {sym}"
+            );
+        }
         assert!(prelude_src.contains("package main"));
 
         let body_src = fs::read_to_string(&body_path).unwrap();

@@ -6255,6 +6255,106 @@ mod tests {
         e.shutdown().expect("shutdown");
     }
 
+    /// M6.6 Cleanup-Pass: method-style ctx parity. Identical to
+    /// `phase3e_gamma_use_spawn_child_creates_dynamic_node` but
+    /// drives the dynamic-child mount through `ctx.spawnChild(spec)`
+    /// — the method-style sibling API installed by `__augmentCtx` in
+    /// the JS HOOK_PRELUDE. Confirms parity is one-line thick:
+    /// replacing `useSpawnChild()` with `ctx.spawnChild` produces
+    /// the same observation log.
+    #[test]
+    fn m66_method_style_ctx_spawn_child_parity() {
+        let _g = engine_lock();
+        reset_global_state();
+
+        let mut graph = CommunicationGraph::new();
+        graph.add_node("parent".to_string(), Attrs::new());
+
+        let observations: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observations_for_cb = std::sync::Arc::clone(&observations);
+
+        let engine_rc: Rc<RefCell<JscEngine>> = Rc::new(RefCell::new(JscEngine::new()));
+        let iso = {
+            let mut e = engine_rc.borrow_mut();
+            e.initialize().expect("init");
+            let iso = e.create_isolate(IsolateOptions::default()).expect("create");
+            e.register_callback(iso, "host_state", build_host_state_callback())
+                .expect("host_state");
+            e.register_callback(iso, "host_state_set", build_host_state_set_callback())
+                .expect("host_state_set");
+            e.register_callback(iso, "host_spawn_child", build_host_spawn_child_callback())
+                .expect("host_spawn_child");
+            e.register_callback(
+                iso,
+                "host_observe",
+                Box::new(move |args| {
+                    if let Some(HostValue::String(s)) = args.first() {
+                        observations_for_cb.lock().push(s.clone());
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("host_observe");
+            iso
+        };
+
+        // Identical to phase3e_gamma but uses `ctx.spawnChild` in
+        // place of `useSpawnChild()`.
+        let body = "\
+            const [count, setCount] = useState(0);\n\
+            host_observe('parent:' + count);\n\
+            if (count === 0) {\n\
+              ctx.spawnChild({\n\
+                id: 'child-1',\n\
+                component: function(childCtx) {\n\
+                  host_observe('child:' + childCtx.id);\n\
+                  return { accepts: [], emits: [] };\n\
+                },\n\
+                props: { label: 'first' },\n\
+                connectTo: ['parent']\n\
+              });\n\
+              setCount(1);\n\
+            }\n\
+            return { accepts: [], emits: [] };\n\
+        ";
+        let fn_handle = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Parent", body)
+            .expect("eval");
+
+        let definition = build_js_node_definition(
+            "Parent".into(),
+            Rc::clone(&engine_rc),
+            iso,
+            fn_handle,
+        );
+        let mut scheduler = Scheduler::new(graph);
+        scheduler
+            .register_node(definition, "parent".to_string(), Attrs::new(), 0_u32)
+            .expect("register");
+
+        {
+            let _engine_guard = EngineGuard::new(Rc::clone(&engine_rc), iso);
+            scheduler.process_batch().expect("batch");
+        }
+
+        let observed = observations.lock();
+        assert!(
+            observed.iter().any(|s| s == "parent:0"),
+            "parent rendered; observations: {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|s| s == "child:child-1"),
+            "ctx.spawnChild mounted the dynamic child; observations: {observed:?}"
+        );
+
+        drop(observed);
+        let mut e = engine_rc.borrow_mut();
+        e.dispose_isolate(iso).expect("dispose");
+        e.shutdown().expect("shutdown");
+    }
+
     /// Phase 3e-γ: `useSpawnChild()` returns a function that, when
     /// invoked with a spec containing a JS component body, registers
     /// the body via the `__hostCallbacks` token registry, hands a

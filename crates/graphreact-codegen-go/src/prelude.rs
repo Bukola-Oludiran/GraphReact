@@ -230,6 +230,29 @@ type Ctx struct {{
     Neighbors []string               `json:"neighbors"`
 }}
 
+// M6.6 method-style sibling API on Ctx. Thin delegations to the
+// UseX hook accessors — mechanically identical (same HOOK_CTX TLS,
+// same host callbacks), exposed as methods for ergonomic parity
+// with React-style "ctx-as-prop" bodies. Bodies may freely mix the
+// hook form (e.g. `UseSpawnChild()(spec)`) and the method form
+// (e.g. `ctx.SpawnChild(spec)`).
+
+// SpawnChild requests the scheduler to mount a dynamic child node
+// with the given spec. Same semantics as `UseSpawnChild()(spec)`.
+func (Ctx) SpawnChild(spec ChildSpec) {{ UseSpawnChild()(spec) }}
+
+// Compose declares the active node's composed children. Same
+// semantics as `UseCompose()(specs)`.
+func (Ctx) Compose(specs []ChildSpec) {{ UseCompose()(specs) }}
+
+// Unmount schedules the active node for removal. Same semantics
+// as `UseUnmountSelf()()`.
+func (Ctx) Unmount() {{ UseUnmountSelf()() }}
+
+// AcceptEdge installs an accept-edge predicate targeting the
+// named neighbour. Same semantics as `UseAcceptEdge()(targetID)`.
+func (Ctx) AcceptEdge(targetID string) {{ UseAcceptEdge()(targetID) }}
+
 // Manifest is the body's return value — the per-node permission
 // manifest the Rust scheduler installs in `Scheduler::manifests`.
 // `Extra` is round-tripped to the Rust side under any non-standard

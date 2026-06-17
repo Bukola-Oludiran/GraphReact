@@ -424,9 +424,31 @@ const HOOK_PRELUDE: []const u8 =
     \\// invocation by the wrap that gr_jsc_component_register installs;
     \\// also called by the JS-side spawnChild/compose wrappers so
     \\// dynamically-defined component bodies see the same surface.
+    \\//
+    \\// M6.6 method-style sibling API: ctx.spawnChild / ctx.compose /
+    \\// ctx.unmount / ctx.acceptEdge are thin delegations to the
+    \\// useX() hook accessors. They exist for ergonomic parity with
+    \\// React-style "ctx-as-prop" bodies; mechanically identical to
+    \\// the hook-style accessors (same HOOK_CTX, same host callbacks).
     \\globalThis.__augmentCtx = function(rawCtx) {
     \\  if (!rawCtx || typeof rawCtx !== 'object') return rawCtx;
     \\  rawCtx.directory = __directoryProxy;
+    \\  rawCtx.spawnChild = function(spec) {
+    \\    if (typeof useSpawnChild === 'undefined') return;
+    \\    return useSpawnChild()(spec);
+    \\  };
+    \\  rawCtx.compose = function(specs) {
+    \\    if (typeof useCompose === 'undefined') return;
+    \\    return useCompose()(specs);
+    \\  };
+    \\  rawCtx.unmount = function() {
+    \\    if (typeof useUnmountSelf === 'undefined') return;
+    \\    return useUnmountSelf()();
+    \\  };
+    \\  rawCtx.acceptEdge = function(targetId) {
+    \\    if (typeof useAcceptEdge === 'undefined') return;
+    \\    return useAcceptEdge()(targetId);
+    \\  };
     \\  return rawCtx;
     \\};
     \\

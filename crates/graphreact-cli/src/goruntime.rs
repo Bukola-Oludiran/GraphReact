@@ -5732,6 +5732,63 @@ mod tests {
         );
     }
 
+    /// M6.6 Cleanup-Pass: method-style ctx sibling API.
+    ///
+    /// Mirrors `scenario_use_spawn_child_use_compose_use_unmount_self`
+    /// (which uses the hook-form `UseSpawnChild()(spec)` etc.) but
+    /// drives the dynamic-lifecycle path through the method-form
+    /// `ctx.SpawnChild(spec)` / `ctx.Compose(specs)` / `ctx.Unmount()`
+    /// instead. Mechanically identical — same HOOK_CTX TLS, same
+    /// host callbacks — so the observation log should look identical:
+    /// dyn1, compA, compB all observed; compB unmounts on the next
+    /// cascade. This is the M6.6 parity gate for the Go arm.
+    fn scenario_method_style_ctx_parity() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/go-method-style-ctx.grx");
+        assert!(fixture.exists(), "fixture missing at {}", fixture.display());
+
+        let out_dir = fresh_out_dir("method-style-ctx");
+        let mut runtime = mount_with_scheduler(&fixture, &out_dir)
+            .expect("mount_with_scheduler should succeed for go-method-style-ctx.grx");
+
+        let observed: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observed_cb = std::sync::Arc::clone(&observed);
+        runtime
+            .engine
+            .borrow_mut()
+            .register_callback(
+                runtime.iso,
+                "host_observe_method_ctx",
+                Box::new(move |args| {
+                    if let Some(HostValue::String(s)) = args.first() {
+                        observed_cb.lock().push(s.clone());
+                    }
+                    Ok(HostValue::Null)
+                }),
+            )
+            .expect("register host_observe_method_ctx");
+
+        // Same three-batch shape as the hook-form scenario.
+        runtime.process_batch().expect("batch 1");
+        runtime.process_batch().expect("batch 2");
+        runtime.process_batch().expect("batch 3");
+
+        let log = observed.lock();
+        assert!(
+            log.iter().any(|s| s == "dyn1"),
+            "expected 'dyn1' observation via ctx.SpawnChild; got {log:?}"
+        );
+        assert!(
+            log.iter().any(|s| s == "compA"),
+            "expected 'compA' observation via ctx.Compose; got {log:?}"
+        );
+        assert!(
+            log.iter().any(|s| s == "compB"),
+            "expected 'compB' observation via ctx.Compose; got {log:?}"
+        );
+    }
+
     /// Phase 3c: feeding a `lang="js"` definition to the Go arm
     /// surfaces a clean EngineMisroute diagnostic. Mirrors
     /// pyruntime::phase3a_rejects_js_lang_definition.
@@ -5764,85 +5821,89 @@ mod tests {
         // Reset per-scenario so SIGNAL_REGISTRY ids don't bleed
         // between fixtures (each fresh mount expects to start at
         // signal id 1 for assertion stability).
-        eprintln!("[goruntime smoke 1/20] build_and_load + body dispatch");
+        eprintln!("[goruntime smoke 1/21] build_and_load + body dispatch");
         reset_global_state();
         scenario_build_and_load_body_dispatch();
 
-        eprintln!("[goruntime smoke 2/20] EngineMisroute rejects non-Go bodies");
+        eprintln!("[goruntime smoke 2/21] EngineMisroute rejects non-Go bodies");
         reset_global_state();
         scenario_rejects_non_go_lang();
 
-        eprintln!("[goruntime smoke 3/20] emit/message round-trip");
+        eprintln!("[goruntime smoke 3/21] emit/message round-trip");
         reset_global_state();
         scenario_emit_dispatches_to_neighbor();
 
-        eprintln!("[goruntime smoke 4/20] use_state preserves value across renders");
+        eprintln!("[goruntime smoke 4/21] use_state preserves value across renders");
         reset_global_state();
         scenario_use_state_preserves_value_across_renders();
 
-        eprintln!("[goruntime smoke 5/20] state survives a message");
+        eprintln!("[goruntime smoke 5/21] state survives a message");
         reset_global_state();
         scenario_use_state_survives_a_message();
 
-        eprintln!("[goruntime smoke 6/20] use_effect with empty deps fires once");
+        eprintln!("[goruntime smoke 6/21] use_effect with empty deps fires once");
         reset_global_state();
         scenario_use_effect_empty_deps_fires_once();
 
-        eprintln!("[goruntime smoke 7/20] use_memo single-render fires factory once");
+        eprintln!("[goruntime smoke 7/21] use_memo single-render fires factory once");
         reset_global_state();
         scenario_use_memo_caches_when_deps_unchanged();
 
-        eprintln!("[goruntime smoke 8/20] use_memo recomputes on dep change");
+        eprintln!("[goruntime smoke 8/21] use_memo recomputes on dep change");
         reset_global_state();
         scenario_use_memo_caches_and_recomputes();
 
-        eprintln!("[goruntime smoke 9/20] use_reducer dispatch updates state");
+        eprintln!("[goruntime smoke 9/21] use_reducer dispatch updates state");
         reset_global_state();
         scenario_use_reducer_dispatch_updates_state();
 
-        eprintln!("[goruntime smoke 10/20] use_neighbors returns structural ids");
+        eprintln!("[goruntime smoke 10/21] use_neighbors returns structural ids");
         reset_global_state();
         scenario_use_neighbors_returns_structural_ids();
 
-        eprintln!("[goruntime smoke 11/20] use_accept_edge fires topology event");
+        eprintln!("[goruntime smoke 11/21] use_accept_edge fires topology event");
         reset_global_state();
         scenario_accept_edge_fires_topology_event();
 
-        eprintln!("[goruntime smoke 12/20] use_graph_query Tier 1 accessors");
+        eprintln!("[goruntime smoke 12/21] use_graph_query Tier 1 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_1_accessors();
 
-        eprintln!("[goruntime smoke 13/20] use_directory find_by_id");
+        eprintln!("[goruntime smoke 13/21] use_directory find_by_id");
         reset_global_state();
         scenario_use_directory_find_by_id();
 
-        eprintln!("[goruntime smoke 14/20] use_graph_query Tier 1 algorithms");
+        eprintln!("[goruntime smoke 14/21] use_graph_query Tier 1 algorithms");
         reset_global_state();
         scenario_use_graph_query_tier_1_algorithms();
 
-        eprintln!("[goruntime smoke 15/20] use_graph_query Tier 2 accessors");
+        eprintln!("[goruntime smoke 15/21] use_graph_query Tier 2 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_2_accessors();
 
-        eprintln!("[goruntime smoke 16/20] use_edge_accept_handler + Tier 3 accessors");
+        eprintln!("[goruntime smoke 16/21] use_edge_accept_handler + Tier 3 accessors");
         reset_global_state();
         scenario_use_graph_query_tier_3_accessors();
 
-        eprintln!("[goruntime smoke 17/20] use_spawn_child + use_compose + use_unmount_self");
+        eprintln!("[goruntime smoke 17/21] use_spawn_child + use_compose + use_unmount_self");
         reset_global_state();
         scenario_use_spawn_child_use_compose_use_unmount_self();
 
-        eprintln!("[goruntime smoke 18/20] supervision hooks (monitor/demonitor/link/unlink/group)");
+        eprintln!("[goruntime smoke 18/21] supervision hooks (monitor/demonitor/link/unlink/group)");
         reset_global_state();
         scenario_supervision_hooks_round_trip();
 
-        eprintln!("[goruntime smoke 19/20] use_source dispatches timer/delay/http/watch descriptors");
+        eprintln!("[goruntime smoke 19/21] use_source dispatches timer/delay/http/watch descriptors");
         reset_global_state();
         scenario_use_source_dispatches_descriptors();
 
-        eprintln!("[goruntime smoke 20/20] use_effect_async cooperative-cancel runs user cleanup");
+        eprintln!("[goruntime smoke 20/21] use_effect_async cooperative-cancel runs user cleanup");
         reset_global_state();
         scenario_use_effect_async_cancellation_runs_user_cleanup();
+
+        eprintln!("[goruntime smoke 21/21] method-style ctx parity (ctx.SpawnChild/Compose/Unmount)");
+        reset_global_state();
+        scenario_method_style_ctx_parity();
 
         eprintln!("[goruntime smoke] all scenarios passed");
         // Exit fast — see module-level docs on the Go TSD-cleanup
