@@ -19,6 +19,7 @@ members = [
     "crates/graphreact-cli",
     "crates/graphreact-napi",
     "crates/graphreact-wasm",
+    "crates/graphreact-lsp",
     "tree-sitter-grx",
     "xtask",
 ]

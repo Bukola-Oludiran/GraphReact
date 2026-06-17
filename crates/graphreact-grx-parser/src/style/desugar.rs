@@ -13,8 +13,11 @@ use super::error::StyleError;
 
 /// Set of property names that desugar to numeric attributes (and
 /// would conflict with the equivalent attribute being present
-/// elsewhere on the same element).
-const RECOGNIZED_PROPS: &[&str] = &[
+/// elsewhere on the same element). Exposed via
+/// [`crate::style::recognized_style_properties`] for the M23 LSP so
+/// its completion table is sourced from the same constant the
+/// desugarer enforces.
+pub(super) const RECOGNIZED_PROPS: &[&str] = &[
     "position",
     "left",
     "top",
