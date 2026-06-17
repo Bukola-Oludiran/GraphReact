@@ -38,83 +38,146 @@ pub struct ImportedFile {
 }
 
 impl MultiFileResolved {
-    /// PCBPnR Phase 5-D §2.2/§2.3 — roll up root + root-level imports'
-    /// subgraphs into a single list with alias-qualified names. The
-    /// returned list is suitable for assigning to a [`GrxFile.subgraphs`]
-    /// field passed to [`crate::ir::build_ir`] for splice resolution.
+    /// PCBPnR Phase 5-D §2.2/§2.3 — roll up root + transitively-imported
+    /// subgraphs into a single list with alias-chain-qualified names.
+    /// The returned list is suitable for assigning to a
+    /// [`GrxFile.subgraphs`] field passed to [`crate::ir::build_ir`]
+    /// for splice resolution.
     ///
-    /// Aliased root-level imports register their subgraphs under
-    /// `"<alias>:<name>"`. Unaliased imports flatten into the bare
-    /// namespace (matches today's import-flatten semantic). The root
-    /// file's own subgraphs are bare.
+    /// # Alias-chain semantics
     ///
-    /// Transitively-imported files (imports-of-imports) are NOT
-    /// flattened with alias context — their subgraphs are only visible
-    /// to their immediate importer. This matches the v1 scope chosen
-    /// in the Phase 5-D plan; the open question on transitive alias
-    /// propagation is deferred to a future revision.
+    /// The walker visits every imported file in DFS order from the
+    /// root. At each step the alias chain extends (when the import
+    /// directive carried `as="..."`) or stays the same (unaliased
+    /// flatten). The chain is `:`-joined and prefixed onto each
+    /// subgraph's bare name.
+    ///
+    /// Example. Root `mainboard.grx` imports `mcu/board.grx` as `mcu`,
+    /// which in turn imports `cpu/core.grx` as `cpu`. A subgraph
+    /// `Core` declared in `cpu/core.grx` becomes visible at the root
+    /// as `mcu:cpu:Core`. If the inner import is unaliased, the same
+    /// `Core` flattens through to `mcu:Core`. If BOTH outer imports
+    /// are unaliased, `Core` falls into the bare namespace and can
+    /// collide with sibling subgraphs (caught as
+    /// `DuplicateSubgraphAcrossImports`).
     ///
     /// # Errors
     ///
     /// Returns [`crate::GrxParseError::DuplicateSubgraphAcrossImports`]
-    /// when two root-level imports register the same qualified name
-    /// (typically the unaliased-collision case).
+    /// when two qualified names collide anywhere in the import tree.
     pub fn collect_root_subgraphs(&self) -> crate::GrxResult<Vec<crate::ast::SubgraphDecl>> {
         use crate::ast::SubgraphDecl;
-        use crate::GrxParseError;
+
+        // Path-keyed lookup so per-file recursion costs are O(1).
+        let by_path: FxHashMap<&Path, &GrxFile> = self
+            .imports
+            .iter()
+            .map(|i| (i.path.as_path(), &i.file))
+            .collect();
 
         let mut out: Vec<SubgraphDecl> = Vec::new();
-        let mut seen: rustc_hash::FxHashMap<String, crate::error::SourceLoc> =
-            rustc_hash::FxHashMap::default();
+        let mut seen: FxHashMap<String, crate::error::SourceLoc> = FxHashMap::default();
+        // Per-(file-path × alias-chain) memo — guards against
+        // exponential blow-up on DAG-shaped imports where the same
+        // file is reached via multiple paths AND the same alias chain
+        // would re-register identical qualified names. Distinct chains
+        // are intentionally allowed (the qualified names differ), so
+        // the key is the (path, chain) pair.
+        let mut visited_chains: FxHashSet<(PathBuf, Vec<String>)> = FxHashSet::default();
 
-        // First, root's own subgraphs (bare names).
-        for sg in &self.root.subgraphs {
-            if let Some(_prev_loc) = seen.get(&sg.name) {
-                return Err(GrxParseError::DuplicateSubgraphAcrossImports {
-                    qualified_name: sg.name.clone(),
-                    loc: sg.loc,
-                });
-            }
-            seen.insert(sg.name.clone(), sg.loc);
-            out.push(sg.clone());
-        }
-
-        // Then, each root-level import's subgraphs, qualified by alias.
-        let root_dir = self.root_path.parent().map(Path::to_path_buf);
-        for import in &self.root.imports {
-            let resolved_path = match &root_dir {
-                Some(d) => match canonicalize(&d.join(&import.src)) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                },
-                None => continue,
-            };
-            let imp_file = match self.imports.iter().find(|i| i.path == resolved_path) {
-                Some(i) => &i.file,
-                None => continue,
-            };
-            for sg in &imp_file.subgraphs {
-                let qualified = match &import.alias {
-                    Some(alias) => format!("{alias}:{}", sg.name),
-                    None => sg.name.clone(),
-                };
-                if let Some(_prev_loc) = seen.get(&qualified) {
-                    return Err(GrxParseError::DuplicateSubgraphAcrossImports {
-                        qualified_name: qualified,
-                        loc: sg.loc,
-                    });
-                }
-                seen.insert(qualified.clone(), sg.loc);
-                out.push(SubgraphDecl {
-                    name: qualified,
-                    children: sg.children.clone(),
-                    loc: sg.loc,
-                });
-            }
-        }
-
+        walk_imports(
+            &self.root,
+            self.root_path.as_path(),
+            &[],
+            &by_path,
+            &mut out,
+            &mut seen,
+            &mut visited_chains,
+        )?;
         Ok(out)
     }
+}
+
+/// Recursive DFS helper for [`MultiFileResolved::collect_root_subgraphs`].
+/// Walks the import tree, extending the alias chain on each
+/// `as="..."` directive and qualifying every subgraph with the
+/// current chain.
+fn walk_imports(
+    file: &GrxFile,
+    file_path: &Path,
+    chain: &[String],
+    by_path: &FxHashMap<&Path, &GrxFile>,
+    out: &mut Vec<crate::ast::SubgraphDecl>,
+    seen: &mut FxHashMap<String, crate::error::SourceLoc>,
+    visited_chains: &mut FxHashSet<(PathBuf, Vec<String>)>,
+) -> crate::GrxResult<()> {
+    use crate::ast::SubgraphDecl;
+    use crate::GrxParseError;
+
+    // De-dup repeated (path, chain) pairs that DAG-shaped imports
+    // can produce. The qualified names would be identical to those
+    // already emitted, so re-emitting would falsely trip the
+    // duplicate guard below.
+    let visit_key = (file_path.to_path_buf(), chain.to_vec());
+    if !visited_chains.insert(visit_key) {
+        return Ok(());
+    }
+
+    for sg in &file.subgraphs {
+        let qualified = if chain.is_empty() {
+            sg.name.clone()
+        } else {
+            format!("{}:{}", chain.join(":"), sg.name)
+        };
+        if seen.contains_key(&qualified) {
+            return Err(GrxParseError::DuplicateSubgraphAcrossImports {
+                qualified_name: qualified,
+                loc: sg.loc,
+            });
+        }
+        seen.insert(qualified.clone(), sg.loc);
+        out.push(SubgraphDecl {
+            name: qualified,
+            children: sg.children.clone(),
+            loc: sg.loc,
+        });
+    }
+
+    // Recurse through this file's imports.
+    let file_dir = file_path.parent();
+    for import in &file.imports {
+        let resolved_path = match file_dir {
+            Some(d) => match canonicalize(&d.join(&import.src)) {
+                Ok(p) => p,
+                // Resolver already validated the path; a failure
+                // here means the file moved out from under us
+                // between resolve and collect. Skip silently —
+                // matches the v1 single-hop posture;
+                // collect_root_subgraphs is not the place to
+                // surface missing-file errors.
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+        let imp_file = match by_path.get(resolved_path.as_path()) {
+            Some(f) => *f,
+            None => continue,
+        };
+        let mut child_chain = chain.to_vec();
+        if let Some(alias) = &import.alias {
+            child_chain.push(alias.clone());
+        }
+        walk_imports(
+            imp_file,
+            resolved_path.as_path(),
+            &child_chain,
+            by_path,
+            out,
+            seen,
+            visited_chains,
+        )?;
+    }
+    Ok(())
 }
 
 /// Resolve a `.grx` file plus all of its transitive `<import>`s from
@@ -931,5 +994,160 @@ return { accepts: ['poll'] };
             .collect();
         // DFS: a-sub before a (children first), then b.
         assert_eq!(names, vec!["a-sub.grx", "a.grx", "b.grx"]);
+    }
+
+    // -- m115-import-alias (Cleanup-Pass) — transitive alias propagation --
+
+    /// Two-hop alias chain: root → mid (as=mcu) → leaf (as=cpu).
+    /// Leaf's `Core` subgraph should surface as `mcu:cpu:Core` at the
+    /// root.
+    #[test]
+    fn transitive_alias_chain_qualifies_with_colon_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.grx");
+        let mid = dir.path().join("mid.grx");
+        let leaf = dir.path().join("leaf.grx");
+
+        std::fs::write(
+            &root,
+            r#"<import src="./mid.grx" as="mcu" />
+<Graph id="r"><Foo id="x" /></Graph>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &mid,
+            r#"<import src="./leaf.grx" as="cpu" />
+<Subgraph name="Hub"><Foo id="a"/></Subgraph>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &leaf,
+            r#"<Subgraph name="Core"><Foo id="b"/></Subgraph>"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_multi_file(&root).expect("resolve");
+        let combined = resolved.collect_root_subgraphs().expect("collect");
+        let names: Vec<&str> = combined.iter().map(|sg| sg.name.as_str()).collect();
+        // mid's subgraphs prefixed with "mcu:"; leaf's prefixed with
+        // "mcu:cpu:".
+        assert!(names.contains(&"mcu:Hub"), "names: {names:?}");
+        assert!(names.contains(&"mcu:cpu:Core"), "names: {names:?}");
+    }
+
+    /// Two-hop chain where the inner import is unaliased — the leaf's
+    /// subgraphs flatten through into the outer alias namespace.
+    #[test]
+    fn transitive_unaliased_inner_flattens_through_outer_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.grx");
+        let mid = dir.path().join("mid.grx");
+        let leaf = dir.path().join("leaf.grx");
+
+        std::fs::write(
+            &root,
+            r#"<import src="./mid.grx" as="mcu" />
+<Graph id="r"><Foo id="x" /></Graph>"#,
+        )
+        .unwrap();
+        // Inner import has NO alias — flattens into mid's namespace.
+        std::fs::write(
+            &mid,
+            r#"<import src="./leaf.grx" />
+<Subgraph name="Hub"><Foo id="a"/></Subgraph>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &leaf,
+            r#"<Subgraph name="Core"><Foo id="b"/></Subgraph>"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_multi_file(&root).expect("resolve");
+        let combined = resolved.collect_root_subgraphs().expect("collect");
+        let names: Vec<&str> = combined.iter().map(|sg| sg.name.as_str()).collect();
+        assert!(names.contains(&"mcu:Hub"));
+        // Leaf's `Core` flattens through the unaliased mid→leaf hop
+        // into mid's namespace (which itself sits under "mcu:").
+        assert!(
+            names.contains(&"mcu:Core"),
+            "leaf should flatten through unaliased hop: {names:?}"
+        );
+    }
+
+    /// Sibling DAG: root imports both A (as=a) and B (as=b); both A
+    /// and B import the SAME leaf (as=l). The leaf's subgraphs should
+    /// appear under BOTH `a:l:...` and `b:l:...` without false
+    /// collision.
+    #[test]
+    fn dag_shaped_imports_register_under_each_qualified_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.grx");
+        let a = dir.path().join("a.grx");
+        let b = dir.path().join("b.grx");
+        let leaf = dir.path().join("leaf.grx");
+
+        std::fs::write(
+            &root,
+            r#"<import src="./a.grx" as="a" />
+<import src="./b.grx" as="b" />
+<Graph id="r"><Foo id="x" /></Graph>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &a,
+            r#"<import src="./leaf.grx" as="l" />
+<Subgraph name="HubA"><Foo id="ha"/></Subgraph>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            r#"<import src="./leaf.grx" as="l" />
+<Subgraph name="HubB"><Foo id="hb"/></Subgraph>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &leaf,
+            r#"<Subgraph name="Core"><Foo id="b"/></Subgraph>"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_multi_file(&root).expect("resolve");
+        let combined = resolved.collect_root_subgraphs().expect("collect");
+        let names: Vec<&str> = combined.iter().map(|sg| sg.name.as_str()).collect();
+        assert!(names.contains(&"a:HubA"));
+        assert!(names.contains(&"b:HubB"));
+        assert!(names.contains(&"a:l:Core"), "names: {names:?}");
+        assert!(names.contains(&"b:l:Core"), "names: {names:?}");
+    }
+
+    /// Single-hop behavior remains backward-compatible: the same
+    /// fixtures that worked under the v1 single-level walker should
+    /// produce identical qualified names under the transitive walker.
+    #[test]
+    fn single_hop_back_compat_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.grx");
+        let lib = dir.path().join("lib.grx");
+
+        std::fs::write(
+            &root,
+            r#"<import src="./lib.grx" as="x" />
+<Subgraph name="Top"><Foo id="t"/></Subgraph>
+<Graph id="r"><Foo id="y" /></Graph>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &lib,
+            r#"<Subgraph name="Hub"><Foo id="h"/></Subgraph>"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_multi_file(&root).expect("resolve");
+        let combined = resolved.collect_root_subgraphs().expect("collect");
+        let names: Vec<&str> = combined.iter().map(|sg| sg.name.as_str()).collect();
+        assert!(names.contains(&"Top"));
+        assert!(names.contains(&"x:Hub"));
+        assert_eq!(combined.len(), 2);
     }
 }
