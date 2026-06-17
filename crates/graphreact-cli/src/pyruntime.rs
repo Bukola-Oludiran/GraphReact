@@ -5806,7 +5806,7 @@ pub(crate) fn signal_id_for(node_id: &str, hook_pos: usize) -> Option<u64> {
 }
 
 #[cfg(test)]
-fn reset_global_state() {
+pub(crate) fn reset_global_state() {
     SIGNAL_REGISTRY.with(|r| r.borrow_mut().clear());
     SIGNAL_BY_HOOK_POS.with(|m| m.borrow_mut().clear());
     NEXT_SIGNAL_ID.with(|c| c.set(1));

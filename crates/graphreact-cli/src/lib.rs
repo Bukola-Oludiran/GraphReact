@@ -40,6 +40,12 @@ pub mod pyruntime;
 /// scheduler integration lands at M17 phase 3a follow-on (alongside
 /// the hook surface 3c–h).
 pub mod goruntime;
+/// **M22 — Mixed-runtime orchestrator.** Hosts JSC + CPython + Go
+/// engines in one daemon. Initialize-all-before-mount + reverse-
+/// order shutdown + per-component dispatch via Phase 1's relaxed
+/// per-engine mount paths. See `docs/backend/m22-mixed-runtime.md`.
+#[cfg(target_os = "macos")]
+pub mod mixedruntime;
 pub mod runtime;
 pub mod sources;
 pub mod watch_mode;
