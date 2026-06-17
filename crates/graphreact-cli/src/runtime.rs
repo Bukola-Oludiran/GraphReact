@@ -29,9 +29,17 @@ pub enum RuntimeError {
     NoGraph { path: String },
     #[error("scheduler error: {0}")]
     Scheduler(#[from] graphreact_core::RuntimeError),
+    /// **M22 phase 1 relaxation.** Previously fired by each per-engine
+    /// mount path when a foreign-lang definition was encountered.
+    /// Post-M22 the per-engine mount paths silently skip non-matching
+    /// definitions so the same mount path is reusable from the
+    /// mixed-runtime orchestrator (`MixedRuntime`); this variant
+    /// remains as the diagnostic surface for any future hard-routing
+    /// check (e.g. a Mixed orchestrator that can't bring up the
+    /// required engine slot at all).
     #[error(
-        "component `<{component}>` declares `lang=\"{lang}\"` but the active engine is `{engine}`. \
-         Use `--runtime={lang}` (or remove `lang` to default to JS) to mount it."
+        "component `<{component}>` declares `lang=\"{lang}\"` but no slot for engine `{engine}` is available. \
+         Use `--runtime=mixed` (or `--runtime={lang}`) to mount it."
     )]
     EngineMisroute {
         component: String,
@@ -741,17 +749,23 @@ pub fn dry_mount_jsc(
     // are differentiated by ctx.
     let mut component_handles: HashMap<String, FunctionHandle> = HashMap::new();
     for (origin, component, source, lang) in &definitions {
-        // dry_mount_jsc routes everything through the JSC engine; a
-        // non-JS lang here is a fixture-runtime mismatch (e.g.,
-        // `lang="python"` body fed into the JSC eval path). Fail
-        // loudly with a clear diagnostic — phase 3+ adds the
-        // PyRuntime path that handles the multi-engine case.
+        // **M22 phase 1.** `dry_mount_jsc` historically routed
+        // everything through the JSC engine and failed loudly on a
+        // non-JS lang. Post-M22 the strict gate is relaxed so the
+        // same dry-mount path is reusable from the mixed-runtime
+        // orchestrator (each engine's dry-mount sees the full IR and
+        // picks up only its own `lang` slice). Single-engine
+        // `grx run --runtime=jsc` callers still mount cleanly for
+        // pure-JS `.grx`; a stray non-JS body is now a no-op on the
+        // JSC dry-mount.
         if *lang != graphreact_grx_parser::ast::ComponentLang::Js {
-            return Err(RuntimeError::EngineMisroute {
-                component: component.clone(),
-                lang: lang.as_attr_str().to_string(),
-                engine: "jsc".to_string(),
-            });
+            tracing::debug!(
+                target: "graphreact::m22::routing",
+                component = %component,
+                lang = %lang.as_attr_str(),
+                "dry_mount_jsc: skipping non-JS definition (mixed-runtime path)"
+            );
+            continue;
         }
         let module_name = format!("{origin}::{component}");
         let handle = engine.eval_component(iso, &module_name, source)?;

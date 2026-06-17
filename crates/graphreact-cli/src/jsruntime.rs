@@ -4793,17 +4793,28 @@ pub fn mount_with_scheduler(path: &std::path::Path) -> Result<JsRuntime, Runtime
     }
 
     // Eval each definition as a re-callable component function.
+    //
+    // **M22 phase 1.** Non-JS definitions are silently skipped here so
+    // the same mount path is reusable from the mixed-runtime
+    // orchestrator (which feeds the full IR to every engine and lets
+    // each pick up its own `lang` set). Single-engine callers
+    // (`run_run` / `build_scheduler_host` non-mixed arms) still see
+    // an empty per-node mount for non-JS nodes — there's no JS body
+    // to eval, so `component_handles` won't carry a handle for them
+    // and the per-node registration loop below skips. For a pure
+    // JS-only `.grx`, behavior is unchanged. The mixed orchestrator
+    // composes by routing every node to exactly one engine via the
+    // engine that owns its `lang`.
     let mut component_handles: HashMap<String, FunctionHandle> = HashMap::new();
     for (origin, component, source, lang) in &definitions {
-        // The JSC scheduler-mount path handles JS bodies only. A
-        // non-JS lang here is a fixture-runtime mismatch — the user
-        // likely wants `--runtime=python` or has a stale fixture.
         if *lang != graphreact_grx_parser::ast::ComponentLang::Js {
-            return Err(RuntimeError::EngineMisroute {
-                component: component.clone(),
-                lang: lang.as_attr_str().to_string(),
-                engine: "jsc".to_string(),
-            });
+            tracing::debug!(
+                target: "graphreact::m22::routing",
+                component = %component,
+                lang = %lang.as_attr_str(),
+                "jsruntime mount: skipping non-JS definition (mixed-runtime path)"
+            );
+            continue;
         }
         let module_name = format!("{origin}::{component}");
         let handle = engine_rc.borrow_mut().eval_component(iso, &module_name, source)?;
