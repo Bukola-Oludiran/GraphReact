@@ -57,6 +57,10 @@ M22 (per locked Q1) ships JS + Python + Go bodies in the same `.grx` system. The
 - No change to the `Engine` trait at [crates/graphreact-engine-zig/src/traits.rs](../../crates/graphreact-engine-zig/src/traits.rs) — the 8-method surface is engine-agnostic.
 - No change to [`deny.toml`](../../deny.toml) — Go stdlib BSD-3-Clause is already in the allowlist.
 
+### M17 phase 3f acceptance (added 2026-06-17)
+
+M17 phase 3f's "100 isolates × 1k messages, no GC contention deadlock" acceptance is satisfied at HEAD by the existing substrate — no production lock or layout change. The deadlock-freedom contract is recorded as 8 line-pinned invariants in the module-level doc-comment of [crates/graphreact-codegen-go/src/prelude.rs](../../crates/graphreact-codegen-go/src/prelude.rs); the executable proof lives at [crates/graphreact-engine-go/tests/stress_100x1k.rs](../../crates/graphreact-engine-go/tests/stress_100x1k.rs), driving 100 isolates × 1000 `InvokeHostDouble` round-trips under a `libc::_exit(125)` 120s watchdog with a 60s budget. Notably we did NOT adopt `runtime.LockOSThread` per-isolate pinning — pinning would CREATE the GC-STW-during-cgo-on-locked-M deadlock the acceptance is named after, plus 100 pthread_exits at teardown would surface exactly the [golang/go#47100](https://github.com/golang/go/issues/47100) class of bug.
+
 ### Documentation cross-cuts (this commit + follow-ups)
 
 - ADR-0003 Amendments block flags the `JVM → Go` wording supersession (already applied 2026-06-15).

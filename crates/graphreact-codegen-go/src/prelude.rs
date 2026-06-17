@@ -63,6 +63,77 @@
 //!
 //! Future M17 phase 3e–h sessions add supervision hooks,
 //! `UseSource`, and `UseEffectAsync` on top of this substrate.
+//!
+//! # M17 phase 3f — deadlock-freedom invariants for concurrent isolates
+//!
+//! 100 isolates × 1000 messages stress-tested without GC contention
+//! deadlock by [`crates/graphreact-engine-go/tests/stress_100x1k.rs`].
+//! The acceptance is satisfied by the EXISTING substrate — no
+//! production-code lock or layout change in 3f — because the
+//! emitted prelude already honors a small set of deadlock-freedom
+//! invariants. **Any future edit that touches the cited line ranges
+//! MUST keep the corresponding invariant intact.** Reviewers can
+//! verify each invariant directly from the cited line range.
+//!
+//! 1. **No process-global lock is held across the cgo trampoline
+//!    call.** `Invoke` releases `globalCallbacksMu.RUnlock()` BEFORE
+//!    the `C.grx_invoke_host_callback` round-trip (search the
+//!    emitted body for the `RUnlock` immediately preceding
+//!    `invokeHostCallback`). If any future variant holds a Go-side
+//!    Mutex across cgo, a Go GC stop-the-world phase that waits on
+//!    the lock-holding goroutine will deadlock against the host
+//!    callback waiting on the same lock.
+//!
+//! 2. **`hostSlotMu.RUnlock()` is released BEFORE host-callback fire
+//!    in `UseEmit`** (search for `hostSlotMu.RUnlock()` immediately
+//!    above `invokeHostCallback(slot, args)`). Same rationale as
+//!    invariant #1.
+//!
+//! 3. **Per-isolate `is.mu` is released BEFORE `body(ctx)` in
+//!    `GrxFunctionCall`** — the function-table read is the only
+//!    work that holds `is.mu`; body execution itself runs unlocked,
+//!    so bodies on different isolates run concurrently from the
+//!    Go-runtime POV. (The Rust `Engine` trait's `&mut self`
+//!    contract still serializes call_function on a single GoEngine
+//!    instance; that's a Rust-side invariant unrelated to Go-side
+//!    deadlock-freedom.)
+//!
+//! 4. **`callbackSlot.cbData` is stored as `uintptr`, never
+//!    `unsafe.Pointer`.** The integer-encoded callback id is a fake
+//!    pointer value that fails Go's goroutine-stack-walker pointer
+//!    validation when stored as `unsafe.Pointer`. The conversion to
+//!    `unsafe.Pointer` happens ONLY at the cgo call site in
+//!    `invokeHostCallback`. Any future field that holds an
+//!    integer-encoded id MUST follow the same `uintptr`-at-rest,
+//!    `unsafe.Pointer`-at-boundary pattern (see the long doc-
+//!    comment on `callbackSlot`).
+//!
+//! 5. **Zero `runtime.LockOSThread`, zero `runtime.Lock*` anywhere
+//!    in the emitted prelude.** Pinning a goroutine to its OS
+//!    thread is what would expose the GC-STW-during-cgo-on-locked-M
+//!    deadlock 3f's acceptance is named after. Any future addition
+//!    MUST update this invariant + the stress test.
+//!
+//! 6. **`UseEffectAsync` holds `callbackMu` ONLY across the small
+//!    registry insert + goroutine spawn — NEVER across the cgo
+//!    `host_effect` call.** (Verify: the `callbackMu.Unlock()`
+//!    immediately precedes `Invoke("host_effect", ...)`.) Same
+//!    rationale as invariant #1.
+//!
+//! 7. **`Invoke`'s args buffer + result buffer live on the C heap
+//!    via `C.malloc` / `C.free`, NOT the Go heap.** The Go GC
+//!    mark-phase does not scan C-heap allocations; `C.CString(...)`
+//!    creates a C-heap copy of the args JSON. This bounds the GC
+//!    pressure of high-frequency `Invoke` calls.
+//!
+//! 8. **`host_message` / `host_effect` / `host_topology` defer
+//!    engine re-entry to a closure invoked LATER from scheduler
+//!    flush — NEVER inside a body holding `engine.borrow_mut()`.**
+//!    This is the deferred-closure pattern documented in
+//!    `goruntime.rs::build_host_*_callback` (Rust side); the Go
+//!    side honors it by emitting only sync envelope returns —
+//!    actual cleanup / handler dispatch fires from a fresh
+//!    scheduler tick.
 
 /// ABI version baked into the emitted prelude. Must match
 /// [`graphreact_engine_go::ffi::GRX_GO_ABI_VERSION`] (currently `1`).

@@ -1383,6 +1383,7 @@ version = "0.1.0"
 dependencies = [
  "dashmap",
  "graphreact-engine-zig",
+ "libc",
  "libloading",
  "parking_lot",
  "rustc-hash 2.1.2",

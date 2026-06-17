@@ -20,5 +20,12 @@ dashmap.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# libc::_exit is the only safe watchdog escape for the 3f stress test:
+# std::process::exit and std::process::abort both run destructors /
+# pthread cleanup which themselves deadlock against a wedged Go
+# runtime per golang/go#47100 (the same hazard ADR-0005 cites).
+libc = "0.2"
+
 [lints]
 workspace = true
