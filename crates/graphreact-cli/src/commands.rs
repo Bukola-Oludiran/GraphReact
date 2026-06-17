@@ -655,20 +655,26 @@ pub fn run_run(
                             })?;
                         let local = tokio::task::LocalSet::new();
                         local.block_on(&rt, async move {
-                            // **M16-Backend P8.** When `--debug` is
-                            // set we use `mount_with_scheduler`
-                            // (which doesn't run any body) so
-                            // debugpy lands BEFORE the first batch
-                            // — required for `def init(ctx)`
-                            // breakpoints to hit on first mount.
-                            // Without `--debug` the historical
-                            // `mount_python_definitions` path
-                            // (mount + sync first batch) stays.
-                            let mut runtime = if debug_install.is_some() {
-                                crate::pyruntime::mount_with_scheduler(&path_buf)?
-                            } else {
-                                crate::pyruntime::mount_python_definitions(&path_buf)?
-                            };
+                            // Cleanup-Pass `m16-mount-path-
+                            // consolidation` (2026-06-17): always
+                            // use `mount_with_scheduler` regardless
+                            // of `--debug` state. Debugpy still
+                            // lands BEFORE the first batch
+                            // (`process_batch_async` runs only AFTER
+                            // the install block below). The
+                            // historical non-debug path used
+                            // `mount_python_definitions` which ran
+                            // a sync first batch INSIDE the mount
+                            // — that batch was redundant for the
+                            // dry-mount report since
+                            // `process_batch_async` runs anyway,
+                            // and consolidating eliminates a
+                            // duplicate body-fire on the non-debug
+                            // path (perf wash for any body without
+                            // observable side effects on second
+                            // render).
+                            let mut runtime =
+                                crate::pyruntime::mount_with_scheduler(&path_buf)?;
                             if let Some(d) = debug_install {
                                 {
                                     let mut engine = runtime.engine.borrow_mut();

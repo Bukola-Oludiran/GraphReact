@@ -5277,19 +5277,14 @@ impl PyRuntime {
 // Mount entry points
 // ---------------------------------------------------------------------
 
-/// Phase 3a back-compat entry: parse + resolve a `.grx` file, mount
-/// every `lang="python"` definition with a one-shot `init(ctx)` call
-/// per node. No scheduler, no hooks. Retained so existing callers /
-/// the phase 3a smoke fixture keep working through the same surface.
-///
-/// New code should prefer [`mount_with_scheduler`] which handles both
-/// phase 3a-shaped bodies (no hooks) and phase 3b-shaped bodies (real
-/// hooks + scheduler integration) via the `body(ctx)` / `init(ctx)`
-/// fallback.
-///
-/// Returns a [`PyRuntime`] for shape parity; the scheduler inside has
-/// no nodes registered (all mounting happens by direct
-/// `call_function` here) and `process_batch` is a no-op.
+/// **Test convenience wrapper.** Mounts via [`mount_with_scheduler`]
+/// then runs one sync `process_batch` so callers immediately see
+/// the post-first-render `mounted` field. Production code paths
+/// (`commands.rs` and `hotreload_adapter.rs`) use [`mount_with_scheduler`]
+/// directly and run their own batches per Cleanup-Pass
+/// `m16-mount-path-consolidation` (2026-06-17). Kept here so the
+/// 3 in-crate phase 3a tests that depend on the inline-batch shape
+/// keep working through the same surface.
 pub fn mount_python_definitions(path: &std::path::Path) -> Result<PyRuntime, RuntimeError> {
     // Phase 3a back-compat: route through mount_with_scheduler which
     // now subsumes both shapes. The phase 3a mount_python_definitions
