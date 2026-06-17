@@ -34,6 +34,14 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 graphreact-grx-parser = { path = "../graphreact-grx-parser" }
+# Percent-decoding for `file://` URIs. LSP clients percent-encode
+# reserved characters (spaces, non-ASCII, `#`, `?`) in `DocumentUri`
+# per RFC 3986. A literal `strip_prefix("file://")` leaves `%20` etc.
+# in the path string, which then fails `fs::canonicalize`; cross-file
+# goto-definition silently breaks on any project path containing
+# a space or non-ASCII character. Already in tower-lsp-server's
+# transitive closure, so adding it directly is free in compile graph.
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"

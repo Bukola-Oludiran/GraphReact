@@ -1,29 +1,33 @@
 //! Converters between parser-side [`SourceLoc`] (1-indexed line/column
-//! in characters) and LSP-side [`Position`] / [`Range`] (0-indexed
-//! line/column in UTF-8 code units).
+//! in **UTF-8 bytes**) and LSP-side [`Position`] / [`Range`] (0-indexed
+//! line/column in UTF-8 code units, per the encoding we negotiate in
+//! `initialize`).
 //!
-//! The server advertises `PositionEncodingKind::Utf8` in the
-//! `initialize` handshake so we can stay in byte space and avoid the
-//! UTF-16 conversion tax the risks list flagged. Newer LSP clients
-//! (VS Code 1.74+, Neovim 0.11+, Helix, Zed) honour the advertisement;
-//! older clients fall back to UTF-16 which we approximate by
-//! treating the character index as a code-unit count — good enough for
-//! ASCII-only `.grx`, mildly off for fixtures that embed `→` or `🦀`
-//! glyphs in definition bodies. The risks doc already calls this out.
+//! ## Encoding contract
+//!
+//! The parser's [`SourceLoc`] column is byte-indexed: the lexer's
+//! `advance()` shim ticks `column` once per raw `u8` consumed
+//! (`crates/graphreact-grx-parser/src/lexer.rs::advance`). The server
+//! advertises `PositionEncodingKind::Utf8` in `initialize`, which
+//! defines `Position.character` as a 0-indexed byte offset within the
+//! line. So the conversion is a pure index-base shift (1→0) — no
+//! `char_indices()` walk, no UTF-16 surrogate accounting.
+//!
+//! Modern editors (VS Code 1.74+, Neovim 0.11+, Helix, Zed) honour the
+//! advertisement. Older clients that only support UTF-16 would see
+//! mis-pinned diagnostics on multibyte lines; tracked under M23.next.
 
 use graphreact_grx_parser::SourceLoc;
 use tower_lsp_server::ls_types::{Position, Range};
 
 /// Convert a 1-indexed `SourceLoc` to a 0-indexed LSP `Position`.
-/// The column is mapped to UTF-8 byte offset of the line by walking
-/// the source string when supplied; without source we degrade to the
-/// raw column value (correct for ASCII-only inputs).
+/// Both inputs and outputs measure columns in UTF-8 bytes, so this is
+/// a pure index-base shift.
 #[must_use]
-pub fn loc_to_position(loc: SourceLoc, source: &str) -> Position {
+pub fn loc_to_position(loc: SourceLoc, _source: &str) -> Position {
     let line_idx = loc.line.saturating_sub(1);
     let col_idx = loc.column.saturating_sub(1);
-    let byte_col = find_byte_col_for_char_col(source, line_idx, col_idx);
-    Position::new(line_idx as u32, byte_col as u32)
+    Position::new(line_idx as u32, col_idx as u32)
 }
 
 /// Build a zero-width LSP `Range` at the given source location. Most
@@ -69,26 +73,6 @@ pub fn token_range_at(loc: SourceLoc, source: &str) -> Range {
     Range::new(start, end_pos)
 }
 
-/// Given a 0-indexed `(line, char_col)`, return the byte offset of the
-/// `char_col`-th character on that line of `source`. Used to translate
-/// 1-indexed line/column-in-characters (the parser's units) into
-/// LSP-compatible byte columns.
-fn find_byte_col_for_char_col(source: &str, line_idx: usize, char_col: usize) -> usize {
-    let Some(line) = nth_line(source, line_idx) else {
-        return char_col;
-    };
-    let mut bytes_seen = 0usize;
-    for (i, ch) in line.char_indices() {
-        if bytes_seen == char_col {
-            return i;
-        }
-        bytes_seen += 1;
-        let _ = ch;
-    }
-    // char_col is past end of line — clamp to line byte length.
-    line.len().min(char_col)
-}
-
 /// Return the `n`-th 0-indexed line of `source`, without the trailing
 /// newline. None when out of range.
 fn nth_line(source: &str, n: usize) -> Option<&str> {
@@ -127,22 +111,24 @@ mod tests {
     }
 
     #[test]
-    fn position_handles_multibyte_lines() {
+    fn position_passes_byte_columns_through() {
+        // Parser's column is byte-indexed (lexer ticks per u8). A
+        // SourceLoc captured on the `x` after `→` (3 bytes) would
+        // arrive as column 4, NOT column 2. Round-trip:
         let src = "→x\nfoo";
-        // line 1 col 2 should land just after the arrow's 3 bytes.
-        let p = loc_to_position(SourceLoc::new(1, 2), src);
+        let p = loc_to_position(SourceLoc::new(1, 4), src);
         assert_eq!(p.line, 0);
-        assert_eq!(p.character, 3);
+        assert_eq!(p.character, 3); // 0-indexed byte column of `x`.
     }
 
     #[test]
     fn token_range_widens_identifier() {
         let src = "<Counter id=\"c\"/>";
-        // Caret at col 2 (= char position of 'C').
+        // Lexer byte-column of 'C' = 2 (1-indexed: `<` at 1, `C` at 2).
         let r = token_range_at(SourceLoc::new(1, 2), src);
         assert_eq!(r.start.line, 0);
         assert_eq!(r.start.character, 1);
-        assert_eq!(r.end.character, 8); // "Counter" ends at col 8
+        assert_eq!(r.end.character, 8); // "Counter" ends at byte 8.
     }
 
     #[test]
