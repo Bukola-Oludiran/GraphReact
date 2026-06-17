@@ -30,13 +30,15 @@
 //! both backends co-exist; consumers can pick by importing the
 //! function they want.
 
-use rustc_hash::FxHashMap;
 use serde_json::Value as JsonValue;
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::ast::{AttrMap, ComponentLang};
+use crate::ast::{
+    AttrMap, ComponentLang, EdgeDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl,
+    NodeDefinitionBlock, SubgraphDecl,
+};
 use crate::error::{GrxParseError, GrxResult, SourceLoc};
-use crate::ir::{EdgeKind, GrxIr, IrDefinition, IrEdge, IrNode};
+use crate::ir::GrxIr;
 
 /// Convenience wrapper: parse a `.grx` source string straight to
 /// `GrxIr` via the tree-sitter backend. Mirrors the hand-rolled
@@ -148,11 +150,17 @@ impl IncrementalParser {
 // Tree → GrxIr conversion
 // =============================================================
 
-fn build_ir_from_tree(tree: &Tree, source: &str) -> GrxResult<GrxIr> {
+/// **m115-tree-sitter-splice (Cleanup-Pass).** Walks the CST into an
+/// [`crate::ast::GrxFile`] then routes through the shared
+/// [`crate::ir::build_ir`] so Subsystem splice resolution + multi-
+/// parent reconciliation + depth/parent_path injection live in ONE
+/// place across both parser backends. Previously the tree-sitter
+/// backend went CST → IR directly and silently dropped `<Subgraph>`
+/// blocks; this is the route-(a) refactor that delivers byte-identical
+/// IR parity on splice fixtures.
+pub fn build_grx_file_from_tree(tree: &Tree, source: &str) -> GrxResult<GrxFile> {
     let root = tree.root_node();
     if root.has_error() {
-        // Tree-sitter recovers from errors in-tree; surface the
-        // first error node so callers see actionable diagnostics.
         if let Some(err_node) = first_error_node(root) {
             return Err(GrxParseError::parse(
                 format!(
@@ -168,82 +176,306 @@ fn build_ir_from_tree(tree: &Tree, source: &str) -> GrxResult<GrxIr> {
         ));
     }
 
-    let mut imports: Vec<String> = Vec::new();
-    let mut definitions: Vec<IrDefinition> = Vec::new();
-    let mut graph_id: Option<String> = None;
-    let mut graph_loc: SourceLoc = SourceLoc::default();
-    let mut nodes: Vec<IrNode> = Vec::new();
-    let mut edges: Vec<IrEdge> = Vec::new();
-    let mut seen_ids: FxHashMap<String, crate::ir::FirstOccurrence> = FxHashMap::default();
-
+    let mut file = GrxFile::default();
     let mut cursor = root.walk();
+    let mut graph_seen = false;
     for child in root.named_children(&mut cursor) {
         match child.kind() {
-            "comment" | "subgraph" => {
-                // PCBPnR Phase 5-D §2.2 — Subgraph blocks are
-                // recognized at the grammar level but the v1
-                // tree-sitter→IR pipeline doesn't yet flatten them
-                // (splice resolution at step 4 lives in the
-                // hand-rolled IR builder for now; tree-sitter parity
-                // for splice arrives at step 5). Accepting them
-                // silently here lets fixtures with Subgraphs parse
-                // through the tree-sitter backend without erroring;
-                // the resulting IR has no Subgraph trace, matching
-                // the hand-rolled "Subgraph not spliced in this IR"
-                // shape.
-            }
+            "comment" => {}
             "import_decl" => {
-                if let Some(src) = extract_attribute_string(child, source, "src") {
-                    imports.push(src);
-                }
+                file.imports.push(build_import_decl(child, source)?);
+            }
+            "subgraph" => {
+                file.subgraphs.push(build_subgraph_decl(child, source)?);
             }
             "graph" => {
-                if graph_id.is_some() {
+                if graph_seen {
                     return Err(GrxParseError::parse(
                         "multiple <Graph> blocks at top level",
                         node_loc(child).into_inner(),
                     ));
                 }
-                let (id, loc) = extract_graph_id(child, source)?;
-                graph_id = Some(id);
-                graph_loc = loc;
-                walk_graph_children(
-                    child,
-                    source,
-                    None,
-                    0,
-                    &[],
-                    &mut nodes,
-                    &mut edges,
-                    &mut seen_ids,
-                )?;
+                graph_seen = true;
+                file.graph = Some(build_graph_decl(child, source)?);
             }
             "definition_block" => {
-                let def = build_definition(child, source)?;
-                definitions.push(def);
+                file.definitions.push(build_definition_decl(child, source)?);
             }
             other => {
-                // Should not happen given the grammar, but stay
-                // defensive — surface the node kind so future
-                // grammar changes that add new top-level kinds
-                // don't silently get dropped.
                 return Err(GrxParseError::parse(
-                    format!("unexpected top-level node kind `{other}`"),
+                    format!("unexpected top-level CST kind `{other}`"),
                     node_loc(child).into_inner(),
                 ));
             }
         }
     }
+    Ok(file)
+}
 
-    Ok(GrxIr {
-        graph_id: graph_id.unwrap_or_default(),
-        graph_loc,
-        nodes,
-        edges,
-        definitions,
-        imports,
+fn build_ir_from_tree(tree: &Tree, source: &str) -> GrxResult<GrxIr> {
+    // Route-(a) refactor (Cleanup-Pass `m115-tree-sitter-splice`):
+    // walk the CST into an AST + delegate to the shared
+    // `crate::ir::build_ir` for splice resolution + reconciliation.
+    let file = build_grx_file_from_tree(tree, source)?;
+    crate::ir::build_ir(&file)
+}
+
+// --- CST -> AST helpers (route-(a) m115-tree-sitter-splice) ---
+
+fn build_import_decl(node: Node<'_>, source: &str) -> GrxResult<ImportDirective> {
+    let mut src = None;
+    let mut alias = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "attribute" {
+            let (name, value) = parse_attribute(child, source)?;
+            match (name.as_str(), value) {
+                ("src", Some(JsonValue::String(s))) => src = Some(s),
+                ("as", Some(JsonValue::String(s))) => alias = Some(s),
+                _ => {}
+            }
+        }
+    }
+    let src = src.ok_or_else(|| {
+        GrxParseError::parse(
+            "<import> requires a `src` attribute",
+            node_loc(node).into_inner(),
+        )
+    })?;
+    if let Some(a) = &alias {
+        if !ImportDirective::is_valid_alias(a) {
+            return Err(GrxParseError::parse(
+                format!("invalid import alias `{a}` — must match [a-zA-Z_][a-zA-Z0-9_]*"),
+                node_loc(node).into_inner(),
+            ));
+        }
+    }
+    Ok(ImportDirective {
+        src,
+        alias,
+        loc: node_loc(node).into_inner(),
     })
 }
+
+fn build_graph_decl(graph_node: Node<'_>, source: &str) -> GrxResult<GraphDecl> {
+    let (id, loc) = extract_graph_id(graph_node, source)?;
+    let children = walk_block_children_to_ast(graph_node, source)?;
+    Ok(GraphDecl { id, children, loc })
+}
+
+fn build_subgraph_decl(subgraph_node: Node<'_>, source: &str) -> GrxResult<SubgraphDecl> {
+    // The grammar hides `_subgraph_open`, so `attribute` children sit
+    // directly under the `subgraph` node (interleaved with the body
+    // `edge_decl` / `graph_node` children).
+    let mut name: Option<String> = None;
+    let mut cursor = subgraph_node.walk();
+    for child in subgraph_node.named_children(&mut cursor) {
+        if child.kind() == "attribute" {
+            let (n, v) = parse_attribute(child, source)?;
+            if n == "name" {
+                if let Some(JsonValue::String(s)) = v {
+                    name = Some(s);
+                }
+            }
+        }
+    }
+    let name = name.ok_or_else(|| GrxParseError::MissingSubgraphName {
+        loc: node_loc(subgraph_node).into_inner(),
+    })?;
+    let children = walk_block_children_to_ast(subgraph_node, source)?;
+    Ok(SubgraphDecl {
+        name,
+        children,
+        loc: node_loc(subgraph_node).into_inner(),
+    })
+}
+
+fn walk_block_children_to_ast(block: Node<'_>, source: &str) -> GrxResult<Vec<GrxNode>> {
+    let mut out: Vec<GrxNode> = Vec::new();
+    let mut cursor = block.walk();
+    for child in block.named_children(&mut cursor) {
+        match child.kind() {
+            "edge_decl" => out.push(GrxNode::Edge(build_edge_decl(child, source)?)),
+            "graph_node" => out.push(GrxNode::Node(build_node_decl(child, source)?)),
+            // Skip comments + open-tag tokens; the named-child iteration
+            // surfaces them and the grammar already constrains the
+            // legal set, so unrecognized kinds are tolerated.
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+fn build_node_decl(graph_node: Node<'_>, source: &str) -> GrxResult<NodeDecl> {
+    // Find the open-tag (self-closing or paired).
+    let mut open_tag: Option<Node<'_>> = None;
+    let mut self_closing = false;
+    let mut cursor = graph_node.walk();
+    for child in graph_node.named_children(&mut cursor) {
+        match child.kind() {
+            "graph_node_open" => {
+                open_tag = Some(child);
+                self_closing = false;
+            }
+            "graph_node_self_close" => {
+                open_tag = Some(child);
+                self_closing = true;
+            }
+            _ => {}
+        }
+    }
+    let open = open_tag.ok_or_else(|| {
+        GrxParseError::parse(
+            "graph_node missing open-tag child",
+            node_loc(graph_node).into_inner(),
+        )
+    })?;
+
+    let component = extract_tag_name(open, source).ok_or_else(|| {
+        GrxParseError::parse(
+            "graph_node open-tag missing tag_name",
+            node_loc(open).into_inner(),
+        )
+    })?;
+
+    let mut attrs: AttrMap = AttrMap::new();
+    let mut id: Option<String> = None;
+    let mut attr_cursor = open.walk();
+    for attr_child in open.named_children(&mut attr_cursor) {
+        if attr_child.kind() == "attribute" {
+            let (name, value) = parse_attribute(attr_child, source)?;
+            let json_value = value.unwrap_or(JsonValue::Bool(true));
+            if name == "id" {
+                if let JsonValue::String(s) = &json_value {
+                    id = Some(s.clone());
+                }
+            }
+            attrs.insert(name, json_value);
+        }
+    }
+
+    // Hand-rolled AST strips the `id` from `attrs` after hoisting
+    // it; mirror exactly for parity. `build_ir` reads `id` from the
+    // `NodeDecl.id` field, not the attrs map.
+    attrs.shift_remove("id");
+
+    let id = id.ok_or_else(|| {
+        GrxParseError::parse(
+            format!("node `<{component}>` requires an `id` attribute"),
+            node_loc(graph_node).into_inner(),
+        )
+    })?;
+
+    // Recurse into nested children. Self-closing tags have none.
+    let children = if self_closing {
+        Vec::new()
+    } else {
+        walk_block_children_to_ast(graph_node, source)?
+    };
+
+    Ok(NodeDecl {
+        component,
+        id,
+        attrs,
+        children,
+        self_closing,
+        loc: node_loc(graph_node).into_inner(),
+    })
+}
+
+fn build_edge_decl(edge_decl: Node<'_>, source: &str) -> GrxResult<EdgeDecl> {
+    let mut source_id: Option<String> = None;
+    let mut target_id: Option<String> = None;
+    let mut attrs: AttrMap = AttrMap::new();
+    let mut cursor = edge_decl.walk();
+    for child in edge_decl.named_children(&mut cursor) {
+        if child.kind() == "attribute" {
+            let (name, value) = parse_attribute(child, source)?;
+            let json_value = value.unwrap_or(JsonValue::Bool(true));
+            match (name.as_str(), &json_value) {
+                ("source", JsonValue::String(s)) => source_id = Some(s.clone()),
+                ("target", JsonValue::String(s)) => target_id = Some(s.clone()),
+                _ => {
+                    attrs.insert(name, json_value);
+                }
+            }
+        }
+    }
+    let source = source_id.ok_or_else(|| {
+        GrxParseError::parse(
+            "edge requires `source` and `target` attributes",
+            node_loc(edge_decl).into_inner(),
+        )
+    })?;
+    let target = target_id.ok_or_else(|| {
+        GrxParseError::parse(
+            "edge requires `source` and `target` attributes",
+            node_loc(edge_decl).into_inner(),
+        )
+    })?;
+    Ok(EdgeDecl {
+        source,
+        target,
+        attrs,
+        loc: node_loc(edge_decl).into_inner(),
+    })
+}
+
+fn build_definition_decl(def_block: Node<'_>, source: &str) -> GrxResult<NodeDefinitionBlock> {
+    let mut tag_name: Option<String> = None;
+    let mut lang: ComponentLang = ComponentLang::default();
+    let mut src: Option<String> = None;
+    let mut raw: Option<String> = None;
+    let mut tag_count = 0usize;
+
+    let mut cursor = def_block.walk();
+    for child in def_block.named_children(&mut cursor) {
+        match child.kind() {
+            "tag_name" => {
+                tag_count += 1;
+                if tag_count == 1 {
+                    tag_name = Some(node_text(child, source).to_string());
+                }
+            }
+            "attribute" => {
+                let (name, value) = parse_attribute(child, source)?;
+                match (name.as_str(), value) {
+                    ("lang", Some(JsonValue::String(s))) => {
+                        lang = ComponentLang::from_attr_str(&s).ok_or_else(|| {
+                            GrxParseError::parse(
+                                format!("unknown `lang` value `{s}`"),
+                                node_loc(child).into_inner(),
+                            )
+                        })?;
+                    }
+                    ("src", Some(JsonValue::String(s))) => src = Some(s),
+                    _ => {}
+                }
+            }
+            "raw_body" => {
+                raw = Some(node_text(child, source).trim().to_string());
+            }
+            _ => {}
+        }
+    }
+
+    let component = tag_name.ok_or_else(|| {
+        GrxParseError::parse(
+            "definition_block missing tag name",
+            node_loc(def_block).into_inner(),
+        )
+    })?;
+    let code = raw.unwrap_or_default();
+
+    Ok(NodeDefinitionBlock {
+        component,
+        code,
+        lang,
+        src,
+        loc: node_loc(def_block).into_inner(),
+    })
+}
+
 
 fn first_error_node(node: Node<'_>) -> Option<Node<'_>> {
     if node.is_error() || node.is_missing() {
@@ -281,308 +513,6 @@ fn extract_graph_id(graph: Node<'_>, source: &str) -> GrxResult<(String, SourceL
     Ok((id, node_loc(graph).into_inner()))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn walk_graph_children(
-    graph_or_node: Node<'_>,
-    source: &str,
-    parent_id: Option<&str>,
-    depth: usize,
-    parent_path: &[String],
-    nodes: &mut Vec<IrNode>,
-    edges: &mut Vec<IrEdge>,
-    seen_ids: &mut FxHashMap<String, crate::ir::FirstOccurrence>,
-) -> GrxResult<()> {
-    let mut cursor = graph_or_node.walk();
-    for child in graph_or_node.named_children(&mut cursor) {
-        match child.kind() {
-            "edge_decl" => {
-                let edge = build_edge(child, source)?;
-                edges.push(edge);
-            }
-            "graph_node" => {
-                process_graph_node(child, source, parent_id, depth, parent_path, nodes, edges, seen_ids)?;
-            }
-            // Skip comments, close-tag tag_name remnants, and any
-            // other unrecognised structural noise the grammar
-            // surfaces.
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process_graph_node(
-    graph_node: Node<'_>,
-    source: &str,
-    parent_id: Option<&str>,
-    depth: usize,
-    parent_path: &[String],
-    nodes: &mut Vec<IrNode>,
-    edges: &mut Vec<IrEdge>,
-    seen_ids: &mut FxHashMap<String, crate::ir::FirstOccurrence>,
-) -> GrxResult<()> {
-    // Determine the open-tag (graph_node_open OR graph_node_self_close)
-    // and walk its attributes.
-    let mut open_tag: Option<Node<'_>> = None;
-    let mut cursor = graph_node.walk();
-    for child in graph_node.named_children(&mut cursor) {
-        match child.kind() {
-            "graph_node_open" | "graph_node_self_close" => {
-                open_tag = Some(child);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let open = open_tag.ok_or_else(|| {
-        GrxParseError::parse(
-            "graph_node missing open-tag child",
-            node_loc(graph_node).into_inner(),
-        )
-    })?;
-
-    let component = extract_tag_name(open, source).ok_or_else(|| {
-        GrxParseError::parse(
-            "graph_node open-tag missing tag_name",
-            node_loc(open).into_inner(),
-        )
-    })?;
-
-    let mut attrs: AttrMap = AttrMap::new();
-    let mut id: Option<String> = None;
-    let mut attr_cursor = open.walk();
-    for attr_child in open.named_children(&mut attr_cursor) {
-        if attr_child.kind() == "attribute" {
-            let (name, value) = parse_attribute(attr_child, source)?;
-            let json_value = value.unwrap_or(JsonValue::Bool(true));
-            if name == "id" {
-                if let JsonValue::String(s) = &json_value {
-                    id = Some(s.clone());
-                }
-            }
-            attrs.insert(name, json_value);
-        }
-    }
-
-    let id = id.ok_or_else(|| {
-        GrxParseError::parse(
-            format!("node `<{component}>` requires an `id` attribute"),
-            node_loc(graph_node).into_inner(),
-        )
-    })?;
-
-    // PCBPnR Phase 5-D §3 — desugar `style="…"` on this node before
-    // any further IR processing, so tree-sitter and hand-rolled
-    // backends agree on the post-desugar AttrMap shape (the Part 2
-    // parity contract).
-    if attrs.contains_key("style") {
-        // The tree-sitter `attrs` map includes the `id` key (the
-        // hand-rolled AST strips it). Temporarily remove `id` so the
-        // desugarer doesn't see it as a numeric attribute when
-        // checking for §3.7 conflicts.
-        let id_attr = attrs.shift_remove("id");
-        if let Err(style_err) = crate::style::desugar_style(&component, &mut attrs) {
-            return Err(style_err.into_parse_error(node_loc(graph_node).into_inner()));
-        }
-        if let Some(v) = id_attr {
-            attrs.insert("id".to_string(), v);
-        }
-    }
-
-    // Build the inclusive node-path: parent_path + self. The
-    // hand-rolled parser stores the node's OWN id at the end of
-    // `parent_path`, and `_parentPath` echoes the same — quirky
-    // naming but load-bearing for parity.
-    let mut node_path: Vec<String> = parent_path.to_vec();
-    node_path.push(id.clone());
-
-    // PCBPnR Phase 5-D §2.4 reconciliation — mirrors ir.rs's
-    // process_children logic. First occurrence declares attrs +
-    // component; subsequent occurrences must be attribute-free
-    // re-mentions with the matching component tag. Keeps both
-    // parser backends in lockstep on the reconciled rule.
-    let this_loc = node_loc(graph_node).into_inner();
-    match seen_ids.get(&id) {
-        None => {
-            // Inject the auto-keys the IR builder uses (`component`,
-            // `_depth`, `_parentPath`).
-            let mut full_attrs = AttrMap::new();
-            full_attrs.insert("component".into(), JsonValue::String(component.clone()));
-            full_attrs.insert(
-                "_depth".into(),
-                JsonValue::Number(serde_json::Number::from(depth)),
-            );
-            full_attrs.insert(
-                "_parentPath".into(),
-                JsonValue::Array(
-                    node_path
-                        .iter()
-                        .cloned()
-                        .map(JsonValue::String)
-                        .collect(),
-                ),
-            );
-            for (k, v) in &attrs {
-                full_attrs.insert(k.clone(), v.clone());
-            }
-            nodes.push(IrNode {
-                id: id.clone(),
-                component: component.clone(),
-                attrs: full_attrs,
-                depth,
-                parent_path: node_path.clone(),
-                source_loc: this_loc,
-            });
-            seen_ids.insert(
-                id.clone(),
-                crate::ir::FirstOccurrence {
-                    loc: this_loc,
-                    component: component.clone(),
-                },
-            );
-        }
-        Some(first) => {
-            // Multi-parent reference. Strip the `id` attr from the
-            // attrs map (it's not user-visible content; it was hoisted
-            // out earlier) and any other attrs are a hard error.
-            let extra_attrs = attrs.len() - usize::from(attrs.contains_key("id"));
-            if extra_attrs > 0 {
-                return Err(GrxParseError::IdConflictWithAttrs {
-                    id: id.clone(),
-                    first_loc: first.loc,
-                    second_loc: this_loc,
-                });
-            }
-            if first.component != component {
-                return Err(GrxParseError::IdComponentMismatch {
-                    id: id.clone(),
-                    first_component: first.component.clone(),
-                    first_loc: first.loc,
-                    second_component: component.clone(),
-                    second_loc: this_loc,
-                });
-            }
-            // Valid multi-parent reference — fall through to edge emission.
-        }
-    }
-
-    // Structural edge from parent → this node.
-    if let Some(p) = parent_id {
-        edges.push(IrEdge {
-            source: p.to_string(),
-            target: id.clone(),
-            attrs: AttrMap::new(),
-            source_loc: node_loc(graph_node).into_inner(),
-            kind: EdgeKind::Structural,
-        });
-    }
-
-    // Recurse into nested children (only for non-self-close shapes).
-    if open.kind() == "graph_node_open" {
-        walk_graph_children(
-            graph_node,
-            source,
-            Some(&id),
-            depth + 1,
-            &node_path,
-            nodes,
-            edges,
-            seen_ids,
-        )?;
-    }
-
-    Ok(())
-}
-
-fn build_edge(edge_decl: Node<'_>, source: &str) -> GrxResult<IrEdge> {
-    let mut source_id: Option<String> = None;
-    let mut target_id: Option<String> = None;
-    let mut attrs: AttrMap = AttrMap::new();
-    let mut cursor = edge_decl.walk();
-    for child in edge_decl.named_children(&mut cursor) {
-        if child.kind() == "attribute" {
-            let (name, value) = parse_attribute(child, source)?;
-            let json_value = value.unwrap_or(JsonValue::Bool(true));
-            match (name.as_str(), &json_value) {
-                ("source", JsonValue::String(s)) => source_id = Some(s.clone()),
-                ("target", JsonValue::String(s)) => target_id = Some(s.clone()),
-                _ => {}
-            }
-            attrs.insert(name, json_value);
-        }
-    }
-    let source_id = source_id.ok_or_else(|| {
-        GrxParseError::parse(
-            "edge requires `source` and `target` attributes",
-            node_loc(edge_decl).into_inner(),
-        )
-    })?;
-    let target_id = target_id.ok_or_else(|| {
-        GrxParseError::parse(
-            "edge requires `source` and `target` attributes",
-            node_loc(edge_decl).into_inner(),
-        )
-    })?;
-    Ok(IrEdge {
-        source: source_id,
-        target: target_id,
-        attrs,
-        source_loc: node_loc(edge_decl).into_inner(),
-        kind: EdgeKind::Explicit,
-    })
-}
-
-fn build_definition(def_block: Node<'_>, source: &str) -> GrxResult<IrDefinition> {
-    let mut tag_name: Option<String> = None;
-    let mut lang: ComponentLang = ComponentLang::default();
-    let mut raw: Option<String> = None;
-    let mut tag_count = 0usize;
-
-    let mut cursor = def_block.walk();
-    for child in def_block.named_children(&mut cursor) {
-        match child.kind() {
-            "tag_name" => {
-                tag_count += 1;
-                if tag_count == 1 {
-                    tag_name = Some(node_text(child, source).to_string());
-                }
-            }
-            "attribute" => {
-                let (name, value) = parse_attribute(child, source)?;
-                if name == "lang" {
-                    if let Some(JsonValue::String(s)) = value {
-                        lang = ComponentLang::from_attr_str(&s).ok_or_else(|| {
-                            GrxParseError::parse(
-                                format!("unknown `lang` value `{s}`"),
-                                node_loc(child).into_inner(),
-                            )
-                        })?;
-                    }
-                }
-            }
-            "raw_body" => {
-                raw = Some(node_text(child, source).trim().to_string());
-            }
-            _ => {}
-        }
-    }
-
-    let tag_name = tag_name.ok_or_else(|| {
-        GrxParseError::parse(
-            "definition_block missing tag name",
-            node_loc(def_block).into_inner(),
-        )
-    })?;
-    let raw = raw.unwrap_or_default();
-
-    Ok(IrDefinition {
-        component: tag_name,
-        code: raw,
-        lang,
-        source_loc: node_loc(def_block).into_inner(),
-    })
-}
 
 fn parse_attribute(attr: Node<'_>, source: &str) -> GrxResult<(String, Option<JsonValue>)> {
     let mut name: Option<String> = None;
@@ -654,21 +584,6 @@ fn extract_tag_name(open_tag: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn extract_attribute_string(node: Node<'_>, source: &str, name: &str) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "attribute" {
-            if let Ok((attr_name, value)) = parse_attribute(child, source) {
-                if attr_name == name {
-                    if let Some(JsonValue::String(s)) = value {
-                        return Some(s);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
 
 fn node_text<'src>(node: Node<'_>, source: &'src str) -> &'src str {
     let bytes = source.as_bytes();
@@ -726,7 +641,7 @@ mod tests {
         assert_eq!(ir.graph_id, "g");
         assert_eq!(ir.nodes.len(), 3);
         assert_eq!(ir.edges.len(), 2);
-        assert!(ir.edges.iter().all(|e| e.kind == EdgeKind::Structural));
+        assert!(ir.edges.iter().all(|e| e.kind == crate::ir::EdgeKind::Structural));
     }
 
     #[test]
@@ -736,7 +651,7 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(ir.edges.len(), 1);
-        assert_eq!(ir.edges[0].kind, EdgeKind::Explicit);
+        assert_eq!(ir.edges[0].kind, crate::ir::EdgeKind::Explicit);
         assert_eq!(ir.edges[0].source, "a");
         assert_eq!(ir.edges[0].target, "b");
         assert_eq!(
@@ -852,12 +767,12 @@ def init():
     // (consumed by the splice pass at build_ir time), and the
     // tree-sitter side skips them at the grammar boundary.
     //
-    // `<Subsystem>` splice parity is deferred: the tree-sitter
-    // backend does not yet run splice resolution. Fixtures with
-    // splice references are excluded from cross-backend parity
-    // until the tree-sitter bridge is refactored to route through
-    // the hand-rolled AST builder (substrate refactor, follow-up
-    // scope).
+    // `<Subsystem>` splice parity SHIPPED via Cleanup-Pass
+    // `m115-tree-sitter-splice` (2026-06-17). The tree-sitter
+    // backend now routes CST → GrxFile → `crate::ir::build_ir` so
+    // splice resolution + multi-parent reconciliation live in ONE
+    // place across both backends. See
+    // `cross_validate_backends_splice_subsystem_identically`.
     #[test]
     fn cross_validate_backends_handle_subgraph_blocks_identically() {
         use crate::ir::parse_to_ir;
@@ -885,6 +800,49 @@ def init():
         assert!(!a_ids.contains(&"B1"));
         // Only the <Graph>'s <Logger> appears.
         assert_eq!(a_ids, vec!["log"]);
+    }
+
+    /// Cleanup-Pass `m115-tree-sitter-splice`: a `<Subgraph>` block
+    /// referenced by a `<Subsystem ref=... id=.../>` placeholder
+    /// must be flattened identically by both backends. The
+    /// tree-sitter side now walks the CST into a `GrxFile` and
+    /// delegates to the shared `crate::ir::build_ir`, so splice
+    /// resolution + qualified-id prefix machinery + multi-parent
+    /// reconciliation are shared across both parser paths.
+    #[test]
+    fn cross_validate_backends_splice_subsystem_identically() {
+        use crate::ir::parse_to_ir;
+        let src = r#"<Subgraph name="ShelfA">
+  <Box id="b1" />
+  <Box id="b2" />
+  <edge source="b1" target="b2" />
+</Subgraph>
+<Graph id="board">
+  <Subsystem ref="ShelfA" id="a" />
+</Graph>"#;
+        let a = parse_to_ir(src).expect("hand-rolled parses ok");
+        let b = parse_to_ir_via_treesitter(src).expect("tree-sitter parses ok");
+        assert_eq!(a.graph_id, b.graph_id);
+        let a_ids: Vec<&str> = a.nodes.iter().map(|n| n.id.as_str()).collect();
+        let b_ids: Vec<&str> = b.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(a_ids, b_ids);
+        // Spliced contents: `b1` → `a.b1`, `b2` → `a.b2`. The
+        // splice site itself does not materialize as an IR node.
+        assert!(a_ids.contains(&"a.b1"));
+        assert!(a_ids.contains(&"a.b2"));
+        // Inner edge should also be qualified.
+        let a_edges: Vec<(&str, &str)> = a
+            .edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str()))
+            .collect();
+        let b_edges: Vec<(&str, &str)> = b
+            .edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str()))
+            .collect();
+        assert_eq!(a_edges, b_edges);
+        assert!(a_edges.contains(&("a.b1", "a.b2")));
     }
 
     /// PCBPnR Phase 5-D step 5 — aliased `<import as="...">` parses
