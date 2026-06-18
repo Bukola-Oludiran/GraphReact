@@ -91,6 +91,7 @@ async fn boot_daemon_with_observer() -> graphreact_cli::commands::DaemonHandle {
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
         observer_bind: Some(bind),
+        observer_tls_paths: None,
         debug: None,
         debug_wait: false,
         observer_otel_endpoint: None,

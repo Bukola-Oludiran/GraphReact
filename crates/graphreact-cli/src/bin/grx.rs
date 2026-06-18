@@ -193,6 +193,22 @@ fn dispatch_cluster(
             // shape-rule that `BindConfig::from_flags` enforces is
             // about a remote socket needing token+cert+key; a
             // missing `--observer-bind` means no observer at all.
+            // **M-Prod sub-track #2 Phase B Part 1.** Capture the
+            // cert + key file paths BEFORE the `BindFlags`
+            // constructor consumes the `Option<PathBuf>`s — these
+            // get retained on `DaemonOptions::observer_tls_paths`
+            // so the SIGHUP handler in `drive_handle_until` can
+            // call `DaemonHandle::reload_tls_from_disk` without
+            // re-investigating CLI flags. Only `Some` when BOTH
+            // cert + key were passed (mirrors Phase A's
+            // bind-time invariant that TLS needs both).
+            let observer_tls_paths = match (&observer_cert, &observer_key) {
+                (Some(c), Some(k)) => Some(graphreact_cli::commands::TlsPaths {
+                    cert_path: c.clone(),
+                    key_path: k.clone(),
+                }),
+                _ => None,
+            };
             let observer_bind = if observer_bind.is_some()
                 || observer_token_env.is_some()
                 || observer_token_file.is_some()
@@ -225,6 +241,7 @@ fn dispatch_cluster(
                 net_split_policy: NetSplitPolicy::default(),
                 duration_secs,
                 observer_bind,
+                observer_tls_paths,
                 observer_otel_endpoint,
                 observer_otel_service_name,
                 observer_audit_log,

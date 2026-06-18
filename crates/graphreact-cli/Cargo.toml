@@ -73,6 +73,17 @@ assert_cmd = "2"
 # through the upstream Prometheus exposition parser (catches any
 # encoder regression). Mirrors graphreact-observer's existing dev-dep.
 prometheus-parse.workspace = true
+# **M-Prod sub-track #2 Phase B Part 1.** Audit-event capture layer
+# for the SIGHUP rotation tests (mirrors the graphreact-observer
+# crate's existing tls_rotation test pattern). Registry + std only;
+# no env-filter / fmt layer needed here.
+tracing-subscriber = { workspace = true }
+# **M-Prod sub-track #2 Phase B Part 1.** Subprocess SIGHUP test
+# uses `libc::kill(pid, SIGHUP)` to drive a real signal at the
+# spawned daemon. libc is already in the workspace's transitive
+# graph (engine-cpython / engine-jsc / engine-go); declaring it
+# as a CLI dev-dep documents the use site.
+libc = "0.2"
 
 [lints]
 workspace = true

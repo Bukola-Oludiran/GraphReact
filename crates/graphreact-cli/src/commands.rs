@@ -1182,6 +1182,21 @@ pub fn resolve_drain_deadline(cli_secs: Option<u64>) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// **M-Prod sub-track #2 Phase B Part 1.** Retained cert + key
+/// file paths so the SIGHUP handler can re-read them without
+/// re-investigating CLI flags. Populated by the bin/grx
+/// translation layer when `--observer-cert` + `--observer-key`
+/// were passed alongside `--observer-bind`. Absolute paths are
+/// REQUIRED at boot — a relative path with respect to the
+/// daemon's startup CWD becomes meaningless after `chdir` /
+/// systemd `WorkingDirectory` changes; we emit a warning
+/// (`tls_paths_relative` boot audit row) when violated.
+#[derive(Clone, Debug)]
+pub struct TlsPaths {
+    pub cert_path: std::path::PathBuf,
+    pub key_path: std::path::PathBuf,
+}
+
 /// Daemon CLI knobs translated into structured form. Constructed
 /// from the [`crate::cli::ClusterOp::Daemon`] variant; consumed by
 /// [`start_daemon`].
@@ -1207,6 +1222,14 @@ pub struct DaemonOptions {
     /// `start_daemon` is called, so any flag-validation error
     /// surfaces at process start (NOT during the first scrape).
     pub observer_bind: Option<graphreact_observer::BindConfig>,
+    /// **M-Prod sub-track #2 Phase B Part 1.** Retained cert + key
+    /// file paths for the SIGHUP-driven `reload_tls_from_disk`
+    /// handler. `Some` only when `--observer-cert` + `--observer-key`
+    /// were passed alongside `--observer-bind` — i.e. the daemon
+    /// actually has a TLS-enabled observer to rotate. `None` (the
+    /// non-TLS, loopback, or no-observer cases) makes SIGHUP a
+    /// silent no-op (no operator-visible TLS surface to inform).
+    pub observer_tls_paths: Option<TlsPaths>,
     /// **M16-Backend P8.** Per-body source-debug listener spec.
     /// `Some(_)` installs debugpy (P8) / JSC inspector (P9) on
     /// the engine matching `runtime` after first mount. `None`
@@ -1405,6 +1428,14 @@ pub struct DaemonHandle {
     /// construct); read by [`Self::start_drain`] to know when
     /// ingress quiesced.
     ingress_in_flight: graphreact_observer::IngressInFlight,
+    /// **M-Prod sub-track #2 Phase B Part 1.** Cert + key file
+    /// paths captured at boot for SIGHUP-triggered atomic-swap
+    /// rotation. `None` when no TLS-enabled observer was wired —
+    /// SIGHUP is then a silent no-op (no operator-visible TLS
+    /// surface to inform). `Some(paths)` enables
+    /// [`Self::reload_tls_from_disk`] to re-read the files and
+    /// drive Phase A's `ApiServerHandle::reload_tls` substrate.
+    tls_paths: Option<TlsPaths>,
 }
 
 /// **M-Prod sub-track #4 Phase α.** Outcome of a graceful drain
@@ -1592,6 +1623,88 @@ impl DaemonHandle {
         }
     }
 
+    /// **M-Prod sub-track #2 Phase B Part 1.** SIGHUP entry point.
+    /// Re-reads the cert + key files from disk, parses them, and
+    /// drives them through Phase A's `ApiServerHandle::reload_tls`
+    /// atomic-swap substrate. Drain-respect: when a drain is in
+    /// progress the swap is skipped and an audit row of shape
+    /// `event="tls_reload_skipped" reason="draining"` is emitted
+    /// in place of the usual attempt/success/failure trio. When
+    /// `self.observer` is `None` OR `self.tls_paths` is `None`
+    /// (daemon was booted without a TLS-enabled observer), the
+    /// call is a no-op (also no audit emission — there's no
+    /// operator-visible surface to inform).
+    ///
+    /// Failure modes:
+    /// - cert/key file read error → audit `tls_reload_attempt`
+    ///   followed by `tls_reload_failure` with `error_kind =
+    ///   "cert_parse"` or `"key_parse"` and `detail =
+    ///   display(io_error)`. The prior `ServerConfig` keeps
+    ///   serving.
+    /// - cert/key parse / rustls build → flows through Phase A's
+    ///   `reload_tls` typed-error machinery unchanged.
+    pub fn reload_tls_from_disk(&self) {
+        let Some(observer) = self.observer.as_ref() else {
+            return;
+        };
+        let Some(paths) = self.tls_paths.as_ref() else {
+            return;
+        };
+        let sink = observer.audit_sink.as_ref();
+        // Drain-respect: skip when SIGTERM drain has flipped the
+        // bit. Audit, do NOT call reload_tls (would generate a
+        // confusing tls_reload_attempt + tls_reload_success pair
+        // mid-drain that operators would have to explain).
+        if let Some(flag) = self.drain.as_ref() {
+            if flag.is_draining() {
+                graphreact_observer::log_tls_reload_skipped("draining", sink);
+                return;
+            }
+        }
+        // **Verify-finding patch (MED).** Distinguish I/O failures
+        // (ENOENT, EACCES, EISDIR, EIO) from PEM-parse failures by
+        // using new `cert_read` / `key_read` error_kinds. Phase A's
+        // documented `cert_parse` / `key_parse` taxonomy in
+        // `m-prod-tls-rotation.md` reserves those for malformed-PEM /
+        // rustls-rejected bytes. Conflating "cert file vanished after
+        // cert-manager rotation" with "cert-manager wrote a malformed
+        // PEM" forces operators to grep `detail` to disambiguate; the
+        // typed split lets per-error_kind alerting fire on the right
+        // remediation path. `log_tls_reload_failure` accepts
+        // `error_kind: &'static str` so the extension is additive.
+        let cert_bytes = match std::fs::read(&paths.cert_path) {
+            Ok(b) => b,
+            Err(e) => {
+                graphreact_observer::audit::log_tls_reload_attempt(0, 0, sink);
+                graphreact_observer::audit::log_tls_reload_failure(
+                    "cert_read",
+                    &format!("read {}: {}", paths.cert_path.display(), e),
+                    sink,
+                );
+                return;
+            }
+        };
+        let key_bytes = match std::fs::read(&paths.key_path) {
+            Ok(b) => b,
+            Err(e) => {
+                graphreact_observer::audit::log_tls_reload_attempt(
+                    cert_bytes.len(),
+                    0,
+                    sink,
+                );
+                graphreact_observer::audit::log_tls_reload_failure(
+                    "key_read",
+                    &format!("read {}: {}", paths.key_path.display(), e),
+                    sink,
+                );
+                return;
+            }
+        };
+        // Phase A's reload_tls emits tls_reload_attempt / success /
+        // failure for us — no double-emission.
+        let _ = observer.reload_tls(&cert_bytes, &key_bytes);
+    }
+
     /// Drop the cluster and tear down the engine (if any).
     /// **M16-Backend P2:** also signals + joins the observer HTTP
     /// server (if one was spawned). **M16-Backend P10:** flushes
@@ -1708,6 +1821,30 @@ impl DaemonHandle {
     #[must_use]
     pub fn observer_ingress_counter(&self) -> Option<graphreact_observer::IngressInFlight> {
         self.observer.as_ref().map(|_| self.ingress_in_flight.clone())
+    }
+}
+
+/// **M-Prod sub-track #2 Phase B Part 1.** Boot-time validation
+/// of the SIGHUP cert+key path retention contract: paths MUST be
+/// absolute because the daemon's CWD can shift after `chdir` /
+/// systemd `WorkingDirectory` changes, making a relative path
+/// resolve to a different file on SIGHUP than at boot. We accept
+/// relative paths for back-compat but emit a `tls_paths_relative`
+/// WARN audit row so operator dashboards can surface the
+/// misconfig. Tracing-only — mirrors the
+/// `drain_budget_misconfig` precedent which fans only to the
+/// tracing stream (not the AuditSink) so boot-time warnings stay
+/// uniform across the codebase.
+fn validate_tls_paths_absolute(paths: Option<&TlsPaths>) {
+    let Some(p) = paths else { return };
+    if !p.cert_path.is_absolute() || !p.key_path.is_absolute() {
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            event = "tls_paths_relative",
+            cert_path = %p.cert_path.display(),
+            key_path = %p.key_path.display(),
+            "observer TLS cert/key path is relative; SIGHUP re-read may resolve unexpectedly after working-directory changes"
+        );
     }
 }
 
@@ -1854,6 +1991,13 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     let drain_flag = graphreact_observer::DrainFlag::new();
 
     let observer = if let Some(bind_cfg) = opts.observer_bind {
+        // **M-Prod sub-track #2 Phase B Part 1.** Boot-time path
+        // validation runs only when an observer is actually being
+        // wired — a non-TLS daemon has no SIGHUP reload surface,
+        // so a relative-path warning would be operator noise. The
+        // validator is tracing-only (no AuditSink fan) per the
+        // drain_budget_misconfig precedent below.
+        validate_tls_paths_absolute(opts.observer_tls_paths.as_ref());
         let metrics = std::sync::Arc::new(graphreact_observer::MetricsInner::new());
         metrics_for_engine_counts = Some(metrics.clone());
         let prom_sink = std::sync::Arc::new(graphreact_observer::PrometheusSink::from_arc(
@@ -2054,6 +2198,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         otel_provider,
         drain,
         ingress_in_flight,
+        tls_paths: opts.observer_tls_paths,
     })
 }
 
@@ -2263,6 +2408,17 @@ pub async fn run_daemon_blocking(opts: DaemonOptions) -> Result<String, CommandE
 /// callers (`run_daemon_blocking`, `run_connect_blocking`) need
 /// to read the discriminator; tests that drive the loop directly
 /// can match on it too.
+///
+/// **M-Prod sub-track #2 Phase B Part 1.** SIGHUP is intentionally
+/// NOT a `LoopExit` variant — it is handled IN-LOOP via a fourth
+/// arm on the same `tokio::select!` (alongside `tick`, `sigint`,
+/// `sigterm`). The topology choice is "one signal-kind per
+/// `select!` arm, all sharing the same `drive_handle_until`
+/// task": concentrates signal handling in one file, avoids a
+/// second long-running spawned task that would need its own
+/// shutdown coordination, and keeps the `Signal` stream registered
+/// once across the loop's lifetime (re-registering on every
+/// iteration would leak signal-handler slots).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopExit {
     /// `duration_secs` was set and elapsed. Snappy shutdown.
@@ -2320,6 +2476,9 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         // too) goes straight to `shutdown()`.
         drain: None,
         ingress_in_flight: graphreact_observer::IngressInFlight::default(),
+        // **M-Prod sub-track #2 Phase B Part 1.** `connect` has no
+        // observer-TLS surface to rotate; SIGHUP is a silent no-op.
+        tls_paths: None,
     };
     let _exit = drive_handle_until(&mut handle, duration).await?;
     handle.shutdown().await;
@@ -2369,6 +2528,41 @@ pub async fn drive_handle_until(
         signal(SignalKind::terminate())
             .map_err(|e| CommandError::ClusterArg(format!("SIGTERM register: {e}")))?
     };
+    // **M-Prod sub-track #2 Phase B Part 1.** Register SIGHUP once
+    // outside the loop (mirrors the existing `sigterm` pattern —
+    // re-registering on every iteration would leak signal-handler
+    // slots; tokio releases the signalfd / kqueue slot on drop).
+    // SIGHUP triggers an in-loop `DaemonHandle::reload_tls_from_disk`
+    // call and does NOT exit the loop, unlike SIGINT / SIGTERM.
+    //
+    // **Verify-finding patch (MED).** GATE the SIGHUP signal-stream
+    // installation on `handle.tls_paths.is_some()`. Once a tokio
+    // `Signal(SignalKind::hangup())` exists for the process, the OS
+    // installs its own signal handler — even after the Signal stream
+    // drops, the kernel default action (terminate) is no longer in
+    // effect for SIGHUP. Without this gate, non-TLS daemons (e.g.
+    // `grx connect`, daemons without `--observer-cert`/`--observer-key`)
+    // would silently no-op on operator-fired SIGHUP that today
+    // terminates them. Keeping the default for non-TLS daemons matches
+    // the principle of least surprise for `kill -HUP` workflows.
+    //
+    // **Verify-finding patch (MED).** Emit a `grx-sighup-ready` line
+    // immediately AFTER the signal stream is registered so operator
+    // tooling (cert-manager hooks, k8s preStop, integration tests) can
+    // wait for it before firing the first SIGHUP. The Phase A
+    // race-window between `start_daemon`'s `grx-observer-ready` and
+    // this point is now operator-observable; production scripts that
+    // watch stdout for `grx-sighup-ready` close the race.
+    #[cfg(unix)]
+    let mut sighup = if handle.tls_paths.is_some() {
+        use tokio::signal::unix::{signal, SignalKind};
+        let stream = signal(SignalKind::hangup())
+            .map_err(|e| CommandError::ClusterArg(format!("SIGHUP register: {e}")))?;
+        println!("grx-sighup-ready {}", std::process::id());
+        Some(stream)
+    } else {
+        None
+    };
 
     loop {
         if let Some(d) = deadline {
@@ -2391,6 +2585,45 @@ pub async fn drive_handle_until(
             }
             _ = sigterm.recv(), if duration.is_none() => {
                 return Ok(LoopExit::Sigterm);
+            }
+            // **M-Prod sub-track #2 Phase B Part 1.** SIGHUP triggers
+            // a cert+key re-read against the absolute paths
+            // captured at boot. Does NOT exit the loop — the
+            // rotation is the unit of work for this select-arm and
+            // we loop back to keep ticking. Skipping `drive_one_tick`
+            // is intentional: the next 50ms tick arm will pick up
+            // the scheduler work; doing both inside one select
+            // iteration would double-bill the tick budget.
+            // `tokio::select!` is fair across arms so a SIGHUP
+            // storm cannot starve ticks.
+            //
+            // **Deviation from plan**: SIGHUP is NOT gated by
+            // `if duration.is_none()` (unlike SIGINT/SIGTERM).
+            // Duration-bounded runs (CI tests, subprocess fixtures,
+            // scheduled cron-style daemons) still need to respond
+            // to operator-driven cert rotation — gating SIGHUP
+            // behind `duration.is_none()` would silently drop the
+            // rotation in those configurations. Since SIGHUP does
+            // NOT exit the loop, gating it provides no shutdown-
+            // semantics benefit; the duration check on sigint/sigterm
+            // exists because those return from the function, which
+            // a duration-bounded run handles via its own `deadline`
+            // arm.
+            //
+            // `sighup` is `Option<Signal>` — `None` for non-TLS
+            // daemons where the gate at registration kept the kernel
+            // default (terminate) in effect. The inner `async`
+            // resolves only when the Signal is `Some` AND fires;
+            // when `None` the inner future pends forever so this
+            // arm is dormant. The `if` guard ensures the select!
+            // doesn't even poll the future when sighup is None.
+            _ = async {
+                match sighup.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => { std::future::pending::<()>().await; }
+                }
+            }, if sighup.is_some() => {
+                handle.reload_tls_from_disk();
             }
         }
         #[cfg(not(unix))]
