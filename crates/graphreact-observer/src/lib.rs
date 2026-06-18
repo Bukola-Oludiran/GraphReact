@@ -36,6 +36,7 @@
 //!   consumers should prefer non-blocking emit).
 
 pub mod audit;
+pub mod audit_chain;
 pub mod auth;
 pub mod bind;
 pub mod events;
@@ -74,6 +75,10 @@ pub use otel::{
 #[cfg(feature = "otel")]
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 
+pub use audit_chain::{
+    replay as replay_audit_chain, AuditChainError, AuditRecord, AuditRecordInput, AuditSink,
+    FileAuditSink, NopAuditSink,
+};
 pub use auth::{AuthError, BearerToken};
 pub use bind::{BindConfig, BindConfigError, BindFlags, DEFAULT_BIND};
 pub use events::TelemetryEvent;

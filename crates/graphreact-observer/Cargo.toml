@@ -40,6 +40,13 @@ arc-swap.workspace = true
 # event (matches `openssl x509 -fingerprint -sha256 -noout`). Pinned
 # to the same major version rustls picks (0.17.x).
 ring = "0.17"
+# **M-Prod sub-track #1 Phase A.** Hash-chained tamper-evident
+# audit-log SINK. The chain digest is SHA-256 over the canonical
+# bytes of each `AuditRecord` (excluding the record's own
+# `this_hash` field); `sha2` already ships at the workspace level
+# (Cargo.toml:82) for the M14 wire-protocol hashes. Reusing it
+# avoids pulling a second SHA-256 implementation.
+sha2.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 hyper.workspace = true
 hyper-util.workspace = true
