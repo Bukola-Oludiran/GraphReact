@@ -1538,6 +1538,22 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     #[allow(unused_assignments)]
     let mut metrics_for_engine_counts: Option<std::sync::Arc<graphreact_observer::MetricsInner>> =
         None;
+    // **M-Prod sub-track #5.** Cluster-readiness counter shared
+    // between the `/v1/readyz` handler and the per-peer dial loop
+    // below. The handler returns 200 once `configured_peers == 0`
+    // (single-node) OR `dialed_count.load() >= 1` (at least one
+    // peer dialed). Each successful `cluster.connect()` below
+    // bumps the counter; partial-init failure stays at 0 so the
+    // partial daemon is correctly NOT-ready.
+    let configured_peers = opts.peers.len();
+    let dialed_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dialed_for_probe = dialed_count.clone();
+    let cluster_readyz_probe: std::sync::Arc<graphreact_observer::ClusterReadyzProbe> =
+        std::sync::Arc::new(move || {
+            configured_peers == 0
+                || dialed_for_probe.load(std::sync::atomic::Ordering::Relaxed) >= 1
+        });
+
     let observer = if let Some(bind_cfg) = opts.observer_bind {
         let metrics = std::sync::Arc::new(graphreact_observer::MetricsInner::new());
         metrics_for_engine_counts = Some(metrics.clone());
@@ -1550,10 +1566,11 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
             use rand::RngCore;
             rand::thread_rng().next_u64()
         };
-        let server = graphreact_observer::spawn_management_api(
+        let server = graphreact_observer::spawn_management_api_with_cluster_readyz(
             bind_cfg,
             metrics,
             process_start_id,
+            Some(cluster_readyz_probe.clone()),
         )
         .await
         .map_err(|e| CommandError::ClusterArg(format!("observer bind: {e}")))?;
@@ -1646,8 +1663,16 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     // any failure short-circuits the daemon boot (substrate-
     // not-MVP: ops would rather see the error early than have a
     // half-converged cluster).
+    //
+    // **M-Prod sub-track #5.** Bump `dialed_count` after each
+    // successful dial so the `/v1/readyz` cluster-membership
+    // probe (constructed above) can return 200 once at least one
+    // peer is alive. The atomic is read by the management API
+    // handler on every readyz request; bumping it here keeps the
+    // probe lock-free.
     for (peer_id, peer_addr) in opts.peers {
         cluster.connect(peer_addr, peer_id).await?;
+        dialed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     Ok(DaemonHandle {

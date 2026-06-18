@@ -484,7 +484,30 @@ pub struct ApiState {
     /// [`PendingCalls::register`] handles HTTP-client-disconnect
     /// eviction.
     pub pending_calls: PendingCalls,
+    /// **M-Prod sub-track #5.** Cluster-membership signal for
+    /// `/v1/readyz`. `None` means the daemon was started without
+    /// a cluster handle (test / engine-free path); the readiness
+    /// predicate falls back to the bridge + first-batch check
+    /// only. `Some(probe)` carries a cheap closure that returns
+    /// `true` when the cluster is "ready" (no peers configured OR
+    /// at least one peer dialed) so the same probe shape works for
+    /// both single-node and multi-node deployments.
+    pub cluster_readyz: Option<Arc<ClusterReadyzProbe>>,
 }
+
+/// **M-Prod sub-track #5.** Cluster-readiness probe shared by the
+/// `/v1/readyz` handler. Held behind `Arc` so the management API
+/// can clone it into every per-request `ApiState`. The closure
+/// captures `(NodeRegistry, configured_peers: usize)` from the
+/// caller; the call site (`commands.rs::start_daemon`) freezes the
+/// configured-peer count at boot time so the predicate doesn't
+/// false-positive on a partition that loses every peer.
+///
+/// The probe returns a boolean (rather than a richer reason
+/// struct) because `/v1/readyz` only needs a binary go/no-go;
+/// per-reason instrumentation is a sub-track #5 follow-on (open
+/// work in [`m-prod-observability.md`](../../../../docs/backend/m-prod-observability.md)).
+pub type ClusterReadyzProbe = dyn Fn() -> bool + Send + Sync;
 
 /// Maximum number of in-flight `SnapshotRequest`s on the bridge
 /// channel. Operators hammering the management API past this rate
@@ -664,6 +687,20 @@ pub async fn spawn(
     metrics: Arc<MetricsInner>,
     process_start_id: u64,
 ) -> Result<ApiServerHandle, std::io::Error> {
+    spawn_with_cluster_readyz(bind, metrics, process_start_id, None).await
+}
+
+/// **M-Prod sub-track #5.** Variant of [`spawn`] that wires a
+/// cluster-readiness probe through [`ApiState::cluster_readyz`].
+/// Used by `start_daemon` so `/v1/readyz` reflects peer-dial
+/// completion. Pass `None` for single-node / engine-free / test
+/// callers (matching [`spawn`]'s legacy behaviour).
+pub async fn spawn_with_cluster_readyz(
+    bind: BindConfig,
+    metrics: Arc<MetricsInner>,
+    process_start_id: u64,
+    cluster_readyz: Option<Arc<ClusterReadyzProbe>>,
+) -> Result<ApiServerHandle, std::io::Error> {
     let listener = TcpListener::bind(bind.addr).await?;
     let local_addr = listener.local_addr()?;
     crate::audit::log_bind(local_addr, bind.tls.is_some(), bind.token.is_some());
@@ -688,6 +725,12 @@ pub async fn spawn(
         websocket: Some(websocket.clone()),
         idempotency_cache: idempotency_cache.clone(),
         pending_calls: pending_calls.clone(),
+        // **M-Prod sub-track #5.** `spawn` defaults cluster_readyz
+        // to `None` (test + engine-free path);
+        // `spawn_with_cluster_readyz` (called by `start_daemon`)
+        // threads the real probe through. `None` here keeps single-
+        // node + no-cluster tests passing without a synthetic probe.
+        cluster_readyz,
     };
     let router = build_router(state);
 
@@ -843,7 +886,14 @@ async fn healthz() -> Response {
 async fn readyz(State(state): State<ApiState>) -> Response {
     let batches = state.metrics.process_batch_duration.snapshot().count;
     let bridge_capacity = state.snapshot_tx.capacity();
-    let ready = batches > 0 && bridge_capacity > 0;
+    // **M-Prod sub-track #5.** Cluster-membership predicate.
+    // When `cluster_readyz` is `None` (test / engine-free path)
+    // we treat cluster as ready so single-node fixtures aren't
+    // false-503'd. When wired, the probe returns `true` if no
+    // peers were configured (single-node deploy) or at least one
+    // peer dialed (multi-node convergence reached).
+    let cluster_ready = state.cluster_readyz.as_ref().is_none_or(|probe| probe());
+    let ready = batches > 0 && bridge_capacity > 0 && cluster_ready;
     if ready {
         (
             StatusCode::OK,
@@ -854,8 +904,13 @@ async fn readyz(State(state): State<ApiState>) -> Response {
     } else {
         let reason: &str = if batches == 0 {
             "scheduler_first_batch_pending"
-        } else {
+        } else if bridge_capacity == 0 {
             "bridge_saturated"
+        } else {
+            // cluster_ready == false. Distinct reason so ops know
+            // peer dialing is the holdup (not engine init, not
+            // scheduler backpressure).
+            "cluster_no_peers_connected"
         };
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1040,8 +1095,23 @@ async fn inject_message_handler(
         payload: body.payload,
         oneshot_tx: tx,
     };
-    if state.snapshot_tx.send(req).await.is_err() {
-        return service_unavailable("scheduler bridge closed");
+    // **M-Prod sub-track #5.** Ingress endpoints use `try_send`
+    // rather than `send().await` so a saturated bridge surfaces as
+    // 503 + `Retry-After: 1` instead of silently parking the axum
+    // task. Read-snapshot bridges (nodes_list / node_detail /
+    // supervisor_tree) keep `send().await`: those are internal
+    // observer→scheduler reads with bounded depth (scheduler is
+    // single-threaded; drain fires after every batch round), and
+    // blocking briefly on them is preferable to a 503 cascade
+    // on the management API's snapshot routes. The bulk per-line
+    // handler already uses `try_send` and renders the same shape
+    // as a `backpressure_503` line.
+    match state.snapshot_tx.try_send(req) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => return bridge_saturated_response(),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return service_unavailable("scheduler bridge closed");
+        }
     }
     match rx.await {
         Ok(InjectResult::Accepted) => (
@@ -1125,10 +1195,22 @@ async fn inject_call_handler(
         correlation_id: correlation_id.clone(),
         oneshot_tx: disp_tx,
     };
-    if state.snapshot_tx.send(req).await.is_err() {
-        // Drop `guard` evicts the registry entry.
-        drop(guard);
-        return service_unavailable("scheduler bridge closed");
+    // **M-Prod sub-track #5.** Same try_send→503+Retry-After
+    // policy as `inject_message_handler` (see comment there for
+    // the ingress-vs-internal-bridge split). On a full bridge,
+    // drop the guard FIRST so the registry entry evicts before
+    // the 503 returns — leaving a dangling slot would shrink the
+    // [`PendingCalls`] capacity until the TTL prune sweeps it.
+    match state.snapshot_tx.try_send(req) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            drop(guard);
+            return bridge_saturated_response();
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            drop(guard);
+            return service_unavailable("scheduler bridge closed");
+        }
     }
     let disposition = match disp_rx.await {
         Ok(d) => d,
@@ -1574,6 +1656,38 @@ async fn supervisor_tree(
 
 fn service_unavailable(msg: &'static str) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
+}
+
+/// **M-Prod sub-track #5.** Backpressure-shaped 503 for ingress
+/// endpoints that fail `snapshot_tx.try_send` because every slot
+/// of the scheduler bridge (capacity = [`SNAPSHOT_CHANNEL_CAPACITY`])
+/// is occupied. The shape matches the `/v1/readyz` bridge-saturation
+/// reply: 503 + `Retry-After: 1` + a stable plain-text reason —
+/// load balancers + k8s probes see the same back-off contract on the
+/// liveness/readiness pair and on individual ingress POSTs, so a
+/// caller hammering a wedged daemon gets uniform behaviour across
+/// the surface.
+///
+/// `Retry-After: 1` is intentional: the bridge drains in milliseconds
+/// once the scheduler-thread loop runs again, so a one-second back-off
+/// is short enough to recover quickly but long enough to avoid
+/// thundering-herd retries from many in-flight clients (see
+/// [`m-prod-observability.md`](../../../../docs/backend/m-prod-observability.md)
+/// for the trade-off rationale).
+fn bridge_saturated_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::RETRY_AFTER, "1"),
+        ],
+        serde_json::json!({
+            "error": "bridge_saturated",
+            "retry_after_secs": 1,
+        })
+        .to_string(),
+    )
+        .into_response()
 }
 
 async fn auth_layer(
