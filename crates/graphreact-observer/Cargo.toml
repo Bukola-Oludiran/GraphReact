@@ -59,6 +59,21 @@ axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 
+# **M-Prod sub-track #6 Phase A.** Per-IP rate limiter for the
+# protected `/v1/*` routes. `tower_governor 0.5.x` is the latest
+# release compatible with our `axum 0.7` pin (0.6+ require axum
+# 0.8 — a separate, larger migration involving handler signatures
+# + extractor changes). When the workspace migrates to axum 0.8,
+# this pin MUST bump in lockstep — flag it on the axum-bump
+# tracking issue. `axum` feature wires `PeerIpKeyExtractor` to read
+# `ConnectInfo<SocketAddr>` from request extensions; the
+# `accept_loop` inserts that extension per accept so the extractor
+# never falls back to `UnableToExtractKey`. `tracing` feature is
+# intentionally OFF so the layer's own events don't bypass the
+# single canonical `target = "graphreact::observer::audit"` sink
+# — the `error_handler` closure rolls the audit event itself.
+tower_governor = { version = "0.5", default-features = false, features = ["axum"] }
+
 # M-Ingress phase 2 — UUIDv4 correlation_id mint for `POST /v1/nodes/:id/call`.
 uuid.workspace = true
 

@@ -171,6 +171,23 @@ pub fn encode_text(inner: &MetricsInner) -> String {
         &inner.process_batch_duration.snapshot(),
     );
 
+    // **M-Prod sub-track #6 Phase A.** Per-route rate-limit-blocked
+    // counter. `route` label is bounded to the protected-route
+    // pattern table (≤ 11 entries + `"unknown"` sentinel); family
+    // is suppressed entirely until the first 429 fires so steady-
+    // state daemons don't pay even a HELP+TYPE line.
+    encode_labeled_counter(
+        &mut s,
+        "grx_rate_limit_blocked_total",
+        "Per-route count of HTTP requests rejected by the per-IP \
+         rate limiter with 429. route label is the protected-route \
+         pattern (e.g. /v1/nodes/:id/messages), classified by the \
+         rate-limit observer middleware from the raw URI path so \
+         cardinality is bounded by the registered protected-route \
+         table.",
+        &inner.rate_limit_blocked,
+    );
+
     s
 }
 
