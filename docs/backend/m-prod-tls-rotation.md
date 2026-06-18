@@ -110,11 +110,21 @@ All three rotation events ride the same `graphreact::observer::audit` target as 
 |---|---|---|---|
 | `tls_reload_attempt` | INFO | `cert_bytes_len: usize`, `key_bytes_len: usize` | Entry to `reload_tls` (BEFORE parsing) |
 | `tls_reloaded` | INFO | `leaf_fingerprint_sha256: &str` (lowercase hex SHA-256) | After successful `RotatableServerConfig::rotate` |
-| `tls_reload_failure` | WARN | `error_kind: &'static str` ∈ {`cert_parse`, `empty_chain`, `key_parse`, `rustls`, `not_configured`}, `detail: &str` (display of `TlsRotationError`) | After any failure point |
+| `tls_reload_failure` | WARN | `error_kind: &'static str` ∈ {`cert_read`, `cert_parse`, `empty_chain`, `key_read`, `key_parse`, `rustls`, `not_configured`}, `detail: &str` (display of `TlsRotationError` or the I/O error) | After any failure point |
 
 **Invariant: cert / key bytes are NEVER logged.** The `cert_bytes_len` / `key_bytes_len` fields on the attempt event give operators a sanity check that the supplied secret was non-empty, but the bytes themselves never enter the structured-field stream. The integration test [`tls_reload_audit_event_fires`](../../crates/graphreact-observer/tests/tls_rotation.rs) enforces this negatively — it scans every captured event for the substrings `-----BEGIN` and `PRIVATE KEY` and fails if either appears.
 
-**Operator dashboard contract.** Counting `event=tls_reloaded` vs `event=tls_reload_failure` across a window gives the operator a rotation success ratio; alerting on the failure event with a per-`error_kind` split surfaces secret-store outages (`cert_parse` after cert-manager rotation), config drift (`rustls` cert/key mismatch), and lifecycle bugs (`not_configured` indicates a daemon that shouldn't be receiving rotation triggers).
+**Operator dashboard contract.** Counting `event=tls_reloaded` vs `event=tls_reload_failure` across a window gives the operator a rotation success ratio; alerting on the failure event with a per-`error_kind` split surfaces:
+
+- `cert_read` / `key_read` — file vanished, permissions broke (EACCES), wrong FS mode → check cert-manager pod / file-system / mount points.
+- `cert_parse` / `key_parse` — malformed PEM → check cert-manager wrote the file fully (incomplete write), check intermediate cert chain.
+- `empty_chain` — cert file present but no PEM blocks parsed → check cert-manager wrote the right artifact (key file instead of cert).
+- `rustls` — cert/key mismatch (different keypairs), or cert validity issue → check cert-manager renewed both in lock-step.
+- `not_configured` — daemon shouldn't be receiving rotation triggers → check ops automation, daemon misconfiguration.
+
+The `cert_read` / `key_read` split (Phase B Part 1 verify-finding patch 2026-06-18) distinguishes I/O failures from PEM-parse failures — they map to different remediation paths. Prior to the patch, both reported as `cert_parse` / `key_parse`, forcing operators to grep `detail` to disambiguate.
+
+**Readiness line for SIGHUP**. TLS-configured daemons emit `grx-sighup-ready <pid>` on stdout after the SIGHUP signal stream is registered (Phase B Part 1 verify-finding patch). Operator tooling (cert-manager hooks, k8s preStop, integration tests) MUST wait for this line before firing the first SIGHUP — a SIGHUP arriving between `grx-observer-ready` and `grx-sighup-ready` would hit the kernel default action (terminate) instead of the rotation handler. Non-TLS daemons (`grx connect`, daemons without `--observer-cert`/`--observer-key`) do NOT emit `grx-sighup-ready` and do NOT install a SIGHUP handler — `kill -HUP` retains the kernel default (terminate) for those run modes.
 
 ## Cross-track contracts
 
