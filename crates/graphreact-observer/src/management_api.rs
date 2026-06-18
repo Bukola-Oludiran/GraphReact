@@ -493,6 +493,18 @@ pub struct ApiState {
     /// at least one peer dialed) so the same probe shape works for
     /// both single-node and multi-node deployments.
     pub cluster_readyz: Option<Arc<ClusterReadyzProbe>>,
+    /// **M-Prod sub-track #1 Phase A.** Hash-chained tamper-evident
+    /// audit sink. `None` for the default test + embedding path:
+    /// the existing `target="graphreact::observer::audit"` tracing
+    /// stream remains the sole audit surface and behavior is
+    /// bit-for-bit identical to the pre-M-Prod baseline. `Some(sink)`
+    /// fans every `audit::log_*` call to the sink in parallel, where
+    /// the sink stamps `{seq, ts_ms, prev_hash, kind, fields,
+    /// this_hash}` and writes one NDJSON line. Wired by
+    /// `graphreact-cli` when the operator passes
+    /// `--observer-audit-log <PATH>`. See `docs/backend/m-prod-auth.md`
+    /// for the Phase B/C/D roadmap.
+    pub audit_sink: Option<Arc<dyn crate::AuditSink>>,
 }
 
 /// **M-Prod sub-track #5.** Cluster-readiness probe shared by the
@@ -588,6 +600,13 @@ pub struct ApiServerHandle {
     /// ACME, today's tests) call that method to swap in a new
     /// cert without restarting the daemon.
     pub tls: Option<crate::RotatableServerConfig>,
+    /// **M-Prod sub-track #1 Phase A.** Audit sink wired through
+    /// [`SpawnOptions::audit_sink`]. Surfaced on the handle so
+    /// [`Self::reload_tls`] can fan the
+    /// `tls_reload_{attempt,success,failure}` records to the same
+    /// sink the accept-loop bind event lands on. `None` keeps the
+    /// legacy tracing-only audit surface bit-for-bit unchanged.
+    pub audit_sink: Option<Arc<dyn crate::AuditSink>>,
 }
 
 impl ApiServerHandle {
@@ -622,11 +641,13 @@ impl ApiServerHandle {
         cert_pem: &[u8],
         key_pem: &[u8],
     ) -> Result<(), crate::TlsRotationError> {
-        crate::audit::log_tls_reload_attempt(cert_pem.len(), key_pem.len());
+        let sink = self.audit_sink.as_ref();
+        crate::audit::log_tls_reload_attempt(cert_pem.len(), key_pem.len(), sink);
         let Some(handle) = self.tls.as_ref() else {
             crate::audit::log_tls_reload_failure(
                 "not_configured",
                 "observer was spawned without TLS at bind time",
+                sink,
             );
             return Err(crate::TlsRotationError::NotConfigured);
         };
@@ -651,7 +672,7 @@ impl ApiServerHandle {
                     crate::TlsRotationError::Rustls { .. } => "rustls",
                     crate::TlsRotationError::NotConfigured => "not_configured",
                 };
-                crate::audit::log_tls_reload_failure(kind, &err.to_string());
+                crate::audit::log_tls_reload_failure(kind, &err.to_string(), sink);
                 return Err(err);
             }
         };
@@ -663,7 +684,7 @@ impl ApiServerHandle {
         // be defensive: surface a sentinel so operators see *some*
         // audit record on every successful rotation.
         let fp = leaf_fingerprint.as_deref().unwrap_or("unavailable");
-        crate::audit::log_tls_reload_success(fp);
+        crate::audit::log_tls_reload_success(fp, sink);
         Ok(())
     }
 }
@@ -806,9 +827,54 @@ pub async fn spawn_with_cluster_readyz(
     process_start_id: u64,
     cluster_readyz: Option<Arc<ClusterReadyzProbe>>,
 ) -> Result<ApiServerHandle, std::io::Error> {
+    spawn_with_options(SpawnOptions {
+        bind,
+        metrics,
+        process_start_id,
+        cluster_readyz,
+        audit_sink: None,
+    })
+    .await
+}
+
+/// **M-Prod sub-track #1 Phase A.** Knob struct passed to
+/// [`spawn_with_options`]. New options are additive — existing
+/// callers either keep using [`spawn`] / [`spawn_with_cluster_readyz`]
+/// (which default the new fields) or migrate to this struct when
+/// they need the new capability.
+pub struct SpawnOptions {
+    pub bind: BindConfig,
+    pub metrics: Arc<MetricsInner>,
+    pub process_start_id: u64,
+    pub cluster_readyz: Option<Arc<ClusterReadyzProbe>>,
+    /// **M-Prod sub-track #1 Phase A.** Hash-chained audit sink.
+    /// `None` keeps the legacy tracing-only audit surface. `Some`
+    /// fans every `audit::log_*` call to the sink in parallel.
+    pub audit_sink: Option<Arc<dyn crate::AuditSink>>,
+}
+
+/// **M-Prod sub-track #1 Phase A.** Full-knob variant of [`spawn`]
+/// accepting a [`SpawnOptions`]. Mirrors [`spawn_with_cluster_readyz`]
+/// plus the `audit_sink` field; this is the call shape
+/// `graphreact-cli` uses when `--observer-audit-log` is set.
+pub async fn spawn_with_options(
+    opts: SpawnOptions,
+) -> Result<ApiServerHandle, std::io::Error> {
+    let SpawnOptions {
+        bind,
+        metrics,
+        process_start_id,
+        cluster_readyz,
+        audit_sink,
+    } = opts;
     let listener = TcpListener::bind(bind.addr).await?;
     let local_addr = listener.local_addr()?;
-    crate::audit::log_bind(local_addr, bind.tls.is_some(), bind.token.is_some());
+    crate::audit::log_bind(
+        local_addr,
+        bind.tls.is_some(),
+        bind.token.is_some(),
+        audit_sink.as_ref(),
+    );
 
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<SnapshotRequest>(SNAPSHOT_CHANNEL_CAPACITY);
 
@@ -836,6 +902,11 @@ pub async fn spawn_with_cluster_readyz(
         // threads the real probe through. `None` here keeps single-
         // node + no-cluster tests passing without a synthetic probe.
         cluster_readyz,
+        // **M-Prod sub-track #1 Phase A.** Audit sink defaults to
+        // `None` unless `spawn_with_options` was called with a
+        // pre-constructed sink (typically `FileAuditSink` opened
+        // by `graphreact-cli` when `--observer-audit-log` is set).
+        audit_sink: audit_sink.clone(),
     };
     let router = build_router(state);
 
@@ -851,9 +922,17 @@ pub async fn spawn_with_cluster_readyz(
     let shutdown = Arc::new(Notify::new());
     let shutdown_for_loop = shutdown.clone();
     let tls_handle_for_loop = tls_handle.clone();
+    let audit_sink_for_loop = audit_sink.clone();
 
     let task = tokio::spawn(async move {
-        accept_loop(listener, router, tls_handle_for_loop, shutdown_for_loop).await;
+        accept_loop(
+            listener,
+            router,
+            tls_handle_for_loop,
+            shutdown_for_loop,
+            audit_sink_for_loop,
+        )
+        .await;
     });
 
     Ok(ApiServerHandle {
@@ -866,6 +945,10 @@ pub async fn spawn_with_cluster_readyz(
         idempotency_cache,
         pending_calls,
         tls: tls_handle,
+        // **M-Prod sub-track #1 Phase A.** Surfaced on the handle so
+        // `reload_tls` can fan TLS-rotation events to the same sink
+        // the accept-loop bind event already lands on.
+        audit_sink,
     })
 }
 
@@ -874,6 +957,7 @@ async fn accept_loop(
     router: Router,
     tls_handle: Option<crate::RotatableServerConfig>,
     shutdown: Arc<Notify>,
+    audit_sink: Option<Arc<dyn crate::AuditSink>>,
 ) {
     use hyper_util::rt::TokioIo;
     use hyper_util::server::conn::auto::Builder as ConnBuilder;
@@ -892,11 +976,26 @@ async fn accept_loop(
                             ?err,
                             "observer accept failed"
                         );
+                        // **M-Prod sub-track #1 Phase A.** Sink fan
+                        // for accept-loop accept failures. `detail`
+                        // is the formatted error message so an
+                        // operator triaging FD exhaustion sees the
+                        // same shape in the chained record they see
+                        // in tracing.
+                        if let Some(sink) = audit_sink.as_ref() {
+                            sink.append(crate::AuditRecordInput {
+                                kind: "accept_failed",
+                                fields: serde_json::json!({
+                                    "detail": format!("{err}"),
+                                }),
+                            });
+                        }
                         continue;
                     }
                 };
                 let router = router.clone();
                 let tls_handle = tls_handle.clone();
+                let audit_sink_for_handshake = audit_sink.clone();
                 tokio::spawn(async move {
                     // axum's `Router` becomes a `tower::Service`
                     // once we feed it a single connection's IO.
@@ -934,6 +1033,20 @@ async fn accept_loop(
                                     ?err,
                                     "observer TLS handshake failed"
                                 );
+                                // **M-Prod sub-track #1 Phase A.**
+                                // Sink fan for per-peer TLS
+                                // handshake failures. Cert + key
+                                // bytes are NEVER logged — only the
+                                // peer + error detail string.
+                                if let Some(sink) = audit_sink_for_handshake.as_ref() {
+                                    sink.append(crate::AuditRecordInput {
+                                        kind: "tls_handshake_failed",
+                                        fields: serde_json::json!({
+                                            "peer": peer.to_string(),
+                                            "detail": format!("{err}"),
+                                        }),
+                                    });
+                                }
                             }
                         }
                     } else {
@@ -1868,6 +1981,21 @@ async fn auth_layer(
                 peer = %peer_repr,
                 "observer auth fail (missing)"
             );
+            // **M-Prod sub-track #1 Phase A.** Fan to the sink in
+            // parallel. The tracing line above is unchanged; the
+            // sink record carries the same `peer` + `reason`
+            // fields the audit::log_auth_fail helper would emit
+            // from an accept-loop callsite. Phase B's RBAC verdict
+            // fields ride here without bumping the line format.
+            if let Some(sink) = state.audit_sink.as_ref() {
+                sink.append(crate::AuditRecordInput {
+                    kind: "auth_fail",
+                    fields: serde_json::json!({
+                        "peer": peer_repr,
+                        "reason": "missing",
+                    }),
+                });
+            }
             challenge_response()
         }
         Some(c) if expected.matches(c.as_bytes()) => next.run(req).await,
@@ -1877,6 +2005,15 @@ async fn auth_layer(
                 peer = %peer_repr,
                 "observer auth fail (wrong)"
             );
+            if let Some(sink) = state.audit_sink.as_ref() {
+                sink.append(crate::AuditRecordInput {
+                    kind: "auth_fail",
+                    fields: serde_json::json!({
+                        "peer": peer_repr,
+                        "reason": "wrong",
+                    }),
+                });
+            }
             challenge_response()
         }
     }

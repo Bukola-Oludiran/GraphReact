@@ -1403,6 +1403,21 @@ impl DaemonHandle {
                         deadline_ms = deadline.as_millis() as u64,
                         "OTel provider shutdown exceeded OBSERVER_SHUTDOWN_DEADLINE",
                     );
+                    // **M-Prod sub-track #1 Phase A.** Fan to the
+                    // sink in parallel. The tracing line above is
+                    // unchanged; the chained record gives operators
+                    // a tamper-evident anchor for the deadline
+                    // breach during teardown.
+                    if let Some(observer) = self.observer.as_ref() {
+                        if let Some(sink) = observer.audit_sink.as_ref() {
+                            sink.append(graphreact_observer::AuditRecordInput {
+                                kind: "otel_shutdown_timeout",
+                                fields: serde_json::json!({
+                                    "deadline_ms": deadline.as_millis() as u64,
+                                }),
+                            });
+                        }
+                    }
                 }
             }
         }

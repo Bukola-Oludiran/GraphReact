@@ -91,7 +91,12 @@ pub async fn spawn(
 ) -> Result<ServerHandle, std::io::Error> {
     let listener = TcpListener::bind(bind.addr).await?;
     let local_addr = listener.local_addr()?;
-    audit::log_bind(local_addr, bind.tls.is_some(), bind.token.is_some());
+    // **M-Prod sub-track #1 Phase A.** Legacy P2 `/metrics` server
+    // is sink-free — pre-management-API embedders use the modern
+    // `spawn_management_api` path to wire an `AuditSink`. Passing
+    // `None` here preserves bit-for-bit identical tracing output
+    // for the legacy server.
+    audit::log_bind(local_addr, bind.tls.is_some(), bind.token.is_some(), None);
 
     let ctx = Arc::new(ServerCtx {
         metrics,
@@ -232,27 +237,29 @@ fn handle_request(
             // shipping the bearer token to every load balancer.
             // P2 is liveness-only; readiness ("can serve metrics
             // for a known scheduler?") lands at M-Prod.
-            audit::log_response(peer, "/healthz", 200, 2);
+            // Legacy P2 server keeps a sink-free fan: see comment
+            // on `audit::log_bind` above.
+            audit::log_response(peer, "/healthz", 200, 2, None);
             response(StatusCode::OK, "text/plain; charset=utf-8", "ok")
         }
         (Method::GET, "/metrics") => match check_auth(req, ctx) {
             AuthCheck::Ok => {
                 let body = encode_text(&ctx.metrics);
                 let bytes = body.len();
-                audit::log_response(peer, "/metrics", 200, bytes);
+                audit::log_response(peer, "/metrics", 200, bytes, None);
                 response(StatusCode::OK, METRICS_CONTENT_TYPE, body)
             }
             AuthCheck::Missing => {
-                audit::log_auth_fail(peer, "missing");
+                audit::log_auth_fail(peer, "missing", None);
                 challenge_response()
             }
             AuthCheck::Wrong => {
-                audit::log_auth_fail(peer, "wrong");
+                audit::log_auth_fail(peer, "wrong", None);
                 challenge_response()
             }
         },
         (_, _) => {
-            audit::log_response(peer, &path, 404, 0);
+            audit::log_response(peer, &path, 404, 0, None);
             response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", "not found")
         }
     }
