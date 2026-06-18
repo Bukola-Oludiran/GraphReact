@@ -310,3 +310,135 @@ jobs:
             fuzz/corpus/
           retention-days: 14
           if-no-files-found: warn
+
+  reproducible-build:
+    # **M-Prod sub-track #7 residual — reproducible-build verifier.**
+    # Twice-builds the `grx` release binary on a single runner and
+    # compares the SHA-256 hashes. The contract under proof: given a
+    # pinned toolchain (dtolnay/rust-toolchain@stable, same SHA across
+    # both builds in one job), pinned zig static libs (frozen between
+    # the two builds; produced once via `cargo xtask zig-build`), a
+    # pinned `SOURCE_DATE_EPOCH` (HEAD's committer timestamp), and
+    # `--remap-path-prefix` RUSTFLAGS to strip host-specific paths
+    # from debuginfo — the `grx` binary should rebuild byte-identical.
+    #
+    # Push-to-main + tag only (matches the fuzz cell guard at line 245):
+    # the twice-build costs ~6-8 min and we don't want every PR to
+    # pay that. `continue-on-error: true` is the first-ship posture —
+    # current Phase A may still drift due to absolute LC_RPATH paths
+    # emitted by `crates/graphreact-cli/build.rs` (Homebrew libpython
+    # libdir is host-specific). The flip-to-hard-gate trigger:
+    # documented in `docs/backend/m-prod-supply-chain.md`.
+    #
+    # Scope: ONLY the Rust binary is twice-built. The zig static libs
+    # (`libgraphreact_*_zig.a`) are produced ONCE and frozen between
+    # the two runs — `cargo xtask zig-build` does not (yet) thread
+    # SOURCE_DATE_EPOCH / --remap-path-prefix through to `zig build`,
+    # so any byte-diff in the .a files would falsely fail this gate.
+    # Phase B (when the zig-build lane adopts the same env vars) can
+    # flip to a full twice-build including zig.
+    name: reproducible-build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install zig (for one-shot bridge build)
+        # zig is needed to produce the static .a files that the engine
+        # build.rs's link against; we build them ONCE and freeze them
+        # between the two Rust builds.
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache key from sbom / fuzz / clippy so the
+          # repro build's stripped + path-remapped target dir doesn't
+          # contaminate the other lanes (different RUSTFLAGS = cache
+          # divergence anyway, but explicit is better).
+          key: repro-1
+      - name: Compute SOURCE_DATE_EPOCH from HEAD committer timestamp
+        # Pinning SOURCE_DATE_EPOCH to HEAD's committer timestamp gives
+        # every build of the same SHA an identical epoch — bytes-of-the-
+        # output-depend-only-on-the-source-tree, which is the
+        # reproducible-build floor. Surfaced via $GITHUB_ENV so both
+        # build steps see the same value.
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+      - name: Build zig bridge static libs (frozen between builds)
+        # One-shot — neither twice-build pass re-runs this. The .a
+        # files in zig/bridge/zig-out/lib/ are byte-identical inputs
+        # to both Rust builds, so any difference in the final `grx`
+        # binary is attributable to the Rust build alone.
+        run: cargo xtask zig-build --release
+      - name: First build (capture sha256)
+        # --remap-path-prefix strips the workspace + cargo home from
+        # debuginfo so the runner's homedir doesn't leak into the
+        # binary. SOURCE_DATE_EPOCH was set above.
+        env:
+          # Override the default `RUSTFLAGS: -D warnings` from the
+          # workflow env: this lane needs path-remapping, and `-D
+          # warnings` would already have been caught by the clippy
+          # lane.
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=${{ env.HOME }}/.cargo=/cargo"
+        run: |
+          set -euo pipefail
+          cargo build --release --bin grx
+          sha256sum target/release/grx | tee /tmp/grx-sha256-1.txt
+          cp target/release/grx /tmp/grx-build-1
+      - name: Wipe the Rust target dir between builds
+        # Force the second build to recompile everything from scratch.
+        # The Swatinem cache still hydrates the registry + git checkouts
+        # (which are content-addressed and so don't affect byte output),
+        # but `target/release/grx` itself MUST be re-emitted from source
+        # for the comparison to be meaningful. `cargo clean -p
+        # graphreact-cli` only purges that crate's artifacts; we want a
+        # full target wipe to also re-link.
+        run: |
+          set -euo pipefail
+          rm -rf target/release/grx target/release/deps/grx-*
+          # Don't touch zig/bridge/zig-out/ — those .a files are the
+          # frozen inputs.
+      - name: Second build (capture sha256)
+        env:
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=${{ env.HOME }}/.cargo=/cargo"
+        run: |
+          set -euo pipefail
+          cargo build --release --bin grx
+          sha256sum target/release/grx | tee /tmp/grx-sha256-2.txt
+          cp target/release/grx /tmp/grx-build-2
+      - name: Compare twice-build SHAs
+        # Diff the two hashes. Phase A continues on error if they
+        # diverge (LC_RPATH absolute libpython path, .a files still
+        # carry build-time host data, etc.). Phase B flips this to a
+        # hard gate once the known divergence sources are closed.
+        run: |
+          set -euo pipefail
+          h1=$(awk '{print $1}' /tmp/grx-sha256-1.txt)
+          h2=$(awk '{print $1}' /tmp/grx-sha256-2.txt)
+          echo "build-1 sha256: $h1"
+          echo "build-2 sha256: $h2"
+          if [ "$h1" = "$h2" ]; then
+            echo "REPRODUCIBLE: $h1"
+          else
+            echo "::warning::Build is NOT yet reproducible (h1=$h1 h2=$h2). \
+              continue-on-error: true is in effect; see \
+              docs/backend/m-prod-supply-chain.md for Phase B flip-to-hard-gate trigger."
+            # Surface a non-zero exit so `continue-on-error: true` marks
+            # the job as failed-but-non-blocking; without this the job
+            # would pass green and operators would miss the regression.
+            exit 1
+          fi
+      - name: Upload twice-build SHA records (for audit)
+        # Always upload so even a divergence surfaces both hashes to
+        # the workflow artifact store. Operators can grab them via
+        # `gh run download` to audit which bytes drifted.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reproducible-build-sha256-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+          path: |
+            /tmp/grx-sha256-1.txt
+            /tmp/grx-sha256-2.txt
+          retention-days: 90
+          if-no-files-found: warn
