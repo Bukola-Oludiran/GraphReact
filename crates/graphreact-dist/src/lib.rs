@@ -94,8 +94,9 @@ pub use telemetry::TelemetrySinkSlot;
 pub use tls_config::TlsConfig;
 pub use transport::{Connection, Listener};
 pub use wire::{
-    MAX_FRAME_BYTES, MIN_SUPPORTED_VERSION, Packet, PacketType, PgBroadcast, ReloadModulePacket,
-    WireCodec, WireExitReason, WireFrame, WIRE_VERSION,
+    CAP_AUDIT_CHAIN, CAP_DELEGATED_RESTART, CAP_MIXED_RUNTIME, MAX_FRAME_BYTES,
+    MIN_SUPPORTED_VERSION, Packet, PacketType, PgBroadcast, ReloadModulePacket, WireCodec,
+    WireExitReason, WireFrame, WIRE_VERSION,
 };
 
 /// Result alias used throughout the dist crate.

@@ -4,6 +4,27 @@
 //! is `#[derive(Serialize, Deserialize)]` postcard-compatible.
 //!
 //! Field order in each struct is the on-wire order.
+//!
+//! ## Capability surfaces (Phase β)
+//!
+//! Two parallel surfaces carry per-engine + per-feature capability
+//! advertisement:
+//!
+//! - [`Hello::capabilities`] / [`ChallengeAck::server_capabilities`]
+//!   — `Vec<String>` of per-feature opt-in flags
+//!   (`"reload-v1"`, `"observer-otel-v1"`, `"ingress-call-v1"`,
+//!   etc.). Open string set; each consumer owns its flag name.
+//! - [`Hello::capabilities_bitmap`] /
+//!   [`ChallengeAck::capabilities_bitmap`] — `u64` typed bitmap for
+//!   substrate-level engine capabilities ([`CAP_MIXED_RUNTIME`],
+//!   [`CAP_DELEGATED_RESTART`], [`CAP_AUDIT_CHAIN`]). Closed flag
+//!   set governed by the dist crate.
+//!
+//! Future contributors: a new feature picks ONE surface — don't
+//! double-declare. String-vec is for per-feature opt-in flags
+//! (engines may not implement all of them); the bitmap is for
+//! substrate-level capabilities that the dist crate or other
+//! cross-engine layers structure dispatch around.
 
 use serde::{Deserialize, Serialize};
 
@@ -48,11 +69,63 @@ use serde::{Deserialize, Serialize};
 ///   `2 → 3` bump: v3 peers cannot interop with v4 peers; M-Prod
 ///   owns rolling-version negotiation. The capability flag handles
 ///   in-version graceful-mixed-version operation.
-pub const WIRE_VERSION: u16 = 4;
+/// - `5` — **M-Prod sub-track #4 Phase β.** Rolling-version safe-slice.
+///   Adds [`Hello::capabilities_bitmap: u64`] and
+///   [`ChallengeAck::capabilities_bitmap: u64`] as a parallel typed
+///   capability surface alongside the existing `Vec<String>`
+///   per-feature flags. The floor [`MIN_SUPPORTED_VERSION`] no
+///   longer tracks [`WIRE_VERSION`] one-for-one — it lags by one to
+///   open a one-bump rolling-upgrade compat window so v4 daemons
+///   can interop with v5 daemons during a cluster rollout. v4 peers
+///   shipping a Hello/ChallengeAck WITHOUT the new field are
+///   accepted via a dual-struct fallback in
+///   [`crate::wire::WireCodec::decode`] that synthesises
+///   `capabilities_bitmap = 0` (no substrate-bitmap capabilities
+///   advertised). Future bumps either move BOTH constants together
+///   (when no compat window is desired) OR move WIRE_VERSION only
+///   (to widen the window). Planned consumers: #4 Phase γ
+///   (cross-node delegated-restart, [`CAP_DELEGATED_RESTART`]) and
+///   #1 Phase B (multi-token audit-chain, [`CAP_AUDIT_CHAIN`]).
+pub const WIRE_VERSION: u16 = 5;
 /// Minimum protocol version this build will accept on a Hello/Challenge.
-/// Equal to [`WIRE_VERSION`] today; widens on backwards-compatible
-/// extension, narrows on deprecation.
+///
+/// Lags [`WIRE_VERSION`] by one for one-bump rolling-upgrade
+/// compatibility as of Phase β (sub-track #4). Future bumps either
+/// move both constants together (no compat window) OR move
+/// [`WIRE_VERSION`] only (widen the window by one). The handshake
+/// also rejects peers ABOVE [`WIRE_VERSION`] (future peers we don't
+/// understand) — see [`crate::handshake::server_handshake`].
 pub const MIN_SUPPORTED_VERSION: u16 = 4;
+
+/// **Phase β (sub-track #4).** Per-engine capability bitmap exchanged in
+/// [`Hello::capabilities_bitmap`] / [`ChallengeAck::capabilities_bitmap`].
+/// Distinct from the existing [`Hello::capabilities`] `Vec<String>` —
+/// the bitmap is the new typed-flag surface for substrate features;
+/// the string vec stays for per-feature opt-in flags
+/// (`"reload-v1"`, `"observer-otel-v1"`, `"ingress-call-v1"`).
+///
+/// Both sides exchange their LOCAL bitmap; the negotiated
+/// "effective" set is the bitwise AND of `our_bitmap & peer_bitmap`,
+/// queryable from [`crate::Cluster::peer_effective_capabilities`].
+///
+/// Phase β only EXPOSES the bitmap — no dispatch path consumes it
+/// yet. The first consumer ships in Phase γ (M14.11 cross-node
+/// delegated-restart via [`CAP_DELEGATED_RESTART`]).
+///
+/// Reserved-but-unimplemented placeholder for M22 mixed-runtime
+/// (cross-engine routing under one daemon). Listed here so the bit
+/// position is reserved across the substrate before the M22 work
+/// lands.
+pub const CAP_MIXED_RUNTIME: u64 = 1 << 0;
+/// **Phase β (sub-track #4).** Reserved for M14.11 cross-node
+/// delegated-restart — supervisors on one node delegating restart
+/// to another node's supervision tree. Phase γ consumer.
+pub const CAP_DELEGATED_RESTART: u64 = 1 << 1;
+/// **Phase β (sub-track #4).** Reserved for the M-Prod #1 multi-token
+/// audit-chain feature — hash-chained audit-event sequences shipped
+/// alongside cluster-wide reloads + cross-node delegated operations.
+/// #1 Phase B consumer.
+pub const CAP_AUDIT_CHAIN: u64 = 1 << 2;
 
 /// Single-byte type discriminant for every wire packet.
 ///
@@ -139,6 +212,41 @@ pub struct Hello {
     pub node_name: String,
     pub creation: u32,
     pub capabilities: Vec<String>,
+    /// **Phase β (sub-track #4).** Per-engine capability bitmap.
+    /// Substrate-level typed flag surface; see [`CAP_MIXED_RUNTIME`],
+    /// [`CAP_DELEGATED_RESTART`], [`CAP_AUDIT_CHAIN`]. v4 peers
+    /// (without this field on the wire) decode via the
+    /// [`HelloV4`] fallback path in
+    /// [`crate::wire::WireCodec::decode`], synthesising
+    /// `capabilities_bitmap = 0` (no substrate-bitmap capabilities
+    /// advertised). Outbound from v5 daemons always populates this
+    /// field — v4 peers parse the new shape as garbage if they tried
+    /// (postcard would error with `DeserializeUnexpectedEnd` on the
+    /// trailing u64), so v4 peers MUST be on the receiving end of
+    /// the dual-struct fallback rather than the dispatching end.
+    /// That's only true for receivers running v5 or newer; v4
+    /// daemons in a mixed cluster see v5 Hellos as malformed and
+    /// drop the connection — Phase β's compat is one-directional
+    /// (v5 accepts v4; v4 does NOT accept v5). Operators rolling a
+    /// cluster therefore upgrade ALL daemons one bump up (v4→v5)
+    /// before any operator-driven feature that consumes the bitmap
+    /// (Phase γ +) starts demanding `capabilities_bitmap != 0`.
+    pub capabilities_bitmap: u64,
+}
+
+/// **Phase β internal.** v4 wire shape of [`Hello`] (without
+/// `capabilities_bitmap`). Used ONLY by the codec's
+/// fallback-on-`DeserializeUnexpectedEnd` path in
+/// [`crate::wire::WireCodec::decode`] so v5 daemons can parse v4
+/// peers' Hello payloads. Never constructed by the handshake code
+/// paths — they always emit the current [`Hello`] shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct HelloV4 {
+    pub version: u16,
+    pub flags: u32,
+    pub node_name: String,
+    pub creation: u32,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,6 +278,25 @@ pub struct ChallengeAck {
     /// learns them from `Hello.capabilities`, so cluster-wide
     /// hot reload (and any future capability-gated dispatch) can
     /// filter peers regardless of which side dialled.
+    pub server_capabilities: Vec<String>,
+    /// **Phase β (sub-track #4).** Server's capability bitmap (mirrors
+    /// [`Hello::capabilities_bitmap`]). v4 peers without this field
+    /// decode via the [`ChallengeAckV4`] fallback path in
+    /// [`crate::wire::WireCodec::decode`], synthesising
+    /// `capabilities_bitmap = 0`. Outbound from v5 daemons always
+    /// populates the field — see [`Hello::capabilities_bitmap`] for
+    /// the one-directional compat caveat.
+    pub capabilities_bitmap: u64,
+}
+
+/// **Phase β internal.** v4 wire shape of [`ChallengeAck`] (without
+/// `capabilities_bitmap`). Used ONLY by the codec's
+/// fallback-on-`DeserializeUnexpectedEnd` path in
+/// [`crate::wire::WireCodec::decode`]. Never constructed by the
+/// handshake code paths.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ChallengeAckV4 {
+    pub digest: [u8; 32],
     pub server_capabilities: Vec<String>,
 }
 

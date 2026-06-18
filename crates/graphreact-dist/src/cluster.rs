@@ -92,6 +92,16 @@ pub struct ClusterConfig {
     pub cookie: SecretCookie,
     pub tls: TlsConfig,
     pub capabilities: Vec<String>,
+    /// **Phase β (sub-track #4).** Per-engine substrate capability
+    /// bitmap advertised on the local Hello/ChallengeAck. The peer's
+    /// bitmap is bitwise-ANDed with this to produce the negotiated
+    /// "effective" set queryable via
+    /// [`Cluster::peer_effective_capabilities`]. Default `0` (no
+    /// substrate-bitmap capabilities advertised); higher layers
+    /// (typically `graphreact-cli`) compose the bitmap from
+    /// `CAP_MIXED_RUNTIME | CAP_DELEGATED_RESTART | CAP_AUDIT_CHAIN`
+    /// per the engine's actual capabilities.
+    pub capabilities_bitmap: u64,
     /// **M14.7.** Tick / partition-detection knobs. Default
     /// is OTP-shaped (5s tick, 3 misses → 15s detection
     /// floor); tests typically override to 100ms / 2.
@@ -420,6 +430,23 @@ impl Cluster {
         self.peer_states.get(name).map(|e| *e.value())
     }
 
+    /// **Phase β (sub-track #4).** Effective capability bitmap
+    /// negotiated with the peer at handshake completion (bitwise
+    /// AND of `our_local_bitmap & peer_advertised_bitmap`). Returns
+    /// `None` if the peer is not currently registered.
+    ///
+    /// Capability-gated dispatch (Phase γ +) consults this to
+    /// decide whether to ship a feature-specific packet to a given
+    /// peer. Phase β only EXPOSES the value — no dispatch path
+    /// consumes it yet (the first consumer ships in Phase γ via
+    /// M14.11 delegated-restart).
+    #[must_use]
+    pub fn peer_effective_capabilities(&self, name: &str) -> Option<u64> {
+        self.registry
+            .get_by_name(name)
+            .map(|h| h.effective_capabilities)
+    }
+
     /// Outbound dial. Performs TLS handshake + OTP-style handshake;
     /// on success registers the peer + spawns its connection task.
     pub async fn connect(
@@ -435,6 +462,7 @@ impl Cluster {
             self.config.creation,
             &expected_peer,
             self.config.capabilities.clone(),
+            self.config.capabilities_bitmap,
         )
         .await?;
         promote_connection_client(
@@ -442,6 +470,7 @@ impl Cluster {
             result.peer_node,
             result.peer_creation,
             result.peer_capabilities,
+            result.effective_capabilities,
             self.registry.clone(),
             self.scheduler_handle.clone(),
             self.supervision.clone(),
@@ -480,6 +509,7 @@ impl Cluster {
             self.config.creation,
             &expected_peer,
             self.config.capabilities.clone(),
+            self.config.capabilities_bitmap,
         )
         .await?;
         promote_connection_client(
@@ -487,6 +517,7 @@ impl Cluster {
             result.peer_node,
             result.peer_creation,
             result.peer_capabilities,
+            result.effective_capabilities,
             self.registry.clone(),
             self.scheduler_handle.clone(),
             self.supervision.clone(),
@@ -518,6 +549,7 @@ impl Cluster {
             &self.config.node_id,
             self.config.creation,
             self.config.capabilities.clone(),
+            self.config.capabilities_bitmap,
         )
         .await?;
         promote_connection_server(
@@ -525,6 +557,7 @@ impl Cluster {
             result.peer_node,
             result.peer_creation,
             result.peer_capabilities,
+            result.effective_capabilities,
             self.registry.clone(),
             self.scheduler_handle.clone(),
             self.supervision.clone(),
@@ -1125,6 +1158,7 @@ async fn handle_inbound(
         &config.node_id,
         config.creation,
         config.capabilities.clone(),
+        config.capabilities_bitmap,
     )
     .await
     {
@@ -1140,6 +1174,7 @@ async fn handle_inbound(
         result.peer_node,
         result.peer_creation,
         result.peer_capabilities,
+        result.effective_capabilities,
         registry,
         scheduler_handle,
         supervision,
@@ -1170,6 +1205,7 @@ fn promote_connection_server<S>(
     peer_node: NodeId,
     peer_creation: Creation,
     peer_capabilities: Vec<String>,
+    effective_capabilities: u64,
     registry: NodeRegistry,
     scheduler_handle: SchedulerHandle,
     supervision: RemoteSupervision,
@@ -1188,6 +1224,7 @@ fn promote_connection_server<S>(
         peer_creation,
         send_tx,
         peer_capabilities,
+        effective_capabilities,
     ));
     let last_tick = Arc::clone(&handle.last_tick);
     if let Err(e) = registry.insert(handle) {
@@ -1241,6 +1278,7 @@ fn promote_connection_client<S>(
     peer_node: NodeId,
     peer_creation: Creation,
     peer_capabilities: Vec<String>,
+    effective_capabilities: u64,
     registry: NodeRegistry,
     scheduler_handle: SchedulerHandle,
     supervision: RemoteSupervision,
@@ -1259,6 +1297,7 @@ fn promote_connection_client<S>(
         peer_creation,
         send_tx,
         peer_capabilities,
+        effective_capabilities,
     ));
     let last_tick = Arc::clone(&handle.last_tick);
     if let Err(e) = registry.insert(handle) {
@@ -1574,6 +1613,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(b"shared".to_vec()).unwrap(),
             tls: bob_tls.config.clone(),
             capabilities: vec!["ping-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -1623,6 +1663,7 @@ mod tests {
             cookie,
             tls: alice_tls.config.clone(),
             capabilities: vec!["ping-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -1741,6 +1782,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[1].config.clone(),
             capabilities: vec!["mon-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -1798,6 +1840,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[0].config.clone(),
             capabilities: vec!["mon-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -1826,6 +1869,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie).unwrap(),
             tls: identities[2].config.clone(),
             capabilities: vec!["mon-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -2007,6 +2051,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[0].config.clone(),
             capabilities: vec!["pg-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -2035,6 +2080,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[1].config.clone(),
             capabilities: vec!["pg-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -2063,6 +2109,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie).unwrap(),
             tls: identities[2].config.clone(),
             capabilities: vec!["pg-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -2253,6 +2300,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(b"shared".to_vec()).unwrap(),
             tls: bob_tls.config.clone(),
             capabilities: vec!["tick-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig {
                 tick_interval: Duration::from_millis(100),
                 miss_threshold: 3,
@@ -2274,6 +2322,7 @@ mod tests {
             cookie,
             tls: alice_tls.config.clone(),
             capabilities: vec!["tick-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig {
                 tick_interval: Duration::from_millis(100),
                 miss_threshold: 3,
@@ -2431,6 +2480,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[0].config.clone(),
             capabilities: vec!["soak-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig {
                 tick_interval: Duration::from_millis(200),
                 miss_threshold: 5,
@@ -2464,6 +2514,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[1].config.clone(),
             capabilities: vec!["soak-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig {
                 tick_interval: Duration::from_millis(200),
                 miss_threshold: 5,
@@ -2497,6 +2548,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie).unwrap(),
             tls: identities[2].config.clone(),
             capabilities: vec!["soak-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig {
                 tick_interval: Duration::from_millis(200),
                 miss_threshold: 5,
@@ -2705,6 +2757,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(b"shared".to_vec()).unwrap(),
             tls: bob_tls.config.clone(),
             capabilities: vec!["tick-v1".into()],
+            capabilities_bitmap: 0,
             // Disable the cluster-wide tick loop here — it would
             // race with the manual Tick we send below and the
             // assertion would have to filter out spurious ticks.
@@ -2730,6 +2783,7 @@ mod tests {
             cookie,
             tls: alice_tls.config.clone(),
             capabilities: vec!["tick-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig {
                 tick_interval: Duration::from_secs(3600),
                 miss_threshold: 1,
@@ -2911,6 +2965,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(b"split-cookie".to_vec()).unwrap(),
             tls: bob_tls.config.clone(),
             capabilities: vec!["split-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig {
                 tick_interval: Duration::from_millis(100),
                 miss_threshold: 2,
@@ -2931,6 +2986,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(b"split-cookie".to_vec()).unwrap(),
             tls: alice_tls.config.clone(),
             capabilities: vec!["split-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig {
                 tick_interval: Duration::from_millis(100),
                 miss_threshold: 2,
@@ -3091,6 +3147,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[0].config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3101,6 +3158,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[1].config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3111,6 +3169,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie).unwrap(),
             tls: identities[2].config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3269,6 +3328,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[0].config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3279,6 +3339,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[1].config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3290,6 +3351,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie).unwrap(),
             tls: identities[2].config.clone(),
             capabilities: vec!["grx-v1".into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3394,6 +3456,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities.0.config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3404,6 +3467,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie).unwrap(),
             tls: identities.1.config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3533,6 +3597,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[0].config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3543,6 +3608,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
             tls: identities[1].config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3553,6 +3619,7 @@ mod tests {
             cookie: SecretCookie::from_bytes(cookie).unwrap(),
             tls: identities[2].config.clone(),
             capabilities: vec!["grx-v1".into(), RELOAD_V1_CAPABILITY.into()],
+            capabilities_bitmap: 0,
             net_tick: NetTickConfig::default(),
             net_split_policy: NetSplitPolicy::default(),
         };
@@ -3800,6 +3867,7 @@ mod tests {
             Creation(1),
             tx_a,
             vec!["grx-v1".into(), INGRESS_CALL_V1_CAPABILITY.into()],
+            0,
         );
         assert!(peer_supports_ingress_call_v1(&peer_with_cap));
 
@@ -3813,6 +3881,7 @@ mod tests {
             Creation(1),
             tx_b,
             vec!["grx-v1".into()],
+            0,
         );
         assert!(!peer_supports_ingress_call_v1(&peer_without_cap));
 

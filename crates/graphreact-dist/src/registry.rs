@@ -55,6 +55,17 @@ pub struct PeerHandle {
     /// capability-gated dispatch (e.g. `Cluster::reload_module`
     /// only ships to peers with `"reload-v1"` listed).
     pub capabilities: Vec<String>,
+    /// **Phase β (sub-track #4).** Effective (negotiated) substrate
+    /// capability bitmap — bitwise AND of our local bitmap and the
+    /// peer's advertised bitmap, computed by
+    /// [`crate::handshake::server_handshake`] /
+    /// [`crate::handshake::client_handshake`]. v4 peers without a
+    /// wire-level bitmap decode to `0` via the codec fallback path,
+    /// so v4-with-v5 pairings always see `0` here. Phase β only
+    /// EXPOSES the value (via
+    /// [`crate::Cluster::peer_effective_capabilities`]); no
+    /// dispatch path consumes it yet (Phase γ consumer).
+    pub effective_capabilities: u64,
 }
 
 impl PeerHandle {
@@ -67,6 +78,7 @@ impl PeerHandle {
         creation: Creation,
         send_tx: mpsc::Sender<Packet>,
         capabilities: Vec<String>,
+        effective_capabilities: u64,
     ) -> Self {
         Self {
             node,
@@ -74,6 +86,7 @@ impl PeerHandle {
             send_tx,
             last_tick: Arc::new(AtomicU64::new(now_ms())),
             capabilities,
+            effective_capabilities,
         }
     }
 
@@ -213,7 +226,13 @@ mod tests {
 
     fn make_handle(node: &str, creation: u32) -> Arc<PeerHandle> {
         let (tx, _rx) = mpsc::channel(8);
-        Arc::new(PeerHandle::new(id(node), Creation(creation), tx, Vec::new()))
+        Arc::new(PeerHandle::new(
+            id(node),
+            Creation(creation),
+            tx,
+            Vec::new(),
+            0,
+        ))
     }
 
     #[test]

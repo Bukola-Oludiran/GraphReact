@@ -74,6 +74,19 @@ pub struct HandshakeResult {
     pub peer_node: NodeId,
     pub peer_creation: Creation,
     pub peer_capabilities: Vec<String>,
+    /// **Phase β (sub-track #4).** Bitwise AND of our local
+    /// substrate capability bitmap and the peer's, computed at
+    /// handshake completion. v4 peers (which don't ship a bitmap
+    /// on the wire) decode through the
+    /// [`crate::wire::WireCodec`] fallback path with
+    /// `capabilities_bitmap = 0`, so the AND with our local
+    /// bitmap is also `0` — they advertise no substrate-bitmap
+    /// capabilities, by design.
+    ///
+    /// Capability-gated dispatch (Phase γ +) consults this via
+    /// [`crate::Cluster::peer_effective_capabilities`] to decide
+    /// whether to ship feature-specific packets to a given peer.
+    pub effective_capabilities: u64,
 }
 
 /// Drive the server-side handshake. The connection must already be
@@ -81,12 +94,28 @@ pub struct HandshakeResult {
 /// [`crate::transport::accept_over`]). On success, the peer's
 /// identity is verified at both the TLS cert layer and the cluster
 /// cookie layer.
+///
+/// **Phase β (sub-track #4):** also accepts/advertises a per-engine
+/// capability bitmap. The peer's bitmap is bitwise-ANDed with our
+/// local bitmap to produce
+/// [`HandshakeResult::effective_capabilities`]. v4 peers that don't
+/// ship a bitmap on the wire decode through the codec's fallback
+/// path with `capabilities_bitmap = 0`, so the AND with our local
+/// bitmap is also `0` (they advertise no substrate-bitmap
+/// capabilities, by design).
+///
+/// Audit events are emitted on the `graphreact::observer::audit`
+/// target on both rejection paths (`cluster_handshake_rejected`,
+/// reason ∈ `{wire_version_below_floor, wire_version_above_ceiling}`)
+/// and on success (`cluster_handshake_complete`).
+#[allow(clippy::too_many_arguments)]
 pub async fn server_handshake<S>(
     conn: &mut Connection<S>,
     cookie: &SecretCookie,
     our_name: &NodeId,
     our_creation: Creation,
     our_capabilities: Vec<String>,
+    our_capabilities_bitmap: u64,
 ) -> Result<HandshakeResult, DistError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -102,7 +131,36 @@ where
         }
         None => return Err(DistError::PeerDisconnected),
     };
+    // Phase β: reject above-ceiling FIRST — future peers we don't
+    // understand are caught here. The ceiling is exclusive
+    // (WIRE_VERSION is the current build's version; anything
+    // higher is unknown). v4 peers (below WIRE_VERSION but at or
+    // above MIN_SUPPORTED_VERSION) fall through this block.
+    if hello.version > WIRE_VERSION {
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            event = "cluster_handshake_rejected",
+            peer_wire_version = hello.version,
+            local_wire_version = WIRE_VERSION,
+            reason = "wire_version_above_ceiling",
+            "cluster handshake rejected: peer version above local ceiling"
+        );
+        return Err(DistError::UnsupportedVersion {
+            got: hello.version,
+            // The error variant uses `min` for both bounds in
+            // Phase β; see DistError doc for the dual-use note.
+            min: MIN_SUPPORTED_VERSION,
+        });
+    }
     if hello.version < MIN_SUPPORTED_VERSION {
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            event = "cluster_handshake_rejected",
+            peer_wire_version = hello.version,
+            local_wire_version = WIRE_VERSION,
+            reason = "wire_version_below_floor",
+            "cluster handshake rejected: peer version below local floor"
+        );
         return Err(DistError::UnsupportedVersion {
             got: hello.version,
             min: MIN_SUPPORTED_VERSION,
@@ -113,6 +171,11 @@ where
     })?;
     let peer_creation = Creation(hello.creation);
     let peer_capabilities = hello.capabilities;
+    // Phase β: capture peer's substrate-bitmap and compute the
+    // effective (negotiated) set as the bitwise AND with ours.
+    let peer_bitmap = hello.capabilities_bitmap;
+    let effective_capabilities = our_capabilities_bitmap & peer_bitmap;
+    let peer_wire_version = hello.version;
 
     // 2. Send Challenge — random nonce + our identity.
     let server_challenge = generate_challenge();
@@ -146,17 +209,35 @@ where
     //    client side learns them — closes the M14.3 substrate gap
     //    where client-side `client_handshake` returned an empty
     //    `peer_capabilities`.
+    //    Wire v5 (Phase β sub-track #4): also echo our substrate-
+    //    bitmap so the client side can compute its own effective
+    //    set symmetrically.
     let ack_digest = compute_digest(cookie, &reply.challenge);
     conn.send(Packet::ChallengeAck(ChallengeAck {
         digest: ack_digest,
         server_capabilities: our_capabilities,
+        capabilities_bitmap: our_capabilities_bitmap,
     }))
     .await?;
+
+    // Phase β: success audit event. `peer_wire_version` is the
+    // value from the peer's Hello — authoritative on the server
+    // path. `negotiated_capabilities` is the bitwise AND.
+    tracing::info!(
+        target: "graphreact::observer::audit",
+        event = "cluster_handshake_complete",
+        peer_id = %peer_node,
+        peer_wire_version,
+        local_wire_version = WIRE_VERSION,
+        negotiated_capabilities = effective_capabilities,
+        "cluster handshake complete"
+    );
 
     Ok(HandshakeResult {
         peer_node,
         peer_creation,
         peer_capabilities,
+        effective_capabilities,
     })
 }
 
@@ -169,6 +250,7 @@ where
 /// different NodeId, the handshake fails with
 /// [`DistError::UnexpectedPeer`] — protects against misconfigured
 /// discovery entries and impersonation attempts.
+#[allow(clippy::too_many_arguments)]
 pub async fn client_handshake<S>(
     conn: &mut Connection<S>,
     cookie: &SecretCookie,
@@ -176,6 +258,7 @@ pub async fn client_handshake<S>(
     our_creation: Creation,
     expected_peer: &NodeId,
     capabilities: Vec<String>,
+    our_capabilities_bitmap: u64,
 ) -> Result<HandshakeResult, DistError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -187,6 +270,7 @@ where
         node_name: our_name.to_string(),
         creation: our_creation.0,
         capabilities: capabilities.clone(),
+        capabilities_bitmap: our_capabilities_bitmap,
     }))
     .await?;
 
@@ -239,6 +323,34 @@ where
         return Err(DistError::AuthFailed);
     }
 
+    // Phase β: capture peer's substrate-bitmap (v4 peers decode
+    // with bitmap = 0 via the codec fallback path) and compute
+    // the effective set.
+    let peer_bitmap = ack.capabilities_bitmap;
+    let effective_capabilities = our_capabilities_bitmap & peer_bitmap;
+
+    // Phase β: success audit event. NOTE — on the client path the
+    // peer's `Hello`-version is NOT delivered (the `Challenge`
+    // packet doesn't carry a version field today). We populate
+    // `peer_wire_version` with our LOCAL WIRE_VERSION as a
+    // best-effort tag: if the handshake reached this point the
+    // peer is AT LEAST at our floor (else server-side reject
+    // would've fired) AND AT MOST at our ceiling (else the
+    // peer's parsing of our Hello would've gone sideways before
+    // we got the Challenge). Phase γ may extend the
+    // `Challenge` packet shape to carry the peer's version
+    // explicitly if precise peer-version tracking becomes
+    // load-bearing.
+    tracing::info!(
+        target: "graphreact::observer::audit",
+        event = "cluster_handshake_complete",
+        peer_id = %server_node,
+        peer_wire_version = WIRE_VERSION,
+        local_wire_version = WIRE_VERSION,
+        negotiated_capabilities = effective_capabilities,
+        "cluster handshake complete"
+    );
+
     Ok(HandshakeResult {
         peer_node: server_node,
         peer_creation: Creation(challenge.creation),
@@ -249,6 +361,7 @@ where
         // for cluster-wide hot reload + any future capability-
         // gated dispatch.
         peer_capabilities: ack.server_capabilities,
+        effective_capabilities,
     })
 }
 
@@ -331,6 +444,7 @@ mod tests {
                 &alice_node,
                 Creation(1),
                 vec!["mon-v1".into(), "reload-v1".into()],
+                0,
             )
             .await;
             let _ = conn.close().await;
@@ -346,6 +460,7 @@ mod tests {
                 Creation(2),
                 &expected_peer,
                 vec!["pg-v1".into()],
+                0,
             )
             .await;
             let _ = conn.close().await;
@@ -441,5 +556,490 @@ mod tests {
         let a = generate_challenge();
         let b = generate_challenge();
         assert_ne!(a, b);
+    }
+}
+
+/// **Phase β (sub-track #4).** Rolling-version handshake tests.
+///
+/// Lives inside `src/handshake.rs` rather than an external
+/// `tests/` directory because it needs the `pub(crate) dev_tls`
+/// helpers (gated behind `#[cfg(test)]`) and the v4-payload
+/// raw-byte injection helper below.
+#[cfg(test)]
+mod rolling_version_tests {
+    use super::*;
+    use crate::dev_tls;
+    use crate::transport::{accept_over, dial_over};
+    use crate::wire::packet::{ChallengeReply, HelloV4, PacketType};
+    use crate::wire::{
+        CAP_AUDIT_CHAIN, CAP_DELEGATED_RESTART, CAP_MIXED_RUNTIME, MIN_SUPPORTED_VERSION,
+        WIRE_VERSION,
+    };
+
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::codec::Decoder as _;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Registry;
+
+    fn cookie_str(s: &str) -> SecretCookie {
+        SecretCookie::from_bytes(s.as_bytes().to_vec()).unwrap()
+    }
+
+    /// Build a v4-shape Hello frame (no `capabilities_bitmap`)
+    /// using the [`HelloV4`] private struct. Returns the
+    /// `[Type:u8][Len:u32 BE][Payload]` byte vector ready to be
+    /// shipped via a raw `AsyncWrite::write_all`.
+    fn build_v4_hello_frame(version: u16, node_name: &str, creation: u32) -> Vec<u8> {
+        let payload = postcard::to_stdvec(&HelloV4 {
+            version,
+            flags: 0,
+            node_name: node_name.to_string(),
+            creation,
+            capabilities: vec!["pg-v1".to_string()],
+        })
+        .expect("encode HelloV4");
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(PacketType::Hello as u8);
+        let len_u32: u32 = u32::try_from(payload.len()).unwrap();
+        frame.extend_from_slice(&len_u32.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Build a real v5 ChallengeReply frame so the simulated v4
+    /// client can complete step 3 of the handshake after the
+    /// server's Challenge arrives.
+    fn build_challenge_reply_frame(
+        cookie: &SecretCookie,
+        server_challenge: &[u8; 32],
+        client_challenge: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut mac = HmacSha256::new_from_slice(cookie.as_bytes())
+            .expect("HMAC-SHA256 accepts arbitrary key lengths");
+        mac.update(server_challenge);
+        let result = mac.finalize().into_bytes();
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&result);
+        let payload = postcard::to_stdvec(&ChallengeReply {
+            challenge: *client_challenge,
+            digest,
+        })
+        .expect("encode ChallengeReply");
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(PacketType::ChallengeReply as u8);
+        let len_u32: u32 = u32::try_from(payload.len()).unwrap();
+        frame.extend_from_slice(&len_u32.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Capture audit-target tracing events into a shared buffer
+    /// (one JSON line per event with target/level/event plus the
+    /// emitted field key/values). Configured into the subscriber
+    /// via [`make_audit_subscriber`].
+    #[derive(Clone, Default)]
+    struct AuditCapture(Arc<Mutex<Vec<String>>>);
+
+    impl AuditCapture {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// Field-value visitor for [`AuditLayer`] — collects every
+    /// (name, formatted-value) pair for serialisation.
+    #[derive(Default)]
+    struct AuditFieldVisitor {
+        fields: Vec<(String, String)>,
+    }
+    impl tracing::field::Visit for AuditFieldVisitor {
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            self.fields
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    /// Minimal `tracing-subscriber::Layer` that JSON-serialises
+    /// every event whose target is `graphreact::observer::audit`.
+    /// Self-contained so this test module doesn't add a
+    /// graphreact-observer dev-dep cycle.
+    struct AuditLayer {
+        buf: AuditCapture,
+    }
+    impl<S> tracing_subscriber::Layer<S> for AuditLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use std::fmt::Write as _;
+            let meta = event.metadata();
+            if meta.target() != "graphreact::observer::audit" {
+                return;
+            }
+            let mut visitor = AuditFieldVisitor::default();
+            event.record(&mut visitor);
+            let level = meta.level().to_string();
+            let mut json = format!("{{\"target\":\"{}\",\"level\":\"{level}\"", meta.target());
+            for (k, v) in &visitor.fields {
+                // Escape just the inner quotes — values from tracing
+                // come pre-formatted; the goal here is "captureable
+                // by string-contains" not strict JSON.
+                let v_esc = v.replace('"', "\\\"");
+                let _ = write!(json, ",\"{k}\":\"{v_esc}\"");
+            }
+            json.push('}');
+            self.buf.0.lock().unwrap().push(json);
+        }
+    }
+
+    fn make_audit_subscriber(
+        buf: &AuditCapture,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        Registry::default().with(AuditLayer { buf: buf.clone() })
+    }
+
+    /// Test 1: a v4 peer (one bump below WIRE_VERSION) ships a
+    /// Hello WITHOUT `capabilities_bitmap`. The v5 server-side
+    /// codec falls back to `HelloV4` decode → synthesises
+    /// `capabilities_bitmap = 0`. `server_handshake` MUST accept
+    /// the peer with `effective_capabilities = 0` AND fire the
+    /// `cluster_handshake_complete` audit event with
+    /// `peer_wire_version=4, local_wire_version=5,
+    /// negotiated_capabilities=0`.
+    #[tokio::test]
+    async fn floor_minus_one_peer_handshakes_with_zero_bitmap() {
+        assert_eq!(MIN_SUPPORTED_VERSION, WIRE_VERSION - 1);
+
+        let (alice, bob) = dev_tls::pair("alice", "bob").expect("pair");
+        let (alice_stream, bob_stream) = tokio::io::duplex(64 * 1024);
+        let alice_cfg = alice.config.clone();
+        let bob_cfg = bob.config.clone();
+        let alice_node: NodeId = "alice@127.0.0.1".parse().unwrap();
+        let server_cookie = cookie_str("shared");
+        let client_cookie = cookie_str("shared");
+
+        // Server runs the real `server_handshake`. Wrap the future
+        // with our test-local audit subscriber so the audit events
+        // emitted inside the spawn-task end up in our buffer.
+        let buf = AuditCapture::new();
+        let server_subscriber = make_audit_subscriber(&buf);
+        let our_bitmap_server: u64 = CAP_AUDIT_CHAIN;
+        let server_task = tokio::spawn(
+            async move {
+                let mut conn = accept_over(alice_stream, &alice_cfg).await?;
+                let result = server_handshake(
+                    &mut conn,
+                    &server_cookie,
+                    &alice_node,
+                    Creation(1),
+                    vec!["mon-v1".into()],
+                    our_bitmap_server,
+                )
+                .await;
+                let _ = conn.close().await;
+                result
+            }
+            .with_subscriber(server_subscriber),
+        );
+
+        // Client manually completes TLS via dial_over → Connection,
+        // then we drop into raw-byte mode to ship a v4-shape Hello
+        // and ride the rest of the handshake. We want to drive the
+        // server's audit path without depending on a v4 daemon
+        // binary.
+        let client_task = tokio::spawn(async move {
+            // Drive TLS handshake via the normal client path, then
+            // tear back down to the raw framed stream beneath.
+            let conn = dial_over(bob_stream, "alice", &bob_cfg).await?;
+            // Build a v4-shape Hello and ship it via the framed
+            // codec's raw byte path. We can't go through
+            // `conn.send` because `Packet::Hello` is the v5 shape;
+            // we need the v4 trailing-u64-absent shape. Reach into
+            // the framed stream's `get_mut` to grab the raw stream
+            // and write the bytes.
+            let raw_frame = build_v4_hello_frame(MIN_SUPPORTED_VERSION, "bob@127.0.0.1", 2);
+            // `Connection` does not expose its inner stream. We
+            // work around by piggy-backing on `WireFrame`'s codec:
+            // we can write the bytes via `framed.get_mut()` once
+            // they expose it. Since they don't, we use a separate
+            // raw write path — re-acquiring the inner stream via
+            // `Framed::into_parts`.
+            let parts = conn.into_parts();
+            let (mut tls_stream, _codec, mut read_buf, mut write_buf) = (
+                parts.io,
+                parts.codec,
+                parts.read_buf,
+                parts.write_buf,
+            );
+            // Drain any pending write_buf bytes that the codec may
+            // have left there (none expected this early in the
+            // handshake, but it costs nothing to flush).
+            if !write_buf.is_empty() {
+                tls_stream.write_all(&write_buf).await.map_err(DistError::from)?;
+                write_buf.clear();
+            }
+            tls_stream
+                .write_all(&raw_frame)
+                .await
+                .map_err(DistError::from)?;
+            tls_stream.flush().await.map_err(DistError::from)?;
+
+            // Receive Challenge from server via raw read +
+            // codec-shaped parse. We read into `read_buf` until a
+            // full frame is parseable.
+            let mut codec = crate::wire::WireFrame;
+            let challenge = loop {
+                if let Some(packet) = codec.decode(&mut read_buf)? {
+                    break match packet {
+                        Packet::Challenge(c) => c,
+                        other => {
+                            return Err(DistError::Handshake(format!(
+                                "expected Challenge, got {:?}",
+                                other.packet_type()
+                            )));
+                        }
+                    };
+                }
+                let mut tmp = [0u8; 4096];
+                let n = tls_stream.read(&mut tmp).await.map_err(DistError::from)?;
+                if n == 0 {
+                    return Err(DistError::PeerDisconnected);
+                }
+                read_buf.extend_from_slice(&tmp[..n]);
+            };
+
+            // Ship a ChallengeReply with the right HMAC over the
+            // server's challenge.
+            let client_challenge = generate_challenge();
+            let reply_frame = build_challenge_reply_frame(
+                &client_cookie,
+                &challenge.challenge,
+                &client_challenge,
+            );
+            tls_stream
+                .write_all(&reply_frame)
+                .await
+                .map_err(DistError::from)?;
+            tls_stream.flush().await.map_err(DistError::from)?;
+
+            // Receive ChallengeAck (we don't need to verify it for
+            // the server-side audit path test).
+            loop {
+                if let Some(_packet) = codec.decode(&mut read_buf)? {
+                    break;
+                }
+                let mut tmp = [0u8; 4096];
+                let n = tls_stream.read(&mut tmp).await.map_err(DistError::from)?;
+                if n == 0 {
+                    return Err(DistError::PeerDisconnected);
+                }
+                read_buf.extend_from_slice(&tmp[..n]);
+            }
+            Ok::<(), DistError>(())
+        });
+
+        let server_result = server_task.await.expect("server join");
+        let _ = client_task.await.expect("client join");
+
+        let result = server_result.expect("server handshake");
+        // v4 peer decoded via fallback → bitmap = 0 → AND with our
+        // bitmap = 0.
+        assert_eq!(result.effective_capabilities, 0);
+        // String-vec capability still arrives untouched.
+        assert_eq!(result.peer_capabilities, vec!["pg-v1".to_string()]);
+        assert_eq!(result.peer_node.to_string(), "bob@127.0.0.1");
+
+        // Audit-row inspection — find the `cluster_handshake_complete`
+        // line and assert the version fields.
+        let lines = buf.lines();
+        let complete = lines
+            .iter()
+            .find(|l| l.contains("cluster_handshake_complete"))
+            .expect("cluster_handshake_complete audit row");
+        assert!(
+            complete.contains("\"peer_wire_version\":\"4\""),
+            "expected peer_wire_version=4 in {complete}"
+        );
+        assert!(
+            complete.contains("\"local_wire_version\":\"5\""),
+            "expected local_wire_version=5 in {complete}"
+        );
+        assert!(
+            complete.contains("\"negotiated_capabilities\":\"0\""),
+            "expected negotiated_capabilities=0 in {complete}"
+        );
+    }
+
+    /// Test 2: a v3 peer (two bumps below WIRE_VERSION) is REJECTED
+    /// at the floor with audit event `cluster_handshake_rejected`,
+    /// `reason="wire_version_below_floor"`.
+    #[tokio::test]
+    async fn floor_minus_two_peer_rejected_with_below_floor_audit() {
+        let (alice, bob) = dev_tls::pair("alice", "bob").expect("pair");
+        let (alice_stream, bob_stream) = tokio::io::duplex(64 * 1024);
+        let alice_cfg = alice.config.clone();
+        let bob_cfg = bob.config.clone();
+        let alice_node: NodeId = "alice@127.0.0.1".parse().unwrap();
+        let server_cookie = cookie_str("shared");
+
+        let buf = AuditCapture::new();
+        let server_subscriber = make_audit_subscriber(&buf);
+        let server_task = tokio::spawn(
+            async move {
+                let mut conn = accept_over(alice_stream, &alice_cfg).await?;
+                let result = server_handshake(
+                    &mut conn,
+                    &server_cookie,
+                    &alice_node,
+                    Creation(1),
+                    vec!["mon-v1".into()],
+                    0,
+                )
+                .await;
+                let _ = conn.close().await;
+                result
+            }
+            .with_subscriber(server_subscriber),
+        );
+
+        let client_task = tokio::spawn(async move {
+            let conn = dial_over(bob_stream, "alice", &bob_cfg).await?;
+            // v3 — two bumps below the current WIRE_VERSION = 5.
+            let frame = build_v4_hello_frame(3, "bob@127.0.0.1", 1);
+            let parts = conn.into_parts();
+            let mut tls_stream = parts.io;
+            let mut write_buf = parts.write_buf;
+            if !write_buf.is_empty() {
+                tls_stream.write_all(&write_buf).await.map_err(DistError::from)?;
+                write_buf.clear();
+            }
+            tls_stream
+                .write_all(&frame)
+                .await
+                .map_err(DistError::from)?;
+            tls_stream.flush().await.map_err(DistError::from)?;
+            // Drain the close signal.
+            let mut tmp = [0u8; 4096];
+            let _ = tls_stream.read(&mut tmp).await;
+            Ok::<(), DistError>(())
+        });
+
+        let server_result = server_task.await.expect("server join");
+        let _ = client_task.await.expect("client join");
+
+        match server_result {
+            Err(DistError::UnsupportedVersion { got, min }) => {
+                assert_eq!(got, 3);
+                assert_eq!(min, MIN_SUPPORTED_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+
+        let lines = buf.lines();
+        let rejected = lines
+            .iter()
+            .find(|l| l.contains("cluster_handshake_rejected"))
+            .expect("cluster_handshake_rejected audit row");
+        assert!(
+            rejected.contains("\"peer_wire_version\":\"3\""),
+            "expected peer_wire_version=3 in {rejected}"
+        );
+        assert!(
+            rejected.contains("\"local_wire_version\":\"5\""),
+            "expected local_wire_version=5 in {rejected}"
+        );
+        assert!(
+            rejected.contains("wire_version_below_floor"),
+            "expected reason=wire_version_below_floor in {rejected}"
+        );
+    }
+
+    /// Test 3: two v5 peers exchange bitmaps; the negotiated set is
+    /// the bitwise AND. Server advertises
+    /// `CAP_DELEGATED_RESTART | CAP_AUDIT_CHAIN` and client
+    /// advertises `CAP_AUDIT_CHAIN | CAP_MIXED_RUNTIME`; the
+    /// intersection is `CAP_AUDIT_CHAIN`.
+    #[tokio::test]
+    async fn v5_peer_with_bitmap_intersects_correctly() {
+        let (alice, bob) = dev_tls::pair("alice", "bob").expect("pair");
+        let (alice_stream, bob_stream) = tokio::io::duplex(64 * 1024);
+        let alice_cfg = alice.config.clone();
+        let bob_cfg = bob.config.clone();
+        let alice_node: NodeId = "alice@127.0.0.1".parse().unwrap();
+        let bob_node: NodeId = "bob@127.0.0.1".parse().unwrap();
+        let cookie = cookie_str("shared");
+
+        let server_bitmap = CAP_DELEGATED_RESTART | CAP_AUDIT_CHAIN;
+        let client_bitmap = CAP_AUDIT_CHAIN | CAP_MIXED_RUNTIME;
+        let expected_effective = CAP_AUDIT_CHAIN;
+
+        let s_cookie = cookie.clone();
+        let server_task = tokio::spawn(async move {
+            let mut conn = accept_over(alice_stream, &alice_cfg).await?;
+            let result = server_handshake(
+                &mut conn,
+                &s_cookie,
+                &alice_node,
+                Creation(1),
+                vec!["mon-v1".into()],
+                server_bitmap,
+            )
+            .await;
+            let _ = conn.close().await;
+            result
+        });
+        let c_cookie = cookie;
+        let alice_expected_id: NodeId = "alice@127.0.0.1".parse().unwrap();
+        let client_task = tokio::spawn(async move {
+            let mut conn = dial_over(bob_stream, "alice", &bob_cfg).await?;
+            let result = client_handshake(
+                &mut conn,
+                &c_cookie,
+                &bob_node,
+                Creation(2),
+                &alice_expected_id,
+                vec!["pg-v1".into()],
+                client_bitmap,
+            )
+            .await;
+            let _ = conn.close().await;
+            result
+        });
+
+        let server = server_task.await.expect("server join").expect("server handshake");
+        let client = client_task.await.expect("client join").expect("client handshake");
+
+        assert_eq!(server.effective_capabilities, expected_effective);
+        assert_eq!(client.effective_capabilities, expected_effective);
     }
 }

@@ -816,7 +816,7 @@ mod tests {
     fn insert_peer(reg: &NodeRegistry, name: &str) -> mpsc::Receiver<Packet> {
         let (tx, rx) = mpsc::channel(64);
         let node: NodeId = format!("{name}@127.0.0.1").parse().unwrap();
-        let handle = Arc::new(PeerHandle::new(node, Creation(1), tx, Vec::new()));
+        let handle = Arc::new(PeerHandle::new(node, Creation(1), tx, Vec::new(), 0));
         reg.insert(handle).unwrap();
         rx
     }

@@ -1779,6 +1779,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         cookie: opts.cookie,
         tls: opts.tls,
         capabilities,
+        capabilities_bitmap: 0,
         net_tick: opts.net_tick,
         net_split_policy: opts.net_split_policy,
     };
@@ -2294,6 +2295,7 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
             RELOAD_V1_CAPABILITY.into(),
             graphreact_dist::INGRESS_CALL_V1_CAPABILITY.into(),
         ],
+        capabilities_bitmap: 0,
         net_tick: opts.net_tick,
         net_split_policy: opts.net_split_policy,
     };

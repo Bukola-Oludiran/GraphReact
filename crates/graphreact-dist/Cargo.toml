@@ -38,6 +38,9 @@ futures.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "test-util"] }
 criterion.workspace = true
+# M-Prod sub-track #4 Phase β — rolling-version handshake tests capture
+# `graphreact::observer::audit`-target events via a tiny in-test Layer.
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "cross_node_throughput"
