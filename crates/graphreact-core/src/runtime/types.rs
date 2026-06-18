@@ -157,6 +157,20 @@ pub struct PermissionManifest {
     /// handler can match the reply. Distinct from `accepts_external`
     /// (single-shot inject) — call shape is request/response.
     pub accepts_external_call: Vec<ExternalCall>,
+    /// **M-Prod sub-track #3 Phase B Part 1.** Per-component
+    /// allowlist of secret names the body declares it may read via
+    /// `ctx.secret(name)`. `None` = no secrets (default-deny: every
+    /// `ctx.secret(name)` call resolves to null). `Some(vec!["FOO"])`
+    /// = bodies may read `FOO`; any other name still resolves to
+    /// null. Mirrors the `accepts_external` default-deny shape.
+    ///
+    /// The Phase B Part 1 production host-callback factory (in
+    /// `graphreact-cli/src/jsruntime.rs`, deferred to Part 2) reads
+    /// the last-committed manifest for the active node via
+    /// `Scheduler::manifests` and checks `manifest.needs_secret`
+    /// before dispatching the read to the registered `SecretStore`.
+    /// See ADR-0007.
+    pub needs_secret: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for PermissionManifest {
@@ -167,6 +181,7 @@ impl std::fmt::Debug for PermissionManifest {
             .field("channels", &self.channels)
             .field("accepts_external", &self.accepts_external)
             .field("accepts_external_call", &self.accepts_external_call)
+            .field("needs_secret", &self.needs_secret)
             .finish()
     }
 }
@@ -187,6 +202,7 @@ impl PermissionManifest {
             channels: IndexMap::new(),
             accepts_external: Vec::new(),
             accepts_external_call: Vec::new(),
+            needs_secret: None,
         }
     }
 }

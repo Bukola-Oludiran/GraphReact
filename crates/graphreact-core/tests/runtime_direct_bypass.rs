@@ -60,6 +60,7 @@ fn direct_message_bypasses_channel_policy_that_would_reject() {
                 channels,
                 accepts_external: Vec::new(),
                 accepts_external_call: Vec::new(),
+                needs_secret: None,
             }
         }
     };
