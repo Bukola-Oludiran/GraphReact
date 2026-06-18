@@ -272,6 +272,7 @@ pub fn run_version() -> CommandResult<String> {
     let echo_engine = graphreact_engine_echo::EchoEngine::new();
     let jsc_line = jsc_version_line();
     let cpython_line = cpython_version_line();
+    let signature_line = signature_url_line();
     Ok(format!(
         "grx {cli}\n\
          parser  {parser}\n\
@@ -279,13 +280,34 @@ pub fn run_version() -> CommandResult<String> {
          engine-null   {engine_null}\n\
          engine-echo   {engine_echo}\n\
          {jsc_line}\n\
-         {cpython_line}\n",
+         {cpython_line}\n\
+         {signature_line}",
         cli = env!("CARGO_PKG_VERSION"),
         parser = env!("CARGO_PKG_VERSION"),
         engine_trait = env!("CARGO_PKG_VERSION"),
         engine_null = null_engine.engine_version(),
         engine_echo = echo_engine.engine_version(),
     ))
+}
+
+/// **M-Prod sub-track #7** — render the operator-verifiable signature URL
+/// when it was baked in at build time (release pipeline sets
+/// `GRX_SIGNATURE_URL`), or render nothing when absent / empty. The
+/// build.rs unconditionally emits `cargo:rustc-env=GRX_SIGNATURE_URL=...`
+/// (empty string when the env var was unset), so `option_env!()` returns
+/// `Some(s)` and we branch on `s.is_empty()`. Returning the empty string
+/// when unset means the `format!()` placeholder collapses to a trailing
+/// newline-less zero-width slot — matches the contract documented in
+/// `docs/backend/m-prod-supply-chain.md` (absent ⇒ no line at all).
+///
+/// Output shape when set: `signature: <URL>\n` (trailing newline so it
+/// matches the rest of the version output and downstream parsers don't
+/// fail on a missing final newline).
+fn signature_url_line() -> String {
+    match option_env!("GRX_SIGNATURE_URL") {
+        Some(url) if !url.is_empty() => format!("signature: {url}\n"),
+        _ => String::new(),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2291,5 +2313,75 @@ mod tests {
             msg.contains("M16-Backend") || msg.contains("management API"),
             "redirect must explain why this is gated: {msg}",
         );
+    }
+
+    /// **M-Prod sub-track #7** — `signature_url_line()` returns an empty
+    /// string when `GRX_SIGNATURE_URL` was unset / empty at build time.
+    ///
+    /// Note on test surface: `option_env!()` resolves at COMPILE time,
+    /// so we can only exercise the path that the CI / dev environment
+    /// happens to be running under. Local + PR CI (`GRX_SIGNATURE_URL`
+    /// unset) hits the empty branch — exercised here. The set-to-a-URL
+    /// branch is exercised in the release pipeline (sub-track #8) where
+    /// the build env injects `GRX_SIGNATURE_URL`; we lock the rendered
+    /// contract via the formatting in `signature_url_line()` itself
+    /// (`format!("signature: {url}\n")`) rather than a unit test.
+    #[test]
+    fn version_omits_signature_when_unset() {
+        // build.rs emits `cargo:rustc-env=GRX_SIGNATURE_URL=<value>`
+        // unconditionally; `<value>` defaults to "" when the build
+        // env didn't set the var. The signature renderer must
+        // collapse that to a zero-byte line.
+        let line = signature_url_line();
+        // EITHER the build env set GRX_SIGNATURE_URL (release-pipeline
+        // build — should start with "signature: ") OR it didn't (every
+        // other build — must be empty). Branch on what we observe so
+        // this test stays green in both worlds.
+        match option_env!("GRX_SIGNATURE_URL") {
+            None | Some("") => {
+                assert!(
+                    line.is_empty(),
+                    "GRX_SIGNATURE_URL unset/empty must collapse to empty line, got: {line:?}",
+                );
+                // And the full version output must NOT contain a
+                // "signature: " line.
+                let version_out = run_version().expect("version ok");
+                assert!(
+                    !version_out.contains("signature:"),
+                    "version output must omit signature line when env unset: {version_out}",
+                );
+            }
+            Some(url) => {
+                assert!(
+                    line.starts_with("signature: "),
+                    "set GRX_SIGNATURE_URL must render `signature: ...`, got: {line:?}",
+                );
+                assert!(
+                    line.contains(url),
+                    "rendered line must contain the baked URL: {line:?} vs {url}",
+                );
+                assert!(
+                    line.ends_with('\n'),
+                    "rendered line must end with newline: {line:?}",
+                );
+            }
+        }
+    }
+
+    /// **M-Prod sub-track #7** — the legacy version output shape is
+    /// preserved. Operator scripts that grep `grx version` for `grx <ver>`
+    /// or any of the engine-* prefixes must not regress when the
+    /// optional signature line is appended.
+    #[test]
+    fn version_shape_preserved() {
+        let out = run_version().expect("version ok");
+        // Locked prefixes: anything an operator script might depend on
+        // when parsing `grx version`.
+        for needle in ["grx ", "parser ", "engine-trait", "engine-null", "engine-echo"] {
+            assert!(
+                out.contains(needle),
+                "version output must contain `{needle}`: {out}",
+            );
+        }
     }
 }

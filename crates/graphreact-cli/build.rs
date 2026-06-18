@@ -27,9 +27,24 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DEP_GRAPHREACT_CPYTHON_PYTHON_RPATH");
     println!("cargo:rerun-if-env-changed=DEP_GRAPHREACT_CPYTHON_PYTHON_3_12");
     println!("cargo:rerun-if-env-changed=DEP_GRAPHREACT_CPYTHON_PYTHON_FREE_THREADED");
+    println!("cargo:rerun-if-env-changed=GRX_SIGNATURE_URL");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo::rustc-check-cfg=cfg(python_3_12)");
     println!("cargo::rustc-check-cfg=cfg(python_free_threaded)");
+
+    // **M-Prod sub-track #7 — operator-verifiable signature URL.** When
+    // the release pipeline (sub-track #8) sets `GRX_SIGNATURE_URL` at
+    // build time, bake it into the binary so `grx version` advertises
+    // where operators can fetch the cosign signature for re-verification
+    // (`cosign verify-blob --signature <URL>.sig <URL>`). When unset /
+    // empty (every dev build, every CI build that isn't a tagged release),
+    // we emit the env var as an empty string so `option_env!()` returns
+    // `Some("")` — the `run_version()` printer then suppresses the line.
+    // We deliberately emit the directive ALWAYS (rather than skipping
+    // when the env var is unset) so the rustc-env contract is uniform
+    // across builds; the call-site decides whether to render the line.
+    let signature_url = std::env::var("GRX_SIGNATURE_URL").unwrap_or_default();
+    println!("cargo:rustc-env=GRX_SIGNATURE_URL={signature_url}");
 
     // engine-cpython's build.rs runs first (we depend on it) and
     // emits `cargo:python-rpath=<path>`. Cargo surfaces it as
