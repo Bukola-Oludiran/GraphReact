@@ -97,15 +97,19 @@ pub async fn spawn(
         metrics,
         token: bind.token,
     });
-    let tls_acceptor = bind
-        .tls
-        .as_ref()
-        .map(|tls| TlsAcceptor::from(tls.server.clone()));
+    // **M-Prod sub-track #2 Phase A.** Carry the rotatable handle,
+    // NOT a pre-built `TlsAcceptor`. The legacy `/metrics` scrape
+    // server picks up rotations driven through
+    // `ApiServerHandle::reload_tls` because the rotation handle
+    // (an `Arc<ArcSwap<_>>` under the hood) is shared across every
+    // clone of `RotatableServerConfig`.
+    let tls_handle: Option<crate::RotatableServerConfig> =
+        bind.tls.as_ref().map(|tls| tls.server.clone());
     let shutdown = Arc::new(Notify::new());
     let shutdown_for_loop = shutdown.clone();
 
     let task = tokio::spawn(async move {
-        accept_loop(listener, ctx, tls_acceptor, shutdown_for_loop).await;
+        accept_loop(listener, ctx, tls_handle, shutdown_for_loop).await;
     });
 
     Ok(ServerHandle {
@@ -118,7 +122,7 @@ pub async fn spawn(
 async fn accept_loop(
     listener: TcpListener,
     ctx: Arc<ServerCtx>,
-    tls_acceptor: Option<TlsAcceptor>,
+    tls_handle: Option<crate::RotatableServerConfig>,
     shutdown: Arc<Notify>,
 ) {
     loop {
@@ -145,7 +149,14 @@ async fn accept_loop(
                     }
                 };
                 let ctx = ctx.clone();
-                let acceptor = tls_acceptor.clone();
+                // **M-Prod sub-track #2 Phase A.** Build the
+                // `TlsAcceptor` PER ACCEPT off the current
+                // rotation snapshot — see `crate::tls_rotation`
+                // module docs for why this can't be cached at
+                // spawn time.
+                let acceptor = tls_handle
+                    .as_ref()
+                    .map(|handle| TlsAcceptor::from(handle.current()));
                 tokio::spawn(async move {
                     handle_connection(socket, peer, ctx, acceptor).await;
                 });
