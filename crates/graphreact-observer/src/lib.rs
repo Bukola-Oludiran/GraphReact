@@ -38,6 +38,7 @@
 pub mod audit;
 pub mod auth;
 pub mod bind;
+pub mod drain;
 pub mod events;
 pub mod http_server;
 pub mod json_escape;
@@ -76,14 +77,18 @@ pub use opentelemetry_sdk::trace::SdkTracerProvider;
 
 pub use auth::{AuthError, BearerToken};
 pub use bind::{BindConfig, BindConfigError, BindFlags, DEFAULT_BIND};
+pub use drain::{
+    log_drain_completed, log_drain_deadline_exceeded, DrainFlag, InflightGuard, IngressInFlight,
+};
 pub use events::TelemetryEvent;
 pub use graphreact_core::TelemetrySink;
 pub use http_server::{spawn as spawn_http_server, ServerHandle};
 pub use json_logs::JsonLogTelemetry;
 pub use management_api::{
     build_router, drain_snapshot_requests, parse_bulk_line, spawn as spawn_management_api,
-    spawn_with_cluster_readyz as spawn_management_api_with_cluster_readyz, ApiServerHandle,
-    ApiState, BulkInjectResult, BulkLineBody, CallMessageBody, CallResult, ClusterReadyzProbe,
+    spawn_with_cluster_readyz as spawn_management_api_with_cluster_readyz,
+    spawn_with_drain as spawn_management_api_with_drain, ApiServerHandle, ApiState,
+    BulkInjectResult, BulkLineBody, CallMessageBody, CallResult, ClusterReadyzProbe,
     IdempotencyCache, Identity, InjectMessageBody, InjectMessageWithReplyDisposition, InjectResult,
     PendingCallGuard, PendingCalls, SnapshotRequest, BULK_MAX_BODY_BYTES, BULK_MAX_LINE_BYTES,
     DEFAULT_BULK_LINE_CAP, SNAPSHOT_CHANNEL_CAPACITY,
