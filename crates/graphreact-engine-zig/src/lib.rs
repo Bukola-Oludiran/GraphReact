@@ -41,5 +41,5 @@ pub mod value;
 pub use error::{EngineError, EngineResult};
 pub use handles::{IsolateHandle, ModuleHandle, FunctionHandle, CallbackId};
 pub use options::{IsolateOptions, MicrotaskPolicy};
-pub use traits::{BoxCallback, Engine, EngineCallback, HostCall};
+pub use traits::{BoxCallback, Engine, EngineCallback, HostCall, HostSecretCallback};
 pub use value::{HostObject, HostValue, HostValueKind};

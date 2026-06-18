@@ -3830,6 +3830,7 @@ fn host_value_to_manifest(hv: HostValue) -> PermissionManifest {
     let mut emits: Vec<String> = Vec::new();
     let mut accepts_external: Vec<String> = Vec::new();
     let mut accepts_external_call: Vec<graphreact_core::ExternalCall> = Vec::new();
+    let mut needs_secret: Option<Vec<String>> = None;
     for (k, v) in pairs {
         match (k.as_str(), v) {
             ("accepts", HostValue::Array(arr)) => {
@@ -3855,6 +3856,25 @@ fn host_value_to_manifest(hv: HostValue) -> PermissionManifest {
                         }
                     })
                     .collect();
+            }
+            // **M-Prod #3 Phase B Part 1.** Per-component allowlist of
+            // secret names the body may read via `ctx.Secret(name)`.
+            // Parsed here even though the Go `Ctx.Secret` codegen
+            // method ships Part 2 — once the engine-side dispatch
+            // lands, the allowlist plumbing is already in place.
+            // Per ADR-0007.
+            ("needs_secret", HostValue::Array(arr)) => {
+                needs_secret = Some(
+                    arr.into_iter()
+                        .filter_map(|x| {
+                            if let HostValue::String(s) = x {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                );
             }
             ("accepts_external", HostValue::Array(arr)) => {
                 accepts_external = arr
@@ -3900,7 +3920,50 @@ fn host_value_to_manifest(hv: HostValue) -> PermissionManifest {
     let mut manifest = PermissionManifest::new(accepts, emits);
     manifest.accepts_external = accepts_external;
     manifest.accepts_external_call = accepts_external_call;
+    manifest.needs_secret = needs_secret;
     manifest
+}
+
+#[cfg(test)]
+mod manifest_extraction_tests {
+    //! **M-Prod #3 Phase B Part 1 verify-finding patch.** Pure-function
+    //! unit tests for `host_value_to_manifest` on the Go side. Pure
+    //! HostValue→PermissionManifest extraction — does NOT spin up the
+    //! Go runtime (so it sidesteps the macOS TSD-cleanup deadlock
+    //! noted in `mod tests` below). Mirrors the JS + Py extraction
+    //! tests so the `needs_secret` allowlist parsing is locked in
+    //! symmetrically across all three engine-host runtimes.
+    use super::host_value_to_manifest;
+    use graphreact_engine_zig::HostValue;
+
+    #[test]
+    fn needs_secret_array_populates_field() {
+        let hv = HostValue::Object(vec![
+            ("accepts".to_string(), HostValue::Array(vec![])),
+            ("emits".to_string(), HostValue::Array(vec![])),
+            (
+                "needs_secret".to_string(),
+                HostValue::Array(vec![
+                    HostValue::String("API_KEY".to_string()),
+                ]),
+            ),
+        ]);
+        let m = host_value_to_manifest(hv);
+        assert_eq!(
+            m.needs_secret.as_deref(),
+            Some(&["API_KEY".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn needs_secret_absent_keeps_field_none() {
+        let hv = HostValue::Object(vec![
+            ("accepts".to_string(), HostValue::Array(vec![])),
+            ("emits".to_string(), HostValue::Array(vec![])),
+        ]);
+        let m = host_value_to_manifest(hv);
+        assert!(m.needs_secret.is_none());
+    }
 }
 
 fn component_name_for_node(node: &IrNode) -> String {

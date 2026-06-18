@@ -1490,6 +1490,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "graphreact-engine-zig",
+ "graphreact-secrets",
  "libc",
  "parking_lot",
  "rustc-hash 2.1.2",
@@ -1510,6 +1511,7 @@ dependencies = [
 name = "graphreact-engine-zig"
 version = "0.1.0"
 dependencies = [
+ "graphreact-secrets",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

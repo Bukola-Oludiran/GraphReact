@@ -35,6 +35,7 @@ fn manifest_with_channels(
         channels: channel_map,
         accepts_external: Vec::new(),
         accepts_external_call: Vec::new(),
+        needs_secret: None,
     }
 }
 

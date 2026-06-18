@@ -4260,6 +4260,7 @@ fn host_value_to_manifest(hv: HostValue) -> PermissionManifest {
     let mut emits: Vec<String> = Vec::new();
     let mut accepts_external: Vec<String> = Vec::new();
     let mut accepts_external_call: Vec<graphreact_core::ExternalCall> = Vec::new();
+    let mut needs_secret: Option<Vec<String>> = None;
     for (k, v) in pairs {
         match (k.as_str(), v) {
             ("accepts", HostValue::Array(arr)) => {
@@ -4285,6 +4286,26 @@ fn host_value_to_manifest(hv: HostValue) -> PermissionManifest {
                         }
                     })
                     .collect();
+            }
+            // **M-Prod #3 Phase B Part 1.** Per-component allowlist of
+            // secret names the body may read via `ctx.secret(name)`.
+            // Mirrors `accepts_external` default-deny: absent or empty
+            // = no secrets resolve. Present as `Some(vec![...])` so the
+            // host-callback can distinguish "no allowlist declared"
+            // (None → deny) from "explicit empty allowlist" (Some([]) →
+            // also deny). Per ADR-0007.
+            ("needs_secret", HostValue::Array(arr)) => {
+                needs_secret = Some(
+                    arr.into_iter()
+                        .filter_map(|x| {
+                            if let HostValue::String(s) = x {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                );
             }
             // **M-Ingress.** Optional component-declared list of message
             // types accepted from external HTTP injection (POST
@@ -4345,7 +4366,99 @@ fn host_value_to_manifest(hv: HostValue) -> PermissionManifest {
     let mut manifest = PermissionManifest::new(accepts, emits);
     manifest.accepts_external = accepts_external;
     manifest.accepts_external_call = accepts_external_call;
+    manifest.needs_secret = needs_secret;
     manifest
+}
+
+#[cfg(test)]
+mod manifest_extraction_tests {
+    //! **M-Prod #3 Phase B Part 1 verify-finding patch.** Pure-function
+    //! unit tests for `host_value_to_manifest`. Distinct from the
+    //! heavyweight JSC mount tests in `mod tests` below (which need
+    //! `engine_lock` + JSC isolates) — these exercise only the
+    //! `HostValue` → `PermissionManifest` extraction.
+    use super::host_value_to_manifest;
+    use graphreact_engine_zig::HostValue;
+
+    #[test]
+    fn needs_secret_array_populates_field() {
+        let hv = HostValue::Object(vec![
+            ("accepts".to_string(), HostValue::Array(vec![])),
+            ("emits".to_string(), HostValue::Array(vec![])),
+            (
+                "needs_secret".to_string(),
+                HostValue::Array(vec![
+                    HostValue::String("DATABASE_URL".to_string()),
+                    HostValue::String("API_KEY".to_string()),
+                ]),
+            ),
+        ]);
+        let m = host_value_to_manifest(hv);
+        assert_eq!(
+            m.needs_secret.as_deref(),
+            Some(&["DATABASE_URL".to_string(), "API_KEY".to_string()][..]),
+            "needs_secret entries from the JS-returned object must \
+             populate PermissionManifest::needs_secret as Some(vec)"
+        );
+    }
+
+    #[test]
+    fn needs_secret_empty_array_is_some_empty_not_none() {
+        // Explicit empty allowlist resolves to Some(vec![]) so the
+        // host-callback can distinguish "no allowlist declared" (None
+        // → deny) from "explicit empty allowlist" (Some([]) → also
+        // deny). Both deny in practice, but the contract distinction
+        // is locked by ADR-0007.
+        let hv = HostValue::Object(vec![
+            ("accepts".to_string(), HostValue::Array(vec![])),
+            ("emits".to_string(), HostValue::Array(vec![])),
+            (
+                "needs_secret".to_string(),
+                HostValue::Array(vec![]),
+            ),
+        ]);
+        let m = host_value_to_manifest(hv);
+        assert_eq!(m.needs_secret, Some(Vec::<String>::new()));
+    }
+
+    #[test]
+    fn needs_secret_absent_keeps_field_none() {
+        let hv = HostValue::Object(vec![
+            ("accepts".to_string(), HostValue::Array(vec![])),
+            ("emits".to_string(), HostValue::Array(vec![])),
+        ]);
+        let m = host_value_to_manifest(hv);
+        assert!(
+            m.needs_secret.is_none(),
+            "absent needs_secret key must keep the field as None — \
+             default-deny matches Phase A pre-existing semantics \
+             bit-for-bit"
+        );
+    }
+
+    #[test]
+    fn needs_secret_non_string_entries_silently_skipped() {
+        // Match the existing accepts / emits / accepts_external
+        // filter_map(HostValue::String) pattern — non-string entries
+        // in the array are dropped silently, NOT a parse error.
+        let hv = HostValue::Object(vec![
+            ("accepts".to_string(), HostValue::Array(vec![])),
+            ("emits".to_string(), HostValue::Array(vec![])),
+            (
+                "needs_secret".to_string(),
+                HostValue::Array(vec![
+                    HostValue::String("VALID_NAME".to_string()),
+                    HostValue::Number(42.0),
+                    HostValue::Null,
+                ]),
+            ),
+        ]);
+        let m = host_value_to_manifest(hv);
+        assert_eq!(
+            m.needs_secret.as_deref(),
+            Some(&["VALID_NAME".to_string()][..])
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

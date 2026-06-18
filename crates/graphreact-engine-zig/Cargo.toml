@@ -15,6 +15,10 @@ crate-type = ["rlib"]
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
+# **M-Prod sub-track #3 Phase B Part 1.** Carries the SecretValue
+# type the HostSecretCallback trait surfaces. graphreact-secrets has
+# zero engine deps so the dependency direction stays acyclic.
+graphreact-secrets = { path = "../graphreact-secrets" }
 
 [lints]
 workspace = true

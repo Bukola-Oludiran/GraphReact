@@ -21,6 +21,32 @@ pub struct HostCall {
 /// code calls the corresponding name.
 pub type BoxCallback = Box<dyn Fn(&[HostValue]) -> EngineResult<HostValue> + Send + Sync>;
 
+/// **M-Prod sub-track #3 Phase B Part 1.** Host-side callback the
+/// engine consults when guest code invokes `ctx.secret(name)`.
+/// Implementations close over an `Arc<dyn SecretStore>` (and Phase B
+/// Part 2: the active node's allowlist). Object-safe + `Send + Sync`
+/// so the engine can store it behind `&dyn HostSecretCallback` and
+/// dispatch from worker threads.
+///
+/// Return `None` for default-deny + unmapped names. The engine is
+/// responsible for marshalling `Some(bytes)` into the guest's native
+/// secret shape (JSC: UTF-8 string; CPython: bytes object; Go:
+/// `[]byte`).
+///
+/// The `SecretValue` carries the `Zeroize` + `ZeroizeOnDrop` derive
+/// so the bytes are scrubbed when the value is dropped — but only
+/// the original Rust-side `Vec<u8>`; once the bytes cross the
+/// engine ABI into the guest VM's heap, that copy is outside the
+/// zeroize regime. See ADR-0007 for the boundary discussion + the
+/// Phase B Part 2 widening plan to typed-bytes.
+pub trait HostSecretCallback: Send + Sync {
+    /// Read a secret by name. The implementation enforces the
+    /// per-component `needs_secret` allowlist; `None` is the
+    /// default-deny signal that bodies see as `null` / `None` /
+    /// zero-value depending on the guest language.
+    fn read(&self, name: &str) -> Option<graphreact_secrets::SecretValue>;
+}
+
 /// Interpreted "what should the engine do next" signal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineCallback {
@@ -104,6 +130,22 @@ pub trait Engine {
 
     /// Engine version string, e.g. JSC major.minor or `"null-1.0"`.
     fn engine_version(&self) -> String;
+
+    /// **M-Prod sub-track #3 Phase B Part 1.** Optional host-secret
+    /// callback surface. Engines that wire `ctx.secret(name)`
+    /// override to return `Some(...)`. The default `None` keeps
+    /// non-secret-aware engines (cpython / go / echo / null / zig)
+    /// compiling unchanged. See ADR-0007.
+    ///
+    /// The orchestrator queries this method as the gating predicate
+    /// for whether to install the JS-side `ctx.secret` shim; engines
+    /// that return `None` keep the prelude's `if (typeof host_secret
+    /// === 'undefined') return null;` guard in effect so bodies that
+    /// call `ctx.secret(name)` get a `null` (default-deny) without
+    /// crashing.
+    fn host_secret_callback(&self) -> Option<&dyn HostSecretCallback> {
+        None
+    }
 }
 
 #[cfg(test)]
