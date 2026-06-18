@@ -2619,7 +2619,7 @@ pub async fn drive_handle_until(
             // when `None` the inner future pends forever so this
             // arm is dormant. The `if` guard ensures the select!
             // doesn't even poll the future when sighup is None.
-            _ = async {
+            () = async {
                 match sighup.as_mut() {
                     Some(s) => { s.recv().await; }
                     None => { std::future::pending::<()>().await; }
