@@ -55,7 +55,11 @@ GraphReact (Backend) ships first. GraphReactDB starts materializing after the Ba
 | **M22** | [Backend] | **Mixed-runtime systems — JS + Python + Go in same `.grx` (phases 1-4 SHIPPED 2026-06-17, see [`m22-mixed-runtime.md`](m22-mixed-runtime.md); phase 5+ cross-engine messaging open)** |
 | **M23** | [Shared] | **LSP server for `.grx` — outer-shell MVP shipped 2026-06-17 (see [`m23-lsp.md`](m23-lsp.md)); semantic tokens / VS Code extension publishing / in-body completions deferred to M23.next** |
 | **Cleanup-Pass** | [Backend / Shared] | **Pre-M-Prod deferred-cleanup slice (13 named residuals)** |
+<<<<<<< HEAD
 | **M-Prod** | [Production-hardening] | **Production-readiness milestone — 9 sub-tracks (auth / TLS / secrets / lifecycle (incl. M14.11) / observability / rate limiting / supply-chain / packaging / chaos+fuzz). STARTED 2026-06-17 with the safest 2 slices: #5 observability (`/v1/readyz` + `OBSERVER_SHUTDOWN_DEADLINE`, see [`m-prod-observability.md`](m-prod-observability.md)) and #7 supply chain (CycloneDX SBOM in CI, see [`m-prod-supply-chain.md`](m-prod-supply-chain.md)). Group 1 batch landed 2026-06-17: #3 secrets Phase A (`grx secrets` CLI + OS keyring backend, see [`m-prod-secrets.md`](m-prod-secrets.md)).** |
+=======
+| **M-Prod** | [Production-hardening] | **Production-readiness milestone — 9 sub-tracks (auth / TLS / secrets / lifecycle (incl. M14.11) / observability / rate limiting / supply-chain / packaging / chaos+fuzz). STARTED 2026-06-17 with the safest 2 slices: #5 observability (`/v1/readyz` + `OBSERVER_SHUTDOWN_DEADLINE`, see [`m-prod-observability.md`](m-prod-observability.md)) and #7 supply chain (CycloneDX SBOM in CI, see [`m-prod-supply-chain.md`](m-prod-supply-chain.md)). Group 1 residual landed 2026-06-17: #5 mpsc backpressure sweep (ingress = try_send→503) + cluster-membership /readyz extension + published [`SLO.md`](../SLO.md).** |
+>>>>>>> m-prod-5-residual
 | **M19** | [DB] | **`graphreact-persistence` — own segment log + snapshot + replay** |
 | **M20** | [DB] | **`graphreact-db-distributed` — sharded `CommunicationGraph` with Raft per shard** |
 | **M21** | [DB] | **`graphreact-query` — SpacetimeDB-style reducer-with-subscription (supersedes the prior "Cypher-shaped" wording)** |

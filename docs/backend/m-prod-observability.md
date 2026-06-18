@@ -26,6 +26,7 @@ The **safest slice** lands #1 + #2 (this commit pair); items #3–#5 are address
 |---|---|---|
 | Scheduler has completed ≥1 `process_batch` round | `MetricsInner::process_batch_duration.snapshot().count > 0` | The histogram is updated by `PrometheusSink::on_tick_end` exactly once per scheduler tick. Count > 0 means the first mount cascade drained, so the daemon's view of the `.grx` system is consistent. |
 | Snapshot bridge has capacity | `state.snapshot_tx.capacity() > 0` | Capacity at zero means the scheduler thread is wedged behind a long `process_batch` round AND every `SnapshotRequest` slot is full. Inbound HTTP would 503 anyway; pre-emptively de-route via readiness rather than serve a stale snapshot. |
+| Cluster membership reached (M-Prod residual, shipped 2026-06-17) | `cluster_readyz()` probe — returns `true` if `configured_peers == 0` OR `dialed_count >= 1` | Single-node deploys (no peers configured) pass trivially. Multi-node deploys flip to ready only once at least one peer dial completed, so load balancers don't route to a daemon whose `Cluster::start` hasn't yet handshook with anyone. Lock-free `AtomicUsize` read on the hot path. |
 
 **Response shape:**
 
@@ -34,6 +35,7 @@ The **safest slice** lands #1 + #2 (this commit pair); items #3–#5 are address
 | Ready | 200 OK | `ready` | `Content-Type: text/plain; charset=utf-8` |
 | Pre-tick | 503 Service Unavailable | `scheduler_first_batch_pending` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
 | Bridge saturated | 503 Service Unavailable | `bridge_saturated` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
+| Cluster peers configured but none dialed (M-Prod residual) | 503 Service Unavailable | `cluster_no_peers_connected` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
 
 **Auth contract:** identical to `/v1/healthz` — the route is mounted on `public_routes` (no `auth_layer` middleware). Probes ride the k8s sidecar without access to the operator secret store; the readiness predicate is derived from `MetricsInner` + bridge capacity, so the response neither leaks secrets nor depends on per-probe authentication.
 
@@ -95,8 +97,9 @@ match tokio::time::timeout(deadline, join).await {
 
 ## Open work in #5
 
-- **`docs/SLO.md`**: not yet authored — needs per-engine cardinality lock from M17 (Go engine) + M22 (mixed runtimes) before per-engine p99s can be honestly published. Tracked here so the follow-up slice doesn't lose the scope.
-- **mpsc::Sender uniform backpressure audit**: the bulk-response `out_tx = mpsc::channel(64)` and the `nodes/:id/messages` + `nodes/:id/call` non-bulk handlers use `send().await` (silent block under saturation) while inject/call/bulk surfaces use `try_send`→503. Pick one policy, sweep the surface, publish the contract on the runbook.
+- ~~**`docs/SLO.md`**: not yet authored~~ — **SHIPPED 2026-06-17.** See [`docs/SLO.md`](../../docs/SLO.md). Engine-attributed rows are explicitly marked `BLOCKED ON M17/M22 per-engine cardinality lock`.
+- ~~**mpsc::Sender uniform backpressure audit**~~ — **SHIPPED 2026-06-17 (residual slice).** Ingress endpoints (`POST /v1/nodes/:id/{messages,call,messages/bulk}`) now use `try_send`→503 + `Retry-After: 1` via [`bridge_saturated_response`](../../crates/graphreact-observer/src/management_api.rs). Read-snapshot bridges (`nodes_list` / `node_detail` / `supervisor_tree`) keep `send().await` — those are internal observer→scheduler reads with bounded depth; blocking briefly is preferable to a 503 cascade on the snapshot surface. The bulk-response body `out_tx` (`mpsc::channel(64)`) also keeps `send().await` — that's slow-HTTP-client flow control, NOT scheduler backpressure; converting it to `try_send` would silently drop NDJSON result lines.
+- ~~**Cluster-membership readyz extension**~~ — **SHIPPED 2026-06-17 (residual slice).** See predicate row above. Probe is a lock-free `Arc<dyn Fn() -> bool>` capturing `configured_peers + Arc<AtomicUsize>` so `/v1/readyz` doesn't pay any allocation per request.
 - **OTel `case_g_batch` bench variant**: the current `case_g_otel_sink` uses SimpleSpanProcessor and overstates per-emit cost. The production path uses BatchSpanProcessor; needs a parallel bench cell to measure it honestly.
 - **Per-route 503-vs-429 ordering audit** (joint contract with sub-track #6 rate-limiter): when both fire under saturation, which precedence does the operator see? Need a single policy locked between #5 and #6.
 - **Readiness predicate extensions** (deferred inside #5 until sub-track dependencies land):
