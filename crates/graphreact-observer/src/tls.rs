@@ -187,7 +187,7 @@ impl ServerTlsConfig {
         // rotation. Phase A does not surface a knob to change ALPN
         // mid-rotation; operators who need that restart the daemon
         // with the new flags.
-        next.alpn_protocols = template.alpn_protocols.clone();
+        next.alpn_protocols.clone_from(&template.alpn_protocols);
         Ok(Arc::new(next))
     }
 }

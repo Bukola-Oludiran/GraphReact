@@ -124,8 +124,7 @@ async fn reload_tls_rejects_garbage_pem() {
     // Cert bytes that don't decode as a CERTIFICATE PEM block.
     let result = handle.reload_tls(b"-----BEGIN GARBAGE-----\nnope\n", cert_a.key_pem.as_bytes());
     match result {
-        Err(TlsRotationError::CertParse { .. })
-        | Err(TlsRotationError::EmptyCertChain) => {}
+        Err(TlsRotationError::CertParse { .. } | TlsRotationError::EmptyCertChain) => {}
         other => panic!("expected CertParse/EmptyCertChain, got {other:?}"),
     }
     // Failure path leaves the prior config installed: a second
