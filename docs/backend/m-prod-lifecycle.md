@@ -1,6 +1,6 @@
 # M-Prod — Lifecycle (sub-track #4)
 
-**Status:** SHIPPED Phase α 2026-06-17 — SIGTERM drain primitive landed (drain bit + `/v1/readyz` extension + ingress 503 `draining` + `DaemonHandle::start_drain`); rolling-version negotiation (Phase β) + M14.11 delegated-restart (Phase γ) deferred.
+**Status:** SHIPPED Phase α 2026-06-17 — SIGTERM drain primitive landed (drain bit + `/v1/readyz` extension + ingress 503 `draining` + `DaemonHandle::start_drain`); rolling-version negotiation (Phase β) + M14.11 delegated-restart (Phase γ) deferred; Phase β SHIPPED 2026-06-18 — WIRE_VERSION bumped to 5 + MIN_SUPPORTED_VERSION at 4 (one-bump rolling-upgrade compat) + per-engine capability bitmap.
 
 This document covers sub-track #4 of the M-Prod milestone (production-hardening): orderly daemon lifecycle — graceful drain on SIGTERM, rolling-version handshake compatibility, and delegated restart for the M14.11 hot-reload escalation path. Sibling tracks (#2 TLS / SIGHUP topology, #5 observability `/v1/readyz`, #1 audit-sink for drain events, #9 chaos arms) reference this substrate; see [Cross-track contracts](#cross-track-contracts).
 
@@ -22,7 +22,7 @@ Phase α ships the **SIGTERM drain primitive** — every future drain trigger (k
 | SIGTERM signal stream (unix) inside `drive_handle_until` | SHIPPED | `commands.rs` |
 | `--drain-deadline-secs` / `GRX_DRAIN_DEADLINE_SECS` / `DEFAULT_DRAIN_DEADLINE_SECS=20` | SHIPPED | `cli.rs` + `commands.rs` |
 | Integration tests (5 observer + 3 CLI + 4 unit) | SHIPPED | [`crates/graphreact-observer/tests/drain.rs`](../../crates/graphreact-observer/tests/drain.rs), [`crates/graphreact-cli/tests/drain_orchestration.rs`](../../crates/graphreact-cli/tests/drain_orchestration.rs) |
-| Rolling-version handshake (`WIRE_VERSION` floor relax) | DEFERRED → Phase β | n/a |
+| Rolling-version handshake (`WIRE_VERSION` floor relax) | SHIPPED — Phase β 2026-06-18 | [`crates/graphreact-dist/src/handshake.rs`](../../crates/graphreact-dist/src/handshake.rs) + `wire/packet.rs` |
 | M14.11 delegated-restart (reload-driven drain → spawn) | DEFERRED → Phase γ | n/a |
 | Cluster handshake quiescence (`Cluster::begin_drain`) | DEFERRED → Phase β | n/a |
 | SIGTERM on Windows (named-event or REST endpoint) | DEFERRED → Phase β | n/a |
@@ -229,7 +229,7 @@ Phase α extends the `/v1/readyz` predicate row + adds a 503 reason row for `dra
 
 | Item | Reason | Lands in |
 |---|---|---|
-| Rolling-version handshake (`WIRE_VERSION = N`, `MIN_SUPPORTED_VERSION = N-1`) | The wire-protocol crate (`graphreact-dist`) is explicitly out of scope for Phase α per cross-track contract. Phase β picks up the `WIRE_VERSION` floor relax + per-engine capability negotiation. | Phase β |
+| Rolling-version handshake (`WIRE_VERSION = N`, `MIN_SUPPORTED_VERSION = N-1`) | The wire-protocol crate (`graphreact-dist`) is explicitly out of scope for Phase α per cross-track contract. ~~Phase β picks up the `WIRE_VERSION` floor relax + per-engine capability negotiation.~~ → SHIPPED Phase β 2026-06-18; see [Shipped — Phase β: rolling-version handshake](#shipped--phase-β-rolling-version-handshake). | Phase β |
 | M14.11 delegated-restart (reload-driven drain → spawn new process → handoff connections) | Requires both the drain primitive (this Phase α) AND the hot-reload pipeline (M15) AND the rolling-version handshake (Phase β). Phase γ composes all three. | Phase γ |
 | Cluster handshake quiescence (`Cluster::begin_drain` softer than `Cluster::shutdown`) | Today `Cluster::shutdown` aborts every per-peer task immediately. Phase α accepts this — handshakes that don't complete in the drain window get re-tried by the dialing peer on next reconnect. `cluster_quiesced` in `DrainOutcome` is reported `true` unconditionally for Phase α. | Phase β |
 | SIGHUP signal handler | Cross-platform signal handling for cert rotation is sub-track #2 Phase B's domain. Phase α's `drive_handle_until` topology (one `tokio::signal::unix::signal` arm per signal kind) is the contract Phase B extends. | #2 Phase B |
@@ -237,6 +237,94 @@ Phase α extends the `/v1/readyz` predicate row + adds a 503 reason row for `dra
 | Per-call drain-aware timeout truncation | `MAX_CALL_TIMEOUT_MS = 300_000` (5 min) can outlive any reasonable drain deadline; Phase α surfaces the count via `drain_deadline_exceeded` + lets SIGKILL handle truncation. | Phase β |
 | `grx cluster connect` SIGTERM wiring | `connect` is a one-shot dial without an ingress surface; drain would be a no-op. | Phase β if `connect` ever grows an observer bind. |
 | `drain_budget_misconfig` boot rejection | Phase α emits a WARN audit row rather than rejecting — back-compat with existing operator configs is preferred over hard failure. | Operators escalate to a hard reject via #8 helm chart Pod validation. |
+
+## Shipped — Phase β: rolling-version handshake
+
+Phase β SHIPPED 2026-06-18 (sub-track #4 Group B-2). Lands the
+WIRE_VERSION floor relax + per-engine capability negotiation as a
+safe-slice on top of Phase α's drain primitive.
+
+**Scope:**
+
+- `WIRE_VERSION` bumped 4 → **5**
+  ([`crates/graphreact-dist/src/wire/packet.rs`](../../crates/graphreact-dist/src/wire/packet.rs)).
+- `MIN_SUPPORTED_VERSION` stays at **4** —
+  `MIN_SUPPORTED_VERSION + 1 == WIRE_VERSION` is the new one-bump
+  compat-window invariant (asserted in
+  `wire/frame.rs::tests::min_supported_version_is_one_below_wire_version`).
+  Future bumps either move both constants together (no compat window)
+  OR move WIRE_VERSION only (widen the window by one).
+- `Hello.capabilities_bitmap: u64` +
+  `ChallengeAck.capabilities_bitmap: u64` added as a parallel typed
+  capability surface alongside the existing `Vec<String>` per-feature
+  flags. String-vec stays for per-feature opt-in
+  (`"reload-v1"`, `"observer-otel-v1"`, `"ingress-call-v1"`); the
+  bitmap is for substrate-level engine capabilities.
+- `CAP_MIXED_RUNTIME = 1 << 0`,
+  `CAP_DELEGATED_RESTART = 1 << 1`,
+  `CAP_AUDIT_CHAIN = 1 << 2` constants reserved
+  (re-exported from `graphreact_dist::wire`). M22, Phase γ, and #1
+  Phase B respectively are the planned consumers.
+- Effective bitmap = `our_bitmap & peer_bitmap`, computed at
+  handshake completion and queryable via
+  `Cluster::peer_effective_capabilities(name) -> Option<u64>`.
+  Phase β only EXPOSES the value — no dispatch path consumes it yet
+  (Phase γ ships the first consumer via M14.11 delegated-restart).
+- Audit events on the
+  `graphreact::observer::audit` target:
+  - `cluster_handshake_complete` (INFO) — fields `peer_id`,
+    `peer_wire_version`, `local_wire_version`,
+    `negotiated_capabilities`. Server-side `peer_wire_version` is
+    authoritative (from the peer's Hello); client-side
+    `peer_wire_version` is best-effort and equal to our local
+    WIRE_VERSION (the Challenge packet doesn't carry the peer's
+    version — Phase γ may extend this if precise tracking becomes
+    load-bearing).
+  - `cluster_handshake_rejected` (WARN) — fields `peer_wire_version`,
+    `local_wire_version`,
+    `reason ∈ {wire_version_below_floor, wire_version_above_ceiling}`.
+- v4 peers (Hello/ChallengeAck without the new `capabilities_bitmap`
+  field on the wire) decode via the **dual-struct fallback** in
+  [`crate::wire::WireCodec::decode`] — v5 shape tried first; on
+  `postcard::Error::DeserializeUnexpectedEnd` the payload is
+  re-decoded as `HelloV4` / `ChallengeAckV4` and the missing field
+  synthesises to `0` (no substrate-bitmap capabilities advertised).
+  Any other postcard error propagates — genuine wire corruption is
+  NOT papered over as "v4 peer with zero bitmap". Compat is
+  **one-directional**: v5 daemons accept v4 Hellos; v4 daemons see
+  v5 Hellos as malformed (trailing u64 they don't recognise). The
+  policy implication: operators bump every daemon ONE step (v4→v5)
+  before any operator-driven feature (Phase γ +) starts demanding
+  `capabilities_bitmap != 0`.
+- Above-ceiling rejection: peers with `version > WIRE_VERSION`
+  (future peers we don't understand) are rejected at the server-side
+  handshake BEFORE the floor check; reuses the existing
+  `DistError::UnsupportedVersion` variant with the `min` field
+  carrying `MIN_SUPPORTED_VERSION` (dual-use; the operator-facing
+  message reads slightly off for above-ceiling rejections — a
+  future variant split is acceptable if operator clarity demands
+  it).
+
+**Planned consumers** (Phase γ +):
+
+- **#4 Phase γ (M14.11 cross-node delegated-restart)** — gates the
+  outbound `delegated_restart` packet on
+  `peer_effective_capabilities & CAP_DELEGATED_RESTART != 0`.
+- **#1 Phase B (multi-token audit-chain)** — gates the
+  hash-chained audit-event payload on
+  `peer_effective_capabilities & CAP_AUDIT_CHAIN != 0`.
+
+**Cross-track contract integrity** (Phase β):
+
+- Audit-target convention (`graphreact::observer::audit`) preserved —
+  both new events ride the same target.
+- ApiState additive-only contract — unaffected; the handshake doesn't
+  touch ApiState.
+- Atomic-swap pattern — unaffected.
+- Drain-budget math — unaffected.
+- Back-pressure response envelope + precedence ladder — unaffected
+  (handshake is the dist layer, not the ingress layer).
+- mode 0o600 — unaffected.
 
 ## References
 
