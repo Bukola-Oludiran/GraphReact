@@ -208,6 +208,96 @@ pub enum Command {
         #[command(flatten)]
         target: TlsObserverTarget,
     },
+    /// **M-Prod sub-track #3 (Phase A).** Operator-facing secret
+    /// store. Backs developer + ops workflows that need to set /
+    /// retrieve / list / remove credentials without putting them in
+    /// `.grx` files or environment-variable scrollback.
+    ///
+    /// Two backends ship in Phase A: `keyring` (default; macOS
+    /// Keychain / Linux Secret Service / Windows Credential Manager
+    /// via the `keyring` crate) and `env` (reads `GRX_SECRET_<NAME>`
+    /// environment variables; the documented production path for
+    /// headless containers / k8s where no OS keyring agent is
+    /// running). The Phase B runtime accessor (`ctx.secret(name)`
+    /// inside `.grx` bodies) is deferred — see
+    /// `docs/backend/m-prod-secrets.md`.
+    Secrets {
+        #[command(subcommand)]
+        op: SecretsOp,
+    },
+}
+
+/// **M-Prod sub-track #3.** Sub-subcommand block under
+/// `grx secrets <op>`. Each leaf carries the secret name plus a
+/// shared [`SecretsBackend`] flag picking the backend (defaults to
+/// `keyring`). The `Set` variant reads the plaintext from a
+/// zeroized stdin prompt — clients MUST NOT pass the value as a
+/// CLI argument because `ps`/shell-history would leak it.
+#[derive(Debug, clap::Subcommand)]
+pub enum SecretsOp {
+    /// Write a secret. Reads the plaintext from stdin (TTY-detected;
+    /// a piped stdin works too but emits a stderr warning that the
+    /// caller is responsible for not having logged the value).
+    /// Existing entries are overwritten (upsert).
+    Set {
+        /// Secret name. Must match `[A-Z][A-Z0-9_]*` so the entry
+        /// round-trips identically across the keyring + env
+        /// backends. Validated in `graphreact-secrets::validate_secret_name`.
+        name: String,
+        #[arg(long, default_value_t = SecretsBackend::Keyring)]
+        backend: SecretsBackend,
+    },
+    /// Read a secret. Writes the raw bytes to stdout WITHOUT a
+    /// trailing newline so callers can compose with
+    /// `--token-file <(grx secrets get FOO)`. Exit code 1 if the
+    /// secret is absent (matches Unix `cat`-style ergonomics for
+    /// missing files).
+    Get {
+        /// Secret name (see `Set` for validation rules).
+        name: String,
+        #[arg(long, default_value_t = SecretsBackend::Keyring)]
+        backend: SecretsBackend,
+    },
+    /// List the secret names visible to this backend. Names ONLY —
+    /// never values. Sorted ascending. The keyring backend returns
+    /// an empty vec on Phase A (the `keyring` crate's enumeration
+    /// surface isn't uniform across platforms); switch to
+    /// `--backend env` to enumerate.
+    List {
+        #[arg(long, default_value_t = SecretsBackend::Keyring)]
+        backend: SecretsBackend,
+    },
+    /// Remove a secret. Idempotent — removing an absent entry
+    /// succeeds with exit code 0 so `grx secrets remove FOO` is
+    /// safe to re-run.
+    Remove {
+        /// Secret name (see `Set` for validation rules).
+        name: String,
+        #[arg(long, default_value_t = SecretsBackend::Keyring)]
+        backend: SecretsBackend,
+    },
+}
+
+/// **M-Prod sub-track #3.** Which backend `grx secrets` should
+/// dispatch through. Defaults to `keyring` because that's the
+/// developer-workstation path; containers / k8s deploys override
+/// to `env`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum SecretsBackend {
+    /// OS keyring (Keychain / Secret Service / Credential Manager).
+    Keyring,
+    /// `GRX_SECRET_<NAME>` env vars (process-local).
+    Env,
+}
+
+impl std::fmt::Display for SecretsBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keyring => write!(f, "keyring"),
+            Self::Env => write!(f, "env"),
+        }
+    }
 }
 
 /// Reusable target + auth flag block for `grx ps/tree/top/trace`.

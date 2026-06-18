@@ -1,0 +1,42 @@
+[package]
+name = "graphreact-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "M-Prod sub-track #3 (Phase A). Operator-facing secret store abstraction for GraphReact — `SecretValue` (Zeroize + ZeroizeOnDrop), `SecretStore` trait, OS-keyring backend (macOS Keychain / Linux Secret Service / Windows Credential Manager) and an env-var backend. Backs the `grx secrets {set,get,list,remove}` CLI; the Phase B runtime accessor (`ctx.secret`) is deferred (ADR-0005 placeholder)."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+zeroize.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# M-Prod sub-track #3 Phase A — OS keyring abstraction. Per-platform
+# features are selected explicitly; we never want dbus on macOS or
+# `security-framework` on Linux. License-wise everything is MIT OR
+# Apache-2.0; covered by deny.toml's existing allow list.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["linux-native-sync-persistent"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[dev-dependencies]
+# Per-test scratch env-var namespace; we don't need a global tempdir
+# crate since the env backend is process-local. Unit tests cover the
+# env backend in full; keyring backend tests are gated under the
+# `GRX_SECRETS_RUN_KEYRING_TESTS` env-var because GitHub-hosted CI
+# runners don't have an unlocked OS keyring agent (Keychain prompts
+# for TouchID on macOS, secret-service requires dbus + a running
+# gnome-keyring / kwallet on Linux).
+
+[lints]
+workspace = true

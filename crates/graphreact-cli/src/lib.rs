@@ -29,6 +29,8 @@ pub mod hotreload_adapter;
 pub mod observer_client;
 pub mod observer_commands;
 pub mod observer_tui;
+/// **M-Prod sub-track #3 (Phase A).** `grx secrets …` dispatcher.
+pub mod secrets_commands;
 #[cfg(target_os = "macos")]
 pub mod jsruntime;
 #[cfg(target_os = "macos")]

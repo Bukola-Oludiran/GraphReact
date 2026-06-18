@@ -41,6 +41,12 @@ pub enum CommandError {
     /// without `@`, malformed addr, etc.).
     #[error("cluster argument error: {0}")]
     ClusterArg(String),
+    /// **M-Prod sub-track #3.** `grx secrets` error path. Wraps
+    /// every backend's failure surface in the same typed error so
+    /// the CLI message reads the same regardless of which store
+    /// produced the failure.
+    #[error("secrets error: {0}")]
+    Secrets(#[from] graphreact_secrets::SecretsError),
 }
 
 pub type CommandResult<T> = Result<T, CommandError>;

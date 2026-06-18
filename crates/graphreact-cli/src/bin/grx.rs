@@ -124,6 +124,9 @@ fn dispatch(runtime: &tokio::runtime::Runtime, command: Command) -> Result<(), C
         Command::Observer { target } => {
             runtime.block_on(graphreact_cli::observer_tui::run(target))?;
         }
+        Command::Secrets { op } => {
+            graphreact_cli::secrets_commands::run_secrets(op)?;
+        }
     }
     Ok(())
 }
@@ -301,7 +304,8 @@ fn associated_path(command: &Command) -> Option<&Path> {
         | Command::Tree { .. }
         | Command::Top { .. }
         | Command::Trace { .. }
-        | Command::Observer { .. } => None,
+        | Command::Observer { .. }
+        | Command::Secrets { .. } => None,
     }
 }
 
