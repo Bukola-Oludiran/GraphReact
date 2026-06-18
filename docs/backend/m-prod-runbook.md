@@ -1,6 +1,6 @@
 # M-Prod — Operator runbook (draft scaffold)
 
-**Status:** DRAFT scaffold — fills in as M-Prod sub-tracks land. Group 2 batch (2026-06-17) ships the "verify a release" section below; other sections are placeholders cross-linked to the owning sub-track's design doc.
+**Status:** DRAFT scaffold — fills in as M-Prod sub-tracks land. Group 2 batch (2026-06-17) ships the "verify a release" section below. Group 4 batch (2026-06-17) extends it with steps 6 (Dockerfile build) and 7 (helm chart install) for the sub-track #8 Phase A packaging surface; other sections remain placeholders cross-linked to the owning sub-track's design doc.
 
 This document is the production operator's index. Each sub-track owns one runbook section; the design docs in this directory own the "why we built it this way" narrative. When in doubt, the runbook is the source of truth for what the operator does; the design docs are the source of truth for what the substrate guarantees.
 
@@ -80,6 +80,49 @@ Operators verifying a tagged `grx` release follow this flow. The contract under 
    - **`trivy-sarif-<tag>` workflow artifact** — the raw SARIF for offline analysis / ingest into the operator's own vulnerability tracker.
 
    The CycloneDX SBOM itself can also be re-scanned with the operator's tool of choice (Grype, Dependency-Track, Snyk) for a second-opinion signal.
+
+6. **Build the OCI image locally (optional — Phase A scaffold).**
+
+   The release.yml `docker-build` matrix attaches `oci-image-{amd64,arm64}-<tag>.tar` to the GitHub Release (Phase A — Phase B replaces these with ghcr.io references once the keyless-signing push lane lands). Operators reproducing the image locally:
+
+   ```sh
+   # Mirror the release.yml docker-build inputs
+   SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+   docker buildx build \
+     --platform=linux/amd64 \
+     --build-arg GRX_PYTHON_MINOR=3.13 \
+     --build-arg SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH \
+     --build-arg GRX_SIGNATURE_URL=https://github.com/graphreact/graphreact/releases/download/v0.1.0/grx.sig \
+     -t grx:v0.1.0 .
+
+   # Inspect the embedded signature URL
+   docker run --rm grx:v0.1.0 version
+   ```
+
+   Cross-link: [`m-prod-packaging.md`](m-prod-packaging.md) documents the Dockerfile stage layout (zig-builder → rust-builder → python-donor → distroless final) and the per-CPython-minor ABI lock.
+
+7. **Install the helm chart (optional — Phase A scaffold).**
+
+   `charts/grx/` is shipped in the source tree (Phase A — Phase B publishes to a chart repo). Operators install directly from the checkout:
+
+   ```sh
+   helm install grx ./charts/grx \
+     --namespace grx \
+     --create-namespace \
+     --set image.repository=<your-registry>/grx \
+     --set image.tag=v0.1.0
+
+   # Wait for the readiness probe to flip green
+   kubectl --namespace grx rollout status deployment/grx
+
+   # Probe the observer endpoints (drain-aware /v1/readyz)
+   kubectl --namespace grx port-forward svc/grx 9090:9090 &
+   curl http://localhost:9090/v1/readyz
+   ```
+
+   Default values match SHIPPED code: `terminationGracePeriodSeconds=30` = `drainDeadlineSecs=20` + `observerShutdownDeadline=5` + 5s slack (matches the budget math in [`m-prod-lifecycle.md`](m-prod-lifecycle.md)). The Deployment runs as the distroless `nonroot` UID 65532 with `readOnlyRootFilesystem=true` and emptyDir mounts at `/tmp` + `/home/nonroot`.
+
+   Cross-link: [`m-prod-packaging.md`](m-prod-packaging.md) documents every knob in `values.yaml`.
 
 ---
 

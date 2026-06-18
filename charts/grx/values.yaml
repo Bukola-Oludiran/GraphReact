@@ -1,0 +1,221 @@
+# Default values for grx.
+#
+# All values are documented inline. The chart is deliberately verbose:
+# Phase A operators reading this file should understand WHY each default
+# is what it is without cross-referencing 5 design docs.
+#
+# Cross-references:
+#   - lifecycle / drain budgets — docs/backend/m-prod-lifecycle.md
+#   - readiness vs liveness     — docs/backend/m-prod-observability.md
+#   - signature verification    — docs/backend/m-prod-supply-chain.md
+#   - operator runbook          — docs/backend/m-prod-runbook.md
+#   - packaging Phase A         — docs/backend/m-prod-packaging.md
+
+# -----------------------------------------------------------------------------
+# Image
+# -----------------------------------------------------------------------------
+
+image:
+  # Phase A: the OCI image is shipped as a docker-load-able tar attached
+  # to each GitHub Release. Operators load it into their registry and
+  # point this `repository` at it. Phase B flips the default to
+  # `ghcr.io/graphreact/graphreact/grx` once the keyless-signing push
+  # lane lands.
+  repository: ghcr.io/graphreact/graphreact/grx
+  # Default tag follows Chart.appVersion. Override per environment.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -----------------------------------------------------------------------------
+# Replicas / scheduling
+# -----------------------------------------------------------------------------
+
+# Phase A default: single replica. The M14 distribution layer is intra-
+# cluster-aware (Erlang-shaped supervision) but the helm chart does NOT
+# wire pod-to-pod gossip in Phase A — operators running >1 replica today
+# get N independent daemons, not a clustered fleet. Multi-replica
+# clustering substrate (StatefulSet + headless Service + cluster
+# discovery via DNS-SRV) lands Phase B.
+replicas: 1
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -----------------------------------------------------------------------------
+# Runtime (engine + args)
+# -----------------------------------------------------------------------------
+
+runtime:
+  # Engine kind: "jsc" | "cpython" | "go" | "mixed" | "null" — passed
+  # through as the daemon's `--runtime` selector (cli.rs::RuntimeArg).
+  # The default `mixed` brings up every engine present in the .grx body
+  # (matches M22 mixed-runtime semantics).
+  kind: "mixed"
+
+  # Path to the `.grx` system the daemon runs. REQUIRED for the default
+  # `grx run` entrypoint shipped in Phase A. Mount the .grx (and any
+  # imports) via a ConfigMap or PVC at this path before installing —
+  # the default below points at a placeholder ConfigMap path operators
+  # MUST override. (Cluster mode — `grx cluster daemon` — requires
+  # node-id / cookie / TLS material that doesn't sensibly default;
+  # cluster-mode preset ships in Phase B.)
+  scriptPath: "/etc/grx/system.grx"
+
+  # `args` passes additional CLI flags to `grx run`. Defaults above
+  # already cover the M-Prod posture (runtime, observer bind, audit
+  # log, token); operators add more here (e.g. `--watch`).
+  args: []
+
+# -----------------------------------------------------------------------------
+# Observer / management API
+# -----------------------------------------------------------------------------
+
+observer:
+  # Bind for /v1/healthz, /v1/readyz, /metrics, /v1/nodes/:id/*.
+  # MUST be a fully-qualified `IP:port` — Rust's `SocketAddr` parser
+  # rejects the bare `:port` shorthand. `0.0.0.0:9090` exposes the
+  # observer to in-cluster traffic on the standard m-prod-observability
+  # reference port. Empty disables the management API entirely.
+  bind: "0.0.0.0:9090"
+
+  token:
+    # Auth bearer for the M-Ingress surface — read from an existing
+    # Secret. Leave empty to disable auth (M16-Backend default; NOT
+    # recommended for production).
+    existingSecret: ""
+    key: "observer-token"
+
+  audit:
+    # Path inside the pod where the hash-chained audit log writes
+    # (sub-track #1 Phase A). Empty disables the file sink (tracing
+    # stream still emits to stdout).
+    logPath: ""
+
+# -----------------------------------------------------------------------------
+# Lifecycle (drain budgets)
+# -----------------------------------------------------------------------------
+#
+# Phase A default values match the SHIPPED defaults in
+# `crates/graphreact-cli/src/commands.rs:1162`
+# (`DEFAULT_DRAIN_DEADLINE_SECS = 20`) and `m-prod-observability.md`
+# (`DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS = 5`). The k8s
+# terminationGracePeriodSeconds is set to 30 below to match
+# m-prod-lifecycle.md's budget math: `drain + observer + slack = 20 + 5
+# + 5 = 30s`.
+#
+# **Phase A vs orchestration-spec divergence:** the M-Prod #8
+# orchestration spec floated terminationGracePeriodSeconds=35 (drain 25
+# + OTel 5 + slack 5). Raising the drain default from 20→25s would
+# require a CLI code change in `commands.rs`, which is out of scope for
+# this packaging slice (constraint: "DO NOT modify any crates/* code").
+# Phase A ships the matching-current-code values; Phase B re-evaluates.
+
+lifecycle:
+  # Maps to `--drain-deadline-secs` / `GRX_DRAIN_DEADLINE_SECS`.
+  # Outer SIGTERM drain budget. Source of truth: helm sets the env var
+  # below.
+  drainDeadlineSecs: 20
+
+  # Maps to `OBSERVER_SHUTDOWN_DEADLINE`. OTel teardown bound. Runs
+  # INSIDE the drain budget; the daemon enforces drain >= observer.
+  observerShutdownDeadline: 5
+
+  # k8s pod-level grace period. Must cover drain + observer + ~5s slack
+  # for cluster + engine teardown. Helm computes the recommended value
+  # in the deployment template (lifecycle.terminationGracePeriodSeconds
+  # below); override here only when raising drain or observer above the
+  # defaults.
+  terminationGracePeriodSeconds: 30
+
+# -----------------------------------------------------------------------------
+# Probes
+# -----------------------------------------------------------------------------
+#
+# Pasted verbatim from m-prod-observability.md (the "k8s configuration"
+# block — that doc explicitly says "paste into the helm chart when
+# sub-track #8 lands"). Distinct readiness vs liveness probes:
+#   - liveness = is the process alive? slow period, high tolerance
+#   - readiness = should the LB route traffic here? fast period, low
+#     tolerance, AUTH-BYPASSED so the kubelet doesn't need the bearer
+
+probes:
+  liveness:
+    path: /v1/healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /v1/readyz
+    initialDelaySeconds: 1
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 3
+
+# -----------------------------------------------------------------------------
+# Service
+# -----------------------------------------------------------------------------
+
+service:
+  type: ClusterIP
+  # Service-facing port. Operators front this with their own ingress
+  # (nginx, Cilium, Istio) — the chart does NOT ship an Ingress resource
+  # to avoid coupling to one controller.
+  port: 9090
+  annotations: {}
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+
+resources:
+  # Phase A defaults sized for the M-Prod SLO numbers in docs/SLO.md.
+  # Operators MUST review for their workload — `.grx` body memory
+  # footprint dominates total RSS at scale (JS heap + CPython arena +
+  # Go heap per body).
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+
+# -----------------------------------------------------------------------------
+# Pod-level security
+# -----------------------------------------------------------------------------
+
+podSecurityContext:
+  fsGroup: 65532
+  runAsUser: 65532
+  runAsGroup: 65532
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop:
+      - ALL
+
+# -----------------------------------------------------------------------------
+# Extra mounts (for /etc/grx config + writable scratch if needed)
+# -----------------------------------------------------------------------------
+
+extraVolumes: []
+extraVolumeMounts: []
+
+# -----------------------------------------------------------------------------
+# Service account
+# -----------------------------------------------------------------------------
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
