@@ -14,6 +14,11 @@ crate-type = ["rlib"]
 
 [dependencies]
 graphreact-engine-zig = { path = "../graphreact-engine-zig" }
+# **M-Prod sub-track #3 Phase B Part 1.** Provides the SecretValue
+# type used at the host-callback boundary (HostSecretCallback::read
+# returns Option<SecretValue>) and the SecretStore trait the
+# production daemon's host_secret factory will eventually close over.
+graphreact-secrets = { path = "../graphreact-secrets" }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 parking_lot.workspace = true

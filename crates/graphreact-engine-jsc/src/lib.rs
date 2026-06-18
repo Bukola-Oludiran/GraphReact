@@ -40,8 +40,8 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use graphreact_engine_zig::{
-    BoxCallback, CallbackId, Engine, EngineError, EngineResult, FunctionHandle, HostValue,
-    IsolateHandle, IsolateOptions, ModuleHandle,
+    BoxCallback, CallbackId, Engine, EngineError, EngineResult, FunctionHandle, HostSecretCallback,
+    HostValue, IsolateHandle, IsolateOptions, ModuleHandle,
 };
 
 const RESULT_BUFFER_INITIAL: usize = 4096;
@@ -63,6 +63,34 @@ static CALLBACK_REGISTRY: OnceLock<RwLock<FxHashMap<u64, SharedCallback>>> = Onc
 
 fn callback_registry() -> &'static RwLock<FxHashMap<u64, SharedCallback>> {
     CALLBACK_REGISTRY.get_or_init(|| RwLock::new(FxHashMap::default()))
+}
+
+/// **M-Prod sub-track #3 Phase B Part 1.** Process-global shadow that
+/// backs [`JscEngine::host_secret_callback`]. The trait method
+/// returns `Option<&dyn HostSecretCallback>` (a `&self`-tied borrow)
+/// but the underlying `Arc<dyn HostSecretCallback>` lives behind a
+/// `RwLock` on the engine instance for swap semantics. To satisfy
+/// the trait shape without unsafe lifetime gymnastics, the engine
+/// also publishes the currently-installed callback into this
+/// `OnceLock`; the trait method's returned reference points at the
+/// `Arc` inside the lock cell (which is `'static`).
+///
+/// Production model: one `SecretStore` per process, set once at
+/// startup before isolates spin up — consistent with Phase A's
+/// `EnvStore` / `KeyringStore` semantics. Phase B Part 2's SIGHUP
+/// rotation will widen this to `Arc<arc_swap::ArcSwap<Arc<dyn
+/// HostSecretCallback>>>` for atomic-swap semantics; the trait shape
+/// stays bit-for-bit compatible (the borrow handed out still resolves
+/// to the currently-swapped Arc).
+///
+/// Tests that need to bypass the shadow register a `host_secret`
+/// callback directly via [`Engine::register_callback`] — that wiring
+/// is independent of this `OnceLock` and observes per-isolate
+/// closures instead of the process-global Arc.
+static HOST_SECRET_CALLBACK_SHADOW: OnceLock<Arc<dyn HostSecretCallback>> = OnceLock::new();
+
+fn host_secret_callback_shadow() -> &'static OnceLock<Arc<dyn HostSecretCallback>> {
+    &HOST_SECRET_CALLBACK_SHADOW
 }
 
 /// JSC engine. Wraps the Zig bridge with a safe Rust facade. The Zig
@@ -166,6 +194,42 @@ impl JscEngine {
             1 => Ok(true),
             err => Err(map_status(err)),
         }
+    }
+
+    /// **M-Prod sub-track #3 Phase B Part 1.** Install the
+    /// process-global [`HostSecretCallback`] that
+    /// [`Engine::host_secret_callback`] surfaces. Set-once per
+    /// process: subsequent calls leave the existing entry in place
+    /// and return `Err(...)` semantics implicit in `OnceLock::set`
+    /// (returns `Err(arc)` if already set).
+    ///
+    /// The production daemon (`graphreact-cli`'s `start` path) calls
+    /// this once at startup with a closure that captures the chosen
+    /// `Arc<dyn SecretStore>` + the scheduler-manifest reader. The
+    /// integration test path bypasses this entirely and registers a
+    /// `host_secret` callback directly via
+    /// [`Engine::register_callback`], which avoids the OnceLock and
+    /// gives each test fresh per-isolate semantics.
+    ///
+    /// Phase B Part 2 will widen this to an atomic-swap setter for
+    /// SIGHUP rotation. The current set-once shape pins the contract
+    /// for Phase B Part 1.
+    pub fn set_host_secret_callback(
+        &self,
+        cb: Arc<dyn HostSecretCallback>,
+    ) -> Result<(), Arc<dyn HostSecretCallback>> {
+        host_secret_callback_shadow().set(cb)
+    }
+
+    /// **M-Prod sub-track #3 Phase B Part 1.** Reader for the
+    /// process-global [`HostSecretCallback`] `Arc`. Mirrors
+    /// [`Engine::host_secret_callback`] (which returns a `&self`-tied
+    /// borrow); callers that need to clone the `Arc` past the borrow
+    /// lifetime (e.g. into a `host_secret` BoxCallback closure in
+    /// `graphreact-cli`'s daemon wiring) use this accessor.
+    #[must_use]
+    pub fn host_secret_callback_arc(&self) -> Option<Arc<dyn HostSecretCallback>> {
+        host_secret_callback_shadow().get().cloned()
     }
 
     /// Register a component body as a re-callable function. Diverges
@@ -549,6 +613,25 @@ impl Engine for JscEngine {
         // Phase1: query the version string from the Zig side.
         read_string_buffer(|buf, len| unsafe { ffi::gr_jsc_engine_version(buf, len) })
             .unwrap_or_else(|_| "jsc-unknown".to_string())
+    }
+
+    /// **M-Prod sub-track #3 Phase B Part 1.** Surface the
+    /// process-global [`HostSecretCallback`] installed via
+    /// [`Self::set_host_secret_callback`]. Returns `None` when no
+    /// callback has been registered — bodies that call
+    /// `ctx.secret(name)` then see the prelude's `if (typeof
+    /// host_secret === 'undefined') return null;` guard in effect
+    /// and get a `null` (default-deny) without crashing.
+    ///
+    /// The borrow points into the process-static `OnceLock`-backed
+    /// shadow; it is `'static` in practice and the trait-required
+    /// `'_` lifetime is upheld by tying it to `&self`. See ADR-0007
+    /// for the Phase B Part 2 widening plan that swaps the shadow
+    /// to an atomic-swap cell.
+    fn host_secret_callback(&self) -> Option<&dyn HostSecretCallback> {
+        host_secret_callback_shadow()
+            .get()
+            .map(|arc| arc.as_ref() as &dyn HostSecretCallback)
     }
 }
 

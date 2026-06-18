@@ -449,6 +449,16 @@ const HOOK_PRELUDE: []const u8 =
     \\    if (typeof useAcceptEdge === 'undefined') return;
     \\    return useAcceptEdge()(targetId);
     \\  };
+    \\  // M-Prod sub-track #3 Phase B Part 1: ctx.secret(name).
+    \\  // Resolves to the registered host_secret BoxCallback result
+    \\  // (UTF-8 string) when the active component's manifest
+    \\  // needs_secret allowlist contains the name; default-deny
+    \\  // returns null. See ADR-0007.
+    \\  rawCtx.secret = function(name) {
+    \\    if (typeof host_secret === 'undefined') return null;
+    \\    if (typeof name !== 'string') return null;
+    \\    return host_secret(name);
+    \\  };
     \\  return rawCtx;
     \\};
     \\
