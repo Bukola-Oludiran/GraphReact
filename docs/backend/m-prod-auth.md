@@ -12,7 +12,7 @@ Phase A ships the **SINK substrate** — the on-process append-only hash-chained
 |---|---|---|
 | `AuditSink` trait (object-safe, infallible `append`) | SHIPPED | [`crates/graphreact-observer/src/audit_chain.rs`](../../crates/graphreact-observer/src/audit_chain.rs) |
 | `NopAuditSink` (default; no-op) | SHIPPED | `audit_chain.rs` |
-| `FileAuditSink` (append-only NDJSON, per-line `sync_data`, restart-resume) | SHIPPED | `audit_chain.rs` |
+| `FileAuditSink` (append-only NDJSON, per-line `sync_data`, restart-resume, **mode 0o600 enforced on Unix**) | SHIPPED | `audit_chain.rs` |
 | `AuditRecord` / `AuditRecordInput` types | SHIPPED | `audit_chain.rs` |
 | `replay(path)` chain verifier + `AuditChainError` typed errors | SHIPPED | `audit_chain.rs` |
 | `ApiState::audit_sink` field + `SpawnOptions::audit_sink` | SHIPPED | [`crates/graphreact-observer/src/management_api.rs`](../../crates/graphreact-observer/src/management_api.rs) |
@@ -23,7 +23,8 @@ Phase A ships the **SINK substrate** — the on-process append-only hash-chained
 | `DaemonHandle::shutdown` `otel_shutdown_timeout` fans to sink | SHIPPED | [`crates/graphreact-cli/src/commands.rs`](../../crates/graphreact-cli/src/commands.rs) |
 | `--observer-audit-log <PATH>` CLI flag on `grx cluster daemon` | SHIPPED | [`crates/graphreact-cli/src/cli.rs`](../../crates/graphreact-cli/src/cli.rs) |
 | `grx audit verify <PATH>` subcommand | SHIPPED | [`crates/graphreact-cli/src/audit_commands.rs`](../../crates/graphreact-cli/src/audit_commands.rs) |
-| Unit tests (8) + integration tests (3 observer e2e + 3 CLI verify) | SHIPPED | `crates/graphreact-observer/{src,tests}` + `crates/graphreact-cli/tests/audit_verify.rs` |
+| Unit tests (10) + integration tests (3 observer e2e + 3 CLI verify) | SHIPPED | `crates/graphreact-observer/{src,tests}` + `crates/graphreact-cli/tests/audit_verify.rs` |
+| Mode-0o600 enforcement on create + on open-existing (verify-finding patch) | SHIPPED | `audit_chain.rs::FileAuditSink::open` + 2 unit tests |
 | Multi-token RBAC + per-route ACLs | DEFERRED → Phase B | n/a |
 | Batched-fsync worker task | DEFERRED → Phase B | n/a |
 | Atomic-swap of audit-log file across SIGHUP rotation | DEFERRED → Phase B | n/a |
@@ -90,6 +91,22 @@ Phase A fsyncs (`std::fs::File::sync_data`) on every append: correctness over th
 - `auth_fail` (per-bad-bearer-request): one disk sync per failed auth attempt. On a fast NVMe this is sub-millisecond; on rotational disks or shared cloud storage it can be 5–10ms. Operators tuning a high-auth-fail-flood deploy should consider Phase B's batched-fsync mode.
 
 Phase B will (a) move the sink to an `mpsc`-fed worker task off the request path, (b) batch fsyncs (per N records OR per 250ms, whichever first), (c) expose a `--observer-audit-log-fsync=always|periodic|never` knob so compliance deploys can demand per-record sync while latency-sensitive deploys opt out.
+
+## File permissions (mode 0o600)
+
+`FileAuditSink::open` enforces mode `0o600` on the audit-log file on Unix:
+
+1. **On create.** The `OpenOptions` call passes `.mode(0o600)` via `std::os::unix::fs::OpenOptionsExt` so a fresh file lands at user-readable-only, bypassing the process umask (typically `0o022` → `0o644`).
+2. **On open of a pre-existing file.** `std::fs::set_permissions(path, PermissionsExt::from_mode(0o600))` runs unconditionally after open. Without this, a chain file that was world-readable BEFORE this patch landed (or one a misconfigured operator created with `touch`) would silently stay world-readable across daemon restarts.
+
+Why this matters: audit records carry **peer IPs of every scraper / auth-failer**, **TLS leaf SHA-256 fingerprints** (rotation receipts that ops correlate against secret material), **auth-failure shape** (`missing` / `wrong` + peer), and full chain integrity. The records do **not** carry bearer-token values or PEM bytes — that invariant is enforced at the record-construction sites in `audit.rs` — but the metadata is operator-secret-class data on multi-tenant hosts (CI runners, dev workstations, k8s nodes with non-root pods, shared bastions). Mode-0o600 keeps every unprivileged user on the box from `cat`-ing the chain.
+
+Windows: deferred — the substrate doesn't currently expose a chmod-equivalent. Operators running on Windows hosts should rely on directory-level ACLs as a stop-gap; a follow-up slice can wire `Sid` ACLs once Phase B's auth surface lands.
+
+Verified by two unit tests in `audit_chain::tests`:
+
+- `file_audit_sink_enforces_0600_mode_on_create` — fresh file lands at `0o600`.
+- `file_audit_sink_tightens_mode_on_preexisting_file` — a planted `0o644` file is tightened to `0o600` on next open.
 
 ## Sink-failure policy
 

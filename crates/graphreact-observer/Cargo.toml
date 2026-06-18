@@ -108,6 +108,10 @@ serde_json.workspace = true
 prometheus-parse.workspace = true
 rcgen.workspace = true
 tokio-tungstenite = { workspace = true, default-features = false, features = ["connect", "handshake"] }
+# M-Prod #1 Phase A — audit-chain mode-0600 tests + audit_chain_e2e
+# integration tests both want a per-test scratch directory; tempfile
+# is the workspace-light option vs the heavier sibling tempdir crate.
+tempfile = "3"
 
 [[bench]]
 name = "scheduler_overhead"

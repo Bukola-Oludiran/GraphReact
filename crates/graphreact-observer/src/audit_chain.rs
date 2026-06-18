@@ -207,14 +207,38 @@ impl FileAuditSink {
             (0, GENESIS_PREV_HASH.to_string())
         };
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        // M-Prod #1 Phase A security-handling: audit-log records carry
+        // peer IPs, auth-failure reasons (missing | wrong), TLS leaf
+        // fingerprints, and full chain integrity. On multi-tenant
+        // hosts (CI runners, dev workstations, k8s nodes with other
+        // pods running as non-root) a world-readable file would let
+        // any unprivileged user read the chain. Enforce mode 0o600
+        // both on create AND on a pre-existing file — without the
+        // post-open set_permissions a chain that was world-readable
+        // before this commit would silently stay world-readable
+        // across daemon restarts.
+        let mut open_opts = OpenOptions::new();
+        open_opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.mode(0o600);
+        }
+        let file = open_opts
             .open(&path)
             .map_err(|err| AuditChainError::Io {
                 path: path.clone(),
                 source: err,
             })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&path, perms).map_err(|err| AuditChainError::Io {
+                path: path.clone(),
+                source: err,
+            })?;
+        }
 
         Ok(Self {
             path,
@@ -705,6 +729,52 @@ mod tests {
         assert_eq!(
             h,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    /// **M-Prod #1 Phase A security-handling verify finding (HIGH).**
+    /// Audit-log records carry peer IPs, auth-failure reasons, and TLS
+    /// fingerprints — every byte of the chain is operator-secret class
+    /// data. The file must NOT inherit the umask-default mode (0o644
+    /// on stock Unix); enforce mode 0o600 on both the create-path AND
+    /// the open-existing-file path.
+    #[cfg(unix)]
+    #[test]
+    fn file_audit_sink_enforces_0600_mode_on_create() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("create.ndjson");
+        let _sink = FileAuditSink::open(&path).expect("open");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        // Permissions on Unix include the file-type bits in the upper
+        // bits; mask down to the user/group/other triplet.
+        assert_eq!(mode & 0o777, 0o600, "expected 0o600 on create, got {:o}", mode & 0o777);
+    }
+
+    /// Pair test for the above: pre-existing audit-log files (e.g. one
+    /// created before this patch landed, or by a misconfigured
+    /// operator) MUST be tightened to 0o600 on next open. Otherwise
+    /// the security gain only applies to fresh deployments.
+    #[cfg(unix)]
+    #[test]
+    fn file_audit_sink_tightens_mode_on_preexisting_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("preexisting.ndjson");
+        // Plant a world-readable file at the target path FIRST.
+        std::fs::write(&path, b"").expect("plant");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+        let pre_mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(pre_mode & 0o777, 0o644, "test setup: file should be 0o644");
+        // Now open via FileAuditSink and confirm the mode tightens.
+        let _sink = FileAuditSink::open(&path).expect("open existing");
+        let post_mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            post_mode & 0o777,
+            0o600,
+            "expected 0o600 after open existing, got {:o}",
+            post_mode & 0o777
         );
     }
 }
