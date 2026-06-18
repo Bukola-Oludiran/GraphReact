@@ -1,8 +1,40 @@
 # M-Prod — TLS rotation (sub-track #2)
 
-**Status:** SHIPPED Phase A 2026-06-17 — atomic-swap substrate landed; SIGHUP wiring (Phase B) and ACME (Phase C) deferred.
+**Status:** SHIPPED Phase A 2026-06-17 + Phase B Part 1 SIGHUP 2026-06-18 — atomic-swap substrate + SIGHUP signal handler landed; ACME / cert-manager (Phase C) + session-resumption ticket rotation + Windows path + dist-mTLS rotation deferred to Phase B Part 2 / later.
 
 This document covers sub-track #2 of the M-Prod milestone (production-hardening): in-process TLS certificate rotation for the observer HTTPS surface. Sibling tracks (#1 token rotation, #4 lifecycle / SIGHUP topology, #9 chaos arm) reference this substrate; see [Cross-track contracts](#cross-track-contracts).
+
+## Shipped — Phase B Part 1 (SIGHUP wire-up)
+
+**Status:** SHIPPED 2026-06-18 — SIGHUP signal handler triggers `reload_tls_from_disk` against the cert + key paths captured at boot, atomically swapping through Phase A's `ApiServerHandle::reload_tls` substrate. Unix only. ACME / cert-manager + session-ticket rotation + Windows path remain DEFERRED to Phase B Part 2 / Phase C.
+
+| Deliverable | Status | Location |
+|---|---|---|
+| SIGHUP signal stream in `drive_handle_until` | SHIPPED | `crates/graphreact-cli/src/commands.rs::drive_handle_until` (new `sighup.recv()` arm alongside SIGTERM + SIGINT + tick) |
+| `DaemonHandle::reload_tls_from_disk` helper | SHIPPED | `crates/graphreact-cli/src/commands.rs` |
+| `TlsPaths` struct + `DaemonOptions.observer_tls_paths` + `DaemonHandle.tls_paths` retention | SHIPPED | `crates/graphreact-cli/src/commands.rs` + `crates/graphreact-cli/src/bin/grx.rs` |
+| `tls_reload_skipped` audit event (drain-respect) | SHIPPED | `crates/graphreact-observer/src/audit.rs::log_tls_reload_skipped` |
+| Boot warning on relative TLS paths (`tls_paths_relative`) | SHIPPED | `crates/graphreact-cli/src/commands.rs::validate_tls_paths_absolute` |
+| Integration test (direct-call + drain-respect + subprocess SIGHUP) | SHIPPED | `crates/graphreact-cli/tests/sighup_cert_rotation.rs` + `sighup_cert_rotation_subprocess.rs` |
+
+### Topology decision: one tokio::select! task, four arms
+
+Both SIGTERM (Phase α, sub-track #4) and SIGHUP (this Phase B Part 1) run as `tokio::signal::unix::signal(SignalKind::*)` streams selected inside `drive_handle_until`'s existing `tokio::select!`. Pros vs. independent spawned tasks: no extra shutdown coordination, no race against `DaemonHandle` mutation, signal handling concentrated in one file. The arms are ordered `tick` → `sigint` → `sigterm` → `sighup`; `tokio::select!` is fair across arms so a SIGHUP storm cannot starve ticks. SIGHUP is NOT gated by `if duration.is_none()` (unlike SIGINT/SIGTERM) because it does not exit the loop — duration-bounded daemons (CI tests, scheduled cron-style runs) still need to respond to operator-driven rotation.
+
+### Drain-respect
+
+When a SIGTERM drain is in progress, SIGHUP is a no-op — rotating the cert mid-drain would generate a confusing `tls_reload_attempt` + `tls_reload_success` audit pair mid-drain that operators would have to explain, AND we're tearing down the accept loop in seconds anyway. Drain-respect is enforced by `DaemonHandle::reload_tls_from_disk` checking `self.drain.as_ref().is_some_and(|f| f.is_draining())` BEFORE the file read; on the skip path it emits `log_tls_reload_skipped("draining", sink)` and returns. The skip event is `WARN`-level on the `graphreact::observer::audit` target with field `reason="draining"`.
+
+### Boot-time path validation
+
+`start_daemon` validates that cert + key paths are absolute when `observer_tls_paths` is `Some`. Relative paths are accepted (back-compat) but a `tls_paths_relative` WARN audit row fires at boot — relative paths resolve against the daemon's CWD which can shift after systemd `WorkingDirectory` changes or `chdir`, making SIGHUP re-read non-deterministic. Operators should always pass absolute paths via `--observer-cert` / `--observer-key`.
+
+### Audit-event additions
+
+| Event | Level | Fields | Emitted by |
+|---|---|---|---|
+| `tls_reload_skipped` | WARN | `reason: &'static str` (currently only `"draining"`) | `DaemonHandle::reload_tls_from_disk` when drain is in progress |
+| `tls_paths_relative` | WARN | `cert_path: String`, `key_path: String` | `start_daemon`'s `validate_tls_paths_absolute` (boot-only; tracing-only, not fanned to AuditSink — mirrors `drain_budget_misconfig` precedent) |
 
 ## Phase A scope
 
@@ -18,10 +50,10 @@ Phase A ships the **substrate** — the on-process atomic-swap mechanism that fu
 | `TlsRotationError` typed errors | SHIPPED | `tls.rs::TlsRotationError` |
 | Audit events (`tls_reload_attempt` / `tls_reloaded` / `tls_reload_failure`) | SHIPPED | [`crates/graphreact-observer/src/audit.rs`](../../crates/graphreact-observer/src/audit.rs) |
 | Integration tests (7) | SHIPPED | [`crates/graphreact-observer/tests/tls_rotation.rs`](../../crates/graphreact-observer/tests/tls_rotation.rs) |
-| SIGHUP signal handler | DEFERRED → Phase B | n/a |
+| ~~SIGHUP signal handler~~ | ~~DEFERRED → Phase B~~ → **SHIPPED Phase B Part 1 2026-06-18** | `crates/graphreact-cli/src/commands.rs::drive_handle_until` + `DaemonHandle::reload_tls_from_disk` |
 | ACME / cert-manager auto-renewal | DEFERRED → Phase C | n/a |
 | Dist crate mTLS rotation (server + client) | DEFERRED — separate track | `crates/graphreact-dist/src/tls_config.rs` (untouched) |
-| Session-ticket rotation | DEFERRED → Phase B | n/a |
+| Session-ticket rotation | DEFERRED → Phase B Part 2 | n/a |
 
 ## RotatableServerConfig shape
 
@@ -89,19 +121,19 @@ All three rotation events ride the same `graphreact::observer::audit` target as 
 | Sub-track | What it reuses | Phase A obligation |
 |---|---|---|
 | **#1 Auth & secrets** | The same `Arc<ArcSwap<_>>` shape will back rotatable bearer-token registries (`Arc<ArcSwap<BearerTokenRegistry>>`). | Phase A documents the pattern; sub-track #1 owns its own type. |
-| **#4 Lifecycle** | Phase B SIGHUP handler will hold a clone of `ApiServerHandle` and call `reload_tls` on signal. | Phase A exposes `reload_tls` as a public API; sub-track #4 owns the signal wiring + per-platform fallback (Windows uses a named-event handle or a small REST endpoint instead). |
+| **#4 Lifecycle** | ~~Phase B SIGHUP handler will hold a clone of `ApiServerHandle` and call `reload_tls` on signal.~~ **Phase B Part 1 SHIPPED 2026-06-18** — SIGHUP handler is co-located with #4's SIGTERM handler in `drive_handle_until`'s `tokio::select!` (one signal-kind per arm). | Phase A exposed `reload_tls` as a public API; sub-track #2 Phase B Part 1 owns the signal wiring; Windows fallback (named-event handle or REST `POST /v1/admin/reload-tls`) deferred to Phase B Part 2. |
 | **#9 Chaos & fuzz** | A chaos arm fires `reload_tls(rcgen_minted_cert)` in a loop while the chaos harness's HTTP client scrapes `/v1/healthz`. Asserts no handshake fails mid-rotation. | Phase A's per-accept acceptor construction is the contract — sub-track #9 verifies it under load. |
 
 ## What Phase A does not ship
 
 | Item | Reason | Lands in |
 |---|---|---|
-| SIGHUP signal handler | Cross-platform signal handling is sub-track #4's domain. Phase A's `reload_tls` is the call-site target. | Phase B (#4) |
+| ~~SIGHUP signal handler~~ | ~~Cross-platform signal handling is sub-track #4's domain. Phase A's `reload_tls` is the call-site target.~~ | **SHIPPED Phase B Part 1 2026-06-18** |
 | Reload-on-file-change (`fsnotify`) | Filesystem watchers are platform-specific + the partial-write race lives at the FS layer; ACME / cert-manager are the canonical solutions. | Phase C |
 | ACME / cert-manager integration | External cert lifecycle is a deployment concern, not a runtime concern. | Phase C |
 | Dist crate mTLS rotation | The cluster transport holds BOTH server + client configs and coordinates handshake-in-flight on both sides of mTLS. Different invariants. | Separate track |
-| Session-ticket rotation | Phase A keeps rustls's default session-ticket generator; clients holding tickets from the OLD `ServerConfig` will fall back to a full handshake post-rotation. Operators may see a transient handshake-CPU spike right after rotation. | Phase B |
-| Windows code path verification | Phase A is pure-Rust + portable; SIGHUP is the platform seam. | Phase B (#4) |
+| Session-ticket rotation | Phase A keeps rustls's default session-ticket generator; clients holding tickets from the OLD `ServerConfig` will fall back to a full handshake post-rotation. Operators may see a transient handshake-CPU spike right after rotation. | Phase B Part 2 |
+| Windows code path verification | Phase A is pure-Rust + portable; SIGHUP is the Unix-only platform seam. | Phase B Part 2 |
 
 ## References
 

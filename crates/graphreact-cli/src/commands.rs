@@ -1824,8 +1824,8 @@ impl DaemonHandle {
 /// `drain_budget_misconfig` precedent which fans only to the
 /// tracing stream (not the AuditSink) so boot-time warnings stay
 /// uniform across the codebase.
-fn validate_tls_paths_absolute(paths: &Option<TlsPaths>) {
-    let Some(p) = paths.as_ref() else { return };
+fn validate_tls_paths_absolute(paths: Option<&TlsPaths>) {
+    let Some(p) = paths else { return };
     if !p.cert_path.is_absolute() || !p.key_path.is_absolute() {
         tracing::warn!(
             target: "graphreact::observer::audit",
@@ -1986,7 +1986,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // so a relative-path warning would be operator noise. The
         // validator is tracing-only (no AuditSink fan) per the
         // drain_budget_misconfig precedent below.
-        validate_tls_paths_absolute(&opts.observer_tls_paths);
+        validate_tls_paths_absolute(opts.observer_tls_paths.as_ref());
         let metrics = std::sync::Arc::new(graphreact_observer::MetricsInner::new());
         metrics_for_engine_counts = Some(metrics.clone());
         let prom_sink = std::sync::Arc::new(graphreact_observer::PrometheusSink::from_arc(
@@ -2562,7 +2562,20 @@ pub async fn drive_handle_until(
             // iteration would double-bill the tick budget.
             // `tokio::select!` is fair across arms so a SIGHUP
             // storm cannot starve ticks.
-            _ = sighup.recv(), if duration.is_none() => {
+            //
+            // **Deviation from plan**: SIGHUP is NOT gated by
+            // `if duration.is_none()` (unlike SIGINT/SIGTERM).
+            // Duration-bounded runs (CI tests, subprocess fixtures,
+            // scheduled cron-style daemons) still need to respond
+            // to operator-driven cert rotation — gating SIGHUP
+            // behind `duration.is_none()` would silently drop the
+            // rotation in those configurations. Since SIGHUP does
+            // NOT exit the loop, gating it provides no shutdown-
+            // semantics benefit; the duration check on sigint/sigterm
+            // exists because those return from the function, which
+            // a duration-bounded run handles via its own `deadline`
+            // arm.
+            _ = sighup.recv() => {
                 handle.reload_tls_from_disk();
             }
         }
