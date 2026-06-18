@@ -27,8 +27,9 @@
 //!    failure path: delete the cert file, call
 //!    `reload_tls_from_disk`, confirm a `tls_reload_attempt` +
 //!    `tls_reload_failure` audit pair was emitted with
-//!    `error_kind=cert_parse`, and the prior cert keeps serving on
-//!    a follow-up handshake.
+//!    `error_kind=cert_read` (NOT `cert_parse` — the verify-finding
+//!    patch split I/O failures from PEM-parse failures), and the
+//!    prior cert keeps serving on a follow-up handshake.
 
 #![cfg(unix)]
 
@@ -461,8 +462,9 @@ async fn reload_tls_from_disk_is_noop_during_drain() {
 
 /// **Failure path: missing cert file**. Delete the cert file, call
 /// `reload_tls_from_disk`, confirm `tls_reload_attempt` +
-/// `tls_reload_failure` (`error_kind=cert_parse`) fire and that the
-/// prior cert keeps serving.
+/// `tls_reload_failure` (`error_kind=cert_read` — verify-finding
+/// patch split I/O failures from PEM-parse failures) fire and that
+/// the prior cert keeps serving.
 #[tokio::test]
 async fn reload_tls_from_disk_with_missing_cert_file_surfaces_audit() {
     let capture = install_capture();
@@ -479,8 +481,9 @@ async fn reload_tls_from_disk_with_missing_cert_file_surfaces_audit() {
     // Remove the cert file but leave the key file in place. The
     // helper's `std::fs::read(&cert_path)` will fail with ENOENT;
     // the rotation MUST emit a tls_reload_attempt followed by
-    // tls_reload_failure with error_kind=cert_parse and NOT call
-    // reload_tls (which would observe a non-existent file).
+    // tls_reload_failure with error_kind=cert_read (verify-finding
+    // patch: I/O errors get cert_read/key_read, not cert_parse/
+    // key_parse which is reserved for PEM-parse failures).
     std::fs::remove_file(&booted.cert_path).expect("remove cert");
     booted.handle.reload_tls_from_disk();
 
@@ -505,12 +508,12 @@ async fn reload_tls_from_disk_with_missing_cert_file_surfaces_audit() {
     let failures: Vec<&&String> = window
         .iter()
         .filter(|e| {
-            e.contains("event=tls_reload_failure") && e.contains("error_kind=cert_parse")
+            e.contains("event=tls_reload_failure") && e.contains("error_kind=cert_read")
         })
         .collect();
     assert!(
         !failures.is_empty(),
-        "expected >= 1 tls_reload_failure/cert_parse event in window; captured {window:?}"
+        "expected >= 1 tls_reload_failure/cert_read event in window; captured {window:?}"
     );
 
     booted.handle.shutdown().await;

@@ -1661,12 +1661,23 @@ impl DaemonHandle {
                 return;
             }
         }
+        // **Verify-finding patch (MED).** Distinguish I/O failures
+        // (ENOENT, EACCES, EISDIR, EIO) from PEM-parse failures by
+        // using new `cert_read` / `key_read` error_kinds. Phase A's
+        // documented `cert_parse` / `key_parse` taxonomy in
+        // `m-prod-tls-rotation.md` reserves those for malformed-PEM /
+        // rustls-rejected bytes. Conflating "cert file vanished after
+        // cert-manager rotation" with "cert-manager wrote a malformed
+        // PEM" forces operators to grep `detail` to disambiguate; the
+        // typed split lets per-error_kind alerting fire on the right
+        // remediation path. `log_tls_reload_failure` accepts
+        // `error_kind: &'static str` so the extension is additive.
         let cert_bytes = match std::fs::read(&paths.cert_path) {
             Ok(b) => b,
             Err(e) => {
                 graphreact_observer::audit::log_tls_reload_attempt(0, 0, sink);
                 graphreact_observer::audit::log_tls_reload_failure(
-                    "cert_parse",
+                    "cert_read",
                     &format!("read {}: {}", paths.cert_path.display(), e),
                     sink,
                 );
@@ -1682,7 +1693,7 @@ impl DaemonHandle {
                     sink,
                 );
                 graphreact_observer::audit::log_tls_reload_failure(
-                    "key_parse",
+                    "key_read",
                     &format!("read {}: {}", paths.key_path.display(), e),
                     sink,
                 );
@@ -2523,11 +2534,34 @@ pub async fn drive_handle_until(
     // slots; tokio releases the signalfd / kqueue slot on drop).
     // SIGHUP triggers an in-loop `DaemonHandle::reload_tls_from_disk`
     // call and does NOT exit the loop, unlike SIGINT / SIGTERM.
+    //
+    // **Verify-finding patch (MED).** GATE the SIGHUP signal-stream
+    // installation on `handle.tls_paths.is_some()`. Once a tokio
+    // `Signal(SignalKind::hangup())` exists for the process, the OS
+    // installs its own signal handler — even after the Signal stream
+    // drops, the kernel default action (terminate) is no longer in
+    // effect for SIGHUP. Without this gate, non-TLS daemons (e.g.
+    // `grx connect`, daemons without `--observer-cert`/`--observer-key`)
+    // would silently no-op on operator-fired SIGHUP that today
+    // terminates them. Keeping the default for non-TLS daemons matches
+    // the principle of least surprise for `kill -HUP` workflows.
+    //
+    // **Verify-finding patch (MED).** Emit a `grx-sighup-ready` line
+    // immediately AFTER the signal stream is registered so operator
+    // tooling (cert-manager hooks, k8s preStop, integration tests) can
+    // wait for it before firing the first SIGHUP. The Phase A
+    // race-window between `start_daemon`'s `grx-observer-ready` and
+    // this point is now operator-observable; production scripts that
+    // watch stdout for `grx-sighup-ready` close the race.
     #[cfg(unix)]
-    let mut sighup = {
+    let mut sighup = if handle.tls_paths.is_some() {
         use tokio::signal::unix::{signal, SignalKind};
-        signal(SignalKind::hangup())
-            .map_err(|e| CommandError::ClusterArg(format!("SIGHUP register: {e}")))?
+        let stream = signal(SignalKind::hangup())
+            .map_err(|e| CommandError::ClusterArg(format!("SIGHUP register: {e}")))?;
+        println!("grx-sighup-ready {}", std::process::id());
+        Some(stream)
+    } else {
+        None
     };
 
     loop {
@@ -2575,7 +2609,20 @@ pub async fn drive_handle_until(
             // exists because those return from the function, which
             // a duration-bounded run handles via its own `deadline`
             // arm.
-            _ = sighup.recv() => {
+            //
+            // `sighup` is `Option<Signal>` — `None` for non-TLS
+            // daemons where the gate at registration kept the kernel
+            // default (terminate) in effect. The inner `async`
+            // resolves only when the Signal is `Some` AND fires;
+            // when `None` the inner future pends forever so this
+            // arm is dormant. The `if` guard ensures the select!
+            // doesn't even poll the future when sighup is None.
+            _ = async {
+                match sighup.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => { std::future::pending::<()>().await; }
+                }
+            }, if sighup.is_some() => {
                 handle.reload_tls_from_disk();
             }
         }

@@ -167,10 +167,14 @@ fn dial_observer_capture_cert(
     })
 }
 
-/// Watch the child's stdout for the readiness lines emitted by the
-/// daemon (`grx-daemon-ready` + `grx-observer-ready`). Returns the
-/// observer's bound socket addr once seen. Each line passes through
-/// to stderr for test-driver triage.
+/// Watch the child's stdout for the daemon readiness lines:
+/// `grx-daemon-ready`, `grx-observer-ready <addr>`, AND
+/// `grx-sighup-ready <pid>` (verify-finding patch — emitted by
+/// `drive_handle_until` AFTER it registers the SIGHUP signal stream
+/// so operator tooling can wait for it before firing SIGHUP, closing
+/// the prior 200ms-sleep race window). Returns the observer's
+/// bound socket addr once all three are seen. Each line passes
+/// through to stderr for test-driver triage.
 fn wait_for_observer_ready(
     child: &mut std::process::Child,
     deadline: Duration,
@@ -179,21 +183,31 @@ fn wait_for_observer_ready(
     let reader = BufReader::new(stdout);
     let start = Instant::now();
     let mut observer_addr: Option<SocketAddr> = None;
-    let mut buffered: Vec<String> = Vec::new();
+    let mut sighup_ready = false;
     for line in reader.lines() {
         if start.elapsed() > deadline {
             let _ = child.kill();
-            panic!("daemon did not emit `grx-observer-ready` within {deadline:?}");
+            panic!(
+                "daemon did not emit `grx-observer-ready` + \
+                 `grx-sighup-ready` within {deadline:?}"
+            );
         }
         let line = line.expect("read stdout");
         eprintln!("[daemon stdout] {line}");
         if let Some(rest) = line.trim().strip_prefix("grx-observer-ready ") {
             observer_addr = Some(rest.parse().expect("observer addr"));
-            buffered.push(line);
+        }
+        if line.trim().starts_with("grx-sighup-ready ") {
+            sighup_ready = true;
+        }
+        if observer_addr.is_some() && sighup_ready {
             break;
         }
-        buffered.push(line);
     }
+    assert!(
+        sighup_ready,
+        "daemon emitted observer-ready but never grx-sighup-ready"
+    );
     observer_addr.expect("observer-ready line")
 }
 
@@ -295,16 +309,14 @@ fn grx_daemon_sighup_swaps_observer_cert_subprocess() {
         });
     }
 
-    // Give `drive_handle_until` a beat to install the SIGHUP
-    // signal handler. There's a small window between
-    // `start_daemon` returning (which emits the ready lines we
-    // wait for) and `drive_handle_until` calling
-    // `tokio::signal::unix::signal(SignalKind::hangup())`. A
-    // SIGHUP arriving inside that window hits the kernel's
-    // default action (terminate) and kills the daemon before
-    // we get to test the rotation path. 200ms is wildly more than
-    // the actual race window (microseconds) but cheap insurance.
-    std::thread::sleep(Duration::from_millis(200));
+    // **Verify-finding patch (MED).** The 200ms sleep is gone —
+    // `wait_for_observer_ready` above now waits for the
+    // `grx-sighup-ready <pid>` line emitted AFTER
+    // `drive_handle_until` installs the SIGHUP signal stream. The
+    // race window between `start_daemon` returning and the
+    // SIGHUP handler being installed is now observable via stdout;
+    // production operator tooling (cert-manager hooks, k8s preStop)
+    // waits for the same line.
 
     // First handshake — must succeed under CA A's trust anchor.
     // We don't directly compare leaf bytes (the leaf cert DER
