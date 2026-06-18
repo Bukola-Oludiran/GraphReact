@@ -105,14 +105,73 @@ A new `trivy-sbom-scan` job in `.github/workflows/ci.yml` depends on the existin
 - Empty-corpus path: if `sbom/*.cdx.json` matches nothing, the step emits a minimal valid SARIF (`{"version":"2.1.0","runs":[]}`) so `codeql-action/upload-sarif` doesn't fail on a missing file.
 - Persists raw SARIF as `trivy-sarif-<sha-or-tag>` workflow artifact (90-day retention) in addition to the Security-tab upload, so operators can grab it via `gh run download` without going through the API.
 
+## Shipped — Phase B Part 1 (2026-06-18)
+
+Joint #7 + #8 safe-slice: Sigstore-keyless signing of release artifacts + SLSA build provenance attestation + (sub-track #8) Dockerfile base-stage SHA pinning + ghcr.io push gating. All changes are YAML + Dockerfile + docs only — no `crates/*` touched.
+
+### Sigstore-keyless signing
+
+`.github/workflows/release.yml`'s `reproducibility-recheck` job now installs cosign via `sigstore/cosign-installer@v3.5.0` and signs `target/release/grx` keyless via `cosign sign-blob --yes --bundle target/release/grx.cosign.bundle`. Bundle format (cert + signature + Rekor inclusion proof in one file) — operator-friendly verify flow.
+
+The same flow is mirrored at every load-bearing artifact boundary:
+
+| Job | Signed artifact | Bundle output |
+|---|---|---|
+| `reproducibility-recheck` | `target/release/grx` | `target/release/grx.cosign.bundle` |
+| `docker-build` (per matrix shard) | `/tmp/grx-oci-{amd64,arm64}.tar` | `/tmp/grx-oci-{amd64,arm64}.tar.cosign.bundle` |
+| `ghcr-push` | `ghcr.io/<repo>/grx@<digest>` (registry-side image) | Registry-side OCI signature attached to the manifest digest |
+
+`sigstore/cosign-installer@v3.5.0` minor pin: ships cosign 2.2+ (required for the keyless v3 flow). Same pin discipline as `cargo-cyclonedx@0.5.9`, `trivy@0.53.0`, `cargo-fuzz@0.12` in `ci.yml`. Bumps are deliberate PRs.
+
+### SLSA build provenance
+
+`actions/attest-build-provenance@v1` runs in three places: `reproducibility-recheck` (binary), `docker-build` matrix (per-arch tar), `ghcr-push` (registry manifest with `push-to-registry: true`). The action emits GitHub-attested provenance queryable via `gh attestation verify <artifact> --repo graphreact/graphreact`. Output `.intoto.jsonl` bundles are captured via the action's `bundle-path` output, `cp`'d next to each signed artifact, and attached to the GitHub Release alongside the binary + OCI tars so operators can verify without the `gh` CLI.
+
+The `ghcr-push` job uses `push-to-registry: true` so the GitHub-side SLSA attestation lands in the registry alongside the image. This coexists with `docker/build-push-action@v6`'s own `provenance: true` (one is buildkit-shaped, one is GitHub-attestations-shaped); both are standard.
+
+### Verify a release (updated flow)
+
+Operators verify a binary's signature + provenance via:
+
+```sh
+# Sigstore-keyless verify of the binary
+cosign verify-blob --bundle grx.cosign.bundle \
+  --certificate-identity-regexp 'https://github\.com/graphreact/graphreact/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  grx
+
+# SLSA build provenance (either path):
+gh attestation verify grx --repo graphreact/graphreact
+cosign verify-blob-attestation --bundle grx.intoto.jsonl \
+  --certificate-identity-regexp 'https://github\.com/graphreact/graphreact/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --type slsaprovenance grx
+
+# Per-OCI-tar: same flow with grx-oci-{amd64,arm64}.tar +
+# grx-oci-{amd64,arm64}.tar.cosign.bundle + .intoto.jsonl.
+
+# Registry-side image (ghcr.io) once the operator approves the
+# production-release environment gate:
+cosign verify ghcr.io/graphreact/graphreact/grx:<tag> \
+  --certificate-identity-regexp 'https://github\.com/graphreact/graphreact/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+### Cross-track contracts
+
+- `id-token: write` is wired at the JOB scope in three jobs: `reproducibility-recheck`, `docker-build` (matrix), `ghcr-push`. Workflow-level permissions deliberately remain absent (default-deny). Any future Phase B job that needs OIDC MUST declare its own scope.
+- `attestations: write` is the new permission used by `actions/attest-build-provenance@v1` — same job-scope-only discipline.
+- `packages: write` is consumed only by `ghcr-push` (docker login + `docker/build-push-action@v6` with `push: true`). Other jobs do NOT receive this permission.
+- The `ghcr-push` job is structurally a separate gate from `publish-release`: the GH Release ships with the binary + signed OCI tars regardless of whether the operator has approved the `production-release` environment. The release notes' container-images table explicitly flags the ghcr.io row as gated so operators reading the release are not surprised by a pull-error before approving.
+
 ## Open work in #7
 
 - ~~**`grx --version` signature URL**~~ — SHIPPED 2026-06-17 (Group 2 batch above).
 - ~~**Reproducible-build determinism verifier**~~ — SHIPPED 2026-06-17 (Group 2 batch above; Phase A scope: same-runner Rust-only twice-build, see flip-to-hard-gate trigger).
 - ~~**Vulnerability scanning of the CycloneDX output (Trivy)**~~ — SHIPPED 2026-06-17 (Group 2 batch above; Phase A non-gating, flip-to-hard-gate after CVE backlog triage).
-- **Sigstore-keyless signing of release artifacts** — blocked on sub-track #8 (Dockerfile + release.yml + tag triggers). Once #8 ships, add a `cosign sign` step to the release pipeline + GitHub Actions `permissions: id-token: write` (the only sub-track #7 deliverable that needs workflow-level permission widening — the Trivy cell's `security-events: write` is job-scoped).
-- **SLSA build provenance attestation** (`actions/attest-build-provenance@v1`) — pairs naturally with Sigstore-keyless. Same blocker: needs the release pipeline.
-- **Per-arch SBOMs** when the multi-arch matrix lands (sub-track #8).
+- ~~**Sigstore-keyless signing of release artifacts**~~ — SHIPPED 2026-06-18 (Phase B Part 1 above; jointly closed with sub-track #8 — single `release.yml` carries both `cosign sign-blob` of the binary + per-arch OCI tars and `cosign sign` of the ghcr.io registry manifest).
+- ~~**SLSA build provenance attestation** (`actions/attest-build-provenance@v1`)~~ — SHIPPED 2026-06-18 (Phase B Part 1 above; runs in three jobs — binary, per-arch OCI tar, ghcr.io registry manifest with `push-to-registry: true`).
+- **Per-arch SBOMs** when the multi-arch matrix lands (sub-track #8). The `docker-build` matrix is multi-arch but currently consumes the single workspace-rooted SBOM emitted by ci.yml; per-arch SBOMs require a separate CycloneDX invocation per target. Deferred to the next Phase B slice.
 - **Cross-host / Phase B reproducible build** — threading `SOURCE_DATE_EPOCH` + `--remap-path-prefix` through `cargo xtask zig-build`, replacing the absolute LC_RPATH bake with `@rpath`-style lookup. Flip-to-hard-gate trigger for the repro cell.
 
 ## Verifying the SBOM locally

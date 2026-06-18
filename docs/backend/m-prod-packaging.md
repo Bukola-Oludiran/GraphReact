@@ -113,14 +113,80 @@ Phase B submits to a `graphreact/homebrew-tap` repo (with the `bottle` block pop
 - **Sub-track #5 (observability):** the probes block in `charts/grx/values.yaml` was pasted verbatim from m-prod-observability.md's "k8s configuration" anchor — that doc explicitly says "paste into the helm chart when sub-track #8 lands". When the predicate set for `/v1/readyz` evolves (e.g. sub-track #2 TLS rotation adds a `tls_reload_pending` reason), the probe documentation in BOTH docs MUST stay in sync. Cross-link: [`m-prod-observability.md`](m-prod-observability.md).
 - **Sub-track #1 (auth / audit):** `observer.audit.logPath` in `values.yaml` is the operator surface for the hash-chained audit log sink. When sub-track #1 graduates from Phase A (multi-token RBAC + batched-fsync + SIGHUP atomic-swap rotation) the helm chart MUST expose the new knobs. Cross-link: [`m-prod-auth.md`](m-prod-auth.md).
 
+## Shipped — Phase B Part 1 (2026-06-18)
+
+Joint #7 + #8 safe-slice landed in this commit: Dockerfile base-stage SHA pinning + Sigstore-keyless signing (binary + per-arch OCI tar + ghcr.io registry manifest) + SLSA build provenance attestation + gated ghcr.io push. All changes are YAML + Dockerfile + docs only — no `crates/*` touched. Cross-link: [`m-prod-supply-chain.md`](m-prod-supply-chain.md) for the supply-chain-side detail.
+
+### Dockerfile base-stage SHA pinning
+
+All four `FROM` lines now pin `@sha256:<digest>` alongside the LITERAL tag string (no `${RUST_VERSION}` interpolation at the FROM line):
+
+| Stage | FROM pin |
+|---|---|
+| `zig-builder` | `rust:1.83-bookworm@sha256:a45bf1f5d9af0a23b26703b3500d70af1abff7f984a7abef5a104b42c02a292b` |
+| `rust-builder` | same as above (same toolchain image) |
+| `python-donor` | `python:3.13-slim-bookworm@sha256:05b95397cac02b060ff1251afaa78087d92d7034369afbc8eb765631cada8257` |
+| `final` | `gcr.io/distroless/cc-debian12:nonroot@sha256:b0ae8e989418b458e0f25489bc3be523718938a2b70864cc0f6a00af1ddbd985` |
+
+**Why literal tags at the FROM line (not `${RUST_VERSION}-${DEBIAN_RELEASE}`):** the build-arg-interpolation pattern is a trap — a future maintainer can bump `RUST_VERSION` from `1.83` to `1.84` without re-resolving the `@sha256:<digest>`, leaving the FROM line pointing at the new tag but the stale digest. Docker fails fast at pull time with a tag-vs-digest mismatch error, but the silent drift between the ARG declarations and the pinned digest is a worse default than the (intentional) one-line manual coupling. The `RUST_VERSION` / `GRX_PYTHON_MINOR` / `DEBIAN_RELEASE` / `ZIG_VERSION` ARG declarations are KEPT at the top of the Dockerfile because they're still consumed by downstream `apt-get install python${GRX_PYTHON_MINOR}-dev` steps + ENV exports.
+
+**Re-pin command** (documented at the top of the Dockerfile):
+
+```sh
+for img in rust:1.83-bookworm \
+           python:3.13-slim-bookworm \
+           gcr.io/distroless/cc-debian12:nonroot; do
+  echo -n "$img: "
+  docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}'
+done
+```
+
+Each tag resolves to a multi-arch index digest (`application/vnd.oci.image.index.v1+json`); `docker buildx build --platform=…` selects the per-arch manifest from the index at build time. Bumps are deliberate PRs.
+
+**Upstream-tag-rolling risk:** `gcr.io/distroless` rolls `:nonroot` without notice. The resolved digest captures a specific image at resolution time, so the Dockerfile builds reproducibly from one PR to the next; re-pin cadence is a deliberate operator decision (typically aligned with patch-Tuesday-shaped distro security releases).
+
+### Sigstore-keyless signing + SLSA attestation
+
+Mirrors the supply-chain doc — three load-bearing artifact boundaries, all signed + attested:
+
+- `target/release/grx` (in `reproducibility-recheck`) → `grx.cosign.bundle` + `grx.intoto.jsonl`
+- `/tmp/grx-oci-{amd64,arm64}.tar` (in `docker-build` matrix) → `<tar>.cosign.bundle` + `<tar>.intoto.jsonl`
+- `ghcr.io/<repo>/grx@<digest>` (in `ghcr-push`) → registry-side cosign signature + GitHub-side SLSA attestation via `push-to-registry: true`
+
+All three are attached to the GitHub Release (the binary + per-arch tar bundles via `gh release create` file-glob; the registry-side signature lives next to the image in the registry).
+
+### ghcr.io push (gated)
+
+New `ghcr-push` job in `release.yml`. Gates:
+
+1. `if: github.repository == 'graphreact/graphreact' && vars.PUSH_TO_GHCR == 'true'`
+2. `environment: production-release` — reviewer approval required.
+3. Per-job `permissions: { packages: write, id-token: write, attestations: write, contents: read }`. Workflow-level permissions remain absent (default-deny).
+
+The job re-builds the multi-arch manifest directly (it does NOT consume the per-arch tars from `docker-build` — registry push wants a freshly-pushed manifest list, not a `docker load`-merge), pushes to ghcr.io, then signs the pushed manifest digest and attests SLSA provenance to the registry.
+
+**Operator setup checklist (REQUIRED before the first ghcr push):**
+
+1. Repo Settings → Variables → set `PUSH_TO_GHCR = true`.
+2. Repo Settings → Environments → create `production-release`, add at least one required reviewer.
+3. (Optional) Repo Settings → Packages → grant `ghcr.io/graphreact/graphreact/grx` visibility = public.
+
+**Tags pushed:** `ghcr.io/<repo>/grx:<tag>` + `ghcr.io/<repo>/grx:latest` (multi-arch manifest via QEMU).
+
+### docker-build matrix gate status
+
+The Phase A `docker-build` matrix was already a HARD gate (no `continue-on-error`); the close-out doc's "flip continue-on-error: true → hard gate" item is updated to record: matrix is HARD as of Phase A; Phase B Part 1 adds cosign sign + SLSA attest of each per-arch tar (the matrix produces signed artifacts that feed into `publish-release` and is a structural prerequisite for `ghcr-push`'s build). `fail-fast: false` stays preserved so a transient arm64-emulation flake on one shard does not mask amd64 results; both shards must succeed before `publish-release` runs.
+
+`reproducible-build` (ci.yml) + Trivy (ci.yml) `continue-on-error: true` stays — still warming up; flip-trigger documented in m-prod-supply-chain.md unchanged.
+
 ## Open work in #8
 
 | Item | Phase | Blocker |
 |---|---|---|
-| Pin Dockerfile base-stage SHAs (`gcr.io/distroless/cc-debian12@sha256:…`, `python:3.13-slim-bookworm@sha256:…`, `rust:1.83-bookworm@sha256:…`) | B | Phase A uses floating tags so the docker-load tars match whatever upstream ships at build time; Phase B digest-pins them and surfaces the digests in release-notes so the audit trail vouches for the final-image SHA, not just the binary bytes |
-| Sigstore-keyless signing of binary + OCI image | B | OIDC trust setup + `vars.PUSH_TO_GHCR` repo variable + `environment: production-release` approval gate |
-| SLSA build provenance attestation (`actions/attest-build-provenance@v1`) | B | Pairs with Sigstore-keyless — same blockers |
-| ghcr.io push of multi-arch images | B | Same blockers |
+| ~~Pin Dockerfile base-stage SHAs (`gcr.io/distroless/cc-debian12@sha256:…`, `python:3.13-slim-bookworm@sha256:…`, `rust:1.83-bookworm@sha256:…`)~~ | ~~B~~ | SHIPPED 2026-06-18 (Phase B Part 1 above) |
+| ~~Sigstore-keyless signing of binary + OCI image~~ | ~~B~~ | SHIPPED 2026-06-18 (Phase B Part 1 above; jointly with #7) |
+| ~~SLSA build provenance attestation (`actions/attest-build-provenance@v1`)~~ | ~~B~~ | SHIPPED 2026-06-18 (Phase B Part 1 above; jointly with #7) |
+| ~~ghcr.io push of multi-arch images~~ | ~~B~~ | SHIPPED 2026-06-18 (Phase B Part 1 above; gated on `vars.PUSH_TO_GHCR == 'true'` + `environment: production-release`) |
 | Cross-host reproducible-build (zig-build threads `SOURCE_DATE_EPOCH` + `--remap-path-prefix`) | B | xtask `-Dsource-date-epoch` knob, replacing absolute LC_RPATH with `@rpath`-style lookup |
 | Native arm64 cross-compile (xtask `-Dtarget`) | B | xtask cross-compile substrate; multi-arch QEMU is acceptable for Phase A |
 | StatefulSet substrate for multi-replica clustering | B | requires M14 distribution layer to grow a DNS-SRV discovery hook |
