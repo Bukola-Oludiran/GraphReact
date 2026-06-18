@@ -127,6 +127,9 @@ fn dispatch(runtime: &tokio::runtime::Runtime, command: Command) -> Result<(), C
         Command::Secrets { op } => {
             graphreact_cli::secrets_commands::run_secrets(op)?;
         }
+        Command::Audit { op } => {
+            graphreact_cli::audit_commands::run_audit(op)?;
+        }
     }
     Ok(())
 }
@@ -154,6 +157,7 @@ fn dispatch_cluster(
             observer_cert,
             observer_key,
             observer_json_logs,
+            observer_audit_log,
             observer_otel_endpoint,
             observer_otel_service_name,
             debug,
@@ -222,6 +226,7 @@ fn dispatch_cluster(
                 observer_bind,
                 observer_otel_endpoint,
                 observer_otel_service_name,
+                observer_audit_log,
                 debug,
                 debug_wait: !debug_no_wait,
             };
@@ -305,7 +310,8 @@ fn associated_path(command: &Command) -> Option<&Path> {
         | Command::Top { .. }
         | Command::Trace { .. }
         | Command::Observer { .. }
-        | Command::Secrets { .. } => None,
+        | Command::Secrets { .. }
+        | Command::Audit { .. } => None,
     }
 }
 

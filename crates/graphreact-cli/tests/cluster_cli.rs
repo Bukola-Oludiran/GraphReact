@@ -95,6 +95,7 @@ async fn daemon_accepts_peer_with_matching_cookie() {
         debug_wait: false,
         observer_otel_endpoint: None,
         observer_otel_service_name: None,
+        observer_audit_log: None,
     };
     let alice = start_daemon(alice_opts).await.expect("alice daemon start");
     let alice_addr = alice.cluster().local_addr();
@@ -117,6 +118,7 @@ async fn daemon_accepts_peer_with_matching_cookie() {
         debug_wait: false,
         observer_otel_endpoint: None,
         observer_otel_service_name: None,
+        observer_audit_log: None,
     };
     let bob = start_daemon(bob_opts).await.expect("bob daemon start");
 
@@ -162,6 +164,7 @@ async fn daemon_rejects_peer_with_cookie_mismatch() {
         debug_wait: false,
         observer_otel_endpoint: None,
         observer_otel_service_name: None,
+        observer_audit_log: None,
     };
     let alice = start_daemon(alice_opts).await.expect("alice daemon start");
     let alice_addr = alice.cluster().local_addr();
@@ -182,6 +185,7 @@ async fn daemon_rejects_peer_with_cookie_mismatch() {
         debug_wait: false,
         observer_otel_endpoint: None,
         observer_otel_service_name: None,
+        observer_audit_log: None,
     };
     let result = start_daemon(bob_opts).await;
     let err = match result {

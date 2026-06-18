@@ -47,6 +47,14 @@ pub enum CommandError {
     /// produced the failure.
     #[error("secrets error: {0}")]
     Secrets(#[from] graphreact_secrets::SecretsError),
+    /// **M-Prod sub-track #1 Phase A.** `grx audit verify` failure
+    /// path. Wraps the [`graphreact_observer::AuditChainError`]
+    /// surface so the CLI prints a uniform message for parse / I/O
+    /// / tamper / sequence-gap / prev-hash-mismatch outcomes, and
+    /// exits non-zero (the bin's top-level error handler maps any
+    /// CommandError to ExitCode::FAILURE).
+    #[error("audit verify failure: {0}")]
+    AuditVerify(#[from] graphreact_observer::AuditChainError),
 }
 
 pub type CommandResult<T> = Result<T, CommandError>;
@@ -1189,6 +1197,16 @@ pub struct DaemonOptions {
     /// `"graphreact"`. Per OTel SDK convention, can also be set via
     /// the `OTEL_SERVICE_NAME` environment variable.
     pub observer_otel_service_name: Option<String>,
+    /// **M-Prod sub-track #1 Phase A.** When `Some(path)`, open a
+    /// [`graphreact_observer::FileAuditSink`] on `path` (append-
+    /// only, recovering chain head from the file's tail) and wire
+    /// it through [`graphreact_observer::SpawnOptions::audit_sink`].
+    /// The existing
+    /// `target="graphreact::observer::audit"` tracing stream STILL
+    /// fires bit-for-bit unchanged. `None` (default) skips the
+    /// sink — operator + test paths preserve the legacy
+    /// tracing-only audit surface.
+    pub observer_audit_log: Option<std::path::PathBuf>,
 }
 
 /// `grx cluster connect` knobs. Mirrors [`DaemonOptions`] minus
@@ -1403,6 +1421,21 @@ impl DaemonHandle {
                         deadline_ms = deadline.as_millis() as u64,
                         "OTel provider shutdown exceeded OBSERVER_SHUTDOWN_DEADLINE",
                     );
+                    // **M-Prod sub-track #1 Phase A.** Fan to the
+                    // sink in parallel. The tracing line above is
+                    // unchanged; the chained record gives operators
+                    // a tamper-evident anchor for the deadline
+                    // breach during teardown.
+                    if let Some(observer) = self.observer.as_ref() {
+                        if let Some(sink) = observer.audit_sink.as_ref() {
+                            sink.append(graphreact_observer::AuditRecordInput {
+                                kind: "otel_shutdown_timeout",
+                                fields: serde_json::json!({
+                                    "deadline_ms": deadline.as_millis() as u64,
+                                }),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1594,11 +1627,34 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
             use rand::RngCore;
             rand::thread_rng().next_u64()
         };
-        let server = graphreact_observer::spawn_management_api_with_cluster_readyz(
-            bind_cfg,
-            metrics,
-            process_start_id,
-            Some(cluster_readyz_probe.clone()),
+        // **M-Prod sub-track #1 Phase A.** Construct the
+        // FileAuditSink BEFORE the management API bind so the very
+        // first event (`bind`) lands in the chained file. Surfacing
+        // the open error here gives operators a fail-fast signal
+        // (chain-head recovery picked up a tampered tail) — far
+        // better than silently degrading to tracing-only audit at
+        // start-up.
+        let audit_sink: Option<
+            std::sync::Arc<dyn graphreact_observer::AuditSink>,
+        > = match opts.observer_audit_log.as_ref() {
+            Some(path) => Some(std::sync::Arc::new(
+                graphreact_observer::FileAuditSink::open(path).map_err(|e| {
+                    CommandError::ClusterArg(format!(
+                        "observer-audit-log open {}: {e}",
+                        path.display()
+                    ))
+                })?,
+            )),
+            None => None,
+        };
+        let server = graphreact_observer::spawn_management_api_with_options(
+            graphreact_observer::SpawnOptions {
+                bind: bind_cfg,
+                metrics,
+                process_start_id,
+                cluster_readyz: Some(cluster_readyz_probe.clone()),
+                audit_sink,
+            },
         )
         .await
         .map_err(|e| CommandError::ClusterArg(format!("observer bind: {e}")))?;

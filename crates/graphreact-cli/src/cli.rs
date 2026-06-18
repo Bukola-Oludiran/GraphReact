@@ -225,6 +225,36 @@ pub enum Command {
         #[command(subcommand)]
         op: SecretsOp,
     },
+    /// **M-Prod sub-track #1 Phase A.** Inspect the hash-chained
+    /// audit log produced by `--observer-audit-log`. Phase A ships
+    /// one operation:
+    ///
+    /// - `grx audit verify <PATH>` — walks every NDJSON line in
+    ///   the file, recomputes each record's SHA-256, verifies the
+    ///   chain links, and prints either `audit chain OK: <N>
+    ///   records` (exit 0) or a structured tamper / mismatch
+    ///   message (exit 1). Operators wire this into CI / audit
+    ///   review workflows alongside `journalctl -u grx --grep
+    ///   'graphreact::observer::audit'`.
+    Audit {
+        #[command(subcommand)]
+        op: AuditOp,
+    },
+}
+
+/// **M-Prod sub-track #1 Phase A.** Sub-subcommand block under
+/// `grx audit <op>`. Today's surface is the chain verifier; Phase B
+/// adds replay / inspect / report operations.
+#[derive(Debug, clap::Subcommand)]
+pub enum AuditOp {
+    /// Verify the hash chain in the NDJSON file at `<PATH>`.
+    /// Prints `audit chain OK: <N> records` on success (exit 0)
+    /// or a structured error message on the first violation
+    /// (exit 1). The file is opened read-only — never mutated.
+    Verify {
+        /// Path to the NDJSON audit log to verify.
+        path: PathBuf,
+    },
 }
 
 /// **M-Prod sub-track #3.** Sub-subcommand block under
@@ -439,6 +469,28 @@ pub enum ClusterOp {
         /// then conflict.
         #[arg(long, default_value_t = false)]
         observer_json_logs: bool,
+        /// **M-Prod sub-track #1 Phase A.** Write a hash-chained
+        /// tamper-evident audit log to this NDJSON file. One
+        /// record per bind / accept-fail / auth-fail /
+        /// TLS-rotation event with SHA-256 prev/this chain links.
+        /// The pre-existing `target="graphreact::observer::audit"`
+        /// tracing stream STILL fires bit-for-bit unchanged — this
+        /// flag is strictly additive.
+        ///
+        /// The sink fsyncs (sync_data) after every append in Phase
+        /// A, so high-volume `auth_fail` floods will pay a per-
+        /// request disk-sync cost. Phase B switches to a worker-
+        /// task + batched-fsync model. Operators rotate the file
+        /// out-of-band by renaming + restarting the daemon
+        /// (Phase A intentionally refuses SIGHUP; in-process
+        /// rotation would break the chain).
+        ///
+        /// Verify the chain at any time via `grx audit verify
+        /// <PATH>`. Mode 0600 on Unix is recommended on the
+        /// containing directory; the file itself is opened with
+        /// the process's umask.
+        #[arg(long)]
+        observer_audit_log: Option<PathBuf>,
         /// **M16-Backend P10.** Export OpenTelemetry traces to the
         /// given OTLP/gRPC endpoint (e.g. `http://localhost:4317`
         /// for a local OTel collector). When set, the daemon
