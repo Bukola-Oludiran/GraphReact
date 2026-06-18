@@ -523,6 +523,27 @@ pub enum ClusterOp {
         /// the daemon starts running before the IDE attaches.
         #[arg(long, default_value_t = false, requires = "debug")]
         debug_no_wait: bool,
+        /// **M-Prod sub-track #4 Phase α.** Outer SIGTERM drain
+        /// deadline in seconds. On SIGTERM the daemon flips
+        /// `/v1/readyz` to 503 `draining`, refuses new ingress
+        /// POSTs with the same body, and waits up to this many
+        /// seconds for in-flight requests to settle before
+        /// running the existing OTel + cluster + engine teardown.
+        ///
+        /// Budget math vs k8s `terminationGracePeriodSeconds`:
+        /// drain + `OBSERVER_SHUTDOWN_DEADLINE` + slack must be ≤
+        /// `terminationGracePeriodSeconds`. Default 20s drain +
+        /// default 5s OTel + 5s slack = 30s (k8s default).
+        /// Operators raising either bound MUST raise
+        /// `terminationGracePeriodSeconds` accordingly or risk
+        /// SIGKILL-truncated audit logs.
+        ///
+        /// Falls through to the `GRX_DRAIN_DEADLINE_SECS` env var
+        /// when absent; both ≤0 / unparseable fall back to 20s.
+        /// SIGTERM is unix-only; on Windows the daemon falls back
+        /// to ctrl_c-as-snap-shutdown (no drain phase).
+        #[arg(long)]
+        drain_deadline_secs: Option<u64>,
     },
     /// One-shot peer dial. Spins up a minimal cluster (no `.grx`
     /// mount), opens a TLS connection to the named peer, and

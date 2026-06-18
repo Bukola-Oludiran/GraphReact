@@ -162,6 +162,7 @@ fn dispatch_cluster(
             observer_otel_service_name,
             debug,
             debug_no_wait,
+            drain_deadline_secs,
         } => {
             let debug = validate_debug_against_runtime(debug, engine)?;
             // M16-Backend P3 — install the unified JSON-log
@@ -229,6 +230,7 @@ fn dispatch_cluster(
                 observer_audit_log,
                 debug,
                 debug_wait: !debug_no_wait,
+                drain_deadline_secs,
             };
             // Inline the run-loop so we can print the bound
             // address BETWEEN start_daemon (which has finished
@@ -237,6 +239,8 @@ fn dispatch_cluster(
             // line is parsed by the subprocess CLI test (the
             // pre-existing M14.8 boundary said no subprocess
             // test existed; this readiness signal closes that).
+            let drain_deadline_for_run =
+                graphreact_cli::commands::resolve_drain_deadline(opts.drain_deadline_secs);
             runtime.block_on::<_>(async move {
                 let mut handle = start_daemon(opts).await?;
                 println!("grx-daemon-ready {}", handle.cluster().local_addr());
@@ -246,13 +250,23 @@ fn dispatch_cluster(
                     // of `ps aux`.
                     println!("grx-observer-ready {addr}");
                 }
-                drive_handle_until(&mut handle, duration_secs).await?;
+                let exit = drive_handle_until(&mut handle, duration_secs).await?;
+                // **M-Prod sub-track #4 Phase α.** SIGTERM
+                // routes through `start_drain` before shutdown;
+                // SIGINT + duration go straight to shutdown.
+                if matches!(exit, graphreact_cli::commands::LoopExit::Sigterm) {
+                    let _ = handle.start_drain(drain_deadline_for_run).await;
+                }
                 handle.shutdown().await;
                 println!(
                     "grx-daemon-exited{}",
-                    duration_secs
-                        .map(|s| format!(" after {s}s"))
-                        .unwrap_or_else(|| " (signal)".to_string())
+                    match (duration_secs, exit) {
+                        (Some(s), _) => format!(" after {s}s"),
+                        (None, graphreact_cli::commands::LoopExit::Sigterm) => {
+                            " (SIGTERM, drained)".to_string()
+                        }
+                        (None, _) => " (signal)".to_string(),
+                    }
                 );
                 Ok::<(), CommandError>(())
             })?;

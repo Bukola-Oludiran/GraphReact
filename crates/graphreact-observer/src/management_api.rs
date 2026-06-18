@@ -62,6 +62,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::BearerToken;
 use crate::bind::BindConfig;
+use crate::drain::{DrainFlag, IngressInFlight};
 use crate::metrics::MetricsInner;
 use crate::prometheus::encode_text;
 use crate::ring_buffer::{MessageSnapshot, RingBufferTelemetry, DEFAULT_RING_CAPACITY};
@@ -505,6 +506,29 @@ pub struct ApiState {
     /// `--observer-audit-log <PATH>`. See `docs/backend/m-prod-auth.md`
     /// for the Phase B/C/D roadmap.
     pub audit_sink: Option<Arc<dyn crate::AuditSink>>,
+    /// **M-Prod sub-track #4 Phase α.** Drain bit shared with the
+    /// CLI's [`crate::DrainFlag::start`] orchestrator. `None` for
+    /// legacy / test callers that spawned through [`spawn`] or
+    /// [`spawn_with_cluster_readyz`] (drain remains a no-op on
+    /// those paths — the daemon's normal `shutdown()` is the only
+    /// teardown). `Some(flag)` enables: (a) `/v1/readyz` 503ing
+    /// with body `draining` as soon as the flag flips, and (b)
+    /// ingress POSTs (`/v1/nodes/:id/messages`,
+    /// `/v1/nodes/:id/call`, `/v1/nodes/:id/messages/bulk`) 503ing
+    /// with body `draining` BEFORE bumping
+    /// [`Self::ingress_in_flight`]. Mirrors the
+    /// [`Self::cluster_readyz`] Option pattern shipped in #5.
+    pub draining: Option<DrainFlag>,
+    /// **M-Prod sub-track #4 Phase α.** Lock-free count of
+    /// in-flight ingress POSTs. Each entry into
+    /// `inject_message_handler` / `inject_call_handler` /
+    /// `bulk_inject_handler` bumps the counter via
+    /// [`IngressInFlight::enter`], which returns an RAII guard
+    /// that decrements on Drop (so axum future cancellation —
+    /// HTTP client disconnect, drain-deadline-driven abort —
+    /// keeps the count balanced). Read by the drain orchestrator
+    /// to know when ingress quiesced. Clones share state.
+    pub ingress_in_flight: IngressInFlight,
 }
 
 /// **M-Prod sub-track #5.** Cluster-readiness probe shared by the
@@ -607,6 +631,21 @@ pub struct ApiServerHandle {
     /// sink the accept-loop bind event lands on. `None` keeps the
     /// legacy tracing-only audit surface bit-for-bit unchanged.
     pub audit_sink: Option<Arc<dyn crate::AuditSink>>,
+    /// **M-Prod sub-track #4 Phase α.** Drain bit shared with the
+    /// daemon's [`crate::DrainFlag::start`] orchestrator. `None`
+    /// for spawn paths that didn't wire a drain bit
+    /// ([`spawn`] / [`spawn_with_cluster_readyz`]); `Some(flag)`
+    /// for [`spawn_with_drain`] (called by `start_daemon`). The
+    /// orchestrator flips this flag, the management API
+    /// `/v1/readyz` + ingress middlewares observe the flip and
+    /// start 503ing with body `draining`.
+    pub draining: Option<DrainFlag>,
+    /// **M-Prod sub-track #4 Phase α.** In-flight ingress POST
+    /// counter shared with the management API handlers. Always
+    /// present; clones share the underlying `Arc<AtomicUsize>`.
+    /// Read by the drain orchestrator to know when ingress
+    /// quiesced.
+    pub ingress_in_flight: IngressInFlight,
 }
 
 impl ApiServerHandle {
@@ -813,7 +852,7 @@ pub async fn spawn(
     metrics: Arc<MetricsInner>,
     process_start_id: u64,
 ) -> Result<ApiServerHandle, std::io::Error> {
-    spawn_with_cluster_readyz(bind, metrics, process_start_id, None).await
+    spawn_with_drain(bind, metrics, process_start_id, None, None).await
 }
 
 /// **M-Prod sub-track #5.** Variant of [`spawn`] that wires a
@@ -833,15 +872,47 @@ pub async fn spawn_with_cluster_readyz(
         process_start_id,
         cluster_readyz,
         audit_sink: None,
+        draining: None,
     })
     .await
 }
 
-/// **M-Prod sub-track #1 Phase A.** Knob struct passed to
-/// [`spawn_with_options`]. New options are additive — existing
-/// callers either keep using [`spawn`] / [`spawn_with_cluster_readyz`]
-/// (which default the new fields) or migrate to this struct when
-/// they need the new capability.
+/// **M-Prod sub-track #4 Phase α.** Variant of
+/// [`spawn_with_cluster_readyz`] that ALSO wires the drain bit
+/// through [`ApiState::draining`] (so `/v1/readyz` flips to 503
+/// `draining` on drain-start) and the in-flight ingress counter
+/// shared with the CLI orchestrator. Used by `start_daemon` once
+/// SIGTERM-driven graceful drain is the canonical lifecycle.
+///
+/// Pass `None` for `draining` on legacy / test paths — drain
+/// becomes a no-op on those (the daemon's normal `shutdown()` is
+/// the only teardown). [`spawn`] and
+/// [`spawn_with_cluster_readyz`] both default this to `None` for
+/// back-compat with existing call sites.
+pub async fn spawn_with_drain(
+    bind: BindConfig,
+    metrics: Arc<MetricsInner>,
+    process_start_id: u64,
+    cluster_readyz: Option<Arc<ClusterReadyzProbe>>,
+    draining: Option<DrainFlag>,
+) -> Result<ApiServerHandle, std::io::Error> {
+    spawn_with_options(SpawnOptions {
+        bind,
+        metrics,
+        process_start_id,
+        cluster_readyz,
+        audit_sink: None,
+        draining,
+    })
+    .await
+}
+
+/// **M-Prod sub-track #1 Phase A + #4 Phase α.** Knob struct
+/// passed to [`spawn_with_options`]. New options are additive —
+/// existing callers either keep using [`spawn`] /
+/// [`spawn_with_cluster_readyz`] / [`spawn_with_drain`] (which
+/// default the new fields) or migrate to this struct when they
+/// need the full capability set.
 pub struct SpawnOptions {
     pub bind: BindConfig,
     pub metrics: Arc<MetricsInner>,
@@ -851,12 +922,21 @@ pub struct SpawnOptions {
     /// `None` keeps the legacy tracing-only audit surface. `Some`
     /// fans every `audit::log_*` call to the sink in parallel.
     pub audit_sink: Option<Arc<dyn crate::AuditSink>>,
+    /// **M-Prod sub-track #4 Phase α.** Drain bit. `None` keeps
+    /// drain a no-op on the spawned daemon — appropriate for
+    /// legacy and test paths. `Some(flag)` lets the CLI's
+    /// [`crate::DrainFlag::start`] orchestrator flip the bit and
+    /// have the management API observe it on the readyz + ingress
+    /// hot paths.
+    pub draining: Option<DrainFlag>,
 }
 
-/// **M-Prod sub-track #1 Phase A.** Full-knob variant of [`spawn`]
-/// accepting a [`SpawnOptions`]. Mirrors [`spawn_with_cluster_readyz`]
-/// plus the `audit_sink` field; this is the call shape
-/// `graphreact-cli` uses when `--observer-audit-log` is set.
+/// **M-Prod sub-track #1 Phase A + #4 Phase α.** Full-knob
+/// variant of [`spawn`] accepting a [`SpawnOptions`]. Mirrors
+/// [`spawn_with_cluster_readyz`] plus the `audit_sink` and
+/// `draining` fields; this is the call shape `graphreact-cli`
+/// uses when `--observer-audit-log` and/or SIGTERM drain are
+/// wired.
 pub async fn spawn_with_options(
     opts: SpawnOptions,
 ) -> Result<ApiServerHandle, std::io::Error> {
@@ -866,6 +946,7 @@ pub async fn spawn_with_options(
         process_start_id,
         cluster_readyz,
         audit_sink,
+        draining,
     } = opts;
     let listener = TcpListener::bind(bind.addr).await?;
     let local_addr = listener.local_addr()?;
@@ -887,6 +968,7 @@ pub async fn spawn_with_options(
     let websocket = crate::websocket::WebSocketSink::default();
     let idempotency_cache = Arc::new(IdempotencyCache::new());
     let pending_calls = PendingCalls::new();
+    let ingress_in_flight = IngressInFlight::new();
     let state = ApiState {
         metrics,
         snapshot_tx,
@@ -907,6 +989,13 @@ pub async fn spawn_with_options(
         // pre-constructed sink (typically `FileAuditSink` opened
         // by `graphreact-cli` when `--observer-audit-log` is set).
         audit_sink: audit_sink.clone(),
+        // **M-Prod sub-track #4 Phase α.** `spawn` +
+        // `spawn_with_cluster_readyz` default `draining` to `None`
+        // (drain becomes a no-op on those paths). `spawn_with_drain`
+        // threads the real flag from `start_daemon` so SIGTERM-
+        // driven drain flips `/v1/readyz` to 503 `draining`.
+        draining: draining.clone(),
+        ingress_in_flight: ingress_in_flight.clone(),
     };
     let router = build_router(state);
 
@@ -949,6 +1038,8 @@ pub async fn spawn_with_options(
         // `reload_tls` can fan TLS-rotation events to the same sink
         // the accept-loop bind event already lands on.
         audit_sink,
+        draining,
+        ingress_in_flight,
     })
 }
 
@@ -1118,6 +1209,24 @@ async fn healthz() -> Response {
 ///   start of drain so the load balancer de-routes BEFORE we stop
 ///   accepting new calls.
 async fn readyz(State(state): State<ApiState>) -> Response {
+    // **M-Prod sub-track #4 Phase α.** Drain predicate wins over
+    // all other not-ready reasons. A daemon mid-drain should NEVER
+    // surface `scheduler_first_batch_pending` etc. to k8s — once
+    // the drain bit flips, the canonical answer is `draining`, so
+    // the load balancer de-routes immediately without re-checking
+    // every other predicate. The check is a relaxed atomic load
+    // (sub-µs hot-path cost).
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (axum::http::header::RETRY_AFTER, "1"),
+            ],
+            "draining",
+        )
+            .into_response();
+    }
     let batches = state.metrics.process_batch_duration.snapshot().count;
     let bridge_capacity = state.snapshot_tx.capacity();
     // **M-Prod sub-track #5.** Cluster-membership predicate.
@@ -1156,6 +1265,30 @@ async fn readyz(State(state): State<ApiState>) -> Response {
         )
             .into_response()
     }
+}
+
+/// **M-Prod sub-track #4 Phase α.** Backpressure-shaped 503 for
+/// ingress endpoints that hit the drain bit. Mirrors
+/// [`bridge_saturated_response`]'s shape — same status code, same
+/// `Retry-After: 1` back-off contract, JSON body — but a distinct
+/// `error = "draining"` discriminator so operators can grep their
+/// LB / proxy logs apart. Body string matches the `/v1/readyz`
+/// reason for operator-symmetry: every surface that surfaces a
+/// drain-driven 503 uses the word `draining`.
+fn drain_in_progress_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::RETRY_AFTER, "1"),
+        ],
+        serde_json::json!({
+            "error": "draining",
+            "retry_after_secs": 1,
+        })
+        .to_string(),
+    )
+        .into_response()
 }
 
 async fn identity(State(state): State<ApiState>) -> Json<Identity> {
@@ -1302,6 +1435,18 @@ async fn inject_message_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<InjectMessageBody>,
 ) -> Response {
+    // **M-Prod sub-track #4 Phase α.** Drain-bit check fires
+    // BEFORE the in-flight counter bumps so a request that
+    // arrived 1ms after `start_drain` flipped the bit gets
+    // refused symmetrically with the `/v1/readyz` 503 body.
+    // Doing it before the `enter()` bump also keeps drain
+    // quiescence racy-free — the orchestrator's
+    // `ingress_in_flight.load() == 0` poll never sees a
+    // late-arriving request bumping the counter post-drain-start.
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
+        return drain_in_progress_response();
+    }
+    let _inflight = state.ingress_in_flight.enter();
     // Idempotency-Key dedup before crossing the bridge.
     if let Some(key) = headers
         .get("idempotency-key")
@@ -1398,6 +1543,18 @@ async fn inject_call_handler(
     Path(id): Path<String>,
     Json(body): Json<CallMessageBody>,
 ) -> Response {
+    // **M-Prod sub-track #4 Phase α.** Drain check fires before
+    // the in-flight bump + PendingCalls register so a request
+    // that arrived after drain-start gets refused symmetrically
+    // with `/v1/readyz`'s 503 body. The orchestrator's
+    // quiescence loop polls `ingress_in_flight.load() == 0 &&
+    // pending_calls.is_empty()`; keeping the drain check before
+    // both counter bumps prevents a race where a late-arriving
+    // request bumps either counter post-drain-start.
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
+        return drain_in_progress_response();
+    }
+    let _inflight = state.ingress_in_flight.enter();
     // Server-side correlation_id mint. UUIDv4 keeps the space
     // wide enough that operator-driven `correlation_id` reuse is
     // ~impossible without explicit collusion.
@@ -1618,6 +1775,21 @@ async fn bulk_inject_handler(
     use bytes::{Bytes, BytesMut};
     use futures::StreamExt as _;
 
+    // **M-Prod sub-track #4 Phase α.** Drain-bit check fires
+    // BEFORE the streaming response body is constructed so a
+    // bulk POST that arrived after drain-start gets refused with
+    // the same 503 `draining` body the single-shot endpoints
+    // surface. The streaming producer task carries an
+    // `InflightGuard`; if drain fires AFTER the bulk request
+    // entered, the producer's existing per-line bridge `try_send`
+    // path will start failing once the daemon's snapshot bridge
+    // closes — the producer's `BulkLineDisposition::BridgeDropped`
+    // arm emits the per-line 503 row + closes the stream.
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
+        return drain_in_progress_response();
+    }
+    let inflight_guard = state.ingress_in_flight.enter();
+
     // Pre-flight Content-Length cap. Browsers + curl always set
     // Content-Length on POST; chunked-transfer-encoded clients
     // bypass this gate (the per-line cap still applies).
@@ -1654,6 +1826,14 @@ async fn bulk_inject_handler(
     let (out_tx, out_rx) = mpsc::channel::<Bytes>(64);
 
     tokio::spawn(async move {
+        // **M-Prod sub-track #4 Phase α.** Hold the in-flight
+        // guard for the lifetime of the producer task so the
+        // drain orchestrator's `ingress_in_flight.load() == 0`
+        // poll only flips to zero once the bulk producer has
+        // drained EVERY line of the request. If the producer
+        // panics (no recover branch), the guard's Drop still
+        // decrements via the panic-unwinding path.
+        let _inflight_guard = inflight_guard;
         let mut data_stream = body.into_data_stream();
         let mut buf: BytesMut = BytesMut::new();
         let mut line_num: u64 = 0;
