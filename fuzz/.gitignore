@@ -1,0 +1,35 @@
+# **M-Prod sub-track #9 (chaos + fuzz).** libFuzzer runtime state
+# is regenerated on every `cargo fuzz run` invocation; only the
+# manifest + targets + the *seed* corpus (`fuzz/corpus/<target>/*`
+# checked-in seed exemplars) live in version control.
+#
+# Per-target corpora that libFuzzer grows during the run land in
+# `corpus/<target>/` next to the seeds; we ignore everything under
+# `corpus/` to keep the slice minimal. The seed corpus directory
+# (and its readme) is force-included via `!` rules below.
+
+# Build outputs (cargo + libFuzzer).
+target/
+Cargo.lock
+
+# Crash + leak + slow-input artifacts surfaced by libFuzzer. The
+# CI lane (.github/workflows/ci.yml :: fuzz) uploads this directory
+# on failure via `actions/upload-artifact@v4 if: failure()`.
+artifacts/
+
+# Coverage / instrumentation runs.
+coverage/
+
+# Discovered corpus inputs (libFuzzer mutator output). Kept out of
+# version control to avoid the corpus directory drifting silently
+# on every developer's machine; the canonical seeds live under
+# `corpus/<target>/seeds/` and are re-included by the `!` rules.
+corpus/*
+
+# Re-include the per-target *seed* corpora. These are the
+# hand-written + format-canonical JSON exemplars that bootstrap a
+# 10-min CI fuzz run from cold; without them the run finds shallow
+# bugs only.
+!corpus/fuzz_management_api_bodies/
+corpus/fuzz_management_api_bodies/*
+!corpus/fuzz_management_api_bodies/seed_*

@@ -226,3 +226,87 @@ jobs:
           path: sbom/
           retention-days: 90
           if-no-files-found: error
+
+  fuzz:
+    # **M-Prod sub-track #9 (chaos + fuzz) safest slice.** Runs the
+    # `fuzz_management_api_bodies` libFuzzer target against the three
+    # ingress JSON body shapes (`InjectMessageBody`, `CallMessageBody`,
+    # `BulkLineBody`). Kill-gate: any panic / ASan trap / libFuzzer-
+    # detected timeout fails the job — successful deserialisations
+    # (and well-formed serde_json::Err) pass silently.
+    #
+    # Push-to-main + release tags only (NOT PRs): a 10-min libFuzzer
+    # run + ~2-3 min cargo-fuzz cold-build is too heavy for PR
+    # turnaround. The `if` guard at the job level scopes it without
+    # touching the workflow-level `on:` block (which would gate fmt /
+    # clippy / test / deny / sbom too).
+    name: fuzz-management-api-bodies
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        # cargo-fuzz requires nightly Rust (uses `-Z sanitizer=address`
+        # + private libFuzzer compiler intrinsics). Pinning a specific
+        # nightly date keeps a bad nightly from reddening this lane on
+        # an unrelated push; bump via deliberate PR.
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-06-01
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache key separate from test / clippy / sbom so the fuzz
+          # build's nightly + ASan-instrumented target cache doesn't
+          # bust the stable build caches.
+          key: fuzz
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        # Prebuilt-binary install via taiki-e/install-action keeps
+        # the cold-build cost down (consistent with the SBOM cell's
+        # cargo-cyclonedx install). Pin the version explicitly so a
+        # cargo-fuzz upstream regression surfaces as a PR review, not
+        # a silent CI drift.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.12
+      - name: Build fuzz target (sanity)
+        # Build-only step proves the fuzz substrate compiles before
+        # we burn the 10-min runtime budget on a misconfiguration.
+        # Failure here surfaces as a clear "fuzz substrate broken"
+        # signal rather than a vague libFuzzer error.
+        working-directory: fuzz
+        run: cargo +nightly-2026-06-01 fuzz build fuzz_management_api_bodies
+      - name: Run fuzz target (10 min)
+        # `-max_total_time=600` is libFuzzer's wall-clock cap in
+        # seconds. The flag is a soft cap: in-flight inputs finish,
+        # so the actual runtime is 600-650s. ASan is on by default
+        # (cargo-fuzz default); `-rss_limit_mb=2048` caps the
+        # per-iteration memory budget so an unbounded-allocation
+        # bug fails fast instead of OOMing the runner.
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          cargo +nightly-2026-06-01 fuzz run fuzz_management_api_bodies -- \
+            -max_total_time=600 \
+            -rss_limit_mb=2048 \
+            -print_final_stats=1
+      - name: Upload fuzz artifacts (failure inputs + final corpus)
+        # `actions/upload-artifact` ships any crash inputs libFuzzer
+        # found under `fuzz/artifacts/` plus the corpus directory
+        # for downstream replay. Only fires on failure — successful
+        # runs don't surface their corpus growth into the artifact
+        # store yet (that's tracked under the 24h cumulative-corpus
+        # CI cell, which is a CI-infra-track follow-on).
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-management-api-bodies-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
+          retention-days: 14
+          if-no-files-found: warn
