@@ -49,6 +49,28 @@
 #   `-Dtarget` knob (Phase B); see `docs/backend/m-prod-packaging.md`.
 
 # ---- Args (top-level so every stage can FROM ... ARG) ----
+#
+# NOTE on coupling with the FROM-line digest pins below:
+#   Phase B Part 1 pins each base-image FROM at `@sha256:<digest>`
+#   alongside the LITERAL tag (e.g. `rust:1.83-bookworm@sha256:...`).
+#   The ARG declarations below are STILL consumed by the per-stage
+#   apt-get install steps (`python${GRX_PYTHON_MINOR}-dev`) and by
+#   ENV exports, so removing them would break the cpython link path.
+#   They are NOT interpolated into the FROM lines anymore — bumping
+#   `RUST_VERSION` / `GRX_PYTHON_MINOR` / `DEBIAN_RELEASE` REQUIRES a
+#   coupled update to the literal tag strings at the FROM lines AND
+#   a re-resolution of the `@sha256:<digest>` (see top-of-file
+#   "Base-image digest pins" block below for the re-pin command).
+#
+# Base-image digest pins (resolved 2026-06-18). Re-pin via:
+#   for img in rust:1.83-bookworm \
+#              python:3.13-slim-bookworm \
+#              gcr.io/distroless/cc-debian12:nonroot; do
+#     echo -n "$img: "; \
+#       docker buildx imagetools inspect "$img" --format '{{.Manifest.Digest}}'
+#   done
+# Bumping RUST_VERSION / GRX_PYTHON_MINOR / DEBIAN_RELEASE ARGs requires
+# coupled bumps to the literal tag strings at the FROM lines below.
 
 ARG GRX_PYTHON_MINOR=3.13
 ARG RUST_VERSION=1.83
@@ -65,7 +87,12 @@ ARG DEBIAN_RELEASE=bookworm
 # supported builder. We run it here to produce frozen .a files that the
 # `rust-builder` stage consumes.
 
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS zig-builder
+# Base: rust:1.83-bookworm (resolved 2026-06-18 via
+#   docker buildx imagetools inspect rust:1.83-bookworm
+# Multi-arch index digest — buildx selects the per-arch manifest via
+# the `--platform` flag at build time. Re-pin via the same command
+# when bumping RUST_VERSION + DEBIAN_RELEASE in tandem.
+FROM rust:1.83-bookworm@sha256:a45bf1f5d9af0a23b26703b3500d70af1abff7f984a7abef5a104b42c02a292b AS zig-builder
 
 ARG GRX_PYTHON_MINOR
 ARG ZIG_VERSION
@@ -113,7 +140,11 @@ RUN cargo xtask zig-build --release
 # Stage 2 — rust-builder: produce target/release/grx
 # ============================================================================
 
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS rust-builder
+# Base: rust:1.83-bookworm (resolved 2026-06-18 via
+#   docker buildx imagetools inspect rust:1.83-bookworm
+# Same digest as zig-builder by construction — both stages depend on
+# the same toolchain image. Re-pin both stages together when bumping.
+FROM rust:1.83-bookworm@sha256:a45bf1f5d9af0a23b26703b3500d70af1abff7f984a7abef5a104b42c02a292b AS rust-builder
 
 ARG GRX_PYTHON_MINOR
 
@@ -164,7 +195,11 @@ RUN cargo build --release --bin grx
 # possible but wastes 5-7min per build for no security gain (Docker
 # Hub's python:slim images are kept patched ahead of debian:slim itself).
 
-FROM python:${GRX_PYTHON_MINOR}-slim-${DEBIAN_RELEASE} AS python-donor
+# Base: python:3.13-slim-bookworm (resolved 2026-06-18 via
+#   docker buildx imagetools inspect python:3.13-slim-bookworm
+# Multi-arch index digest. Bumping GRX_PYTHON_MINOR or DEBIAN_RELEASE
+# requires a coupled re-resolution of this digest.
+FROM python:3.13-slim-bookworm@sha256:05b95397cac02b060ff1251afaa78087d92d7034369afbc8eb765631cada8257 AS python-donor
 
 ARG GRX_PYTHON_MINOR
 
@@ -189,7 +224,12 @@ RUN test -f "/usr/local/lib/libpython${GRX_PYTHON_MINOR}.so.1.0" \
 # We COPY the binary + libpython + stdlib from earlier stages and run
 # as the `nonroot` user.
 
-FROM gcr.io/distroless/cc-debian12:nonroot AS final
+# Base: gcr.io/distroless/cc-debian12:nonroot (resolved 2026-06-18 via
+#   docker buildx imagetools inspect gcr.io/distroless/cc-debian12:nonroot
+# Multi-arch index digest. The `:nonroot` tag is rolled upstream without
+# notice; the pinned digest captures a specific image at resolution
+# time. Re-pin via the same command when bumping the runtime base.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:b0ae8e989418b458e0f25489bc3be523718938a2b70864cc0f6a00af1ddbd985 AS final
 
 ARG GRX_PYTHON_MINOR
 

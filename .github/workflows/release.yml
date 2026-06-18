@@ -1,6 +1,6 @@
 name: Release
 
-# **M-Prod sub-track #8 — release pipeline (Phase A scaffold).**
+# **M-Prod sub-track #8 — release pipeline (Phase B Part 1 — joint #7+#8).**
 #
 # Tag-triggered. Fires on the same `v*` pattern as `ci.yml`'s top-level
 # `on: push: tags: [v*]` block (line 6) — both workflows run on a tag
@@ -11,23 +11,46 @@ name: Release
 #      maintainers MUST configure the environment in repo settings and
 #      add an approval gate before any push runs.
 #
-# Phase A scope:
+# Phase A scope (HISTORIC; preserved bit-for-bit):
 #   - `reproducibility-recheck` re-runs the ci.yml twice-build cell as
 #     a HARD gate on the tag (ci.yml's version is `continue-on-error:
 #     true`; the release lane needs a real gate).
 #   - `sbom-pin` downloads the matching ci.yml SBOM artifact via the
 #     same SHA and re-uploads it under the tag name.
 #   - `docker-build-{amd64,arm64}` matrix: `docker buildx build` per
-#     arch, OUTPUT to a local tar. Ghcr.io push is gated to Phase B
-#     once OIDC trust is wired (the doc-comment on each docker job
-#     spells out the gate).
+#     arch, OUTPUT to a local tar. This matrix is a HARD gate as of
+#     Phase A (no `continue-on-error`); Phase B Part 1 adds cosign
+#     sign + SLSA attest of each per-arch tar.
 #   - `publish-release` runs `gh release create` with the SBOM + the
-#     OCI tar artifacts attached. Sets a `GRX_SIGNATURE_URL` placeholder
-#     in the release notes; the cosign `.sig` upload lands Phase B
-#     alongside the keyless signing step.
+#     OCI tar artifacts attached.
 #
-# Phase B/C/D deferrals are listed in
-# `docs/backend/m-prod-packaging.md` — see "Deferred to Phase B".
+# Phase B Part 1 additions (joint #7 + #8, this commit):
+#   - `reproducibility-recheck` now also installs cosign
+#     (`sigstore/cosign-installer@v3.5.0`), signs `target/release/grx`
+#     keyless via `cosign sign-blob --yes --bundle` (cert + sig + rekor
+#     entry in one file), and attaches a SLSA build provenance bundle
+#     (`actions/attest-build-provenance@v1`). Bundles flow into the GH
+#     Release alongside the binary.
+#   - `docker-build` matrix mirrors the same flow per per-arch tar
+#     (`/tmp/grx-oci-{amd64,arm64}.tar` + .cosign.bundle + .intoto.jsonl).
+#   - `ghcr-push` job is now wired in the workflow, gated on
+#     `vars.PUSH_TO_GHCR == 'true'` + `environment: production-release`
+#     approval. Pushes a multi-arch manifest to ghcr.io, co-signs the
+#     pushed digest with cosign, and attests SLSA provenance to the
+#     registry via `push-to-registry: true`.
+#   - `publish-release` attaches the cosign bundles + SLSA .intoto.jsonl
+#     to the GH Release for both the binary and each per-arch OCI tar.
+#
+# Permissions discipline (locked cross-track contract):
+#   Workflow-level `permissions:` deliberately remains absent (default-
+#   deny). Every job declares its own narrow scope. The new OIDC-bearing
+#   permissions (`id-token: write`, `attestations: write`, and `packages:
+#   write` on ghcr-push) are job-scoped. Matches the GitHub-Actions-
+#   hardening posture in ci.yml's top doc-comment.
+#
+# Phase B/C/D deferrals (per-arch SBOMs, cross-host repro, native arm64,
+# StatefulSet, macOS notarization, Windows MSI, K8s operator) remain in
+# `docs/backend/m-prod-packaging.md` — see "Open work in #8".
 
 on:
   push:
@@ -61,6 +84,13 @@ jobs:
     name: reproducibility-recheck (hard gate)
     runs-on: ubuntu-latest
     if: github.repository == 'graphreact/graphreact'
+    # Phase B Part 1 (joint #7+#8): widen the job-scope to allow Sigstore
+    # OIDC + GitHub-side attestation storage. Workflow-level permissions
+    # remain absent — narrowest scope that works.
+    permissions:
+      contents: read
+      id-token: write       # Sigstore OIDC + SLSA provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -109,11 +139,49 @@ jobs:
           fi
           echo "REPRODUCIBLE: $h1"
           echo "GRX_RELEASE_SHA256=$h1" >> "$GITHUB_ENV"
+      # ---- Phase B Part 1 (joint #7+#8): Sigstore-keyless sign + SLSA attest ----
+      #
+      # cosign-installer pinned to a minor (v3.5.0 ships cosign 2.2+) —
+      # same pin discipline as cargo-cyclonedx@0.5.9 + trivy@0.53.0 +
+      # cargo-fuzz@0.12. Bumps are deliberate PRs.
+      - name: Install cosign (Sigstore-keyless signer)
+        uses: sigstore/cosign-installer@v3.5.0
+      # Bundle format = cert + signature + Rekor inclusion proof in one
+      # file. Operator-friendly verify flow:
+      #   cosign verify-blob --bundle grx.cosign.bundle \
+      #       --certificate-identity-regexp 'https://github\.com/<repo>/' \
+      #       --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' grx
+      - name: Cosign sign-blob (keyless) the release binary
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle target/release/grx.cosign.bundle \
+            target/release/grx
+      # actions/attest-build-provenance@v1 emits GitHub-attested SLSA
+      # build provenance (queryable via `gh attestation verify`). The
+      # action also writes a .intoto.jsonl bundle to disk; we capture
+      # the path via the step output and cp it next to the binary so
+      # publish-release can attach it to the GH Release.
+      - name: Generate SLSA build provenance for the binary
+        id: attest-binary
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: target/release/grx
+      - name: Copy SLSA bundle next to the binary for upload
+        env:
+          BUNDLE_PATH: ${{ steps.attest-binary.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE_PATH" target/release/grx.intoto.jsonl
+          ls -la target/release/grx target/release/grx.cosign.bundle target/release/grx.intoto.jsonl
       - name: Upload release binary as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: grx-binary-${{ github.ref_name }}
-          path: target/release/grx
+          path: |
+            target/release/grx
+            target/release/grx.cosign.bundle
+            target/release/grx.intoto.jsonl
           retention-days: 90
           if-no-files-found: error
       - name: Upload twice-build SHA records (audit trail)
@@ -224,26 +292,26 @@ jobs:
           if-no-files-found: error
 
   # ===========================================================================
-  # docker-build matrix — multi-arch image build (NO push, Phase A)
+  # docker-build matrix — multi-arch image build + sign + attest (HARD gate)
   # ===========================================================================
   #
   # Builds one image per `{linux/amd64, linux/arm64}` slice via QEMU
-  # emulation (cross-arch buildx, no native ARM runner needed). Phase A
-  # OUTPUTs to a local tar — ghcr.io push is gated to Phase B once OIDC
-  # trust is wired (see "ghcr.io push gating" below).
+  # emulation (cross-arch buildx, no native ARM runner needed). Each
+  # arch produces a local tar; Phase B Part 1 (joint #7+#8) layers
+  # cosign sign-blob (keyless) + SLSA build provenance attestation on
+  # each per-arch tar so the artifacts published to the GH Release are
+  # fully verifiable.
   #
-  # ghcr.io push gating (Phase B trigger):
-  #   - Maintainer flips `vars.PUSH_TO_GHCR == true` in repo settings.
-  #   - Maintainer wires up the `production-release` environment with a
-  #     reviewer-approval gate (already required for the `if:` clause
-  #     below to be load-bearing).
-  #   - Maintainer adds the `id-token: write` permission (the only
-  #     workflow-level permission widening needed) once cosign + Fulcio
-  #     trust is configured.
+  # Gate posture: Phase B HARD. `fail-fast: false` is preserved so a
+  # transient arm64-emulation flake on one shard does not mask amd64
+  # results; both shards must succeed before publish-release runs.
+  # `continue-on-error` is deliberately ABSENT (matrix has been a hard
+  # gate since Phase A).
   #
-  # Until then, this matrix produces a local tar artifact named
-  # `oci-image-{arch}-{tag}` that operators can `docker load` for
-  # smoke-testing. The release notes flag the tar as Phase A scaffold.
+  # ghcr.io registry push lives in the SEPARATE `ghcr-push` job below
+  # — that job re-builds the multi-arch manifest and pushes directly,
+  # gated on `vars.PUSH_TO_GHCR == 'true'` + `environment:
+  # production-release` reviewer approval.
 
   docker-build:
     name: docker-build (${{ matrix.platform }})
@@ -259,8 +327,13 @@ jobs:
             arch_short: amd64
           - platform: linux/arm64
             arch_short: arm64
+    # Phase B Part 1 (joint #7+#8): widen the matrix's job-scope for
+    # Sigstore OIDC + GitHub-side SLSA attestation. Workflow-level
+    # permissions remain absent (default-deny).
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -271,14 +344,14 @@ jobs:
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
       - name: Build OCI image for ${{ matrix.platform }} (tar output)
         # Phase A: NO push. `outputs: type=docker,dest=...` writes a
-        # docker-load-able tar to the runner. Phase B flips this to
-        # `type=image,push=true` and adds `tags: ghcr.io/...`.
+        # docker-load-able tar to the runner. Registry push lives in the
+        # separate `ghcr-push` job (Phase B Part 1).
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
-          provenance: false  # SLSA attestation arrives in Phase B
+          provenance: false  # docker-side provenance is emitted by the ghcr-push job for the registry image
           sbom: false        # SBOM is single-sourced from ci.yml + sbom-pin
           push: false
           load: false
@@ -287,13 +360,132 @@ jobs:
             GRX_PYTHON_MINOR=3.13
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
             GRX_SIGNATURE_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/grx.sig
+      # ---- Phase B Part 1 (joint #7+#8): Sigstore-keyless sign + SLSA attest the per-arch tar ----
+      - name: Install cosign (Sigstore-keyless signer)
+        uses: sigstore/cosign-installer@v3.5.0
+      - name: Cosign sign-blob (keyless) the OCI tar
+        env:
+          ARCH_SHORT: ${{ matrix.arch_short }}
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle "/tmp/grx-oci-${ARCH_SHORT}.tar.cosign.bundle" \
+            "/tmp/grx-oci-${ARCH_SHORT}.tar"
+      - name: Generate SLSA build provenance for the OCI tar
+        id: attest-oci
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: /tmp/grx-oci-${{ matrix.arch_short }}.tar
+      - name: Copy SLSA bundle next to the OCI tar for upload
+        env:
+          BUNDLE_PATH: ${{ steps.attest-oci.outputs.bundle-path }}
+          ARCH_SHORT: ${{ matrix.arch_short }}
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE_PATH" "/tmp/grx-oci-${ARCH_SHORT}.tar.intoto.jsonl"
+          ls -la \
+            "/tmp/grx-oci-${ARCH_SHORT}.tar" \
+            "/tmp/grx-oci-${ARCH_SHORT}.tar.cosign.bundle" \
+            "/tmp/grx-oci-${ARCH_SHORT}.tar.intoto.jsonl"
       - name: Upload OCI tar artifact
         uses: actions/upload-artifact@v4
         with:
           name: oci-image-${{ matrix.arch_short }}-${{ github.ref_name }}
-          path: /tmp/grx-oci-${{ matrix.arch_short }}.tar
+          path: |
+            /tmp/grx-oci-${{ matrix.arch_short }}.tar
+            /tmp/grx-oci-${{ matrix.arch_short }}.tar.cosign.bundle
+            /tmp/grx-oci-${{ matrix.arch_short }}.tar.intoto.jsonl
           retention-days: 90
           if-no-files-found: error
+
+  # ===========================================================================
+  # ghcr-push — gated multi-arch push to ghcr.io (Phase B Part 1)
+  # ===========================================================================
+  #
+  # Re-builds the multi-arch image directly and pushes it to ghcr.io,
+  # signed + attested. Gates (all REQUIRED to be satisfied; default-off):
+  #
+  #   1. `github.repository == 'graphreact/graphreact'` — fork guard.
+  #   2. `vars.PUSH_TO_GHCR == 'true'` — operator MUST explicitly enable
+  #      the variable in repo Settings → Variables.
+  #   3. `environment: production-release` — repo Settings → Environments
+  #      MUST be configured with at least one required reviewer; the
+  #      pushed image waits on manual approval.
+  #
+  # `publish-release` does NOT depend on this job — the GH Release ships
+  # whether or not the operator has approved the ghcr push. The release
+  # notes' container-images table explicitly flags the ghcr.io row as
+  # gated, so operators reading the release are not surprised by a
+  # pull-error before approving the environment.
+  #
+  # OIDC trust:
+  #   `id-token: write` is consumed by both the cosign keyless flow
+  #   AND the actions/attest-build-provenance@v1 push-to-registry call.
+  #   `packages: write` is consumed by docker/login-action + build-push.
+  #   `attestations: write` is consumed by attest-build-provenance.
+
+  ghcr-push:
+    name: ghcr-push (gated)
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.repository == 'graphreact/graphreact' && vars.PUSH_TO_GHCR == 'true'
+    environment: production-release
+    permissions:
+      contents: read
+      packages: write     # ghcr.io push
+      id-token: write     # OIDC for cosign keyless + attest-build-provenance
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to ghcr.io via GITHUB_TOKEN
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute SOURCE_DATE_EPOCH (matches docker-build)
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+      - name: Build + push multi-arch manifest
+        id: pushbuild
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          provenance: true    # docker action emits SLSA provenance for the pushed image
+          sbom: false         # SBOM is single-sourced from ci.yml + sbom-pin
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/grx:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}/grx:latest
+          build-args: |
+            GRX_PYTHON_MINOR=3.13
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+            GRX_SIGNATURE_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/grx.sig
+      - uses: sigstore/cosign-installer@v3.5.0
+      - name: Cosign sign pushed manifest digest (keyless)
+        # Sign the registry-side image by digest (the immutable identity
+        # of the multi-arch manifest the build-push action just pushed).
+        env:
+          REPO: ${{ github.repository }}
+          DIGEST: ${{ steps.pushbuild.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "ghcr.io/${REPO}/grx@${DIGEST}"
+      - name: SLSA attestation of pushed image digest
+        # `push-to-registry: true` writes the GitHub-side SLSA attestation
+        # to the registry alongside the image. Coexists with the docker-
+        # side `provenance: true` on build-push (one is buildkit-shaped,
+        # one is GitHub-attestations-shaped); both are standard.
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ghcr.io/${{ github.repository }}/grx
+          subject-digest: ${{ steps.pushbuild.outputs.digest }}
+          push-to-registry: true
 
   # ===========================================================================
   # publish-release — gh release create with binary + SBOM attached
@@ -359,23 +551,38 @@ jobs:
 
           1. SBOM: \`release-sbom-${TAG_NAME}/*.cdx.json\` (CycloneDX 1.4, per workspace crate). Verify hashes against \`SHA256SUMS.txt\`.
           2. Binary: \`grx\` (linux-amd64 release). Verify via \`grx version\`'s \`signature:\` line.
-          3. OCI images: \`oci-image-{amd64,arm64}-${TAG_NAME}.tar\` (Phase A: \`docker load\`-able tar; Phase B: \`ghcr.io/${REPO}\` once OIDC trust is wired).
+          3. OCI images: \`oci-image-{amd64,arm64}-${TAG_NAME}.tar\` (\`docker load\`-able tar attached to the release; the registry-side image lives at \`ghcr.io/${REPO}/grx:${TAG_NAME}\` once the ghcr-push environment gate is approved).
 
-          ## Signature
+          ## Signature & provenance
 
-          Cosign signature: \`https://github.com/${REPO}/releases/download/${TAG_NAME}/grx.sig\`
+          - **Cosign keyless bundle:** \`grx.cosign.bundle\` — verify via:
 
-          > **Phase A note:** signing pipeline lands in M-Prod #8 Phase B. The URL above is the
-          > canonical location operators will fetch the \`.sig\` from once the keyless signing
-          > step is wired (\`actions/attest-build-provenance@v1\` + \`cosign sign-blob\`).
+              \`\`\`sh
+              cosign verify-blob --bundle grx.cosign.bundle \\
+                --certificate-identity-regexp "https://github\\.com/${REPO}/" \\
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
+                grx
+              \`\`\`
+
+          - **SLSA build provenance:** \`grx.intoto.jsonl\` — verify via either of:
+
+              \`\`\`sh
+              cosign verify-blob-attestation --bundle grx.intoto.jsonl \\
+                --certificate-identity-regexp "https://github\\.com/${REPO}/" \\
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
+                --type slsaprovenance grx
+              gh attestation verify grx --repo ${REPO}
+              \`\`\`
+
+          - **Per-OCI-tar:** the same flow with \`grx-oci-{amd64,arm64}.tar\` + matching \`.cosign.bundle\` / \`.intoto.jsonl\` files attached to this release.
 
           ## Container images
 
-          | Platform     | Artifact                                  | Status      |
-          |--------------|-------------------------------------------|-------------|
-          | linux/amd64  | \`oci-image-amd64-${TAG_NAME}.tar\`         | Phase A tar |
-          | linux/arm64  | \`oci-image-arm64-${TAG_NAME}.tar\`         | Phase A tar |
-          | ghcr.io      | \`ghcr.io/${REPO}:${TAG_NAME}\`             | Phase B     |
+          | Platform     | Artifact                                                  | Status                                        |
+          |--------------|-----------------------------------------------------------|-----------------------------------------------|
+          | linux/amd64  | \`oci-image-amd64-${TAG_NAME}.tar\`                         | Phase B (signed + SLSA-attested)              |
+          | linux/arm64  | \`oci-image-arm64-${TAG_NAME}.tar\`                         | Phase B (signed + SLSA-attested)              |
+          | ghcr.io      | \`ghcr.io/${REPO}/grx:${TAG_NAME}\`                         | Phase B (gated on \`vars.PUSH_TO_GHCR == 'true'\`) |
 
           [runbook]: https://github.com/${REPO}/blob/main/docs/backend/m-prod-runbook.md
           EOF
@@ -390,7 +597,13 @@ jobs:
             --title "grx ${TAG_NAME}" \
             --notes-file release-notes.md \
             release-bundle/grx \
+            release-bundle/grx.cosign.bundle \
+            release-bundle/grx.intoto.jsonl \
             release-bundle/grx-oci-amd64.tar \
+            release-bundle/grx-oci-amd64.tar.cosign.bundle \
+            release-bundle/grx-oci-amd64.tar.intoto.jsonl \
             release-bundle/grx-oci-arm64.tar \
+            release-bundle/grx-oci-arm64.tar.cosign.bundle \
+            release-bundle/grx-oci-arm64.tar.intoto.jsonl \
             release-bundle/sbom/*.cdx.json \
             release-bundle/sbom/SHA256SUMS.txt
