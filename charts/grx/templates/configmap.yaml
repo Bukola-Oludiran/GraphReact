@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "grx.fullname" . }}-config
+  labels:
+    {{- include "grx.labels" . | nindent 4 }}
+data:
+  # Human-readable summary of the runtime knobs applied to this
+  # release. NOT consumed by `grx` at startup — the daemon reads its
+  # config from CLI flags + env vars set in the Deployment. This
+  # ConfigMap is a record of the effective config + a rollout trigger
+  # (the Deployment's `checksum/config` annotation hashes this file, so
+  # editing it via `helm upgrade --set ...` rolls pods).
+  runtime.kind: {{ .Values.runtime.kind | quote }}
+  runtime.args: {{ .Values.runtime.args | toJson | quote }}
+  observer.bind: {{ .Values.observer.bind | quote }}
+  observer.audit.logPath: {{ .Values.observer.audit.logPath | quote }}
+  lifecycle.drainDeadlineSecs: "{{ .Values.lifecycle.drainDeadlineSecs }}"
+  lifecycle.observerShutdownDeadline: "{{ .Values.lifecycle.observerShutdownDeadline }}"
+  lifecycle.terminationGracePeriodSeconds: "{{ .Values.lifecycle.terminationGracePeriodSeconds }}"

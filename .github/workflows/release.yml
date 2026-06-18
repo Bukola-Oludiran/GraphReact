@@ -1,0 +1,396 @@
+name: Release
+
+# **M-Prod sub-track #8 — release pipeline (Phase A scaffold).**
+#
+# Tag-triggered. Fires on the same `v*` pattern as `ci.yml`'s top-level
+# `on: push: tags: [v*]` block (line 6) — both workflows run on a tag
+# push. Defense against fork pushes accidentally hitting ghcr.io:
+#   1. job-level `if: github.repository == 'graphreact/graphreact'` on
+#      every push job below.
+#   2. job-level `environment: production-release` on every push job —
+#      maintainers MUST configure the environment in repo settings and
+#      add an approval gate before any push runs.
+#
+# Phase A scope:
+#   - `reproducibility-recheck` re-runs the ci.yml twice-build cell as
+#     a HARD gate on the tag (ci.yml's version is `continue-on-error:
+#     true`; the release lane needs a real gate).
+#   - `sbom-pin` downloads the matching ci.yml SBOM artifact via the
+#     same SHA and re-uploads it under the tag name.
+#   - `docker-build-{amd64,arm64}` matrix: `docker buildx build` per
+#     arch, OUTPUT to a local tar. Ghcr.io push is gated to Phase B
+#     once OIDC trust is wired (the doc-comment on each docker job
+#     spells out the gate).
+#   - `publish-release` runs `gh release create` with the SBOM + the
+#     OCI tar artifacts attached. Sets a `GRX_SIGNATURE_URL` placeholder
+#     in the release notes; the cosign `.sig` upload lands Phase B
+#     alongside the keyless signing step.
+#
+# Phase B/C/D deferrals are listed in
+# `docs/backend/m-prod-packaging.md` — see "Deferred to Phase B".
+
+on:
+  push:
+    tags: ['v*']
+
+# Default-deny: workflow-level permissions deliberately omitted — every
+# job that needs widening declares its own `permissions:` block. Matches
+# the GitHub-Actions-hardening posture in ci.yml's top doc-comment.
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ===========================================================================
+  # reproducibility-recheck — HARD gate on the tagged build's reproducibility
+  # ===========================================================================
+  #
+  # ci.yml's `reproducible-build` job runs with `continue-on-error: true` —
+  # divergence on `main` is logged but doesn't block. The release lane
+  # cannot tolerate that: a divergent build means the binary the operator
+  # downloads cannot be cross-checked against any audit hash. We re-run
+  # the twice-build here and FAIL HARD on divergence.
+  #
+  # Two-cell strategy (vs `needs: ci`):
+  #   We do NOT depend on the ci.yml run for the same tag — release.yml
+  #   runs in parallel with ci.yml, both triggered by the same `v*` push.
+  #   Re-running the twice-build keeps release.yml self-contained.
+
+  reproducibility-recheck:
+    name: reproducibility-recheck (hard gate)
+    runs-on: ubuntu-latest
+    if: github.repository == 'graphreact/graphreact'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install zig (matches ci.yml repro cell pin)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-repro
+      - name: Compute SOURCE_DATE_EPOCH from HEAD committer timestamp
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+      - name: Build zig bridge static libs (frozen between Rust builds)
+        run: cargo xtask zig-build --release
+      - name: First build (capture sha256)
+        env:
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=${{ env.HOME }}/.cargo=/cargo"
+        run: |
+          set -euo pipefail
+          cargo build --release --bin grx
+          sha256sum target/release/grx | tee /tmp/grx-sha256-1.txt
+      - name: Wipe Rust target between builds (keep zig .a files frozen)
+        run: |
+          set -euo pipefail
+          rm -rf target/release/grx target/release/deps/grx-*
+      - name: Second build (capture sha256)
+        env:
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=${{ env.HOME }}/.cargo=/cargo"
+        run: |
+          set -euo pipefail
+          cargo build --release --bin grx
+          sha256sum target/release/grx | tee /tmp/grx-sha256-2.txt
+      - name: HARD gate on twice-build SHA divergence
+        # Unlike ci.yml's `continue-on-error: true` posture, divergence
+        # here fails the release. The release pipeline cannot ship a
+        # binary whose bytes the audit trail cannot vouch for.
+        run: |
+          set -euo pipefail
+          h1=$(awk '{print $1}' /tmp/grx-sha256-1.txt)
+          h2=$(awk '{print $1}' /tmp/grx-sha256-2.txt)
+          echo "build-1 sha256: $h1"
+          echo "build-2 sha256: $h2"
+          if [ "$h1" != "$h2" ]; then
+            echo "::error::release HARD gate: twice-build diverged (h1=$h1 h2=$h2)"
+            exit 1
+          fi
+          echo "REPRODUCIBLE: $h1"
+          echo "GRX_RELEASE_SHA256=$h1" >> "$GITHUB_ENV"
+      - name: Upload release binary as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grx-binary-${{ github.ref_name }}
+          path: target/release/grx
+          retention-days: 90
+          if-no-files-found: error
+      - name: Upload twice-build SHA records (audit trail)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-repro-sha256-${{ github.ref_name }}
+          path: |
+            /tmp/grx-sha256-1.txt
+            /tmp/grx-sha256-2.txt
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ===========================================================================
+  # sbom-pin — pin the SBOM artifact under the tag name
+  # ===========================================================================
+  #
+  # The `cyclonedx-sbom` job in ci.yml already uploads under
+  # `sbom-cyclonedx-<sha-or-tag>` (line 225 of ci.yml). Per its inline
+  # comment, "Tag runs ship under the tag name (e.g. sbom-cyclonedx-v0.1.0)
+  # so per-tag artifacts are stable + dereferenceable." This job
+  # validates the artifact exists for the current tag's SHA and re-bundles
+  # it under a release-aligned name with a checksum manifest.
+  #
+  # We do NOT duplicate the `cargo cyclonedx` invocation here — that
+  # would emit a second SBOM with a potentially different timestamp,
+  # breaking the supply-chain single-source-of-truth contract.
+
+  sbom-pin:
+    name: sbom-pin
+    runs-on: ubuntu-latest
+    if: github.repository == 'graphreact/graphreact'
+    permissions:
+      actions: read  # required for the GH API artifact lookup
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for ci.yml's cyclonedx-sbom job to publish
+        # ci.yml and release.yml fire on the same `v*` push. The SBOM
+        # job in ci.yml emits its artifact partway through that run; we
+        # poll the run's artifact list until the SBOM appears (or 15min
+        # ceiling so a stuck CI doesn't wedge release.yml indefinitely).
+        #
+        # `github.ref_name` for a tag push is git-validated (no shell
+        # metacharacters can appear in a valid ref name per refname(7)),
+        # but we still thread it through env: + double-quoted shell
+        # expansion as defense-in-depth against future trigger changes.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 900 ))  # 15min budget
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            # Find the ci.yml run for this SHA (the tag push triggered both).
+            # All untrusted strings ($TAG_NAME, $SHA) are passed via env vars
+            # and quoted in --jq's filter via the JSON-string escape `tojson`-
+            # equivalent (gh's --jq passes the env var verbatim into the jq
+            # program; the shell quoting below keeps it from being split).
+            run_id=$(gh run list \
+              --workflow=ci.yml \
+              --branch="$TAG_NAME" \
+              --json databaseId,headSha,status \
+              --jq '.[] | select(.headSha == env.SHA) | .databaseId' \
+              | head -1)
+            if [ -n "${run_id:-}" ]; then
+              # Confirm the artifact exists in that run.
+              if gh api "repos/$REPO/actions/runs/${run_id}/artifacts" \
+                  --jq '.artifacts[] | select(.name == "sbom-cyclonedx-" + env.TAG_NAME) | .id' \
+                  | grep -q .; then
+                echo "Found sbom-cyclonedx-$TAG_NAME in ci.yml run ${run_id}"
+                echo "CI_RUN_ID=${run_id}" >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
+            echo "sbom not yet published; sleeping 30s"
+            sleep 30
+          done
+          echo "::error::ci.yml's cyclonedx-sbom did not publish within 15min"
+          exit 1
+      - name: Download the SBOM artifact from ci.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p sbom-pinned
+          gh run download "${CI_RUN_ID}" \
+            --name "sbom-cyclonedx-$TAG_NAME" \
+            --dir sbom-pinned/
+          ls -la sbom-pinned/
+      - name: Generate checksum manifest
+        run: |
+          set -euo pipefail
+          cd sbom-pinned
+          # `sha256sum *.cdx.json` produces one line per SBOM file.
+          # The manifest is what operators verify against in the
+          # `Verify a release` runbook flow.
+          sha256sum *.cdx.json > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Upload pinned SBOM bundle for the release
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-sbom-${{ github.ref_name }}
+          path: sbom-pinned/
+          retention-days: 90
+          if-no-files-found: error
+
+  # ===========================================================================
+  # docker-build matrix — multi-arch image build (NO push, Phase A)
+  # ===========================================================================
+  #
+  # Builds one image per `{linux/amd64, linux/arm64}` slice via QEMU
+  # emulation (cross-arch buildx, no native ARM runner needed). Phase A
+  # OUTPUTs to a local tar — ghcr.io push is gated to Phase B once OIDC
+  # trust is wired (see "ghcr.io push gating" below).
+  #
+  # ghcr.io push gating (Phase B trigger):
+  #   - Maintainer flips `vars.PUSH_TO_GHCR == true` in repo settings.
+  #   - Maintainer wires up the `production-release` environment with a
+  #     reviewer-approval gate (already required for the `if:` clause
+  #     below to be load-bearing).
+  #   - Maintainer adds the `id-token: write` permission (the only
+  #     workflow-level permission widening needed) once cosign + Fulcio
+  #     trust is configured.
+  #
+  # Until then, this matrix produces a local tar artifact named
+  # `oci-image-{arch}-{tag}` that operators can `docker load` for
+  # smoke-testing. The release notes flag the tar as Phase A scaffold.
+
+  docker-build:
+    name: docker-build (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    needs: reproducibility-recheck
+    if: github.repository == 'graphreact/graphreact'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            arch_short: amd64
+          - platform: linux/arm64
+            arch_short: arm64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Compute SOURCE_DATE_EPOCH (matches reproducibility-recheck)
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> "$GITHUB_ENV"
+      - name: Build OCI image for ${{ matrix.platform }} (tar output)
+        # Phase A: NO push. `outputs: type=docker,dest=...` writes a
+        # docker-load-able tar to the runner. Phase B flips this to
+        # `type=image,push=true` and adds `tags: ghcr.io/...`.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false  # SLSA attestation arrives in Phase B
+          sbom: false        # SBOM is single-sourced from ci.yml + sbom-pin
+          push: false
+          load: false
+          outputs: type=docker,dest=/tmp/grx-oci-${{ matrix.arch_short }}.tar
+          build-args: |
+            GRX_PYTHON_MINOR=3.13
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+            GRX_SIGNATURE_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/grx.sig
+      - name: Upload OCI tar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-image-${{ matrix.arch_short }}-${{ github.ref_name }}
+          path: /tmp/grx-oci-${{ matrix.arch_short }}.tar
+          retention-days: 90
+          if-no-files-found: error
+
+  # ===========================================================================
+  # publish-release — gh release create with binary + SBOM attached
+  # ===========================================================================
+  #
+  # Runs after all build jobs succeed. Creates the GitHub Release with:
+  #   - target/release/grx (from reproducibility-recheck artifact)
+  #   - release-sbom-<tag>/{*.cdx.json + SHA256SUMS.txt}
+  #   - oci-image-{amd64,arm64}-<tag>.tar (Phase A scaffolds; Phase B
+  #     replaces these with ghcr.io image references)
+  # Sets a `GRX_SIGNATURE_URL` placeholder in the release notes pointing
+  # at the canonical `grx.sig` URL that the Phase B signing pipeline will
+  # populate.
+
+  publish-release:
+    name: publish-release
+    runs-on: ubuntu-latest
+    needs: [reproducibility-recheck, sbom-pin, docker-build]
+    if: github.repository == 'graphreact/graphreact'
+    permissions:
+      contents: write  # required for `gh release create`
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: grx-binary-${{ github.ref_name }}
+          path: release-bundle/
+      - name: Download pinned SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: release-sbom-${{ github.ref_name }}
+          path: release-bundle/sbom/
+      - name: Download amd64 OCI tar
+        uses: actions/download-artifact@v4
+        with:
+          name: oci-image-amd64-${{ github.ref_name }}
+          path: release-bundle/
+      - name: Download arm64 OCI tar
+        uses: actions/download-artifact@v4
+        with:
+          name: oci-image-arm64-${{ github.ref_name }}
+          path: release-bundle/
+      - name: Show bundle layout
+        run: |
+          set -euo pipefail
+          ls -la release-bundle/
+          ls -la release-bundle/sbom/
+      - name: Generate release notes scaffold
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          # grx ${TAG_NAME}
+
+          GraphReact backend runtime — \`grx\` CLI release.
+
+          ## Verify this release
+
+          See [docs/backend/m-prod-runbook.md][runbook] for the verification flow.
+
+          1. SBOM: \`release-sbom-${TAG_NAME}/*.cdx.json\` (CycloneDX 1.4, per workspace crate). Verify hashes against \`SHA256SUMS.txt\`.
+          2. Binary: \`grx\` (linux-amd64 release). Verify via \`grx version\`'s \`signature:\` line.
+          3. OCI images: \`oci-image-{amd64,arm64}-${TAG_NAME}.tar\` (Phase A: \`docker load\`-able tar; Phase B: \`ghcr.io/${REPO}\` once OIDC trust is wired).
+
+          ## Signature
+
+          Cosign signature: \`https://github.com/${REPO}/releases/download/${TAG_NAME}/grx.sig\`
+
+          > **Phase A note:** signing pipeline lands in M-Prod #8 Phase B. The URL above is the
+          > canonical location operators will fetch the \`.sig\` from once the keyless signing
+          > step is wired (\`actions/attest-build-provenance@v1\` + \`cosign sign-blob\`).
+
+          ## Container images
+
+          | Platform     | Artifact                                  | Status      |
+          |--------------|-------------------------------------------|-------------|
+          | linux/amd64  | \`oci-image-amd64-${TAG_NAME}.tar\`         | Phase A tar |
+          | linux/arm64  | \`oci-image-arm64-${TAG_NAME}.tar\`         | Phase A tar |
+          | ghcr.io      | \`ghcr.io/${REPO}:${TAG_NAME}\`             | Phase B     |
+
+          [runbook]: https://github.com/${REPO}/blob/main/docs/backend/m-prod-runbook.md
+          EOF
+          cat release-notes.md
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG_NAME}" \
+            --title "grx ${TAG_NAME}" \
+            --notes-file release-notes.md \
+            release-bundle/grx \
+            release-bundle/grx-oci-amd64.tar \
+            release-bundle/grx-oci-arm64.tar \
+            release-bundle/sbom/*.cdx.json \
+            release-bundle/sbom/SHA256SUMS.txt

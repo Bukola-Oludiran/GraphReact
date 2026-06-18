@@ -1,0 +1,26 @@
+{{ .Chart.Name }} {{ .Chart.AppVersion }} installed as `{{ .Release.Name }}` in namespace `{{ .Release.Namespace }}`.
+
+Verify the daemon is up:
+
+  kubectl --namespace {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+Tail logs (structured JSON; pipe through `jq` if installed):
+
+  kubectl --namespace {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }} -f
+
+Probe the observer endpoints (port-forward then curl):
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "grx.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }} &
+  curl -s http://localhost:{{ .Values.service.port }}{{ .Values.probes.readiness.path }}    # `ready` | `draining` | `scheduler_first_batch_pending` | `bridge_saturated`
+  curl -s http://localhost:{{ .Values.service.port }}{{ .Values.probes.liveness.path }}     # `ok`
+  curl -s http://localhost:{{ .Values.service.port }}/metrics | head -40                    # Prometheus scrape
+
+Drain budget (lifecycle):
+
+  terminationGracePeriodSeconds:   {{ .Values.lifecycle.terminationGracePeriodSeconds }}s
+    drain (GRX_DRAIN_DEADLINE_SECS):       {{ .Values.lifecycle.drainDeadlineSecs }}s
+    OTel teardown (OBSERVER_SHUTDOWN_DEADLINE): {{ .Values.lifecycle.observerShutdownDeadline }}s
+    slack:                                  {{ sub (sub (int .Values.lifecycle.terminationGracePeriodSeconds) (int .Values.lifecycle.drainDeadlineSecs)) (int .Values.lifecycle.observerShutdownDeadline) }}s
+
+For the full operator runbook, see:
+  https://github.com/graphreact/graphreact/blob/main/docs/backend/m-prod-runbook.md

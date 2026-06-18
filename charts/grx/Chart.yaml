@@ -1,0 +1,38 @@
+apiVersion: v2
+name: grx
+description: |
+  GraphReact backend runtime — Deployment + Service + ConfigMap for the
+  `grx cluster daemon`. Production-shaped: distinct readiness vs
+  liveness probes (matches m-prod-observability.md), drain-budget-tuned
+  terminationGracePeriodSeconds (matches m-prod-lifecycle.md), default
+  securityContext.runAsNonRoot + readOnlyRootFilesystem.
+
+  M-Prod sub-track #8 Phase A — see
+  https://github.com/graphreact/graphreact/blob/main/docs/backend/m-prod-packaging.md
+type: application
+
+# Chart version (bumps independently of app version).
+version: 0.1.0
+
+# Application version (semver of the grx binary the default image points at).
+appVersion: "0.1.0"
+
+# Keywords (helm-hub search surface).
+keywords:
+  - graphreact
+  - grx
+  - backend
+  - actor-runtime
+  - .grx
+  - distributed-systems
+
+home: https://github.com/graphreact/graphreact
+sources:
+  - https://github.com/graphreact/graphreact
+maintainers:
+  - name: GraphReact Contributors
+    url: https://github.com/graphreact/graphreact
+
+# Annotations: artifact-hub renders these for chart cards.
+annotations:
+  category: ServerlessRuntime

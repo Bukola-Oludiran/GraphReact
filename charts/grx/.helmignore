@@ -1,0 +1,23 @@
+# Patterns to ignore when building helm packages.
+# Mirrors the helm-create scaffold default; trims VCS / editor cruft.
+.DS_Store
+.git/
+.gitignore
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+# Editor + IDE
+.idea/
+.vscode/
+*.iml
+# Helm
+.helmignore
+# OWNERS / kubebuilder cruft
+OWNERS
