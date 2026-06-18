@@ -190,7 +190,7 @@ pub fn log_drain_completed(
     cluster_quiesced: bool,
 ) {
     crate::audit::log_drain_completed(
-        duration.as_millis() as u64,
+        duration_to_ms_u64(duration),
         in_flight_settled,
         cluster_quiesced,
     );
@@ -208,11 +208,27 @@ pub fn log_drain_deadline_exceeded(
     ingress_in_flight_remaining: usize,
 ) {
     crate::audit::log_drain_deadline_exceeded(
-        deadline.as_millis() as u64,
-        duration.as_millis() as u64,
+        duration_to_ms_u64(deadline),
+        duration_to_ms_u64(duration),
         pending_calls_remaining,
         ingress_in_flight_remaining,
     );
+}
+
+/// Saturating conversion from `Duration` to ms-as-u64.
+///
+/// `Duration::as_millis()` returns `u128`; the audit event fields
+/// are `u64`. A direct `as u64` cast triggers
+/// `clippy::cast_possible_truncation` because in theory a
+/// caller could pass a `Duration::MAX`-shaped value. In practice
+/// drain budgets are bounded by `terminationGracePeriodSeconds`
+/// (60s typical) so we never approach the `u64::MAX` ms ceiling
+/// (~584 million years). Saturating conversion preserves the
+/// audit-event semantics even in the (impossible) overflow case
+/// and silences the lint without adding an `#[allow(...)]`.
+#[inline]
+fn duration_to_ms_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

@@ -1499,7 +1499,7 @@ impl DaemonHandle {
                 deadline_exceeded: false,
             };
         };
-        let deadline_ms = deadline.as_millis() as u64;
+        let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
         // Idempotent CAS: only the FIRST call gets `true`.
         // Duplicate SIGTERMs return immediately without resetting
         // the deadline or re-emitting `drain_started`.
@@ -1523,13 +1523,15 @@ impl DaemonHandle {
         poll.tick().await; // skip immediate
         let quiesced = loop {
             let ingress_done = ingress_counter.load() == 0;
-            let calls_done = pending_calls.as_ref().is_none_or(|c| c.is_empty());
+            let calls_done = pending_calls
+                .as_ref()
+                .is_none_or(graphreact_observer::PendingCalls::is_empty);
             if ingress_done && calls_done {
                 break true;
             }
             tokio::select! {
                 _ = poll.tick() => {}
-                _ = tokio::time::sleep_until(
+                () = tokio::time::sleep_until(
                     tokio::time::Instant::from_std(started + deadline)
                 ) => {
                     break false;
@@ -1554,7 +1556,9 @@ impl DaemonHandle {
             }
         } else {
             let ingress_remaining = ingress_counter.load();
-            let pending_remaining = pending_calls.as_ref().map_or(0, |c| c.len());
+            let pending_remaining = pending_calls
+                .as_ref()
+                .map_or(0, graphreact_observer::PendingCalls::len);
             graphreact_observer::log_drain_deadline_exceeded(
                 deadline,
                 elapsed,
@@ -1660,6 +1664,17 @@ impl DaemonHandle {
     #[must_use]
     pub fn observer_addr(&self) -> Option<std::net::SocketAddr> {
         self.observer.as_ref().map(|h| h.local_addr)
+    }
+
+    /// **M-Prod sub-track #4 Phase α.** Clone the in-flight ingress
+    /// counter so out-of-process tests can simulate stuck requests
+    /// (drop the returned guard's clone never → drain hits the
+    /// deadline) without going through real HTTP. Returns `None`
+    /// when no observer was wired (the counter exists but is
+    /// inert — there's no ingress surface bumping it).
+    #[must_use]
+    pub fn observer_ingress_counter(&self) -> Option<graphreact_observer::IngressInFlight> {
+        self.observer.as_ref().map(|_| self.ingress_in_flight.clone())
     }
 }
 
@@ -1952,11 +1967,13 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     let drain_dur = resolve_drain_deadline(opts.drain_deadline_secs);
     let otel_dur = observer_shutdown_deadline();
     if drain_dur < otel_dur {
+        let drain_ms = u64::try_from(drain_dur.as_millis()).unwrap_or(u64::MAX);
+        let otel_ms = u64::try_from(otel_dur.as_millis()).unwrap_or(u64::MAX);
         tracing::warn!(
             target: "graphreact::observer::audit",
             event = "drain_budget_misconfig",
-            drain_deadline_ms = drain_dur.as_millis() as u64,
-            observer_shutdown_deadline_ms = otel_dur.as_millis() as u64,
+            drain_deadline_ms = drain_ms,
+            observer_shutdown_deadline_ms = otel_ms,
             "drain deadline shorter than OBSERVER_SHUTDOWN_DEADLINE — OTel teardown may be cut short by total grace-period exhaustion"
         );
     }
@@ -2648,6 +2665,66 @@ mod tests {
         // Leave the env clean for any other test running on this
         // binary.
         std::env::remove_var("OBSERVER_SHUTDOWN_DEADLINE");
+    }
+
+    /// **M-Prod sub-track #4 Phase α.** Mirror of the
+    /// `OBSERVER_SHUTDOWN_DEADLINE` env-var contract for the
+    /// `GRX_DRAIN_DEADLINE_SECS` knob backing
+    /// [`resolve_drain_deadline`]. Precedence: explicit CLI value
+    /// wins, then env var, then default. Empty / unparseable /
+    /// zero values fall through to the default so an operator
+    /// can't accidentally race the in-flight quiescence loop to
+    /// instant timeout.
+    #[test]
+    fn drain_deadline_resolution_precedence() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::remove_var("GRX_DRAIN_DEADLINE_SECS");
+        assert_eq!(
+            resolve_drain_deadline(None),
+            Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
+            "unset env + no CLI falls through to default",
+        );
+        assert_eq!(
+            resolve_drain_deadline(Some(7)),
+            Duration::from_secs(7),
+            "explicit CLI value wins over default",
+        );
+
+        std::env::set_var("GRX_DRAIN_DEADLINE_SECS", "");
+        assert_eq!(
+            resolve_drain_deadline(None),
+            Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
+            "empty env falls through to default",
+        );
+        std::env::set_var("GRX_DRAIN_DEADLINE_SECS", "0");
+        assert_eq!(
+            resolve_drain_deadline(None),
+            Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
+            "zero env falls through to default (would race to instant timeout)",
+        );
+        std::env::set_var("GRX_DRAIN_DEADLINE_SECS", "garbage");
+        assert_eq!(
+            resolve_drain_deadline(None),
+            Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
+            "unparseable env falls through to default",
+        );
+
+        std::env::set_var("GRX_DRAIN_DEADLINE_SECS", "30");
+        assert_eq!(
+            resolve_drain_deadline(None),
+            Duration::from_secs(30),
+            "positive env value is accepted as seconds",
+        );
+        assert_eq!(
+            resolve_drain_deadline(Some(5)),
+            Duration::from_secs(5),
+            "explicit CLI value still wins over env",
+        );
+
+        std::env::remove_var("GRX_DRAIN_DEADLINE_SECS");
     }
 
     /// **M15 Phase 9.** `grx reload <path>` returns an error today —

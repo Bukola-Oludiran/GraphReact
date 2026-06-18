@@ -24,6 +24,7 @@ The **safest slice** lands #1 + #2 (this commit pair); items #3–#5 are address
 
 | Term | Source | Why |
 |---|---|---|
+| Drain in progress (sub-track #4 Phase α, shipped 2026-06-17) | `state.draining.as_ref().is_some_and(|f| f.is_draining())` — relaxed `AtomicBool` load | First-branch predicate evaluated BEFORE the trio below. When set, return 503 + body `draining` ahead of any other not-ready reason. See [`m-prod-lifecycle.md`](m-prod-lifecycle.md) for the SIGTERM wiring + budget math. |
 | Scheduler has completed ≥1 `process_batch` round | `MetricsInner::process_batch_duration.snapshot().count > 0` | The histogram is updated by `PrometheusSink::on_tick_end` exactly once per scheduler tick. Count > 0 means the first mount cascade drained, so the daemon's view of the `.grx` system is consistent. |
 | Snapshot bridge has capacity | `state.snapshot_tx.capacity() > 0` | Capacity at zero means the scheduler thread is wedged behind a long `process_batch` round AND every `SnapshotRequest` slot is full. Inbound HTTP would 503 anyway; pre-emptively de-route via readiness rather than serve a stale snapshot. |
 | Cluster membership reached (M-Prod residual, shipped 2026-06-17) | `cluster_readyz()` probe — returns `true` if `configured_peers == 0` OR `dialed_count >= 1` | Single-node deploys (no peers configured) pass trivially. Multi-node deploys flip to ready only once at least one peer dial completed, so load balancers don't route to a daemon whose `Cluster::start` hasn't yet handshook with anyone. Lock-free `AtomicUsize` read on the hot path. |
@@ -33,6 +34,7 @@ The **safest slice** lands #1 + #2 (this commit pair); items #3–#5 are address
 | State | Status | Body | Headers |
 |---|---|---|---|
 | Ready | 200 OK | `ready` | `Content-Type: text/plain; charset=utf-8` |
+| **Draining (sub-track #4 Phase α)** | **503 Service Unavailable** | **`draining`** | **`Content-Type: text/plain; charset=utf-8`, `Retry-After: 1`** |
 | Pre-tick | 503 Service Unavailable | `scheduler_first_batch_pending` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
 | Bridge saturated | 503 Service Unavailable | `bridge_saturated` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
 | Cluster peers configured but none dialed (M-Prod residual) | 503 Service Unavailable | `cluster_no_peers_connected` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
@@ -105,7 +107,7 @@ match tokio::time::timeout(deadline, join).await {
 - **Readiness predicate extensions** (deferred inside #5 until sub-track dependencies land):
   - TLS cert loaded / not-in-rotation — needs sub-track #2 SIGHUP reload primitive.
   - OTel exporter reachable — needs BatchSpanProcessor connect handle (currently the SDK absorbs the failure mode).
-  - Drain-in-progress flag — needs sub-track #4 SIGTERM drain primitive; once shipped, readiness flips back to 503 at the start of drain so load balancers de-route BEFORE we stop accepting new calls.
+  - ~~Drain-in-progress flag~~ — **SHIPPED 2026-06-17 (sub-track #4 Phase α).** See [`m-prod-lifecycle.md`](m-prod-lifecycle.md). `/v1/readyz` now flips to 503 `draining` on SIGTERM-driven drain start, ahead of all other not-ready predicates.
 
 ## Cross-track contracts locked here
 

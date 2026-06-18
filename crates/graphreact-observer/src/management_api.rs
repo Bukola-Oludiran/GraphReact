@@ -1083,7 +1083,7 @@ async fn readyz(State(state): State<ApiState>) -> Response {
     // the load balancer de-routes immediately without re-checking
     // every other predicate. The check is a relaxed atomic load
     // (sub-µs hot-path cost).
-    if state.draining.as_ref().is_some_and(|f| f.is_draining()) {
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [
@@ -1310,7 +1310,7 @@ async fn inject_message_handler(
     // quiescence racy-free — the orchestrator's
     // `ingress_in_flight.load() == 0` poll never sees a
     // late-arriving request bumping the counter post-drain-start.
-    if state.draining.as_ref().is_some_and(|f| f.is_draining()) {
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
         return drain_in_progress_response();
     }
     let _inflight = state.ingress_in_flight.enter();
@@ -1418,7 +1418,7 @@ async fn inject_call_handler(
     // pending_calls.is_empty()`; keeping the drain check before
     // both counter bumps prevents a race where a late-arriving
     // request bumps either counter post-drain-start.
-    if state.draining.as_ref().is_some_and(|f| f.is_draining()) {
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
         return drain_in_progress_response();
     }
     let _inflight = state.ingress_in_flight.enter();
@@ -1652,7 +1652,7 @@ async fn bulk_inject_handler(
     // path will start failing once the daemon's snapshot bridge
     // closes — the producer's `BulkLineDisposition::BridgeDropped`
     // arm emits the per-line 503 row + closes the stream.
-    if state.draining.as_ref().is_some_and(|f| f.is_draining()) {
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
         return drain_in_progress_response();
     }
     let inflight_guard = state.ingress_in_flight.enter();
