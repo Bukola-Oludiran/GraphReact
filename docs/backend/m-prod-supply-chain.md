@@ -93,15 +93,16 @@ A new `reproducible-build` job in `.github/workflows/ci.yml` twice-builds `targe
 
 ### Trivy SBOM vulnerability scan (SARIF → GitHub Security tab)
 
-A new `trivy-sbom-scan` job in `.github/workflows/ci.yml` depends on the existing `cyclonedx-sbom` job, downloads the SBOM artifact, runs Trivy in `scan-type: sbom` mode (severity HIGH+CRITICAL) and uploads SARIF to the GitHub Security tab via `github/codeql-action/upload-sarif@v3`.
+A new `trivy-sbom-scan` job in `.github/workflows/ci.yml` depends on the existing `sbom` job (YAML key — display name is `cyclonedx-sbom`), downloads the SBOM artifact, runs Trivy in `trivy sbom <file>` mode per workspace-member CDX (severity HIGH+CRITICAL), merges the per-crate SARIF runs into a single SARIF document, and uploads it to the GitHub Security tab via `github/codeql-action/upload-sarif@v3`.
 
 **Knobs:**
 
-- `needs: cyclonedx-sbom`, `if: github.event_name == 'push'`, `continue-on-error: true`.
+- `needs: sbom`, `if: github.event_name == 'push'`, `continue-on-error: true`.
 - `permissions: { security-events: write, contents: read }` scoped to THIS JOB ONLY — no workflow-level `permissions:` block is added; every other job continues to run under the default GITHUB_TOKEN posture. Matches the GitHub-Actions-hardening doc-comment at the top of `ci.yml`.
-- Action pinning: `aquasecurity/trivy-action@0.24.0` (upstream recommends `@master`; we pin to a tagged release like every other action in this workflow). Bump via deliberate PR.
-- `exit-code: 0` on the Trivy action itself + `continue-on-error: true` at the job level → Phase A is non-gating. SARIF is the operator-facing signal; Phase B flips both knobs to hard-fail once the CVE backlog is triaged.
-- Per-crate SBOM scan: the CycloneDX cell emits one `<crate>.cdx.json` per workspace member; Trivy's SBOM scanner accepts a directory of CycloneDX files and merges the findings — no `cyclonedx-cli` merge step needed.
+- CLI pinning: `taiki-e/install-action@v2` with `tool: trivy@0.53.0` (prebuilt binary; mirrors the cargo-cyclonedx@0.5.9 + cargo-fuzz@0.12 precedent). Bump via deliberate PR. We use the Trivy CLI directly rather than `aquasecurity/trivy-action` because the action wraps a single `trivy sbom <file>` invocation, and we emit per-workspace-member CDX files that need a per-file loop.
+- `trivy sbom --exit-code 0` per file + `continue-on-error: true` at the job level → Phase A is non-gating. SARIF is the operator-facing signal; Phase B flips both knobs to hard-fail once the CVE backlog is triaged.
+- Per-crate SBOM scan: the CycloneDX cell emits one `<crate>.cdx.json` per workspace member; the loop runs `trivy sbom` once per file, writes a per-crate SARIF, then merges every SARIF's `runs[]` array via `jq -s` into one SARIF 2.1.0 document. Trivy itself does NOT accept a directory of SBOMs — the loop is load-bearing.
+- Empty-corpus path: if `sbom/*.cdx.json` matches nothing, the step emits a minimal valid SARIF (`{"version":"2.1.0","runs":[]}`) so `codeql-action/upload-sarif` doesn't fail on a missing file.
 - Persists raw SARIF as `trivy-sarif-<sha-or-tag>` workflow artifact (90-day retention) in addition to the Security-tab upload, so operators can grab it via `gh run download` without going through the API.
 
 ## Open work in #7
