@@ -25,11 +25,111 @@ Phase A ships the **SINK substrate** — the on-process append-only hash-chained
 | `grx audit verify <PATH>` subcommand | SHIPPED | [`crates/graphreact-cli/src/audit_commands.rs`](../../crates/graphreact-cli/src/audit_commands.rs) |
 | Unit tests (10) + integration tests (3 observer e2e + 3 CLI verify) | SHIPPED | `crates/graphreact-observer/{src,tests}` + `crates/graphreact-cli/tests/audit_verify.rs` |
 | Mode-0o600 enforcement on create + on open-existing (verify-finding patch) | SHIPPED | `audit_chain.rs::FileAuditSink::open` + 2 unit tests |
-| Multi-token RBAC + per-route ACLs | DEFERRED → Phase B | n/a |
+| Multi-token RBAC + per-route ACLs | **SHIPPED Phase B Part 1** (2026-06-18) | [§Shipped — Phase B Part 1](#shipped--phase-b-part-1-2026-06-18) |
 | Batched-fsync worker task | DEFERRED → Phase B | n/a |
 | Atomic-swap of audit-log file across SIGHUP rotation | DEFERRED → Phase B | n/a |
 | `grx admin audit-verify` cron-style verification | DEFERRED → Phase C | n/a |
 | ACME-style audit-log forwarder (S3 / Loki / GCS) | DEFERRED → Phase D | n/a |
+
+## Shipped — Phase B Part 1 (2026-06-18)
+
+Phase B Part 1 lands the **multi-token bearer registry + RBAC dispatch engine + per-route ACL substrate** riding the Phase A audit-chain fan + the Group B-2 #2 `Arc<ArcSwap<T>>` atomic-swap pattern. JWT-OIDC, SIGHUP-driven registry reload, batched-fsync, audit forwarders, and the `audit_sink_write_failures_total` counter all defer to **Phase B Part 2** (see [§Phase B Part 2 scope](#phase-b-part-2-scope) at the bottom).
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `TokenId` newtype (operator-assigned identity, NOT a hash) | SHIPPED | [`crates/graphreact-observer/src/rbac.rs`](../../crates/graphreact-observer/src/rbac.rs) |
+| `Role` enum (`Admin` / `ReadOnly` / `Custom(BTreeSet<String>)`) | SHIPPED | `rbac.rs` |
+| `TokenEntry` (id + token + role + optional expiry) | SHIPPED | `rbac.rs` |
+| `TokenRegistry` (Vec<TokenEntry> + constant-time per-entry compare, NO early exit) | SHIPPED | `rbac.rs::TokenRegistry::match_token` |
+| `RotatableRegistry` (`Arc<ArcSwap<TokenRegistry>>` newtype, mirrors `RotatableServerConfig`) | SHIPPED | `rbac.rs::RotatableRegistry` |
+| `READ_ONLY_ROUTES` static vocabulary (subset of `PROTECTED_ROUTE_LABELS`) | SHIPPED | `rbac.rs::READ_ONLY_ROUTES` |
+| `MAX_TOKENS = 256` hard cap + recommended ≤ 32 soft cap | SHIPPED | `rbac.rs::MAX_TOKENS` |
+| `RegistryError` typed errors (`Empty` / `TooMany` / `DuplicateId`) | SHIPPED | `rbac.rs::RegistryError` |
+| `ApiState::rbac: Option<RotatableRegistry>` (additive field) | SHIPPED | [`crates/graphreact-observer/src/management_api.rs`](../../crates/graphreact-observer/src/management_api.rs) |
+| `SpawnOptions::rbac: Option<RotatableRegistry>` (additive field) | SHIPPED | `management_api.rs::SpawnOptions` |
+| `auth_layer` RBAC dispatch (`auth_layer_rbac`) — precedence over Phase A single-token | SHIPPED | `management_api.rs::auth_layer_rbac` |
+| `forbidden_response()` (403, no `WWW-Authenticate`, no `Retry-After`) | SHIPPED | `management_api.rs::forbidden_response` |
+| `audit::log_auth_success` (INFO, kind=`auth_success`, fields=`{token_id, route, role}`) | SHIPPED | [`crates/graphreact-observer/src/audit.rs`](../../crates/graphreact-observer/src/audit.rs) |
+| `audit::log_authz_deny` (WARN, kind=`authz_deny`, fields=`{token_id, route, role, reason}`) | SHIPPED | `audit.rs::log_authz_deny` |
+| Extended `auth_fail.reason` to include `"expired"` | SHIPPED | `audit.rs::log_auth_fail` doc + `auth_layer_rbac` callsite |
+| Unit tests (13) + integration tests (8 observer e2e) | SHIPPED | [`crates/graphreact-observer/src/rbac.rs::tests`](../../crates/graphreact-observer/src/rbac.rs) + [`crates/graphreact-observer/tests/rbac_e2e.rs`](../../crates/graphreact-observer/tests/rbac_e2e.rs) |
+| ADR-0008 | SHIPPED | [`docs/decisions/0008-multi-token-rbac.md`](../decisions/0008-multi-token-rbac.md) |
+
+### Constant-time compare across ALL entries (no early exit)
+
+`TokenRegistry::match_token` iterates the FULL `Vec<TokenEntry>` on every protected request, computing `subtle::ConstantTimeEq` per entry via the existing [`BearerToken::matches`] primitive. The first matching entry in declaration order is returned, but the walk continues across all subsequent entries — an attacker can't time-attack distinguish "matched entry N=1" from "matched entry N=K". See [ADR-0008](../decisions/0008-multi-token-rbac.md#why-constant-time-across-all-entries-no-early-exit) for the falsified-alternatives rationale.
+
+NOTE: `BearerToken::matches` short-circuits on LENGTH mismatch (existing pre-Phase-B contract in `auth.rs:142`). This is an inherited Phase A timing surface that leaks token LENGTH per entry on a miss, NOT contents. Documented in `rbac.rs`'s module-level "Timing-attack discipline" section.
+
+### Role semantics
+
+| Role | Permitted routes |
+|---|---|
+| `Role::Admin` | ALL entries in [`PROTECTED_ROUTE_LABELS`](../../crates/graphreact-observer/src/management_api.rs) (operator credentials) |
+| `Role::ReadOnly` | [`READ_ONLY_ROUTES`](#read_only_routes-vocabulary) subset only (CI scrapers, dashboards, SOC review pipelines) |
+| `Role::Custom(BTreeSet<String>)` | Explicit allowlist drawn from `PROTECTED_ROUTE_LABELS` (per-tenant / per-tool deploy-specific ACL) |
+
+JWT-OIDC subject claim mappings (Phase B Part 2) all fold into one of these three variants via a per-issuer config — no `Role` variant explosion downstream.
+
+### `READ_ONLY_ROUTES` vocabulary
+
+8-entry subset of `PROTECTED_ROUTE_LABELS`. GET endpoints + the WebSocket / SSE subscribe routes (read-only by mutation semantics).
+
+| Route | Rationale |
+|---|---|
+| `/v1/identity` | GET — daemon identity / process_start_id (no scheduler mutation) |
+| `/v1/metrics` | GET — Prometheus scrape (read-only) |
+| `/v1/nodes` | GET — node list (read-only) |
+| `/v1/nodes/:id` | GET — per-node snapshot (read-only) |
+| `/v1/nodes/:id/messages/recent` | GET — recent-messages ring (read-only) |
+| `/v1/supervisor/tree` | GET — supervisor tree (read-only) |
+| `/v1/observer/events` | WebSocket subscribe — event stream (consumer only) |
+| `/v1/observer/events.sse` | SSE subscribe — event stream fallback (consumer only) |
+
+POST endpoints (`/v1/nodes/:id/messages`, `/v1/nodes/:id/call`, `/v1/nodes/:id/messages/bulk`) are EXCLUDED — they mutate scheduler state and are admin-only by default. A deploy that needs a non-Admin principal to invoke a specific POST endpoint uses `Role::Custom` with the explicit label.
+
+A cross-module subset unit test (`rbac.rs::tests::read_only_routes_subset_of_protected_route_labels`) pins the invariant so a future `PROTECTED_ROUTE_LABELS` reshuffle catches mismatches at compile-test.
+
+### `MAX_TOKENS` hard cap + soft cap
+
+`MAX_TOKENS = 256` is the hard upper bound enforced by `TokenRegistry::new`. Recommended soft cap is **≤ 32**: every protected request walks the entire registry per the constant-time discipline — latency grows linearly with the entry count. Production deploys with many principals should use the Phase B Part 2 JWT-OIDC bridge (one signing-key entry, many subject claims fold into Role mappings) rather than enrolling every principal as a static `TokenEntry`.
+
+### Atomic-swap rotation
+
+`RotatableRegistry = Arc<ArcSwap<TokenRegistry>>` mirrors the [Group B-2 #2 atomic-swap pattern](../decisions/0008-multi-token-rbac.md#why-rotatableregistry-mirrors-rotatableserverconfig-shape-not-a-separate-primitive) shipped by sub-track #2's `RotatableServerConfig`. The auth middleware loads one snapshot per protected request (`rbac.load()`); the eventual SIGHUP handler (Phase B Part 2) writes via `rbac.store(Arc::new(new_registry))` exactly the way `reload_tls_from_disk` calls `tls.rotate(...)`. SIGHUP wiring is the largest remaining surface — see [§Phase B Part 2 scope](#phase-b-part-2-scope).
+
+### New audit events
+
+Both ride `target="graphreact::observer::audit"` (the cross-cutting target convention from [m-prod.md "Cross-track contracts"](m-prod.md#cross-track-contracts-locked-here)) + the Phase A AuditSink fan invariant (tracing fires FIRST, sink fans AFTER).
+
+| `kind` | level | `fields` keys |
+|---|---|---|
+| `auth_success` | INFO | `{token_id, route, role}` |
+| `authz_deny` | WARN | `{token_id, route, role, reason}` |
+
+The Phase A `auth_fail` kind grows a third `reason` value `"expired"` alongside the existing `"missing"` / `"wrong"` — emitted when a matched registry entry's `expires_at` has passed.
+
+`token_id` is the operator-assigned `TokenId.0` string (NOT a hash, NOT the raw token). ADR-0008 §"Why operator-assigned TokenId strings (NOT hashes)" supersedes the ADR-0006 prediction that `token_id` would be a constant-time-comparable hash of the token bytes.
+
+`role` is one of `"admin"` / `"read_only"` / `"custom"`. `reason` for `authz_deny` is currently only `"rbac"`; Phase B Part 2 will add `"per_node_acl"` / `"per_message_type_acl"` without bumping the schema.
+
+### Strict-additive guarantee
+
+`state.rbac = None` (the default for legacy `spawn` / `spawn_with_cluster_readyz` / `spawn_with_drain` paths AND the current CLI default — Phase B Part 2 wires SIGHUP) keeps Phase A single-token behavior **bit-for-bit**. The Phase A `auth_chain_e2e.rs::no_sink_default_keeps_legacy_behavior` regression test continues to pass unmodified. The new `auth_layer_rbac` path is precedence-gated on `state.rbac.is_some()`.
+
+### Phase B Part 2 scope
+
+| Item | Notes |
+|---|---|
+| JWT-OIDC bridge | Per-issuer config + JWKS fetch + subject claim → TokenId mapping. Folds into the three existing `Role` variants. |
+| SIGHUP-driven registry reload | Rides the Group B-2 #2 SIGHUP topology shipped by sub-track #2 TLS rotation. New `token_registry_reloaded` + `token_registry_reload_failed` audit kinds. |
+| Batched-fsync worker task | Shared with the Phase A sink + Phase B's `auth_success` fan-out (one record per authorized request); knob-controllable per [ADR-0006](../decisions/0006-audit-chain-substrate.md#why-fsync-per-append). |
+| `audit_sink_write_failures_total` counter | `MetricsInner` extension; participates in `/v1/readyz` (Phase C). |
+| Audit forwarders | S3 / Loki / GCS / OpenSearch backends. |
+| `grx admin audit-verify` daemon-side endpoint | Live chain verification without copying the file off-box. |
+| Per-node / per-message-type ACL | Richer dispatch on top of the same Role substrate. |
+| Windows file-mode ACLs | Deferred from Phase A; same surface. |
+| `/v1/admin/*` route family | Operator-only routes (token reload, audit verify, etc.). |
 
 ## On-disk record shape
 
