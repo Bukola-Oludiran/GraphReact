@@ -1130,6 +1130,50 @@ pub(crate) fn observer_shutdown_deadline() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// **M-Prod sub-track #4 Phase α.** Default outer SIGTERM drain
+/// deadline.
+///
+/// Budget math (locked against k8s default
+/// `terminationGracePeriodSeconds = 30s`):
+///
+/// - 20s drain (this default)
+/// - +5s OTel teardown ([`DEFAULT_OBSERVER_SHUTDOWN_DEADLINE_SECS`])
+/// - +5s slack for cluster shutdown + engine teardown
+/// - = 30s, fits exactly inside the k8s default.
+///
+/// Operators raising `OBSERVER_SHUTDOWN_DEADLINE` past 5s SHOULD
+/// also raise `terminationGracePeriodSeconds` to keep the total
+/// budget consistent — `start_daemon` warns at boot when
+/// drain_deadline ≤ observer_shutdown_deadline (the locked
+/// invariant says drain MUST be ≥ OTel teardown per
+/// `docs/backend/m-prod-observability.md` cross-track contract).
+///
+/// Overridable via the `--drain-deadline-secs` CLI flag or
+/// `GRX_DRAIN_DEADLINE_SECS` env var (integer seconds; ≤0 /
+/// unparseable falls back to the default).
+pub const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 20;
+
+/// **M-Prod sub-track #4 Phase α.** Resolve the effective drain
+/// deadline. Precedence: explicit `--drain-deadline-secs` >
+/// `GRX_DRAIN_DEADLINE_SECS` env var > [`DEFAULT_DRAIN_DEADLINE_SECS`].
+///
+/// Unparseable / zero values fall back to the default — the zero
+/// case in particular would race the in-flight quiescence loop
+/// to instant timeout and emit a guaranteed
+/// `drain_deadline_exceeded` audit-log line on every clean
+/// shutdown, which is noisier than just falling back.
+pub fn resolve_drain_deadline(cli_secs: Option<u64>) -> Duration {
+    let secs = cli_secs
+        .or_else(|| {
+            std::env::var("GRX_DRAIN_DEADLINE_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_DRAIN_DEADLINE_SECS);
+    Duration::from_secs(secs)
+}
+
 /// Daemon CLI knobs translated into structured form. Constructed
 /// from the [`crate::cli::ClusterOp::Daemon`] variant; consumed by
 /// [`start_daemon`].
@@ -1189,6 +1233,16 @@ pub struct DaemonOptions {
     /// `"graphreact"`. Per OTel SDK convention, can also be set via
     /// the `OTEL_SERVICE_NAME` environment variable.
     pub observer_otel_service_name: Option<String>,
+    /// **M-Prod sub-track #4 Phase α.** Outer SIGTERM drain
+    /// deadline (seconds). `None` falls through to
+    /// `GRX_DRAIN_DEADLINE_SECS` env var, then to
+    /// [`DEFAULT_DRAIN_DEADLINE_SECS`]. The drain bound is the
+    /// OUTER budget; the OTel teardown bound
+    /// (`OBSERVER_SHUTDOWN_DEADLINE`) runs INSIDE the drain budget
+    /// so a healthy collector still gets to flush spans before
+    /// SIGKILL. See `docs/backend/m-prod-lifecycle.md` for the
+    /// budget math vs k8s `terminationGracePeriodSeconds`.
+    pub drain_deadline_secs: Option<u64>,
 }
 
 /// `grx cluster connect` knobs. Mirrors [`DaemonOptions`] minus
@@ -1321,6 +1375,52 @@ pub struct DaemonHandle {
     /// passed.
     #[cfg(feature = "otel")]
     otel_provider: Option<graphreact_observer::SdkTracerProvider>,
+    /// **M-Prod sub-track #4 Phase α.** Drain bit shared with the
+    /// observer's [`graphreact_observer::ApiState`]. `None` when
+    /// no observer was wired (drain becomes a no-op then — there's
+    /// no ingress surface to refuse). `Some(flag)` when `start_daemon`
+    /// constructed an observer via
+    /// [`graphreact_observer::spawn_management_api_with_drain`].
+    drain: Option<graphreact_observer::DrainFlag>,
+    /// **M-Prod sub-track #4 Phase α.** In-flight ingress POST
+    /// counter shared with the observer. Always present (cheap to
+    /// construct); read by [`Self::start_drain`] to know when
+    /// ingress quiesced.
+    ingress_in_flight: graphreact_observer::IngressInFlight,
+}
+
+/// **M-Prod sub-track #4 Phase α.** Outcome of a graceful drain
+/// triggered by [`DaemonHandle::start_drain`]. Returned to the
+/// orchestrator (today: SIGTERM path in `run_daemon_blocking`;
+/// future: REST `POST /v1/admin/drain`, operator `grx admin drain`)
+/// so it can decide whether to escalate to hard-shutdown or wait
+/// further. The fields are all observable independent of one
+/// another — `in_flight_settled = false` + `cluster_quiesced =
+/// true` is possible if the deadline expired while a single
+/// long-running ingress call was outstanding but the cluster
+/// handshake population was empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainOutcome {
+    /// `true` if both [`graphreact_observer::PendingCalls::is_empty`]
+    /// AND [`graphreact_observer::IngressInFlight::load`] hit zero
+    /// before the deadline; `false` if the deadline expired with
+    /// either non-zero.
+    pub in_flight_settled: bool,
+    /// `true` for Phase α unconditionally (handshake-quiescence
+    /// is deferred; see `m-prod-lifecycle.md` for why). Future
+    /// phases populate this from a `Cluster::handshakes_pending()`
+    /// counter; today the cluster's per-peer tasks are aborted by
+    /// the subsequent `cluster.shutdown()` call.
+    pub cluster_quiesced: bool,
+    /// Wall-clock span between [`graphreact_observer::DrainFlag::start`]
+    /// returning `true` and quiescence (or deadline expiry).
+    pub drain_duration: Duration,
+    /// `true` when the deadline elapsed without quiescence. Mirrors
+    /// the `drain_deadline_exceeded` audit event the orchestrator
+    /// emitted at the same moment; included here so synchronous
+    /// callers don't have to grep audit logs to know they ran out
+    /// of budget.
+    pub deadline_exceeded: bool,
 }
 
 impl DaemonHandle {
@@ -1351,6 +1451,123 @@ impl DaemonHandle {
     #[must_use]
     pub fn observer_metrics(&self) -> Option<&graphreact_observer::MetricsInner> {
         self.metrics.as_deref()
+    }
+
+    /// **M-Prod sub-track #4 Phase α.** Initiate a graceful drain.
+    ///
+    /// 1. Flip the shared [`graphreact_observer::DrainFlag`] (emits
+    ///    `drain_started` audit BEFORE the AtomicBool flip, so
+    ///    `/v1/readyz` scrapes racing the flip can't see
+    ///    `ready=true` and `no drain_started` in the log).
+    /// 2. Poll the in-flight predicates
+    ///    (`ingress_in_flight.load() == 0`
+    ///    AND, if an observer is wired,
+    ///    `observer.pending_calls.is_empty()`) on a 25ms cadence
+    ///    until quiescence or `deadline` elapses.
+    /// 3. Emit `drain_completed` (success) or
+    ///    `drain_deadline_exceeded` (timeout) on the
+    ///    `graphreact::observer::audit` target.
+    ///
+    /// Idempotent — duplicate SIGTERMs / operator double-fires
+    /// are no-ops past the first call: the underlying
+    /// `DrainFlag::start` is CAS-gated, so the second invocation
+    /// observes `false` from the gate and returns immediately
+    /// with the no-op `DrainOutcome` (the orchestrator can still
+    /// proceed to shutdown).
+    ///
+    /// Does NOT call [`Self::shutdown`] — drain leaves the
+    /// daemon's runtime up so the observer can keep replying
+    /// 503 `draining` to LB probes while the operator decides
+    /// when to escalate. Typical wiring (SIGTERM path):
+    /// `handle.start_drain(deadline).await; handle.shutdown().await`.
+    ///
+    /// When `self.drain` is `None` (no observer wired at boot)
+    /// this is a no-op — returns immediately with
+    /// `in_flight_settled: true` because there's no ingress
+    /// surface to quiesce.
+    pub async fn start_drain(&self, deadline: Duration) -> DrainOutcome {
+        let Some(flag) = self.drain.as_ref() else {
+            // No observer was wired. Drain has nothing to do —
+            // the daemon's ingress surface doesn't exist. Skip
+            // audit emit too: an operator would never call this
+            // path unless they piped SIGTERM into a no-observer
+            // daemon, and even then there's nothing to surface.
+            return DrainOutcome {
+                in_flight_settled: true,
+                cluster_quiesced: true,
+                drain_duration: Duration::ZERO,
+                deadline_exceeded: false,
+            };
+        };
+        let deadline_ms = deadline.as_millis() as u64;
+        // Idempotent CAS: only the FIRST call gets `true`.
+        // Duplicate SIGTERMs return immediately without resetting
+        // the deadline or re-emitting `drain_started`.
+        if !flag.start(deadline_ms) {
+            return DrainOutcome {
+                in_flight_settled: true,
+                cluster_quiesced: true,
+                drain_duration: Duration::ZERO,
+                deadline_exceeded: false,
+            };
+        }
+        let started = std::time::Instant::now();
+        let ingress_counter = self.ingress_in_flight.clone();
+        let pending_calls = self.observer.as_ref().map(|o| o.pending_calls.clone());
+        // Poll the in-flight predicates on a 25ms cadence. The
+        // tight loop gives us sub-50ms drain quiescence for the
+        // healthy fast path (no in-flight requests at SIGTERM
+        // time → drain_completed fires almost immediately);
+        // bounded by `deadline` for the slow path.
+        let mut poll = tokio::time::interval(Duration::from_millis(25));
+        poll.tick().await; // skip immediate
+        let quiesced = loop {
+            let ingress_done = ingress_counter.load() == 0;
+            let calls_done = pending_calls.as_ref().is_none_or(|c| c.is_empty());
+            if ingress_done && calls_done {
+                break true;
+            }
+            tokio::select! {
+                _ = poll.tick() => {}
+                _ = tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(started + deadline)
+                ) => {
+                    break false;
+                }
+            }
+        };
+        let elapsed = started.elapsed();
+        if quiesced {
+            graphreact_observer::log_drain_completed(elapsed, true, true);
+            DrainOutcome {
+                in_flight_settled: true,
+                // Phase α reports `cluster_quiesced: true`
+                // unconditionally — handshake-quiescence is a
+                // Phase β deliverable; today the cluster's
+                // per-peer tasks get aborted by the subsequent
+                // `cluster.shutdown()` call. See
+                // `docs/backend/m-prod-lifecycle.md` for the
+                // deferral rationale.
+                cluster_quiesced: true,
+                drain_duration: elapsed,
+                deadline_exceeded: false,
+            }
+        } else {
+            let ingress_remaining = ingress_counter.load();
+            let pending_remaining = pending_calls.as_ref().map_or(0, |c| c.len());
+            graphreact_observer::log_drain_deadline_exceeded(
+                deadline,
+                elapsed,
+                pending_remaining,
+                ingress_remaining,
+            );
+            DrainOutcome {
+                in_flight_settled: false,
+                cluster_quiesced: true,
+                drain_duration: elapsed,
+                deadline_exceeded: true,
+            }
+        }
     }
 
     /// Drop the cluster and tear down the engine (if any).
@@ -1582,6 +1799,12 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 || dialed_for_probe.load(std::sync::atomic::Ordering::Relaxed) >= 1
         });
 
+    // **M-Prod sub-track #4 Phase α.** Mint the drain bit BEFORE
+    // the observer spawn so the spawn can clone it into ApiState
+    // for the management API hot path AND we can hold a clone on
+    // the DaemonHandle for the SIGTERM-driven orchestrator.
+    let drain_flag = graphreact_observer::DrainFlag::new();
+
     let observer = if let Some(bind_cfg) = opts.observer_bind {
         let metrics = std::sync::Arc::new(graphreact_observer::MetricsInner::new());
         metrics_for_engine_counts = Some(metrics.clone());
@@ -1594,11 +1817,12 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
             use rand::RngCore;
             rand::thread_rng().next_u64()
         };
-        let server = graphreact_observer::spawn_management_api_with_cluster_readyz(
+        let server = graphreact_observer::spawn_management_api_with_drain(
             bind_cfg,
             metrics,
             process_start_id,
             Some(cluster_readyz_probe.clone()),
+            Some(drain_flag.clone()),
         )
         .await
         .map_err(|e| CommandError::ClusterArg(format!("observer bind: {e}")))?;
@@ -1703,6 +1927,40 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         dialed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // **M-Prod sub-track #4 Phase α.** Surface the in-flight
+    // ingress counter from the observer (or a fresh empty one
+    // when no observer was wired) so `DaemonHandle::start_drain`
+    // can poll it during quiescence.
+    let ingress_in_flight = observer
+        .as_ref()
+        .map(|s| s.ingress_in_flight.clone())
+        .unwrap_or_default();
+    // **M-Prod sub-track #4 Phase α.** Only park the drain bit
+    // on the handle when an observer is actually wired —
+    // start_drain treats `None` as "no ingress surface to
+    // quiesce" and returns the no-op outcome immediately.
+    let drain = observer.as_ref().map(|_| drain_flag);
+
+    // **M-Prod sub-track #4 Phase α.** Validate the drain
+    // budget composes correctly with OBSERVER_SHUTDOWN_DEADLINE.
+    // The locked cross-track contract (m-prod-observability.md
+    // line 113) says drain_deadline MUST be ≥
+    // OBSERVER_SHUTDOWN_DEADLINE so OTel teardown runs INSIDE
+    // the drain budget. Warn rather than reject so existing
+    // tests with custom env-var combos keep working; ops
+    // dashboards can alert on the warn line in production.
+    let drain_dur = resolve_drain_deadline(opts.drain_deadline_secs);
+    let otel_dur = observer_shutdown_deadline();
+    if drain_dur < otel_dur {
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            event = "drain_budget_misconfig",
+            drain_deadline_ms = drain_dur.as_millis() as u64,
+            observer_shutdown_deadline_ms = otel_dur.as_millis() as u64,
+            "drain deadline shorter than OBSERVER_SHUTDOWN_DEADLINE — OTel teardown may be cut short by total grace-period exhaustion"
+        );
+    }
+
     Ok(DaemonHandle {
         cluster,
         host,
@@ -1710,6 +1968,8 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         metrics: metrics_for_engine_counts,
         #[cfg(feature = "otel")]
         otel_provider,
+        drain,
+        ingress_in_flight,
     })
 }
 
@@ -1871,18 +2131,64 @@ fn build_scheduler_host(
 }
 
 /// Build a daemon and drive it for the configured duration (or
-/// until SIGINT). Used by the binary; the test path uses
+/// until SIGINT/SIGTERM). Used by the binary; the test path uses
 /// [`start_daemon`] directly.
+///
+/// **M-Prod sub-track #4 Phase α.** SIGTERM (unix) now triggers a
+/// graceful drain via [`DaemonHandle::start_drain`] BEFORE the
+/// existing teardown path runs:
+/// 1. SIGTERM arrives → `/v1/readyz` starts 503ing `draining`,
+///    ingress POSTs start refusing with the same 503 `draining` body.
+/// 2. `start_drain(deadline)` polls in-flight quiescence; deadline
+///    sourced from `opts.drain_deadline_secs` /
+///    `GRX_DRAIN_DEADLINE_SECS` / [`DEFAULT_DRAIN_DEADLINE_SECS`].
+/// 3. `handle.shutdown()` runs the existing OTel-flush +
+///    cluster-shutdown + engine-teardown sequence.
+///
+/// SIGINT (Ctrl-C) keeps the existing snappy semantics —
+/// developer Ctrl-C goes straight to `shutdown()` without the
+/// drain phase (no point making local-dev exits slower).
 pub async fn run_daemon_blocking(opts: DaemonOptions) -> Result<String, CommandError> {
     let duration = opts.duration_secs;
+    let drain_deadline = resolve_drain_deadline(opts.drain_deadline_secs);
     let mut handle = start_daemon(opts).await?;
-    drive_handle_until(&mut handle, duration).await?;
+    let exit = drive_handle_until(&mut handle, duration).await?;
+    if matches!(exit, LoopExit::Sigterm) {
+        // **M-Prod sub-track #4 Phase α.** Drain BEFORE shutdown
+        // so the LB sees /v1/readyz=503 and ingress sees 503
+        // `draining` while in-flight requests finish. Outcome is
+        // logged to the audit stream via `drain_completed` /
+        // `drain_deadline_exceeded` inside `start_drain`; we
+        // don't propagate the deadline-exceeded condition past
+        // shutdown — k8s SIGKILL is the next escalation and we
+        // already emitted the audit row.
+        let _ = handle.start_drain(drain_deadline).await;
+    }
     handle.shutdown().await;
-    Ok(if duration.is_some() {
-        format!("daemon exited after {}s", duration.unwrap_or(0))
-    } else {
-        "daemon exited (signal)".to_string()
+    Ok(match (duration, exit) {
+        (Some(secs), _) => format!("daemon exited after {secs}s"),
+        (None, LoopExit::Sigterm) => "daemon exited (SIGTERM, drained)".to_string(),
+        (None, _) => "daemon exited (signal)".to_string(),
     })
+}
+
+/// **M-Prod sub-track #4 Phase α.** Discriminator returned by
+/// [`drive_handle_until`] so callers know whether to run the
+/// graceful-drain path (SIGTERM) or the snappy shutdown path
+/// (SIGINT / duration). Stays a public enum because both binary
+/// callers (`run_daemon_blocking`, `run_connect_blocking`) need
+/// to read the discriminator; tests that drive the loop directly
+/// can match on it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopExit {
+    /// `duration_secs` was set and elapsed. Snappy shutdown.
+    Duration,
+    /// Ctrl-C (SIGINT). Developer-driven; snappy shutdown — drain
+    /// is k8s/operator territory.
+    Sigint,
+    /// SIGTERM (unix). Kubelet-driven; trigger graceful drain
+    /// before shutdown.
+    Sigterm,
 }
 
 /// One-shot dial. Spins up an empty cluster, opens a TLS
@@ -1924,8 +2230,14 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         // cluster). `None` here regardless of feature.
         #[cfg(feature = "otel")]
         otel_provider: None,
+        // **M-Prod sub-track #4 Phase α.** `connect` has no
+        // observer / ingress surface. Drain is a no-op; SIGTERM
+        // composition (when sub-track #4 wires it for `connect`
+        // too) goes straight to `shutdown()`.
+        drain: None,
+        ingress_in_flight: graphreact_observer::IngressInFlight::default(),
     };
-    drive_handle_until(&mut handle, duration).await?;
+    let _exit = drive_handle_until(&mut handle, duration).await?;
     handle.shutdown().await;
     Ok(match duration {
         Some(secs) => format!("connect to `{}` exited after {secs}s", opts.peer),
@@ -1934,73 +2246,115 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
 }
 
 /// Drive the daemon's `process_batch` on a 50ms cadence until
-/// either `duration` elapses (when `Some`) OR SIGINT fires
-/// (when `None`). `pub` so binaries can split
+/// either `duration` elapses (when `Some`) OR SIGINT / SIGTERM
+/// fires (when `None`). `pub` so binaries can split
 /// `start_daemon` + readiness signal + drive into separate
 /// steps (the subprocess CLI test relies on the binary
 /// printing its bound address BETWEEN start and drive).
+///
+/// **M-Prod sub-track #4 Phase α.** Now distinguishes SIGTERM
+/// (kubelet-driven graceful drain) from SIGINT (developer Ctrl-C
+/// snappy shutdown) via the [`LoopExit`] return value. SIGTERM
+/// is unix-only; on Windows the SIGTERM arm is omitted at
+/// compile time and only `ctrl_c` fires (which the SIGINT arm
+/// catches). The drain-vs-snap distinction is the caller's
+/// concern: `run_daemon_blocking` runs [`DaemonHandle::start_drain`]
+/// only when `LoopExit::Sigterm` is returned.
 pub async fn drive_handle_until(
     handle: &mut DaemonHandle,
     duration: Option<u64>,
-) -> Result<(), CommandError> {
+) -> Result<LoopExit, CommandError> {
     let deadline =
         duration.map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs));
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.tick().await; // skip immediate
+
+    // **M-Prod sub-track #4 Phase α.** Register a SIGTERM signal
+    // stream once outside the loop (re-registering on every
+    // iteration would leak signal-handler slots). Unix-only:
+    // Windows daemons fall back to ctrl_c-as-snap-shutdown. The
+    // `tokio::signal::unix::signal(SignalKind::terminate())`
+    // ctor returns `io::Result`; failure here is exceptional
+    // (signalfd-unsupported kernel) and we surface it through
+    // `CommandError::ClusterArg` rather than panic. Bind under
+    // cfg(unix) so non-unix builds don't see the unused-import
+    // warning.
+    #[cfg(unix)]
+    let mut sigterm = {
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate())
+            .map_err(|e| CommandError::ClusterArg(format!("SIGTERM register: {e}")))?
+    };
+
     loop {
         if let Some(d) = deadline {
             if tokio::time::Instant::now() >= d {
-                return Ok(());
+                return Ok(LoopExit::Duration);
             }
         }
         // Race a process_batch tick against ctrl_c (and the
         // optional deadline). `tokio::select!` is fair across
         // arms so the deadline arm gets evaluated even under
         // sustained tick traffic.
-        let signal = tokio::signal::ctrl_c();
+        let sigint = tokio::signal::ctrl_c();
+        #[cfg(unix)]
         tokio::select! {
             _ = tick.tick() => {
-                // **M22 verify fix.** Route the tick through
-                // `handle.process_batch()` (which dispatches via
-                // `SchedulerHost::process_batch`) instead of the
-                // raw `scheduler().process_batch()`. Under
-                // `--runtime=mixed` the latter would only tick
-                // the first engine slot's scheduler — CPython +
-                // Go bodies would never re-render after the boot
-                // batch. The `SchedulerHost::process_batch` arm
-                // for Mixed fans out across every active engine
-                // in init order via `MixedRuntime::process_batch`.
-                // Single-engine paths see identical behavior
-                // (same engine TLS guard install, same batch
-                // semantics).
-                handle.process_batch().map_err(|e| {
-                    CommandError::Runtime(crate::runtime::RuntimeError::from(e))
-                })?;
-                // **M22 verify fix.** Per-tick increment of
-                // `grx_engine_eval_count{engine}` so the metric
-                // actually tracks evaluation throughput rather
-                // than reporting a one-shot boot snapshot. Matches
-                // the contract in `record_engine_eval_metrics`'s
-                // docstring. Cardinality stays bounded by the
-                // static `{jsc,cpython,go,null,echo}` label set.
-                if let Some(metrics) = handle.observer_metrics() {
-                    record_engine_eval_metrics(&handle.host, metrics);
-                }
-                // M16-Backend P4 — drain pending management-API
-                // snapshot requests. Each request was posted by
-                // an axum handler running on a tokio worker
-                // thread; we respond on the scheduler thread (the
-                // only thread that can read scheduler state, since
-                // Scheduler is !Send). Worst-case latency for an
-                // API request: one process_batch round (~50ms tick
-                // cadence + the drain that follows).
-                drain_management_api_snapshots(handle);
+                drive_one_tick(handle)?;
             }
-            _ = signal, if duration.is_none() => {
-                return Ok(());
+            _ = sigint, if duration.is_none() => {
+                return Ok(LoopExit::Sigint);
+            }
+            _ = sigterm.recv(), if duration.is_none() => {
+                return Ok(LoopExit::Sigterm);
+            }
+        }
+        #[cfg(not(unix))]
+        tokio::select! {
+            _ = tick.tick() => {
+                drive_one_tick(handle)?;
+            }
+            _ = sigint, if duration.is_none() => {
+                return Ok(LoopExit::Sigint);
             }
         }
     }
+}
+
+/// **M-Prod sub-track #4 Phase α.** One tick of the drive loop —
+/// pulled out so the select! macro stays small enough to read
+/// across the unix / non-unix cfg-gated branches.
+fn drive_one_tick(handle: &mut DaemonHandle) -> Result<(), CommandError> {
+    // **M22 verify fix.** Route the tick through
+    // `handle.process_batch()` (which dispatches via
+    // `SchedulerHost::process_batch`) instead of the raw
+    // `scheduler().process_batch()`. Under `--runtime=mixed` the
+    // latter would only tick the first engine slot's scheduler —
+    // CPython + Go bodies would never re-render after the boot
+    // batch. The `SchedulerHost::process_batch` arm for Mixed
+    // fans out across every active engine in init order via
+    // `MixedRuntime::process_batch`. Single-engine paths see
+    // identical behavior (same engine TLS guard install, same
+    // batch semantics).
+    handle
+        .process_batch()
+        .map_err(|e| CommandError::Runtime(crate::runtime::RuntimeError::from(e)))?;
+    // **M22 verify fix.** Per-tick increment of
+    // `grx_engine_eval_count{engine}` so the metric actually
+    // tracks evaluation throughput rather than reporting a
+    // one-shot boot snapshot.
+    if let Some(metrics) = handle.observer_metrics() {
+        record_engine_eval_metrics(&handle.host, metrics);
+    }
+    // M16-Backend P4 — drain pending management-API snapshot
+    // requests. Each request was posted by an axum handler
+    // running on a tokio worker thread; we respond on the
+    // scheduler thread (the only thread that can read scheduler
+    // state, since Scheduler is !Send). Worst-case latency for
+    // an API request: one process_batch round (~50ms tick
+    // cadence + the drain that follows).
+    drain_management_api_snapshots(handle);
+    Ok(())
 }
 
 /// Drain any pending management-API snapshot requests from the

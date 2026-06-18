@@ -106,6 +106,7 @@ async fn pubsub_demo_two_daemons_jsc_grx_broadcast_fans_out() {
         debug_wait: false,
         observer_otel_endpoint: None,
         observer_otel_service_name: None,
+        drain_deadline_secs: None,
     };
     let mut alice = start_daemon(alice_opts).await.expect("alice daemon start");
     let alice_addr = alice.cluster().local_addr();
@@ -129,6 +130,7 @@ async fn pubsub_demo_two_daemons_jsc_grx_broadcast_fans_out() {
         debug_wait: false,
         observer_otel_endpoint: None,
         observer_otel_service_name: None,
+        drain_deadline_secs: None,
     };
     let mut bob = start_daemon(bob_opts).await.expect("bob daemon start");
 
