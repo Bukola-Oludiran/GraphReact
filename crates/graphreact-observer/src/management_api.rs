@@ -2469,20 +2469,33 @@ fn rate_limited_response_from_error(
                 body,
             )
                 .into_response();
-            // Overwrite the default `Retry-After: 1` with the
-            // actually-computed value AND fold in any
-            // `x-ratelimit-*` headers tower_governor attached via
-            // `use_headers()`.
+            // Fold in any `x-ratelimit-*` headers tower_governor
+            // attached via `use_headers()` FIRST so its raw
+            // `retry-after: <wait_time>` value (which is the
+            // truncated `Duration::as_secs()` floor and can be 0
+            // for sub-second token-refill windows) doesn't
+            // silently overwrite the clamped Retry-After below.
+            // The order is load-bearing: tower_governor populates
+            // `extra` with `retry-after` before calling our
+            // error_handler, so without this ordering the JSON
+            // body would say `retry_after_secs: 1` while the HTTP
+            // header would say `Retry-After: 0` — well-behaved
+            // clients honoring `Retry-After: 0` would spin-retry
+            // immediately, defeating the limiter's protective
+            // purpose and breaking operator triage assumptions.
+            if let Some(extra) = headers {
+                for (k, v) in &extra {
+                    resp.headers_mut().insert(k, v.clone());
+                }
+            }
+            // Overwrite the (possibly-folded-in) Retry-After with
+            // the clamped value LAST so the header matches the
+            // documented 1-second-minimum contract.
             if let Ok(value) =
                 axum::http::HeaderValue::from_str(&retry_after.to_string())
             {
                 resp.headers_mut()
                     .insert(axum::http::header::RETRY_AFTER, value);
-            }
-            if let Some(extra) = headers {
-                for (k, v) in &extra {
-                    resp.headers_mut().insert(k, v.clone());
-                }
             }
             resp
         }
@@ -2854,6 +2867,43 @@ mod rate_limit_tests {
             .to_str()
             .unwrap();
         assert_eq!(retry_after, "1");
+    }
+
+    #[test]
+    fn rate_limited_response_clamp_survives_tower_governor_header_fold() {
+        // **Verify-finding regression lock.** tower_governor's
+        // `use_headers()` populates `extra` with a literal
+        // `retry-after: <wait_time>` BEFORE calling our
+        // error_handler. The fold MUST run before the clamp
+        // overwrite — otherwise an under-1-second wait_time (the
+        // default 50/sec config has a 20ms refill, so this hits
+        // production on every blocked request) would silently
+        // overwrite `Retry-After: 1` back to `0`, the body would
+        // say `retry_after_secs: 1`, and a well-behaved client
+        // honoring `Retry-After: 0` would spin-retry into a
+        // tight loop, defeating the limiter's protective purpose.
+        let mut sabotage = axum::http::HeaderMap::new();
+        sabotage.insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("0"),
+        );
+        let resp = rate_limited_response_from_error(
+            tower_governor::GovernorError::TooManyRequests {
+                wait_time: 0,
+                headers: Some(sabotage),
+            },
+        );
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After present")
+            .to_str()
+            .expect("Retry-After valid ascii");
+        assert_eq!(
+            retry_after, "1",
+            "Retry-After must survive the tower_governor header fold + match \
+             the clamped body value (`retry_after_secs: 1`); got {retry_after}"
+        );
     }
 
     #[test]
