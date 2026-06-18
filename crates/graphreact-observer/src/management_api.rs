@@ -67,6 +67,8 @@ use crate::metrics::MetricsInner;
 use crate::prometheus::encode_text;
 use crate::ring_buffer::{MessageSnapshot, RingBufferTelemetry, DEFAULT_RING_CAPACITY};
 use graphreact_core::telemetry::{NodeIntrospection, SupervisorIntrospection};
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::GovernorLayer;
 
 /// Request types posted from axum handlers onto the cross-thread
 /// bridge. The scheduler-thread drain loop matches on the variant,
@@ -560,6 +562,104 @@ pub const SNAPSHOT_CHANNEL_CAPACITY: usize = 256;
 /// down for their workload).
 pub const DEFAULT_BULK_LINE_CAP: usize = 10_000;
 
+/// **M-Prod sub-track #6 Phase A.** Default sustained request rate
+/// per source IP for the protected `/v1/*` routes, in requests per
+/// second. Tunable at boot via the `GRX_RATE_LIMIT_PER_IP_PER_SEC`
+/// env var (positive integer). The picked baseline (50 req/s)
+/// comfortably absorbs a single human-driven `curl` + a
+/// modest-batch script while still pinning a malicious flood that
+/// would otherwise burn auth CPU. NAT'd egress (corporate
+/// gateway → many users) shares one bucket — see
+/// [`m-prod-rate-limit.md`](../../../../docs/backend/m-prod-rate-limit.md)
+/// for the Phase B per-token-key plan that lifts the NAT
+/// limitation.
+pub const DEFAULT_RATE_LIMIT_PER_IP_PER_SEC: u64 = 50;
+
+/// **M-Prod sub-track #6 Phase A.** Default burst size — token
+/// bucket capacity. 100 = 2× the sustained per-second rate, the
+/// classic token-bucket convention that absorbs micro-bursts (a
+/// page-load fanning ~30 parallel requests is well under cap)
+/// while still rejecting sustained floods. Tunable at boot via
+/// the `GRX_RATE_LIMIT_PER_IP_BURST` env var.
+pub const DEFAULT_RATE_LIMIT_PER_IP_BURST: u32 = 100;
+
+/// **M-Prod sub-track #6 Phase A.** Static table of protected
+/// route patterns that map raw URI paths back to bounded labels
+/// for the `grx_rate_limit_blocked_total{route}` counter + the
+/// `rate_limit_blocked` audit event's `route` field.
+///
+/// The rate-limit observer middleware sits OUTSIDE the axum
+/// router (so it can fire on `tower_governor` 429s before any
+/// route match happens), so `MatchedPath` is NOT in extensions on
+/// the request path. Instead, the middleware uses
+/// [`classify_protected_path`] which performs a small fixed-shape
+/// match against the 11 known patterns + a `unknown` sentinel for
+/// anything outside the table (e.g. an operator typoing `/v1/foo`).
+///
+/// Cardinality bound is exactly `11 + 1 = 12` for the rate-limit
+/// metric family — well under the conventional Prometheus
+/// per-family soft cap of ~10k.
+pub const PROTECTED_ROUTE_LABELS: &[&str] = &[
+    "/v1/identity",
+    "/v1/metrics",
+    "/v1/nodes",
+    "/v1/nodes/:id",
+    "/v1/nodes/:id/messages",
+    "/v1/nodes/:id/messages/recent",
+    "/v1/nodes/:id/messages/bulk",
+    "/v1/nodes/:id/call",
+    "/v1/supervisor/tree",
+    "/v1/observer/events",
+    "/v1/observer/events.sse",
+];
+
+/// **M-Prod sub-track #6 Phase A.** Classify a raw URI path to one
+/// of the [`PROTECTED_ROUTE_LABELS`] patterns (or `"unknown"`).
+///
+/// Used by the rate-limit observer middleware to emit a bounded
+/// `route` label on the `grx_rate_limit_blocked_total{route}`
+/// counter + the `rate_limit_blocked` audit event. Bounded
+/// cardinality is the operator contract — without this mapping,
+/// labelling by the raw path would explode by the `:id` cardinality
+/// (one entry per distinct node id ever rate-limited).
+///
+/// Returns the matching pattern as a `&'static str` so the metric
+/// callsite can cheap-store it without per-call allocation.
+#[must_use]
+pub fn classify_protected_path(path: &str) -> &'static str {
+    match path {
+        "/v1/identity" => "/v1/identity",
+        "/v1/metrics" => "/v1/metrics",
+        "/v1/nodes" => "/v1/nodes",
+        "/v1/supervisor/tree" => "/v1/supervisor/tree",
+        "/v1/observer/events" => "/v1/observer/events",
+        "/v1/observer/events.sse" => "/v1/observer/events.sse",
+        p if p.starts_with("/v1/nodes/") => {
+            let tail = &p["/v1/nodes/".len()..];
+            // `tail` is `<id>` or `<id>/<subpath>`. Strip the id.
+            if let Some(slash_idx) = tail.find('/') {
+                let subpath = &tail[slash_idx + 1..];
+                match subpath {
+                    "messages" => "/v1/nodes/:id/messages",
+                    "messages/recent" => "/v1/nodes/:id/messages/recent",
+                    "messages/bulk" => "/v1/nodes/:id/messages/bulk",
+                    "call" => "/v1/nodes/:id/call",
+                    _ => "unknown",
+                }
+            } else if tail.is_empty() {
+                // `/v1/nodes/` (trailing slash) — not a route we
+                // registered; classify as unknown rather than
+                // collapse to `/v1/nodes` which IS a registered
+                // pattern.
+                "unknown"
+            } else {
+                "/v1/nodes/:id"
+            }
+        }
+        _ => "unknown",
+    }
+}
+
 /// **M-Ingress phase 3.** Hard per-line byte cap. A single NDJSON
 /// line larger than this surfaces as `{"line": N, "result":
 /// "line_too_large"}` and the handler skips that line (the stream
@@ -756,10 +856,83 @@ fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// **M-Prod sub-track #6 Phase A.** Per-IP rate-limit knob struct
+/// used by [`build_router_with_rate_limit`]. The legacy
+/// [`build_router`] entry point falls through to
+/// [`RateLimitConfig::from_env`] so production daemons (which
+/// build the router via [`spawn_with_options`]) automatically pick
+/// up `GRX_RATE_LIMIT_PER_IP_{PER_SEC,BURST}` without a callsite
+/// change.
+///
+/// Tests use [`Self::const_for_tests`] to inject a deterministic
+/// cap (low `per_second`, tiny `burst`) so a burst test reliably
+/// trips the limiter inside a sub-second window — without
+/// polluting process-global env state across parallel `cargo test`
+/// runners.
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitConfig {
+    /// Sustained per-source-IP request rate (tokens/sec).
+    pub per_second: u64,
+    /// Burst size (token bucket capacity).
+    pub burst: u32,
+}
+
+impl RateLimitConfig {
+    /// Read defaults from env once at build time. Falls back to
+    /// the in-code constants for unset / empty / unparseable /
+    /// zero values. This is the production path —
+    /// [`spawn_with_options`] threads `Self::from_env()` through
+    /// [`build_router`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            per_second: parse_env_u64(
+                "GRX_RATE_LIMIT_PER_IP_PER_SEC",
+                DEFAULT_RATE_LIMIT_PER_IP_PER_SEC,
+            ),
+            burst: parse_env_u32(
+                "GRX_RATE_LIMIT_PER_IP_BURST",
+                DEFAULT_RATE_LIMIT_PER_IP_BURST,
+            ),
+        }
+    }
+
+    /// **For tests only.** Hand-pick a `(per_second, burst)` pair
+    /// that exercises a specific cap. Production callers should
+    /// use [`Self::from_env`].
+    #[must_use]
+    pub const fn for_tests(per_second: u64, burst: u32) -> Self {
+        Self { per_second, burst }
+    }
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            per_second: DEFAULT_RATE_LIMIT_PER_IP_PER_SEC,
+            burst: DEFAULT_RATE_LIMIT_PER_IP_BURST,
+        }
+    }
+}
+
 /// Build the management API router. The router is the public seam
 /// for tests + future P5+ extensions; spawning the listener is
 /// a separate concern (see [`spawn`]).
+///
+/// **M-Prod sub-track #6 Phase A.** Defaults the rate limit
+/// configuration to [`RateLimitConfig::from_env`] — the production
+/// path. Tests that need a deterministic cap call
+/// [`build_router_with_rate_limit`] directly.
 pub fn build_router(state: ApiState) -> Router {
+    build_router_with_rate_limit(state, RateLimitConfig::from_env())
+}
+
+/// **M-Prod sub-track #6 Phase A.** Variant of [`build_router`]
+/// that accepts an explicit [`RateLimitConfig`]. Used by the
+/// rate-limit integration tests to pin a deterministic cap
+/// without polluting the env-var process state across parallel
+/// test runners.
+pub fn build_router_with_rate_limit(state: ApiState, rl: RateLimitConfig) -> Router {
     use axum::middleware;
 
     // /v1/healthz bypasses auth (liveness probe-friendly).
@@ -773,8 +946,59 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/healthz", get(healthz))
         .route("/v1/readyz", get(readyz));
 
+    // **M-Prod sub-track #6 Phase A.** Per-IP rate limiter for
+    // protected routes. `RateLimitConfig` defaults read from env
+    // once at build time (positive integer or fall back to the
+    // in-code constants); operators tune via
+    // `GRX_RATE_LIMIT_PER_IP_PER_SEC` +
+    // `GRX_RATE_LIMIT_PER_IP_BURST` (no daemon recompile).
+    //
+    // `PeerIpKeyExtractor` (the default) reads
+    // `ConnectInfo<SocketAddr>` from request extensions — the
+    // accept loop in `accept_loop` inserts that extension per
+    // accept so the extractor never falls back to
+    // `UnableToExtractKey`. `use_headers()` enables the
+    // `x-ratelimit-*` family + `retry-after`; our custom
+    // `error_handler` (below) re-emits a matching `Retry-After`
+    // explicitly so the contract survives a future tower_governor
+    // shape change.
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(rl.per_second)
+            .burst_size(rl.burst)
+            .use_headers()
+            // Custom 429 body shape mirrors `bridge_saturated_response`'s
+            // operator contract: same JSON envelope, same
+            // `Retry-After` header semantics, only the `error`
+            // discriminator changes (`bridge_saturated` →
+            // `rate_limited`). See [`rate_limited_response_from_error`]
+            // for the symmetry rationale.
+            .error_handler(|err: tower_governor::GovernorError| {
+                rate_limited_response_from_error(err)
+            })
+            .finish()
+            .expect("rate-limit config: per_second + burst_size both nonzero"),
+    );
+    let governor_layer = GovernorLayer {
+        config: governor_conf,
+    };
+
     // Auth-protected routes. The middleware fires before each
     // handler; missing/wrong token short-circuits with 401.
+    //
+    // **Layer ordering (outermost → innermost):**
+    //
+    // 1. `rate_limit_observer` — captures peer + path classification
+    //    AFTER the chain runs so a 429 returned by the governor below
+    //    fires the audit event + metric. Sits outside everything else
+    //    so it always observes the final response status.
+    // 2. `governor_layer` — per-IP token bucket. Rejected requests
+    //    short-circuit BEFORE auth runs (per the M-Prod #6 brief:
+    //    "unauthenticated floods don't burn auth CPU"). 429 returned
+    //    here flows back through (1) for instrumentation.
+    // 3. `auth_layer` — bearer-token check. Wrapped per-route via
+    //    `route_layer` so it composes with the merged router's CORS
+    //    layer without affecting the public branch.
     let protected_routes = Router::new()
         .route("/v1/identity", get(identity))
         .route("/v1/metrics", get(metrics))
@@ -815,7 +1039,21 @@ pub fn build_router(state: ApiState) -> Router {
             "/v1/observer/events.sse",
             get(crate::websocket::sse_handler),
         )
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer))
+        // **M-Prod sub-track #6 Phase A.** Per-IP rate limiter +
+        // observer middleware. `governor_layer` first (inner of
+        // the two) so it sees requests before observer's
+        // `next.run` returns; `rate_limit_observer` second
+        // (outermost) so it observes the 429 response coming back
+        // through the chain. axum applies layers in the order
+        // they're added: each call to `.layer()` wraps the
+        // previous one (the latest `.layer()` is the new
+        // outermost). See `Router::layer` docs.
+        .layer(governor_layer)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_observer,
+        ));
 
     // **M-Ingress phase 1.** Browser is now a first-class consumer
     // of management-API + ingress endpoints. Baseline `*` origin
@@ -838,6 +1076,28 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(protected_routes)
         .with_state(state)
         .layer(cors)
+}
+
+/// **M-Prod sub-track #6 Phase A.** Parse a positive-integer env
+/// var to `u32`, falling back to `default` for unset / empty /
+/// unparseable / zero. Mirrors the
+/// `OBSERVER_SHUTDOWN_DEADLINE_SECS` shape from sub-track #5 so
+/// operator scripts have one parsing contract across the M-Prod
+/// surface.
+fn parse_env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn parse_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
 }
 
 /// Spawn the management API HTTP server. Returns an
@@ -873,6 +1133,7 @@ pub async fn spawn_with_cluster_readyz(
         cluster_readyz,
         audit_sink: None,
         draining: None,
+        rate_limit: None,
     })
     .await
 }
@@ -903,6 +1164,7 @@ pub async fn spawn_with_drain(
         cluster_readyz,
         audit_sink: None,
         draining,
+        rate_limit: None,
     })
     .await
 }
@@ -929,6 +1191,13 @@ pub struct SpawnOptions {
     /// have the management API observe it on the readyz + ingress
     /// hot paths.
     pub draining: Option<DrainFlag>,
+    /// **M-Prod sub-track #6 Phase A.** Per-IP rate-limit override.
+    /// `None` reads [`RateLimitConfig::from_env`] — production
+    /// shape. `Some(cfg)` pins the cap explicitly (used by the
+    /// rate-limit integration tests so parallel `cargo test`
+    /// runners don't collide on `GRX_RATE_LIMIT_PER_IP_*` env
+    /// vars).
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// **M-Prod sub-track #1 Phase A + #4 Phase α.** Full-knob
@@ -947,6 +1216,7 @@ pub async fn spawn_with_options(
         cluster_readyz,
         audit_sink,
         draining,
+        rate_limit,
     } = opts;
     let listener = TcpListener::bind(bind.addr).await?;
     let local_addr = listener.local_addr()?;
@@ -997,7 +1267,8 @@ pub async fn spawn_with_options(
         draining: draining.clone(),
         ingress_in_flight: ingress_in_flight.clone(),
     };
-    let router = build_router(state);
+    let rl = rate_limit.unwrap_or_else(RateLimitConfig::from_env);
+    let router = build_router_with_rate_limit(state, rl);
 
     // **M-Prod sub-track #2 Phase A.** Hold the rotatable TLS
     // handle (NOT a pre-built `TlsAcceptor`) — the per-connection
@@ -1095,8 +1366,30 @@ async fn accept_loop(
                     // clients all support HTTP/1.1; companion
                     // ecosystem clients negotiate the same).
                     let conn = ConnBuilder::new(hyper_util::rt::TokioExecutor::new());
-                    let svc = hyper::service::service_fn(move |req| {
+                    let svc = hyper::service::service_fn(move |mut req| {
                         let router = router.clone();
+                        // **M-Prod sub-track #6 Phase A.** Inject
+                        // `ConnectInfo<SocketAddr>` into the request
+                        // extensions so:
+                        //   - tower_governor's `PeerIpKeyExtractor`
+                        //     reads the peer IP for keying (without
+                        //     this it would return
+                        //     `UnableToExtractKey` and the layer
+                        //     would 500 every request).
+                        //   - the existing `auth_layer` audit-fail
+                        //     line + the new `rate_limit_observer`
+                        //     audit emit a real peer address rather
+                        //     than the `<unknown>` sentinel that
+                        //     latently masked the auth-fail
+                        //     telemetry pre-#6.
+                        //
+                        // Also insert the raw `SocketAddr` so
+                        // anything reading `req.extensions().get::<SocketAddr>()`
+                        // (e.g. `auth_layer`) continues to work
+                        // unchanged.
+                        req.extensions_mut().insert(peer);
+                        req.extensions_mut()
+                            .insert(axum::extract::ConnectInfo(peer));
                         async move {
                             // Adapter: feed the request through the
                             // axum Router via ServiceExt::oneshot.
@@ -2136,6 +2429,193 @@ fn bridge_saturated_response() -> Response {
         .into_response()
 }
 
+/// **M-Prod sub-track #6 Phase A.** Build the canonical 429 reply
+/// the per-IP rate limiter returns when a client trips the cap.
+/// Shape-symmetric with [`bridge_saturated_response`]: same JSON
+/// envelope, same `Retry-After` header semantics, only the `error`
+/// discriminator changes. Operator scripts grepping for
+/// `bridge_saturated` / `rate_limited` / `draining` /
+/// `scheduler_first_batch_pending` / `cluster_no_peers_connected`
+/// find every back-pressure-class reply in the same place.
+///
+/// `retry_after_secs` is `wait_time` from `tower_governor` (seconds
+/// until the next token becomes available). We re-emit the header
+/// explicitly rather than relying on tower_governor's default
+/// `Retry-After` so a future shape change inside the layer cannot
+/// silently downgrade the operator-visible back-off contract.
+fn rate_limited_response_from_error(
+    err: tower_governor::GovernorError,
+) -> Response {
+    use tower_governor::GovernorError;
+    match err {
+        GovernorError::TooManyRequests { wait_time, headers } => {
+            // `wait_time` is duration-until-next-token in whole
+            // seconds (matches RFC 7231 §7.1.3 delta-seconds and
+            // bridge_saturated's `Retry-After: 1`). Floor at 1 to
+            // keep client retry logic that polls on `Retry-After`
+            // from spinning when the value is technically 0.
+            let retry_after = wait_time.max(1);
+            let body = serde_json::json!({
+                "error": "rate_limited",
+                "retry_after_secs": retry_after,
+            })
+            .to_string();
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/json"),
+                    (axum::http::header::RETRY_AFTER, "1"),
+                ],
+                body,
+            )
+                .into_response();
+            // Fold in any `x-ratelimit-*` headers tower_governor
+            // attached via `use_headers()` FIRST so its raw
+            // `retry-after: <wait_time>` value (which is the
+            // truncated `Duration::as_secs()` floor and can be 0
+            // for sub-second token-refill windows) doesn't
+            // silently overwrite the clamped Retry-After below.
+            // The order is load-bearing: tower_governor populates
+            // `extra` with `retry-after` before calling our
+            // error_handler, so without this ordering the JSON
+            // body would say `retry_after_secs: 1` while the HTTP
+            // header would say `Retry-After: 0` — well-behaved
+            // clients honoring `Retry-After: 0` would spin-retry
+            // immediately, defeating the limiter's protective
+            // purpose and breaking operator triage assumptions.
+            if let Some(extra) = headers {
+                for (k, v) in &extra {
+                    resp.headers_mut().insert(k, v.clone());
+                }
+            }
+            // Overwrite the (possibly-folded-in) Retry-After with
+            // the clamped value LAST so the header matches the
+            // documented 1-second-minimum contract.
+            if let Ok(value) =
+                axum::http::HeaderValue::from_str(&retry_after.to_string())
+            {
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+            resp
+        }
+        GovernorError::UnableToExtractKey => {
+            // Should be impossible under our wiring — the
+            // `accept_loop` injects `ConnectInfo<SocketAddr>` per
+            // accept, so `PeerIpKeyExtractor` always finds a key.
+            // If we ever hit this branch it means the inject point
+            // regressed; surface a 500 with the operator-facing
+            // discriminator so the regression is loud in audit logs.
+            tracing::error!(
+                target: "graphreact::observer::audit",
+                "rate-limit key extraction failed — ConnectInfo<SocketAddr> missing from request extensions"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": "rate_limit_key_unavailable",
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
+        GovernorError::Other { code, msg, headers } => {
+            // Reserved for custom key extractors that return their
+            // own errors — Phase A uses the built-in
+            // `PeerIpKeyExtractor` so this branch is unreachable in
+            // the current shape; surface the structured shape
+            // anyway so a Phase B per-token extractor lights up
+            // here without a callsite change.
+            let body = serde_json::json!({
+                "error": "rate_limit_other",
+                "detail": msg.unwrap_or_default(),
+            })
+            .to_string();
+            let mut resp = (
+                code,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response();
+            if let Some(extra) = headers {
+                for (k, v) in &extra {
+                    resp.headers_mut().insert(k, v.clone());
+                }
+            }
+            resp
+        }
+    }
+}
+
+/// **M-Prod sub-track #6 Phase A.** Observer middleware that wraps
+/// the protected-route chain OUTSIDE the `GovernorLayer`. Captures
+/// peer + classified route on entry; awaits the chain; if the
+/// response is `429 Too Many Requests` (the discriminator the
+/// governor emits via [`rate_limited_response_from_error`]),
+/// fires:
+///
+/// 1. `tracing::warn!(target = "graphreact::observer::audit",
+///    event = "rate_limit_blocked", peer, route)` — same target
+///    convention the existing `auth_fail` / `bind` / `tls_*` events
+///    ride, so the JSON-log + audit-sink fan-out works without a
+///    callsite change.
+/// 2. `state.audit_sink.append(...)` — hash-chained tamper-evident
+///    record if a sink is wired (the M-Prod #1 substrate).
+/// 3. `state.metrics.rate_limit_blocked_inc(route)` — bumps the
+///    `grx_rate_limit_blocked_total{route}` counter under a bounded
+///    label vocabulary (see [`classify_protected_path`]).
+///
+/// `peer` resolution mirrors `auth_layer`: read
+/// `req.extensions().get::<SocketAddr>()`, fall back to
+/// `"<unknown>"` on the (theoretically impossible) miss path. The
+/// `accept_loop` injects both `SocketAddr` AND
+/// `ConnectInfo<SocketAddr>` per accept so the miss path stays
+/// dead under normal operation.
+async fn rate_limit_observer(
+    State(state): State<ApiState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    // Snapshot peer + route classification BEFORE forwarding, so
+    // we don't depend on extensions surviving the chain (they
+    // shouldn't be mutated by inner layers but defensive snapshot
+    // is cheap and decouples this observer from inner-layer
+    // changes).
+    let peer = req
+        .extensions()
+        .get::<SocketAddr>()
+        .map(SocketAddr::to_string)
+        .unwrap_or_else(|| "<unknown>".into());
+    let route = classify_protected_path(req.uri().path());
+
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        // Audit fan + metric bump. Token / cert / payload bytes
+        // are NEVER included — only peer + route + the literal
+        // event name. Substrate-not-MVP: the tracing line is the
+        // canonical surface, the sink is a parallel fan, the
+        // metric is the cumulative aggregate.
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            peer = %peer,
+            route = %route,
+            "rate_limit_blocked"
+        );
+        if let Some(sink) = state.audit_sink.as_ref() {
+            sink.append(crate::AuditRecordInput {
+                kind: "rate_limit_blocked",
+                fields: serde_json::json!({
+                    "peer": peer,
+                    "route": route,
+                }),
+            });
+        }
+        state.metrics.rate_limit_blocked_inc(route);
+    }
+    resp
+}
+
 async fn auth_layer(
     State(state): State<ApiState>,
     req: axum::extract::Request,
@@ -2249,5 +2729,339 @@ mod tests {
         assert_eq!(v["process_start_id"], 1234);
         assert_eq!(v["version"], "0.1.0");
         assert_eq!(v["api_version"], 1);
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    //! **M-Prod sub-track #6 Phase A** — fast in-process unit
+    //! tests for the rate-limit classifier + the
+    //! `rate_limited_response_from_error` shape. End-to-end (HTTP
+    //! over a real listener with burst behavior + per-source-IP
+    //! discrimination) lives in `tests/rate_limit.rs`; the unit
+    //! coverage here keeps the cheap shape checks adjacent to the
+    //! code they exercise.
+
+    use super::*;
+
+    #[test]
+    fn classify_known_protected_routes_round_trip() {
+        // Every registered protected-route pattern in
+        // PROTECTED_ROUTE_LABELS must classify to itself when the
+        // path is its concrete instantiation. Without this,
+        // grx_rate_limit_blocked_total{route} would emit labels
+        // for the raw-path variant (`/v1/nodes/abc`) instead of
+        // the bounded pattern (`/v1/nodes/:id`).
+        assert_eq!(classify_protected_path("/v1/identity"), "/v1/identity");
+        assert_eq!(classify_protected_path("/v1/metrics"), "/v1/metrics");
+        assert_eq!(classify_protected_path("/v1/nodes"), "/v1/nodes");
+        assert_eq!(
+            classify_protected_path("/v1/supervisor/tree"),
+            "/v1/supervisor/tree"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/observer/events"),
+            "/v1/observer/events"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/observer/events.sse"),
+            "/v1/observer/events.sse"
+        );
+        assert_eq!(classify_protected_path("/v1/nodes/abc"), "/v1/nodes/:id");
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/messages"),
+            "/v1/nodes/:id/messages"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/messages/recent"),
+            "/v1/nodes/:id/messages/recent"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/messages/bulk"),
+            "/v1/nodes/:id/messages/bulk"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/call"),
+            "/v1/nodes/:id/call"
+        );
+    }
+
+    #[test]
+    fn classify_unknown_paths_collapse_to_sentinel() {
+        // Routes outside the registered table — typos,
+        // adversarial paths, anything not in
+        // `PROTECTED_ROUTE_LABELS` — collapse to a single
+        // `"unknown"` label so an attacker can't inflate the
+        // metric's cardinality by hammering random URIs.
+        assert_eq!(classify_protected_path("/v1/foo"), "unknown");
+        assert_eq!(classify_protected_path("/v1/nodes/"), "unknown");
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/weird"),
+            "unknown"
+        );
+        assert_eq!(classify_protected_path("/"), "unknown");
+        assert_eq!(classify_protected_path(""), "unknown");
+    }
+
+    #[test]
+    fn classify_returns_static_str_so_metric_label_is_zero_alloc() {
+        // The metric callsite stores the label as `&'static str`
+        // — verify the return type at compile time by passing it
+        // through a function bound. If the classifier ever
+        // returned an owned `String` (or `Cow`), this would
+        // refuse to compile, surfacing the cardinality
+        // regression at build time rather than at scrape time.
+        fn static_label_only(_s: &'static str) {}
+        static_label_only(classify_protected_path("/v1/identity"));
+        static_label_only(classify_protected_path("/v1/nodes/abc"));
+        static_label_only(classify_protected_path("/random"));
+    }
+
+    #[test]
+    fn rate_limited_response_shape_matches_bridge_saturated_envelope() {
+        // Operator contract: every back-pressure-class response
+        // ships the SAME JSON envelope + Retry-After header
+        // semantics; only the `error` discriminator changes.
+        // Drift here breaks operator grep scripts that index on
+        // `error` to triage `{rate_limited, bridge_saturated,
+        // draining, scheduler_first_batch_pending,
+        // cluster_no_peers_connected}`.
+        let resp = rate_limited_response_from_error(
+            tower_governor::GovernorError::TooManyRequests {
+                wait_time: 7,
+                headers: None,
+            },
+        );
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After header required on rate_limited")
+            .to_str()
+            .unwrap();
+        assert_eq!(retry_after, "7");
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("Content-Type required")
+            .to_str()
+            .unwrap();
+        assert_eq!(content_type, "application/json");
+    }
+
+    #[test]
+    fn rate_limited_response_clamps_zero_wait_to_one_second_minimum() {
+        // A `wait_time` of 0 would tell a client to retry
+        // immediately, which spins. Clamp at 1s to match
+        // bridge_saturated_response's `Retry-After: 1` baseline.
+        let resp = rate_limited_response_from_error(
+            tower_governor::GovernorError::TooManyRequests {
+                wait_time: 0,
+                headers: None,
+            },
+        );
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(retry_after, "1");
+    }
+
+    #[test]
+    fn rate_limited_response_clamp_survives_tower_governor_header_fold() {
+        // **Verify-finding regression lock.** tower_governor's
+        // `use_headers()` populates `extra` with a literal
+        // `retry-after: <wait_time>` BEFORE calling our
+        // error_handler. The fold MUST run before the clamp
+        // overwrite — otherwise an under-1-second wait_time (the
+        // default 50/sec config has a 20ms refill, so this hits
+        // production on every blocked request) would silently
+        // overwrite `Retry-After: 1` back to `0`, the body would
+        // say `retry_after_secs: 1`, and a well-behaved client
+        // honoring `Retry-After: 0` would spin-retry into a
+        // tight loop, defeating the limiter's protective purpose.
+        let mut sabotage = axum::http::HeaderMap::new();
+        sabotage.insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("0"),
+        );
+        let resp = rate_limited_response_from_error(
+            tower_governor::GovernorError::TooManyRequests {
+                wait_time: 0,
+                headers: Some(sabotage),
+            },
+        );
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After present")
+            .to_str()
+            .expect("Retry-After valid ascii");
+        assert_eq!(
+            retry_after, "1",
+            "Retry-After must survive the tower_governor header fold + match \
+             the clamped body value (`retry_after_secs: 1`); got {retry_after}"
+        );
+    }
+
+    #[test]
+    fn rate_limited_response_unable_to_extract_key_surfaces_500() {
+        // Should be unreachable under the Phase A wiring (the
+        // accept loop injects ConnectInfo per accept) but lock
+        // the shape so a regression that drops the inject site
+        // surfaces as a loud 500 in audit logs rather than a
+        // silent 200.
+        let resp = rate_limited_response_from_error(
+            tower_governor::GovernorError::UnableToExtractKey,
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn protected_route_labels_table_matches_registered_routes() {
+        // `PROTECTED_ROUTE_LABELS` must list exactly the 11
+        // protected paths the router registers. If a new
+        // protected route lands without updating the table, the
+        // classifier collapses it to `"unknown"` and operators
+        // lose per-route observability — surface that drift here
+        // at unit-test time.
+        let expected: std::collections::HashSet<&'static str> = [
+            "/v1/identity",
+            "/v1/metrics",
+            "/v1/nodes",
+            "/v1/nodes/:id",
+            "/v1/nodes/:id/messages",
+            "/v1/nodes/:id/messages/recent",
+            "/v1/nodes/:id/messages/bulk",
+            "/v1/nodes/:id/call",
+            "/v1/supervisor/tree",
+            "/v1/observer/events",
+            "/v1/observer/events.sse",
+        ]
+        .into_iter()
+        .collect();
+        let actual: std::collections::HashSet<&'static str> =
+            PROTECTED_ROUTE_LABELS.iter().copied().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_is_per_source_ip() {
+        // **Per-IP key extractor invariant.** Two distinct source
+        // IPs each driving below-cap traffic should NEVER produce
+        // 429 — the limiter is per-IP, not global. This test can't
+        // be written as an HTTP integration test on a single host
+        // (every loopback request comes from 127.0.0.1, so they
+        // all share one bucket), so it pokes the router directly
+        // via `tower::Service::oneshot` and crafts requests with
+        // hand-rolled `ConnectInfo<SocketAddr>` extensions —
+        // exactly what the `accept_loop` does per accept under
+        // real traffic.
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use std::net::{Ipv4Addr, SocketAddr};
+        use tower::ServiceExt;
+
+        // Tight cap: per_second=1, burst=2 — three requests from
+        // one IP would 429 on the third. Sending TWO from each of
+        // TWO different IPs must yield 0 429s.
+        let metrics = Arc::new(MetricsInner::new());
+        let snapshot_tx = mpsc::channel(1).0;
+        let state = ApiState {
+            metrics: metrics.clone(),
+            snapshot_tx,
+            token: None,
+            identity: Arc::new(Identity {
+                process_start_id: 1,
+                version: "test",
+                api_version: 1,
+            }),
+            ring: Arc::new(RingBufferTelemetry::new()),
+            websocket: None,
+            idempotency_cache: Arc::new(IdempotencyCache::new()),
+            pending_calls: PendingCalls::new(),
+            cluster_readyz: None,
+            audit_sink: None,
+            draining: None,
+            ingress_in_flight: IngressInFlight::new(),
+        };
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1, 2));
+
+        let alice: SocketAddr = (Ipv4Addr::new(10, 0, 0, 1), 30_000).into();
+        let bob: SocketAddr = (Ipv4Addr::new(10, 0, 0, 2), 30_001).into();
+
+        let mut alice_statuses = Vec::new();
+        let mut bob_statuses = Vec::new();
+        for _ in 0..2 {
+            // Alice's request
+            let mut req = Request::builder()
+                .uri("/v1/identity")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(alice);
+            req.extensions_mut().insert(ConnectInfo(alice));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            alice_statuses.push(resp.status().as_u16());
+
+            // Bob's request
+            let mut req = Request::builder()
+                .uri("/v1/identity")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(bob);
+            req.extensions_mut().insert(ConnectInfo(bob));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            bob_statuses.push(resp.status().as_u16());
+        }
+        let alice_429 = alice_statuses.iter().filter(|s| **s == 429).count();
+        let bob_429 = bob_statuses.iter().filter(|s| **s == 429).count();
+        assert_eq!(alice_429, 0, "alice (10.0.0.1) under cap, got {alice_statuses:?}");
+        assert_eq!(bob_429, 0, "bob (10.0.0.2) under cap, got {bob_statuses:?}");
+        // Now a 3rd request from alice — same IP, over burst —
+        // MUST 429. This locks the per-IP discrimination: if the
+        // limiter were global, the 4 already-spent tokens (2
+        // alice + 2 bob) would have exhausted a burst=2 bucket
+        // long ago.
+        let mut req = Request::builder()
+            .uri("/v1/identity")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(alice);
+        req.extensions_mut().insert(ConnectInfo(alice));
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            429,
+            "alice's 3rd request over burst MUST 429"
+        );
+    }
+
+    #[test]
+    fn rate_limit_blocked_metric_uses_static_route_label() {
+        // Mechanically verify the metric increment + bounded
+        // label: feed a known route through the classifier into
+        // the counter, then walk the DashMap to confirm exactly
+        // one series exists with the expected label value.
+        let m = MetricsInner::new();
+        assert!(m.rate_limit_blocked.is_empty());
+
+        let route = classify_protected_path("/v1/nodes/abc/messages");
+        m.rate_limit_blocked_inc(route);
+        m.rate_limit_blocked_inc(route);
+
+        assert_eq!(m.rate_limit_blocked.len(), 1);
+        let entry = m.rate_limit_blocked.iter().next().unwrap();
+        let label = entry.value();
+        assert_eq!(label.counter.get(), 2);
+        let lv = label
+            .labels
+            .iter()
+            .find(|(k, _)| *k == "route")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(lv, "/v1/nodes/:id/messages");
     }
 }

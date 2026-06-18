@@ -338,6 +338,18 @@ pub struct MetricsInner {
     /// `grx_process_batch_duration_seconds` — histogram of cascade
     /// round duration (tick_start → tick_end delta in nanoseconds).
     pub process_batch_duration: Histogram,
+
+    /// **M-Prod sub-track #6 Phase A.** `grx_rate_limit_blocked_total{route}` —
+    /// per-route count of HTTP requests rejected by `tower_governor`
+    /// with `429 Too Many Requests`. `route` is bounded to the 11
+    /// protected route patterns the management API registers (no
+    /// `:id` substitution — the rate-limit observer middleware
+    /// classifies the raw URI path back to its pattern), so
+    /// cardinality is bounded by the protected-route count plus a
+    /// single `"unknown"` sentinel for routes outside the table.
+    /// See [`crate::management_api::build_router`] for the
+    /// observer middleware that increments this counter.
+    pub rate_limit_blocked: DashMap<u64, Arc<LabeledCounter>>,
 }
 
 impl Default for MetricsInner {
@@ -366,6 +378,7 @@ impl MetricsInner {
             queue_depth_external_inbox: Gauge::new(),
             queue_depth_pending_mutations: Gauge::new(),
             process_batch_duration: Histogram::new(),
+            rate_limit_blocked: DashMap::new(),
         }
     }
 
@@ -528,6 +541,34 @@ impl MetricsInner {
             .entry(key)
             .or_insert_with(|| {
                 Arc::new(LabeledCounter::new(vec![("outcome", outcome.to_string())]))
+            })
+            .counter
+            .inc();
+    }
+
+    /// **M-Prod sub-track #6 Phase A.** Increment the per-route
+    /// rate-limit-blocked counter. `route` is the protected-route
+    /// pattern (`&'static str`) classified by the rate-limit
+    /// observer middleware in
+    /// [`crate::management_api::build_router`]; pattern cardinality
+    /// is bounded by the registered route table (≤ 11 protected
+    /// routes plus a single `"unknown"` sentinel).
+    ///
+    /// Hot-path inline + get-then-insert avoids the DashMap shard
+    /// write lock on cache hit — same pattern as
+    /// [`Self::messages_dropped_inc`] and the M22-phase-4 per-engine
+    /// counters.
+    #[inline]
+    pub fn rate_limit_blocked_inc(&self, route: &'static str) {
+        let key = hash1(route);
+        if let Some(c) = self.rate_limit_blocked.get(&key) {
+            c.counter.inc();
+            return;
+        }
+        self.rate_limit_blocked
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledCounter::new(vec![("route", route.to_string())]))
             })
             .counter
             .inc();
