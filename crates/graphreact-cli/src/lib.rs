@@ -31,6 +31,11 @@ pub mod observer_commands;
 pub mod observer_tui;
 /// **M-Prod sub-track #3 (Phase A).** `grx secrets …` dispatcher.
 pub mod secrets_commands;
+/// **M-Prod sub-track #1 Phase A.** `grx audit …` dispatcher.
+/// Today's surface is the hash-chain verifier for the NDJSON file
+/// produced by `--observer-audit-log`. Phase B adds replay /
+/// inspect / report operations.
+pub mod audit_commands;
 #[cfg(target_os = "macos")]
 pub mod jsruntime;
 #[cfg(target_os = "macos")]
