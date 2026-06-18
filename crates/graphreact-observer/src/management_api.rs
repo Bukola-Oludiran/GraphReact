@@ -581,6 +581,13 @@ pub struct ApiServerHandle {
     /// WebSocket) so the scheduler's `on_call_reply` event
     /// resolves awaiting oneshots.
     pub pending_calls: PendingCalls,
+    /// **M-Prod sub-track #2 Phase A.** Rotatable TLS handle shared
+    /// with the accept loop. `None` when the observer was spawned
+    /// without TLS at bind time (loopback default). Drives
+    /// [`Self::reload_tls`] — operators (Phase B SIGHUP, Phase C
+    /// ACME, today's tests) call that method to swap in a new
+    /// cert without restarting the daemon.
+    pub tls: Option<crate::RotatableServerConfig>,
 }
 
 impl ApiServerHandle {
@@ -589,6 +596,104 @@ impl ApiServerHandle {
         self.shutdown.notify_one();
         let _ = self.task.await;
     }
+
+    /// **M-Prod sub-track #2 Phase A.** Atomic-swap rotation of the
+    /// observer's TLS identity. Parses the supplied PEM-encoded
+    /// cert + key, builds a fresh `rustls::ServerConfig`
+    /// (preserving the prior ALPN list), and stores it through the
+    /// rotatable handle. The NEXT accepted connection serves the
+    /// new identity; in-flight handshakes complete against the old
+    /// `Arc<ServerConfig>` they snapshotted at `acceptor.accept()`
+    /// time — no torn handshake, no use-after-free.
+    ///
+    /// Failure modes (cert parse / key parse / rustls build / no TLS
+    /// configured) are surfaced as [`crate::TlsRotationError`].
+    /// **The rotation is gated on the new config building cleanly**:
+    /// on failure, the old config keeps serving + an audit event of
+    /// shape `event = "tls_reload_failure"` is emitted. On success
+    /// the audit event is `event = "tls_reloaded"` with the SHA-256
+    /// fingerprint of the new leaf cert.
+    ///
+    /// Cert + key bytes are NEVER written to the audit log (only
+    /// `cert_bytes_len` / `key_bytes_len` on the attempt event +
+    /// the SHA-256 fingerprint on success).
+    pub fn reload_tls(
+        &self,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<(), crate::TlsRotationError> {
+        crate::audit::log_tls_reload_attempt(cert_pem.len(), key_pem.len());
+        let Some(handle) = self.tls.as_ref() else {
+            crate::audit::log_tls_reload_failure(
+                "not_configured",
+                "observer was spawned without TLS at bind time",
+            );
+            return Err(crate::TlsRotationError::NotConfigured);
+        };
+        // Compute the leaf-DER fingerprint FROM the supplied PEM
+        // bytes before we build the rustls config — `rustls`'s
+        // `ServerConfig` doesn't expose the cert chain after
+        // construction (the cert resolver is opaque) so we have to
+        // hash on the way in. Hashing the DER (not the PEM ASCII
+        // armor) makes the digest match `openssl x509 -noout
+        // -fingerprint -sha256 -in cert.pem` byte-for-byte.
+        let leaf_fingerprint = leaf_cert_sha256_from_pem(cert_pem);
+        let current = handle.current();
+        let next = match crate::ServerTlsConfig::build_rotated_server_config(
+            cert_pem, key_pem, &current,
+        ) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                let kind = match &err {
+                    crate::TlsRotationError::CertParse { .. } => "cert_parse",
+                    crate::TlsRotationError::EmptyCertChain => "empty_chain",
+                    crate::TlsRotationError::KeyParse { .. } => "key_parse",
+                    crate::TlsRotationError::Rustls { .. } => "rustls",
+                    crate::TlsRotationError::NotConfigured => "not_configured",
+                };
+                crate::audit::log_tls_reload_failure(kind, &err.to_string());
+                return Err(err);
+            }
+        };
+        handle.rotate(next);
+        // Fingerprint may be `None` if the leaf cert PEM parse
+        // step inside `leaf_cert_sha256_from_pem` failed — but in
+        // that case `build_rotated_server_config` would have
+        // failed first and we'd never reach this branch. Still,
+        // be defensive: surface a sentinel so operators see *some*
+        // audit record on every successful rotation.
+        let fp = leaf_fingerprint.as_deref().unwrap_or("unavailable");
+        crate::audit::log_tls_reload_success(fp);
+        Ok(())
+    }
+}
+
+/// **M-Prod sub-track #2 Phase A.** Hex-encoded SHA-256 of the
+/// leaf cert's DER bytes. Returns `None` when the PEM doesn't
+/// parse — callers fall back to a sentinel string. Matches
+/// `openssl x509 -fingerprint -sha256 -noout -in cert.pem` output
+/// (lowercase, no colons).
+fn leaf_cert_sha256_from_pem(cert_pem: &[u8]) -> Option<String> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+    let mut iter = CertificateDer::pem_slice_iter(cert_pem);
+    let first = iter.next()?.ok()?;
+    Some(sha256_hex(first.as_ref()))
+}
+
+/// Lowercase hex SHA-256 digest of `bytes`. Uses `ring` directly
+/// (already in the dep tree via `rustls`'s `ring` feature; declared
+/// crate-locally in `Cargo.toml` so it's a documented direct dep).
+/// Output matches `openssl x509 -fingerprint -sha256 -noout`
+/// byte-for-byte for the leaf cert's DER bytes.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let d = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut s = String::with_capacity(64);
+    for byte in d.as_ref() {
+        write!(s, "{byte:02x}").expect("write to String never fails");
+    }
+    s
 }
 
 /// Build the management API router. The router is the public seam
@@ -734,15 +839,21 @@ pub async fn spawn_with_cluster_readyz(
     };
     let router = build_router(state);
 
-    let tls_acceptor = bind
-        .tls
-        .as_ref()
-        .map(|tls| TlsAcceptor::from(tls.server.clone()));
+    // **M-Prod sub-track #2 Phase A.** Hold the rotatable TLS
+    // handle (NOT a pre-built `TlsAcceptor`) — the per-connection
+    // task constructs `TlsAcceptor::from(handle.current())` per
+    // accept so a `reload_tls(...)` call between accepts surfaces
+    // the new cert on the next handshake. See
+    // `crate::tls_rotation` module-level docs for why caching the
+    // acceptor at spawn time would defeat rotation.
+    let tls_handle: Option<crate::RotatableServerConfig> =
+        bind.tls.as_ref().map(|tls| tls.server.clone());
     let shutdown = Arc::new(Notify::new());
     let shutdown_for_loop = shutdown.clone();
+    let tls_handle_for_loop = tls_handle.clone();
 
     let task = tokio::spawn(async move {
-        accept_loop(listener, router, tls_acceptor, shutdown_for_loop).await;
+        accept_loop(listener, router, tls_handle_for_loop, shutdown_for_loop).await;
     });
 
     Ok(ApiServerHandle {
@@ -754,13 +865,14 @@ pub async fn spawn_with_cluster_readyz(
         websocket: Some(websocket),
         idempotency_cache,
         pending_calls,
+        tls: tls_handle,
     })
 }
 
 async fn accept_loop(
     listener: TcpListener,
     router: Router,
-    tls_acceptor: Option<TlsAcceptor>,
+    tls_handle: Option<crate::RotatableServerConfig>,
     shutdown: Arc<Notify>,
 ) {
     use hyper_util::rt::TokioIo;
@@ -784,7 +896,7 @@ async fn accept_loop(
                     }
                 };
                 let router = router.clone();
-                let acceptor = tls_acceptor.clone();
+                let tls_handle = tls_handle.clone();
                 tokio::spawn(async move {
                     // axum's `Router` becomes a `tower::Service`
                     // once we feed it a single connection's IO.
@@ -801,7 +913,16 @@ async fn accept_loop(
                             router.oneshot(req).await
                         }
                     });
-                    if let Some(acceptor) = acceptor {
+                    if let Some(handle) = tls_handle {
+                        // **M-Prod sub-track #2 Phase A.** Construct
+                        // the `TlsAcceptor` PER ACCEPT off the
+                        // current `Arc<ServerConfig>` snapshot.
+                        // `TlsAcceptor::from` snapshots the Arc at
+                        // construction; this in-flight handshake
+                        // keeps using it until the connection drops,
+                        // while a rotation between accepts surfaces
+                        // the new cert on the next handshake.
+                        let acceptor = TlsAcceptor::from(handle.current());
                         match acceptor.accept(socket).await {
                             Ok(tls_stream) => {
                                 let _ = conn.serve_connection_with_upgrades(TokioIo::new(tls_stream), svc).await;

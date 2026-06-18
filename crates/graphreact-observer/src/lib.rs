@@ -51,6 +51,7 @@ pub mod prometheus;
 pub mod prometheus_sink;
 pub mod ring_buffer;
 pub mod tls;
+pub mod tls_rotation;
 pub mod tracing_layer;
 pub mod websocket;
 
@@ -92,7 +93,8 @@ pub use multiplex::MultiplexSink;
 pub use prometheus::encode_text;
 pub use prometheus_sink::PrometheusSink;
 pub use ring_buffer::{MessageSnapshot, RingBufferTelemetry, DEFAULT_RING_CAPACITY};
-pub use tls::{ServerTlsConfig, TlsError};
+pub use tls::{ServerTlsConfig, TlsError, TlsRotationError};
+pub use tls_rotation::RotatableServerConfig;
 pub use tracing_layer::{stderr_writer, TracingJsonLayer, WriterHandle};
 pub use websocket::{EventFilter, WebSocketSink, BROADCAST_CAPACITY};
 

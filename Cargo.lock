@@ -1577,6 +1577,7 @@ dependencies = [
 name = "graphreact-observer"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "bytes",
  "criterion",
@@ -1594,6 +1595,7 @@ dependencies = [
  "parking_lot",
  "prometheus-parse",
  "rcgen",
+ "ring",
  "rustc-hash 2.1.2",
  "rustls",
  "serde",

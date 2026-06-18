@@ -80,3 +80,58 @@ pub fn log_bind(addr: SocketAddr, tls: bool, auth: bool) {
         "observer listening"
     );
 }
+
+/// **M-Prod sub-track #2 Phase A.** TLS rotation attempt entered the
+/// daemon. Fired at the top of
+/// [`crate::ApiServerHandle::reload_tls`](crate::ApiServerHandle::reload_tls)
+/// BEFORE PEM parsing — pairs with either
+/// [`log_tls_reload_success`] (rotation completed) or
+/// [`log_tls_reload_failure`] (parse / build / not-configured).
+///
+/// `cert_bytes_len` / `key_bytes_len` give operators a sanity check
+/// that the supplied secret was non-empty without ever leaking the
+/// material itself.
+#[inline]
+pub fn log_tls_reload_attempt(cert_bytes_len: usize, key_bytes_len: usize) {
+    tracing::info!(
+        target: "graphreact::observer::audit",
+        event = "tls_reload_attempt",
+        cert_bytes_len,
+        key_bytes_len,
+        "observer TLS rotation attempt"
+    );
+}
+
+/// **M-Prod sub-track #2 Phase A.** TLS rotation completed; the
+/// next accepted connection serves the new leaf cert. The leaf
+/// fingerprint is the SHA-256 hex digest of the first cert in the
+/// chain — operators can cross-reference against `openssl x509
+/// -noout -fingerprint -sha256 -in cert.pem` to confirm the
+/// rotation took. Cert / key bytes are NEVER logged.
+#[inline]
+pub fn log_tls_reload_success(leaf_fingerprint_sha256: &str) {
+    tracing::info!(
+        target: "graphreact::observer::audit",
+        event = "tls_reloaded",
+        leaf_fingerprint_sha256,
+        "observer TLS rotation success"
+    );
+}
+
+/// **M-Prod sub-track #2 Phase A.** TLS rotation failed; the old
+/// `ServerConfig` keeps serving (rotation is gated on the new
+/// config building cleanly). `error_kind` is one of
+/// `"cert_parse"`, `"empty_chain"`, `"key_parse"`, `"rustls"`,
+/// `"not_configured"`; `detail` carries the underlying message
+/// from [`crate::tls::TlsRotationError`] for operator-visible
+/// triage. Cert / key bytes are NEVER logged.
+#[inline]
+pub fn log_tls_reload_failure(error_kind: &'static str, detail: &str) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "tls_reload_failure",
+        error_kind,
+        detail,
+        "observer TLS rotation failure"
+    );
+}

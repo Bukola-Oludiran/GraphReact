@@ -27,6 +27,19 @@ zeroize.workspace = true
 subtle.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
+# M-Prod sub-track #2 Phase A — atomic-swap TLS rotation substrate.
+# `arc-swap` is already pinned at workspace level (Cargo.toml:41).
+# `RotatableServerConfig` wraps `ArcSwap<Arc<rustls::ServerConfig>>`
+# so per-accept handshakes pick up the latest cert without tearing
+# in-flight handshakes — each `acceptor.accept()` task owns its own
+# `Arc<ServerConfig>` clone.
+arc-swap.workspace = true
+# `ring` is already in the dep tree via rustls's `ring` feature; the
+# crate-local direct dep gives us `digest(SHA256, ...)` for the
+# leaf-cert SHA-256 fingerprint emitted by the `tls_reloaded` audit
+# event (matches `openssl x509 -fingerprint -sha256 -noout`). Pinned
+# to the same major version rustls picks (0.17.x).
+ring = "0.17"
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 hyper.workspace = true
 hyper-util.workspace = true
