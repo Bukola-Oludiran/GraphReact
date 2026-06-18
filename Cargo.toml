@@ -16,6 +16,7 @@ members = [
     "crates/graphreact-dist",
     "crates/graphreact-hotreload",
     "crates/graphreact-observer",
+    "crates/graphreact-secrets",
     "crates/graphreact-cli",
     "crates/graphreact-napi",
     "crates/graphreact-wasm",

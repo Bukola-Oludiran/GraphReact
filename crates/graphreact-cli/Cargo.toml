@@ -29,6 +29,7 @@ graphreact-engine-zig = { path = "../graphreact-engine-zig" }
 graphreact-grx-parser = { path = "../graphreact-grx-parser" }
 graphreact-hotreload = { path = "../graphreact-hotreload" }
 graphreact-observer = { path = "../graphreact-observer" }
+graphreact-secrets = { path = "../graphreact-secrets" }
 clap.workspace = true
 clap_complete.workspace = true
 parking_lot.workspace = true
@@ -48,6 +49,11 @@ ratatui.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 tokio-tungstenite.workspace = true
+# **M-Prod sub-track #3.** Zeroized no-echo stdin reader for
+# `grx secrets set <NAME>`. Avoids hand-rolling the POSIX termios
+# dance (which would need workspace `unsafe_code` exemption). Pure
+# Rust, MIT/Apache-2.0, dependency-light.
+rpassword = "7"
 
 [features]
 default = []
