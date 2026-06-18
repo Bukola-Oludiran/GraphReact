@@ -1,0 +1,92 @@
+# M-Prod — Production-readiness milestone (close-out record)
+
+**Status:** SAFE-SLICE PASS CLOSED 2026-06-18. All 9 sub-tracks have safe-slice substrate landed on `main`. Phase B / C / D items are explicitly catalogued in the per-sub-track docs and the next-milestone planning section below.
+
+This document is the canonical disposition record for M-Prod's safe-slice pass — the equivalent of [`cleanup-pass.md`](cleanup-pass.md) but for the 9-sub-track production-readiness milestone.
+
+## Acceptance
+
+Per the [strategic plan](../../../../.claude/plans/graphreact-rust-later-milestones.md) §M-Prod: the milestone's safe-slice pass closes when "every sub-track has a working substrate that the deeper Phase B/C/D increments can ride." All 9 sub-tracks meet that bar as of 2026-06-18. The deeper phases (multi-token RBAC, ACME cert rotation, M14.11 delegated-restart, batched-fsync, Sigstore signing, distributed rate limit, k8s operator, etc.) are scoped to subsequent milestones — see [Open work catalogue](#open-work-catalogue) below.
+
+## Sequencing (how we got here)
+
+The safest-slices pass shipped in 4 parallel-safe groups per the locked dependency graph from the M-Prod remainder plan:
+
+```
+M22 mixed-runtime + M23 LSP + Cleanup-Pass shipped first (pre-M-Prod).
+
+Group 1 (2026-06-17): #3 secrets, #5 observability (safe + residual), #9 chaos+fuzz
+Group 2 (2026-06-17): #2 TLS rotation Phase A, #7 supply-chain (safe + residual)
+Group 3 (2026-06-17): #1 AuthN/AuthZ Phase A, #4 Lifecycle Phase α
+Group 4 (2026-06-18): #6 Rate limit Phase A, #8 Packaging Phase A
+```
+
+Group dependencies (from the audit at workflow `wdwoc3q9z` remainder plan):
+- #1 audit-chain → ride substrate for #2/#4/#6 audit events
+- #2 atomic-swap → reused by #1 SIGHUP token-registry rotation (Phase B)
+- #4 SIGTERM drain → composes with #6 governor + #8 helm `terminationGracePeriodSeconds`
+- #5 backpressure policy → consumed by #6's 429-vs-503 precedence ladder
+- #7 SBOM → #8 release.yml depends on the artifact
+
+## Disposition table (9 sub-tracks)
+
+| # | Sub-track | Phase A shipped | Doc | Phase B+ catalogue |
+|---|---|---|---|---|
+| 1 | **AuthN / AuthZ** | Hash-chained tamper-evident `AuditSink` + `FileAuditSink` NDJSON (mode 0o600) + restart-resume + `grx audit verify` CLI + ADR-0006 | [`m-prod-auth.md`](m-prod-auth.md) | Multi-token bearer registry, RBAC engine, JWT-OIDC bridge, per-route / per-node / per-message-type ACLs, batched-fsync worker, `audit_sink_write_failures_total` counter, `grx admin audit-verify` daemon-side endpoint, audit-log forwarder backends (S3 / Loki / GCS / OpenSearch), Windows file-mode ACLs |
+| 2 | **TLS / mTLS lifecycle** | `RotatableServerConfig` atomic-swap substrate + `ApiServerHandle::reload_tls` + `tls_reload_*` audit events on observer HTTPS path | [`m-prod-tls-rotation.md`](m-prod-tls-rotation.md) | SIGHUP signal handler (jointly owned with #4 topology), ACME / cert-manager integration, session-resumption ticket rotation, dist crate (mTLS) rotation, Windows cross-platform path, full ServerConfig knob preservation across rotation (session_storage / ticketer / etc.) |
+| 3 | **Secrets handling** | `graphreact-secrets` crate (`SecretValue` + `SecretStore` + `EnvStore` + `KeyringStore` for macOS Keychain / Linux Secret Service / Windows Credential Manager) + `grx secrets {set,get,list,remove}` CLI subcommand | [`m-prod-secrets.md`](m-prod-secrets.md) | `ctx.secret(name)` runtime accessor (depends on Engine trait surface change + per-engine host-callback wiring + ADR-0007), SIGHUP-triggered re-read, audit-of-secret-reads (depends on #1 chain sink + Phase B), Keychain access-groups, `keyring` upstream portable enumeration API |
+| 4 | **Lifecycle (incl. M14.11)** | SIGTERM drain primitive (`DrainFlag` + `IngressInFlight` + `InflightGuard` + `/v1/readyz` 503 `draining` + ingress 503 `draining` + `DaemonHandle::start_drain` orchestrator) + `--drain-deadline-secs` CLI flag + `GRX_DRAIN_DEADLINE_SECS` env + four lifecycle audit events | [`m-prod-lifecycle.md`](m-prod-lifecycle.md) | Phase β: rolling-version handshake (`WIRE_VERSION` floor relax + per-engine capability negotiation). Phase γ: M14.11 cross-node delegated-restart wire protocol (depends on Phase β rolling-version + #1 multi-token auth). Cluster handshake quiescence (`Cluster::begin_drain` softer shutdown). Per-call drain-aware timeout truncation. Windows SIGTERM equivalent. |
+| 5 | **Observability completeness** | `/v1/readyz` Kubernetes-shaped readiness (process-batch + bridge-capacity + cluster-membership predicate) + `OBSERVER_SHUTDOWN_DEADLINE` for bounded OTel teardown + mpsc backpressure policy sweep (ingress = try_send→503) + published [`SLO.md`](../SLO.md) with explicit BLOCKED rows | [`m-prod-observability.md`](m-prod-observability.md) | OTel `case_g_batch` bench variant (BatchSpanProcessor + tokio runtime context). Per-route 503-vs-429 ordering (jointly closed with #6 — precedence ladder `drain > rate_limit > auth > bridge_saturated` now locked). Readyz extensions: TLS-cert-loaded (blocked on #2 SIGHUP), OTel-exporter-reachable (blocked on CI-infra), drain-in-progress (now shipped via #4). Per-engine label cardinality lock (blocked on M17/M22). |
+| 6 | **Rate limiting** | Per-IP `tower_governor 0.5` `GovernorLayer` keyed by `PeerIpKeyExtractor` on `protected_routes`; defaults 50 req/s sustained + 100 burst; operator-tunable via `GRX_RATE_LIMIT_PER_IP_{PER_SEC,BURST}` env vars; canonical 429 envelope mirrors `bridge_saturated`; `grx_rate_limit_blocked_total{route}` Prometheus counter (bounded 12-entry label vocabulary); `rate_limit_blocked` hash-chained audit event; precedence-locked Retry-After clamp survives the tower_governor header fold | [`m-prod-rate-limit.md`](m-prod-rate-limit.md) | Per-token rate limit (depends on #1 multi-token TokenId extractor). `X-Forwarded-For` / trusted-proxy honoring. Distributed rate limit across cluster nodes (Redis-class shared store). Cardinality caps on MetricsInner.* (blocked on #1 + #5). Timing-attack-safe auth-failure response (jointly with #1 multi-token compare). |
+| 7 | **Supply chain** | CycloneDX 1.4 JSON SBOM CI cell (`cargo-cyclonedx@0.5.9` via `taiki-e/install-action@v2`, jq validation gate, push + tag triggers) + `GRX_SIGNATURE_URL` baked into `grx version` via build.rs + reproducible-build twice-build CI cell (`SOURCE_DATE_EPOCH` + `--remap-path-prefix`, `continue-on-error: true` first-ship posture) + Trivy SBOM SARIF scan (per-file loop + `jq -s` merge, `taiki-e/install-action@v2` with `trivy@0.53.0`, security-events: write job-scoped) + [`m-prod-runbook.md`](m-prod-runbook.md) scaffold | [`m-prod-supply-chain.md`](m-prod-supply-chain.md) | Sigstore-keyless signing of release artifacts via `cosign sign` + GitHub Actions OIDC `id-token: write`. SLSA build provenance attestation (`actions/attest-build-provenance@v1`). Per-arch SBOMs once multi-arch matrix lands. Cross-host reproducible build (`SOURCE_DATE_EPOCH` threading through `cargo xtask zig-build`; absolute LC_RPATH replacement). Flip reproducible-build + trivy from `continue-on-error: true` to hard gates after stable runs. |
+| 8 | **Packaging** | Multi-stage distroless `Dockerfile` (zig-builder → rust-builder → python-donor → distroless-cc-debian12 final, nonroot UID 65532) + `.dockerignore` + tag-triggered `.github/workflows/release.yml` scaffold (reproducibility-recheck hard gate + sbom-pin + matrix docker-build amd64/arm64 via QEMU + publish-release with `gh release create`) + `charts/grx/` helm chart (`grx run` single-node entrypoint + readinessProbe wired to `/v1/readyz` matching `m-prod-observability.md` YAML + `terminationGracePeriodSeconds=30` matching `m-prod-lifecycle.md` math + securityContext `runAsNonRoot` + `readOnlyRootFilesystem` + `drop:[ALL]` + seccompProfile RuntimeDefault) + `packaging/homebrew/grx.rb` source-build reference formula + extended [`m-prod-runbook.md`](m-prod-runbook.md) "Verify a release" section | [`m-prod-packaging.md`](m-prod-packaging.md) | Pin Dockerfile base-stage SHAs (distroless / python-donor / rust-builder by `@sha256:<digest>`). Sigstore-keyless signing (jointly with #7). SLSA attestation. ghcr.io push (depends on OIDC trust + `vars.PUSH_TO_GHCR` repo variable + `environment: production-release` approval gate). Native arm64 cross-compile (xtask `-Dtarget` knob). StatefulSet substrate for multi-replica clustering (depends on M14 DNS-SRV discovery hook). Raise drain default to 25s + `terminationGracePeriodSeconds=35`. Homebrew tap + homebrew-core submission. macOS notarization. Windows MSI. K8s operator. Cluster-mode helm preset (`values-cluster.yaml`). |
+| 9 | **Chaos + fuzz** | `fuzz/` standalone workspace + `fuzz_management_api_bodies` libFuzzer target driving `serde_json::from_slice` on three ingress shapes (`InjectMessageBody` + `CallMessageBody` + `parse_bulk_line`) + 16-entry seed corpus + push-to-main 10-min CI cell (`taiki-e/install-action@v2` + `cargo-fuzz@0.12` + `nightly-2026-06-01` + ASan + `rss_limit_mb=2048`, `continue-on-error: true` first-ship) | [`m-prod-chaos-fuzz.md`](m-prod-chaos-fuzz.md) | 24h cumulative-corpus CI cell. 7-day soak under chaos arms: partition-storm, cookie-rotation, cert-rotation, crash-restart. Reload-under-load soak (depends on #4 Phase γ remote-reload wire). Round-trip property tests. Flip `continue-on-error: true` → hard gate after stable runs. All blocked on CI-infra track (long-running cells + 3-node cluster fixture + OTel-collector docker fixture + Loki/promtool fixtures + OIDC IdP fixture). |
+
+## Cross-track contracts locked here
+
+The safe-slice pass locked these contracts that future Phase B/C/D increments inherit:
+
+- **Audit-target convention** (`graphreact::observer::audit` tracing target, structured JSON). Every sub-track that emits audit events (bind, accept, auth_fail, response, tls_reload_*, otel_shutdown_timeout, drain_started, drain_completed, drain_deadline_exceeded, drain_budget_misconfig, rate_limit_blocked) uses the same target. Future RBAC events ride the same fan without code change at the audit site.
+- **`AuditSink` fan invariant** (sub-track #1) — the existing `tracing::{info,warn}!` calls fire UNCHANGED; the sink fan happens AFTER, so an audit-sink failure can never break the tracing-side stream. Verified by 'no sink default keeps legacy behavior' regression test.
+- **`AuditSink::append` infallible** at the trait — sink-failure DEGRADES (tracing keeps firing) NEVER panics. The substrate refuses to load-bear on liveness.
+- **Atomic-swap pattern** (sub-track #2) — `Arc<ArcSwap<Arc<T>>>` newtype. Reused by Phase B's multi-token registry + future configuration-reload work.
+- **ApiState additive-only contract** — every sub-track that adds shared state to `ApiState` does so as a new public field (currently 12 fields). Legacy `spawn_management_api` / `spawn_management_api_with_cluster_readyz` / `spawn_management_api_with_drain` defaults the new fields to `None`. The unified `SpawnOptions` struct passed to `spawn_with_options` is the canonical shape; legacy constructors thunk through it. Pre-#1 callers still compile bit-for-bit.
+- **Drain budget math** (sub-track #4) — `drain_deadline + OBSERVER_SHUTDOWN_DEADLINE + slack ≤ k8s terminationGracePeriodSeconds`. Default 20+5+5=30 = k8s default. Helm chart (#8) enforces 30s. `start_daemon` warns at boot when violated.
+- **Back-pressure response envelope** (sub-tracks #5 + #6) — same JSON envelope `{"error": "<reason>", "retry_after_secs": <N>}` + `Retry-After: <N>` header semantics for both 503 (`bridge_saturated`, `draining`, `scheduler_first_batch_pending`, `cluster_no_peers_connected`) and 429 (`rate_limited`). Only the `error` discriminator changes the operator's remediation.
+- **Precedence ladder** (locked across sub-tracks #4 + #5 + #6 + ingress handlers) — `drain > rate_limit > auth > bridge_saturated`. Structurally guaranteed by layer ordering (drain check fires before `rate_limit_observer` middleware → governor short-circuits before auth → auth before ingress handler → bridge try_send is the inner-most).
+- **Protected route catalogue** (sub-tracks #6) — bounded 12-entry static-str vocabulary used for `grx_rate_limit_blocked_total{route}` label + audit event field. Cardinality cap is the substrate; future per-token-key rides on top.
+- **`continue-on-error: true` first-ship posture** (sub-tracks #7 reproducible-build + #7 Trivy + #9 fuzz + #8 release.yml docker-build matrix). Documented flip-to-hard-gate triggers in each sub-track's Open Work table.
+- **mode 0o600 file enforcement** (sub-track #1) — `FileAuditSink::open` enforces on Unix BOTH on create AND on open-of-pre-existing-file. Reused by Phase B's audit-log forwarder (S3 staging file).
+
+## Workspace gates
+
+| Gate | Status post-Group-4 |
+|---|---|
+| `cargo test --release -p graphreact-observer` | ~180+ tests pass across 19 test binaries (Group 1+2+3+4 substrate) |
+| `cargo test --release -p graphreact-cli` | tests pass across debug_flag + drain_orchestration + audit_verify + cluster_cli + ingress + subcommands |
+| `cargo test --release -p graphreact-secrets` | 16 unit tests pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean post-merge (Group 4) |
+| `cargo deny check advisories licenses bans sources` | clean (no new license-allowlist update needed for any of the 4 Groups; tower_governor 0.5 + governor 0.8 + nonzero_ext 0.3 + keyring 3 + rpassword 7 + cargo-cyclonedx 0.5 + trivy 0.53 + cargo-fuzz 0.12 are all MIT / Apache-2.0 / ISC) |
+| Cargo workspace member count | unchanged for #2 / #4 / #5 / #6 / #7 / #8 / #9 (additive crate fields only); added `crates/graphreact-secrets` (#3) + `crates/graphreact-lsp` (M23, pre-M-Prod); standalone `fuzz/` workspace (#9, NOT a member) |
+
+## Open work catalogue (everything deferred from Phase A)
+
+Catalogued in the per-sub-track docs. Top-of-mind for the next milestone:
+
+1. **Phase B for #1 (multi-token RBAC + JWT-OIDC bridge + per-route ACLs).** Depends on #3 keyring for signing-key storage + #2 atomic-swap for SIGHUP-driven token-registry rotation. Audit-chain sink (#1 Phase A) is the substrate; Phase B adds `auth_success` / `authz_deny` / `token_rotated` audit events that ride the same fan.
+2. **Phase B for #4 (rolling-version handshake + `WIRE_VERSION` floor relax).** Phase γ (M14.11 cross-node delegated-restart) depends on Phase β + #1 multi-token (delegated-restart auth) + WIRE_VERSION 4→5 bump coordinated with M19 persistence segment-header version.
+3. **Phase B for #2 (SIGHUP signal handler + ACME).** Jointly owned with #4 signal-handler topology.
+4. **Phase B for #3 (`ctx.secret(name)` runtime accessor inside `.grx` bodies).** Depends on Engine trait surface change + per-engine host-callback wiring (JSC / CPython / Go) + new ADR-0007 locking the contract.
+5. **Phase B for #7 (Sigstore-keyless signing + SLSA + ghcr.io push) + Phase B for #8 (digest-pin Dockerfile bases).** Jointly closed — #8's release.yml pulls in #7's signing pipeline.
+6. **Phase B for #5 (OTel BatchSpanProcessor bench)** + Phase A residual: per-route 503-vs-429 ordering (now locked via #6) + per-engine label cardinality (blocked on M17 + M22 close).
+7. **Phase B for #9 (24h fuzz corpus cell + chaos arms).** Blocked on CI-infra track shipping the long-running cells + cluster fixtures.
+8. **Phase B for #6 (per-token rate limit + distributed rate limit).** Depends on #1 Phase B TokenId extractor + a distributed shared-store decision (Redis / DynamoDB / shared-memory dashmap).
+
+## Cross-references
+
+- [Strategic plan](../../../../.claude/plans/graphreact-rust-later-milestones.md) §M-Prod — original 9-sub-track table.
+- [`cleanup-pass.md`](cleanup-pass.md) — pre-M-Prod 14-item disposition record (precedent for this close-out doc).
+- Per-sub-track docs: [`m-prod-auth.md`](m-prod-auth.md), [`m-prod-tls-rotation.md`](m-prod-tls-rotation.md), [`m-prod-secrets.md`](m-prod-secrets.md), [`m-prod-lifecycle.md`](m-prod-lifecycle.md), [`m-prod-observability.md`](m-prod-observability.md), [`m-prod-rate-limit.md`](m-prod-rate-limit.md), [`m-prod-supply-chain.md`](m-prod-supply-chain.md), [`m-prod-packaging.md`](m-prod-packaging.md), [`m-prod-chaos-fuzz.md`](m-prod-chaos-fuzz.md).
+- Published SLOs: [`SLO.md`](../SLO.md) — what operators can rely on TODAY.
+- Operator runbook: [`m-prod-runbook.md`](m-prod-runbook.md) — release verification flow.
+- ADRs: [`0006-audit-chain-substrate.md`](../decisions/0006-audit-chain-substrate.md).
