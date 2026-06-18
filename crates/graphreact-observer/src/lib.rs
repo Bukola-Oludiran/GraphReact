@@ -76,6 +76,7 @@ pub use otel::{
 #[cfg(feature = "otel")]
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 
+pub use audit::log_tls_reload_skipped;
 pub use audit_chain::{
     replay as replay_audit_chain, AuditChainError, AuditRecord, AuditRecordInput, AuditSink,
     FileAuditSink, NopAuditSink,

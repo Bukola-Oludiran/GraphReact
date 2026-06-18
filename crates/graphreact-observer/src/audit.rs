@@ -254,6 +254,43 @@ pub fn log_tls_reload_failure(
     );
 }
 
+/// **M-Prod sub-track #2 Phase B Part 1.** TLS rotation was triggered
+/// (today: SIGHUP) but skipped without entering the reload path.
+/// Currently `reason` is only `"draining"` — the SIGHUP handler in
+/// `graphreact-cli`'s `DaemonHandle::reload_tls_from_disk` short-
+/// circuits when the [`crate::DrainFlag`] is set so an operator-
+/// triggered cert rotation mid-drain doesn't generate a confusing
+/// `tls_reload_attempt` + `tls_reload_success` pair while the accept
+/// loop is being torn down. `reason` is a `&'static str` so future
+/// skip reasons (e.g. `"locked"` for a rotation-in-progress mutex)
+/// can be added without an enum + matching schema bump downstream.
+///
+/// Pairs with [`log_tls_reload_attempt`] /
+/// [`log_tls_reload_success`] / [`log_tls_reload_failure`]: this
+/// event fires INSTEAD of the attempt/success/failure trio on the
+/// skip path. Operator dashboards counting reload attempts should
+/// include `tls_reload_skipped` to avoid undercounting trigger
+/// surfaces (an operator SIGHUP that skipped is still an operator
+/// SIGHUP).
+#[inline]
+pub fn log_tls_reload_skipped(reason: &'static str, sink: Option<&Arc<dyn AuditSink>>) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "tls_reload_skipped",
+        reason,
+        "observer TLS rotation skipped"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "tls_reload_skipped",
+            fields: serde_json::json!({
+                "reason": reason,
+            }),
+        },
+    );
+}
+
 /// **M-Prod sub-track #4 Phase α.** SIGTERM (or operator-driven)
 /// drain entered. Emitted EXACTLY ONCE per daemon lifetime,
 /// BEFORE [`crate::DrainFlag`]'s AtomicBool flip becomes
