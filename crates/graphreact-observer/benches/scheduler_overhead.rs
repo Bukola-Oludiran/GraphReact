@@ -231,6 +231,96 @@ fn bench_case_g_otel_sink(c: &mut Criterion) {
     });
 }
 
+/// **M-Prod sub-track #5 Phase B gate.** Trait + `OtelSink` + an
+/// `InMemorySpanExporter` via `BatchSpanProcessor` (the production
+/// processor type — `opentelemetry_sdk::trace::BatchSpanProcessor`,
+/// NOT `span_processor_with_async_runtime::BatchSpanProcessor`). The
+/// sync `BatchSpanProcessor` uses a dedicated background OS thread
+/// for the drain; the tokio runtime context the bench wraps around
+/// the iteration is parity with the production-side
+/// `build_otel_sink` constructor at `src/otel.rs:499` — the
+/// `opentelemetry_otlp::SpanExporter::with_tonic()` path requires the
+/// `SdkTracerProvider` be built inside a tokio runtime so the
+/// `grpc-tonic` channel can initialize. The bench uses
+/// `InMemorySpanExporter` not OTLP/gRPC to avoid a network dep, but
+/// the processor-side hot-path cost (queue push + atomic counter) is
+/// the same as the production path.
+///
+/// **Measured 2026-06-18 on macOS dev machine (release profile,
+/// `--measurement-time 5`):** `case_a / case_g_batch / case_g_otel_sink
+/// ≈ 17.7 ms / 19.9 ms / 23.6 ms`. So `case_g_batch / case_a ≈ +12%`
+/// vs `case_g_otel_sink / case_a ≈ +33%` — the batch processor saves
+/// ~21pp of overhead vs the synchronous SimpleSpanProcessor at the
+/// fixture's ~9000 spans/iteration. Variance is wide because the
+/// per-iteration flush+drop step adds tens of ms of jitter; the
+/// ratio band is the load-bearing number, not the absolute time.
+/// Trades p99 emit latency (batched flush jitter) for steady-state
+/// throughput.
+///
+/// **Implementation notes:**
+///
+/// - `BatchSpanProcessor::shutdown()` is blocking — invoked through
+///   `tokio::task::spawn_blocking` per the upstream warning at
+///   `span_processor.rs:279-282` (calling from a current-thread
+///   tokio main thread deadlocks). The bench uses a multi-thread
+///   runtime so even the bench-side `block_on` task can park while
+///   the blocking shutdown joins.
+/// - The exporter + processor + provider are re-constructed per
+///   iteration (matches `case_g_otel_sink` shape) so the bench
+///   measures the full mount → drive → flush path, not just emit.
+///
+/// Gated behind `otel-test` (same as `case_g_otel_sink`). Run with:
+/// `cargo bench -p graphreact-observer --features otel-test --bench
+/// scheduler_overhead case_g_batch -- --warm-up-time 1
+/// --measurement-time 5`
+#[cfg(feature = "otel-test")]
+fn bench_case_g_batch(c: &mut Criterion) {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{
+        BatchSpanProcessor, InMemorySpanExporter, SdkTracerProvider,
+    };
+
+    // Build a multi-thread runtime once, reused across criterion
+    // iterations. The provider + processor are created inside the
+    // runtime so the tonic-gRPC constraint documented at
+    // `opentelemetry_sdk::trace::span_processor::BatchSpanProcessor`
+    // is honored in shape, even though our bench exporter is
+    // in-memory.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for case_g_batch");
+
+    c.bench_function("scheduler_overhead/case_g_batch", |b| {
+        b.iter(|| {
+            runtime.block_on(async {
+                let exporter = InMemorySpanExporter::default();
+                let processor = BatchSpanProcessor::builder(exporter).build();
+                let provider = SdkTracerProvider::builder()
+                    .with_span_processor(processor)
+                    .build();
+                let tracer = provider.tracer("graphreact-observer-bench");
+                let sink = std::sync::Arc::new(
+                    graphreact_observer::OtelSink::with_tracer(tracer),
+                );
+                let mut scheduler = build_ring_scheduler();
+                scheduler.install_telemetry_sink(sink as Arc<dyn TelemetrySink>);
+                drive_rounds(&mut scheduler);
+                // Force the batch processor to drain before the
+                // provider drops so the bench measures the full
+                // emit + flush path, not just emit. `shutdown()` is
+                // blocking — done inside `spawn_blocking` to avoid
+                // the deadlock noted in the upstream warning at
+                // span_processor.rs:279-282.
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = provider.shutdown();
+                })
+                .await;
+            });
+        });
+    });
+}
+
 /// **M-Ingress phase 4 closeout gate.** Trait + ring scheduler + the
 /// HTTP-ingress dispatch path. Each iteration sends `MESSAGE_ROUNDS`
 /// messages through `SchedulerHandle::send_ingress` (the
@@ -319,6 +409,7 @@ criterion_group!(
     bench_case_d,
     bench_case_e,
     bench_case_g_otel_sink,
+    bench_case_g_batch,
     bench_case_h_external_inject
 );
 criterion_main!(benches);

@@ -259,7 +259,7 @@ fn cross_node_message_delivered_produces_link_attribute() {
 
 /// **P10 acceptance gate.** Mount + unmount + restart + hot-reload
 /// + topology + supervisor events fire as instant span events on
-/// the active root tick span (NOT as their own spans).
+///   the active root tick span (NOT as their own spans).
 #[test]
 fn instant_events_fire_on_root_tick_span() {
     let (sink, exporter, provider) = build_test_sink();
@@ -364,6 +364,113 @@ fn current_wire_context_returns_active_span_id() {
     });
     // After tick ends: None.
     assert!(OtelSink::current_wire_context().is_none());
+}
+
+/// **M-Prod sub-track #5 Phase B gate.** A `BatchSpanProcessor` build
+/// of the `OtelSink` + `InMemorySpanExporter` exports EVERY span the
+/// scheduler hot path opens (no silent queue drops at the documented
+/// fixture cadence). Equivalence statement: count of root + child +
+/// one-shot spans the fixture emits MUST equal
+/// `len(get_finished_spans())` after `provider.force_flush()`.
+///
+/// Mirrors the bench fixture's shape (small ring, fixed counts) so
+/// the test is fast (<200ms) while still exercising the same hot
+/// path the bench measures. Drives the `TelemetrySink` trait
+/// directly with synthesized event payloads — the literal field set
+/// matches `crates/graphreact-core/src/telemetry.rs` so a future
+/// payload-shape change must update both at once.
+///
+/// Implementation notes:
+/// - `BatchSpanProcessor::force_flush()` and `shutdown()` are
+///   blocking; both wrapped in `tokio::task::spawn_blocking` per the
+///   upstream warning at `span_processor.rs:279-282` to avoid
+///   deadlocking the multi-thread runtime worker.
+/// - The spans are read AFTER `force_flush` but BEFORE `shutdown`
+///   because `InMemorySpanExporter::shutdown` by default RESETS
+///   its internal buffer (see
+///   `opentelemetry_sdk-0.31.0/src/trace/in_memory_exporter.rs`
+///   `should_reset_on_shutdown`); the bench `case_g_batch` doesn't
+///   read spans, so it can do the simpler shutdown-only path.
+#[tokio::test(flavor = "multi_thread")]
+async fn case_g_batch_no_loss() {
+    use opentelemetry_sdk::trace::BatchSpanProcessor;
+
+    // Fixed counts so the assertion math is explicit.
+    const TICKS: usize = 4;
+    const NODE_EVALS_PER_TICK: usize = 3;
+    const MSG_DELIVERS_PER_TICK: usize = 2;
+
+    let exporter = InMemorySpanExporter::default();
+    let processor = BatchSpanProcessor::builder(exporter.clone()).build();
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(processor)
+        .build();
+    let tracer = provider.tracer("graphreact-observer-test");
+    let sink = Arc::new(OtelSink::with_tracer(tracer));
+
+    for tick in 0..TICKS {
+        sink.on_scheduler_tick_start(&SchedulerTickStart {});
+        for n in 0..NODE_EVALS_PER_TICK {
+            let id = format!("n{tick}_{n}");
+            sink.on_node_evaluate_start(&NodeEvaluateStart { node_id: &id });
+            sink.on_node_evaluate_end(&NodeEvaluateEnd { node_id: &id });
+        }
+        for _m in 0..MSG_DELIVERS_PER_TICK {
+            sink.on_message_delivered(&MessageDelivered {
+                from: "src",
+                to: "dst",
+                message_type: "hop",
+                ttl: 1,
+                direct: true,
+                accepted: true,
+                trace_context: None,
+            });
+        }
+        sink.on_scheduler_tick_end(&SchedulerTickEnd {
+            iterations: 1,
+            terminated_by_depth_cap: false,
+        });
+    }
+
+    // `force_flush` drains the BatchSpanProcessor's queue through
+    // the exporter and waits for completion. We read the spans
+    // BEFORE `shutdown()` because `InMemorySpanExporter::shutdown`
+    // by default resets its internal buffer (see
+    // `opentelemetry_sdk-0.31.0/src/trace/in_memory_exporter.rs`
+    // `should_reset_on_shutdown`); shutdown after force_flush
+    // would clear the spans we want to assert on.
+    //
+    // `force_flush` is blocking under the sync BatchSpanProcessor —
+    // wrap in `spawn_blocking` so we don't deadlock the
+    // multi-thread runtime worker (per upstream warning at
+    // `span_processor.rs:279-282`).
+    let provider_for_flush = provider.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = provider_for_flush.force_flush();
+    })
+    .await
+    .expect("force_flush task");
+
+    let spans = exporter.get_finished_spans().expect("get_finished_spans");
+
+    // Drop the provider cleanly through `shutdown()` to let the
+    // background OS thread join — also blocking, also wrapped in
+    // `spawn_blocking` for the same deadlock-avoidance reason.
+    tokio::task::spawn_blocking(move || {
+        let _ = provider.shutdown();
+    })
+    .await
+    .expect("shutdown task");
+    // 1 root tick span + N node.evaluate child spans + M
+    // message.deliver one-shot spans per tick.
+    let expected = TICKS * (1 + NODE_EVALS_PER_TICK + MSG_DELIVERS_PER_TICK);
+    assert_eq!(
+        spans.len(),
+        expected,
+        "BatchSpanProcessor dropped spans: emitted {} but exporter saw {}",
+        expected,
+        spans.len(),
+    );
 }
 
 /// `decode_wire_context` round-trip: encode → decode → encode again
