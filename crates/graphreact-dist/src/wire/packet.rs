@@ -214,23 +214,25 @@ pub struct Hello {
     pub capabilities: Vec<String>,
     /// **Phase β (sub-track #4).** Per-engine capability bitmap.
     /// Substrate-level typed flag surface; see [`CAP_MIXED_RUNTIME`],
-    /// [`CAP_DELEGATED_RESTART`], [`CAP_AUDIT_CHAIN`]. v4 peers
-    /// (without this field on the wire) decode via the
-    /// [`HelloV4`] fallback path in
+    /// [`CAP_DELEGATED_RESTART`], [`CAP_AUDIT_CHAIN`].
+    ///
+    /// **Compat (one-bump, bitmap-blindness model)**: v5 daemons
+    /// receiving v4 Hellos decode via the [`HelloV4`] fallback path in
     /// [`crate::wire::WireCodec::decode`], synthesising
-    /// `capabilities_bitmap = 0` (no substrate-bitmap capabilities
-    /// advertised). Outbound from v5 daemons always populates this
-    /// field — v4 peers parse the new shape as garbage if they tried
-    /// (postcard would error with `DeserializeUnexpectedEnd` on the
-    /// trailing u64), so v4 peers MUST be on the receiving end of
-    /// the dual-struct fallback rather than the dispatching end.
-    /// That's only true for receivers running v5 or newer; v4
-    /// daemons in a mixed cluster see v5 Hellos as malformed and
-    /// drop the connection — Phase β's compat is one-directional
-    /// (v5 accepts v4; v4 does NOT accept v5). Operators rolling a
-    /// cluster therefore upgrade ALL daemons one bump up (v4→v5)
-    /// before any operator-driven feature that consumes the bitmap
-    /// (Phase γ +) starts demanding `capabilities_bitmap != 0`.
+    /// `capabilities_bitmap = 0`. v4 daemons receiving v5 Hellos
+    /// SILENTLY DROP the trailing u64 — postcard 1.x's `from_bytes`
+    /// documents that the unused portion of the byte slice is not
+    /// returned and does NOT error on trailing data (verify-finding
+    /// correction 2026-06-18; prior comments here claimed postcard
+    /// errored with `DeserializeUnexpectedEnd`, which is empirically
+    /// wrong). So both directions decode at the WIRE layer, but the
+    /// v4 side is BITMAP-BLIND: it sees the v4 shape with no
+    /// `capabilities_bitmap` field at all and cannot advertise or
+    /// consume any `CAP_*` bit. Operators rolling a cluster therefore
+    /// still upgrade ALL daemons one bump up (v4→v5) before any
+    /// feature that consumes the bitmap (Phase γ +) starts demanding
+    /// `capabilities_bitmap != 0` — not because the wire breaks, but
+    /// because v4 daemons cannot participate in bitmap-gated dispatch.
     pub capabilities_bitmap: u64,
 }
 
@@ -280,12 +282,14 @@ pub struct ChallengeAck {
     /// filter peers regardless of which side dialled.
     pub server_capabilities: Vec<String>,
     /// **Phase β (sub-track #4).** Server's capability bitmap (mirrors
-    /// [`Hello::capabilities_bitmap`]). v4 peers without this field
-    /// decode via the [`ChallengeAckV4`] fallback path in
-    /// [`crate::wire::WireCodec::decode`], synthesising
-    /// `capabilities_bitmap = 0`. Outbound from v5 daemons always
-    /// populates the field — see [`Hello::capabilities_bitmap`] for
-    /// the one-directional compat caveat.
+    /// [`Hello::capabilities_bitmap`]). v5 receivers consuming v4
+    /// ChallengeAcks decode via the [`ChallengeAckV4`] fallback path
+    /// in [`crate::wire::WireCodec::decode`], synthesising
+    /// `capabilities_bitmap = 0`. v4 receivers consuming v5
+    /// ChallengeAcks silently drop the trailing u64 (postcard 1.x
+    /// from_bytes ignores trailing data — verify-finding correction
+    /// 2026-06-18). See [`Hello::capabilities_bitmap`] for the
+    /// bitmap-blindness model + upgrade-ordering policy.
     pub capabilities_bitmap: u64,
 }
 

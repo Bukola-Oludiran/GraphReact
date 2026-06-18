@@ -21,12 +21,20 @@
 //!
 //! ## Wire-format dependency
 //!
-//! Trace context propagation REQUIRES `WIRE_VERSION = 3` (the
+//! Trace context propagation REQUIRES `WIRE_VERSION >= 3` (the
 //! [`crate::wire::Message::trace_context`] field landed at the same
 //! time as the version bump from M15's `WIRE_VERSION = 2`). This is
-//! a hard floor — peers running v2 cannot interop with v3 peers
-//! (per the existing `MIN_SUPPORTED_VERSION == WIRE_VERSION`
-//! invariant; M-Prod owns rolling-version negotiation).
+//! a hard floor — peers running v2 cannot interop with v3+ peers.
+//!
+//! **As of M-Prod #4 Phase β (2026-06-18)** the strict
+//! `MIN_SUPPORTED_VERSION == WIRE_VERSION` invariant is relaxed to a
+//! one-bump rolling-upgrade compat window:
+//! `MIN_SUPPORTED_VERSION + 1 == WIRE_VERSION` — see
+//! [`crate::wire::packet::WIRE_VERSION`] doc-comment + the
+//! `wire/frame.rs::tests::min_supported_version_is_one_below_wire_version`
+//! pin. Capability bits exchanged via the handshake still gate
+//! per-feature behavior as documented for each `_CAPABILITY` const
+//! below.
 
 use std::sync::Arc;
 
@@ -62,12 +70,12 @@ pub const OBSERVER_OTEL_V1_CAPABILITY: &str = "observer-otel-v1";
 /// inbound (the call origin's `PendingCalls` lookup never resolves).
 ///
 /// This is the same shape as
-/// [`OBSERVER_OTEL_V1_CAPABILITY`]: hard wire-version floor at the
-/// `WIRE_VERSION` boundary (v3 ↔ v4 are not interop-compatible per
-/// the `MIN_SUPPORTED_VERSION == WIRE_VERSION` invariant), then
-/// in-version capability gating for the new feature so two v4
-/// peers running different daemon configurations can coexist
-/// gracefully.
+/// [`OBSERVER_OTEL_V1_CAPABILITY`]: wire-version floor at the
+/// `MIN_SUPPORTED_VERSION` boundary (one-bump rolling-upgrade compat
+/// per M-Prod #4 Phase β), then in-version capability gating for the
+/// new feature so two peers running different daemon configurations
+/// can coexist gracefully. Phase β example: v4 ↔ v5 ARE
+/// interop-compatible (one bump apart); v3 ↔ v5 are not (two bumps).
 ///
 /// **String stability** — pinned by the
 /// `ingress_call_v1_capability_string_is_ingress_call_v1` test

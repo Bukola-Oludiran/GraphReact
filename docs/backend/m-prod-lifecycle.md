@@ -291,11 +291,20 @@ safe-slice on top of Phase α's drain primitive.
   synthesises to `0` (no substrate-bitmap capabilities advertised).
   Any other postcard error propagates — genuine wire corruption is
   NOT papered over as "v4 peer with zero bitmap". Compat is
-  **one-directional**: v5 daemons accept v4 Hellos; v4 daemons see
-  v5 Hellos as malformed (trailing u64 they don't recognise). The
-  policy implication: operators bump every daemon ONE step (v4→v5)
-  before any operator-driven feature (Phase γ +) starts demanding
-  `capabilities_bitmap != 0`.
+  **bitmap-blind** on the v4 side (verify-finding correction
+  2026-06-18; prior wording claimed v4 daemons "see v5 Hellos as
+  malformed and drop the connection", which is empirically wrong —
+  postcard 1.x's `from_bytes` silently ignores trailing bytes per its
+  documented contract, so v4 daemons successfully decode v5 Hellos
+  into the v4 shape AND silently discard the trailing
+  `capabilities_bitmap` varint). Both directions therefore decode at
+  the WIRE layer — but the v4 side cannot advertise or consume any
+  `CAP_*` bit because the v4 struct has no `capabilities_bitmap`
+  field at all. The policy implication still stands: operators bump
+  every daemon ONE step (v4→v5) before any operator-driven feature
+  (Phase γ +) starts demanding `capabilities_bitmap != 0` — not
+  because the wire breaks, but because bitmap-blind daemons cannot
+  participate in bitmap-gated dispatch.
 - Above-ceiling rejection: peers with `version > WIRE_VERSION`
   (future peers we don't understand) are rejected at the server-side
   handshake BEFORE the floor check; reuses the existing

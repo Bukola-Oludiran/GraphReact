@@ -130,3 +130,111 @@ impl WireCodec {
         })
     }
 }
+
+#[cfg(test)]
+mod wire_v4_fallback_tests {
+    //! **M-Prod sub-track #4 Phase β verify-finding patch.**
+    //! Unit tests for the v4 dual-struct fallback on `Hello` AND
+    //! `ChallengeAck`. The handshake-level integration tests in
+    //! `crate::handshake::rolling_version_tests` exercise the Hello
+    //! v4 path (a v4 dialer connecting to a v5 server). The
+    //! ChallengeAck v4 fallback fires in the OPPOSITE direction
+    //! (a v5 dialer reading a v4 server's ChallengeAck), which is
+    //! exactly the rolling-upgrade ordering where the dialer was
+    //! upgraded first. The handshake-level tests don't reach that
+    //! direction; these pure codec-level tests do.
+    use super::*;
+    use crate::wire::packet::{ChallengeAckV4, HelloV4};
+
+    #[test]
+    fn decode_v4_hello_synthesises_zero_bitmap() {
+        let v4 = HelloV4 {
+            version: 4,
+            flags: 0,
+            node_name: "v4-peer@127.0.0.1".to_string(),
+            creation: 7,
+            capabilities: vec!["pg-v1".into()],
+        };
+        let bytes = postcard::to_stdvec(&v4).expect("encode v4");
+        let decoded = WireCodec::decode(PacketType::Hello, &bytes).expect("decode v4 Hello");
+        match decoded {
+            Packet::Hello(h) => {
+                assert_eq!(h.version, 4);
+                assert_eq!(h.node_name, "v4-peer@127.0.0.1");
+                assert_eq!(h.capabilities, vec!["pg-v1".to_string()]);
+                assert_eq!(
+                    h.capabilities_bitmap, 0,
+                    "v4 dual-struct fallback MUST synthesise zero bitmap"
+                );
+            }
+            other => panic!("expected Packet::Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_v4_challenge_ack_synthesises_zero_bitmap() {
+        let v4 = ChallengeAckV4 {
+            digest: [0x42; 32],
+            server_capabilities: vec!["mon-v1".into(), "observer-otel-v1".into()],
+        };
+        let bytes = postcard::to_stdvec(&v4).expect("encode v4 ChallengeAck");
+        let decoded =
+            WireCodec::decode(PacketType::ChallengeAck, &bytes).expect("decode v4 ChallengeAck");
+        match decoded {
+            Packet::ChallengeAck(a) => {
+                assert_eq!(a.digest, [0x42; 32]);
+                assert_eq!(
+                    a.server_capabilities,
+                    vec!["mon-v1".to_string(), "observer-otel-v1".to_string()]
+                );
+                assert_eq!(
+                    a.capabilities_bitmap, 0,
+                    "v4 dual-struct fallback MUST synthesise zero bitmap on ChallengeAck"
+                );
+            }
+            other => panic!("expected Packet::ChallengeAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_v5_hello_preserves_bitmap() {
+        // Sanity: the v5-direct path still works AND carries
+        // a non-zero bitmap through unchanged.
+        let v5 = Hello {
+            version: 5,
+            flags: 0,
+            node_name: "v5-peer@127.0.0.1".to_string(),
+            creation: 9,
+            capabilities: vec!["pg-v1".into()],
+            capabilities_bitmap: 0x5a5a_5a5a,
+        };
+        let bytes = postcard::to_stdvec(&v5).expect("encode v5");
+        let decoded = WireCodec::decode(PacketType::Hello, &bytes).expect("decode v5 Hello");
+        match decoded {
+            Packet::Hello(h) => {
+                assert_eq!(h.version, 5);
+                assert_eq!(h.capabilities_bitmap, 0x5a5a_5a5a);
+            }
+            other => panic!("expected Packet::Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_v5_challenge_ack_preserves_bitmap() {
+        let v5 = ChallengeAck {
+            digest: [0x7e; 32],
+            server_capabilities: vec!["mon-v1".into()],
+            capabilities_bitmap: 0xdead_beef,
+        };
+        let bytes = postcard::to_stdvec(&v5).expect("encode v5 ChallengeAck");
+        let decoded =
+            WireCodec::decode(PacketType::ChallengeAck, &bytes).expect("decode v5 ChallengeAck");
+        match decoded {
+            Packet::ChallengeAck(a) => {
+                assert_eq!(a.digest, [0x7e; 32]);
+                assert_eq!(a.capabilities_bitmap, 0xdead_beef);
+            }
+            other => panic!("expected Packet::ChallengeAck, got {other:?}"),
+        }
+    }
+}

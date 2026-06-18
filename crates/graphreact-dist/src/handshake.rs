@@ -984,6 +984,99 @@ mod rolling_version_tests {
         );
     }
 
+    /// Test 4 (verify-finding patch): above-ceiling peer rejection
+    /// fires `wire_version_above_ceiling` audit row. Hand-encodes a
+    /// HelloV4-shape payload with `version = WIRE_VERSION + 1 = 6`
+    /// (postcard silently ignores trailing bytes when present, so
+    /// the v4 shape is sufficient — the server's strict ceiling
+    /// check fires on `hello.version > WIRE_VERSION` BEFORE any
+    /// floor logic). Symmetric to `floor_minus_two_peer_rejected`
+    /// but on the OTHER side of the wire-version window.
+    #[tokio::test]
+    async fn above_ceiling_peer_rejected_with_above_ceiling_audit() {
+        let (alice, bob) = dev_tls::pair("alice", "bob").expect("pair");
+        let (alice_stream, bob_stream) = tokio::io::duplex(64 * 1024);
+        let alice_cfg = alice.config.clone();
+        let bob_cfg = bob.config.clone();
+        let alice_node: NodeId = "alice@127.0.0.1".parse().unwrap();
+        let server_cookie = cookie_str("shared");
+
+        let buf = AuditCapture::new();
+        let server_subscriber = make_audit_subscriber(&buf);
+        let server_task = tokio::spawn(
+            async move {
+                let mut conn = accept_over(alice_stream, &alice_cfg).await?;
+                let result = server_handshake(
+                    &mut conn,
+                    &server_cookie,
+                    &alice_node,
+                    Creation(1),
+                    vec!["mon-v1".into()],
+                    0,
+                )
+                .await;
+                let _ = conn.close().await;
+                result
+            }
+            .with_subscriber(server_subscriber),
+        );
+
+        let client_task = tokio::spawn(async move {
+            let conn = dial_over(bob_stream, "alice", &bob_cfg).await?;
+            // version = WIRE_VERSION + 1 = 6 — one bump above the
+            // current ceiling. v4-shape encode is fine: postcard
+            // silently drops trailing bytes when the wire shape
+            // differs, and the server's ceiling check fires on the
+            // version field alone.
+            let frame = build_v4_hello_frame(WIRE_VERSION + 1, "bob@127.0.0.1", 1);
+            let parts = conn.into_parts();
+            let mut tls_stream = parts.io;
+            let mut write_buf = parts.write_buf;
+            if !write_buf.is_empty() {
+                tls_stream.write_all(&write_buf).await.map_err(DistError::from)?;
+                write_buf.clear();
+            }
+            tls_stream
+                .write_all(&frame)
+                .await
+                .map_err(DistError::from)?;
+            tls_stream.flush().await.map_err(DistError::from)?;
+            // Drain the close signal.
+            let mut tmp = [0u8; 4096];
+            let _ = tls_stream.read(&mut tmp).await;
+            Ok::<(), DistError>(())
+        });
+
+        let server_result = server_task.await.expect("server join");
+        let _ = client_task.await.expect("client join");
+
+        match server_result {
+            Err(DistError::UnsupportedVersion { got, .. }) => {
+                assert_eq!(got, WIRE_VERSION + 1);
+            }
+            other => panic!("expected UnsupportedVersion (above-ceiling), got {other:?}"),
+        }
+
+        let lines = buf.lines();
+        let rejected = lines
+            .iter()
+            .find(|l| l.contains("cluster_handshake_rejected"))
+            .expect("cluster_handshake_rejected audit row");
+        assert!(
+            rejected.contains(&format!("\"peer_wire_version\":\"{}\"", WIRE_VERSION + 1)),
+            "expected peer_wire_version={} in {rejected}",
+            WIRE_VERSION + 1
+        );
+        assert!(
+            rejected.contains(&format!("\"local_wire_version\":\"{WIRE_VERSION}\"")),
+            "expected local_wire_version={WIRE_VERSION} in {rejected}"
+        );
+        assert!(
+            rejected.contains("wire_version_above_ceiling"),
+            "expected reason=wire_version_above_ceiling in {rejected}"
+        );
+    }
+
     /// Test 3: two v5 peers exchange bitmaps; the negotiated set is
     /// the bitwise AND. Server advertises
     /// `CAP_DELEGATED_RESTART | CAP_AUDIT_CHAIN` and client
