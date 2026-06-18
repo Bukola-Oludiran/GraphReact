@@ -75,6 +75,10 @@ async fn spawn_with_sink(
         process_start_id: 0xdead_beef,
         cluster_readyz: None,
         audit_sink: Some(sink),
+        // M-Prod #4 Phase α drain flag is None on the audit-chain
+        // e2e path — drain is irrelevant here and a None flag keeps
+        // the readyz + ingress fast-paths in their pre-#4 shape.
+        draining: None,
     })
     .await
     .expect("spawn");

@@ -95,6 +95,7 @@ async fn boot_daemon_with_observer() -> graphreact_cli::commands::DaemonHandle {
         debug_wait: false,
         observer_otel_endpoint: None,
         observer_otel_service_name: None,
+        observer_audit_log: None,
         drain_deadline_secs: None,
     };
     start_daemon(opts).await.expect("daemon start")
