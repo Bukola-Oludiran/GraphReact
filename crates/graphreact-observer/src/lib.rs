@@ -51,6 +51,7 @@ pub mod multiplex;
 pub mod otel;
 pub mod prometheus;
 pub mod prometheus_sink;
+pub mod rbac;
 pub mod ring_buffer;
 pub mod tls;
 pub mod tls_rotation;
@@ -76,12 +77,16 @@ pub use otel::{
 #[cfg(feature = "otel")]
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 
-pub use audit::log_tls_reload_skipped;
+pub use audit::{log_auth_success, log_authz_deny, log_tls_reload_skipped};
 pub use audit_chain::{
     replay as replay_audit_chain, AuditChainError, AuditRecord, AuditRecordInput, AuditSink,
     FileAuditSink, NopAuditSink,
 };
 pub use auth::{AuthError, BearerToken};
+pub use rbac::{
+    RegistryError, Role, RotatableRegistry, TokenEntry, TokenId, TokenRegistry, MAX_TOKENS,
+    READ_ONLY_ROUTES,
+};
 pub use bind::{BindConfig, BindConfigError, BindFlags, DEFAULT_BIND};
 pub use drain::{
     log_drain_completed, log_drain_deadline_exceeded, DrainFlag, InflightGuard, IngressInFlight,

@@ -91,6 +91,12 @@ async fn spawn_with_limit(
         audit_sink,
         draining: None,
         rate_limit: Some(rate_limit),
+        // M-Prod #1 Phase B Part 1 RBAC is None on the rate-limit
+        // e2e path — these tests exercise the per-IP rate-limit
+        // middleware sitting OUTSIDE the auth layer, so the
+        // auth path under test stays in the Phase A single-token
+        // shape.
+        rbac: None,
     })
     .await
     .expect("spawn");

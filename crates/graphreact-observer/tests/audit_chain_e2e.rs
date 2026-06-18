@@ -83,6 +83,11 @@ async fn spawn_with_sink(
         // e2e path — these tests don't exercise the limiter and
         // None falls through to the env-var defaults.
         rate_limit: None,
+        // M-Prod #1 Phase B Part 1 RBAC is None on the audit-chain
+        // e2e path — these tests cover the single-token Phase A
+        // flow + the strict-additive guarantee that a Phase A
+        // daemon spawn keeps producing the same chain shape.
+        rbac: None,
     })
     .await
     .expect("spawn");
