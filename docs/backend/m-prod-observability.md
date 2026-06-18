@@ -97,12 +97,45 @@ match tokio::time::timeout(deadline, join).await {
 
 **Tests:** `commands::tests::observer_shutdown_deadline_env_var` — verifies the env-var contract (unset / empty / unparseable / zero all fall through; positive integer is accepted as seconds).
 
+## Shipped — `case_g_batch` bench
+
+**M-Prod sub-track #5 Phase B closeout, 2026-06-18.** A `case_g_batch` Criterion variant + a `case_g_batch_no_loss` integration test land alongside the existing `case_g_otel_sink` SimpleSpanProcessor cell. The new variant uses `opentelemetry_sdk::trace::BatchSpanProcessor` — the **sync** variant, NOT `span_processor_with_async_runtime::BatchSpanProcessor` — matching the production [`build_otel_sink`](../../crates/graphreact-observer/src/otel.rs) constructor's `.with_batch_exporter(...)` call.
+
+**Bench location:** `crates/graphreact-observer/benches/scheduler_overhead.rs::bench_case_g_batch` (gated behind `otel-test` because `InMemorySpanExporter` lives under `opentelemetry_sdk/testing`).
+
+**Lossless-export test:** `crates/graphreact-observer/tests/otel_sink.rs::case_g_batch_no_loss` — synthesizes a fixed event sequence (4 ticks × (1 + 3 node.evaluate + 2 message.deliver) = 24 spans), `force_flush`es through the `BatchSpanProcessor`, and asserts `get_finished_spans().len() == 24`. Pinning the lossless invariant against future processor or queue-depth tuning.
+
+**Measured 2026-06-18 (macOS dev, release, `--measurement-time 5`):**
+
+| Variant | Time | vs `case_a` baseline |
+|---|---|---|
+| `case_a_trait_not_attached` | 17.7 ms | — |
+| `case_g_batch` (BatchSpanProcessor) | 19.9 ms | **+12%** |
+| `case_g_otel_sink` (SimpleSpanProcessor) | 23.6 ms | +33% |
+
+The batch processor saves ~21 percentage points of overhead vs the synchronous `SimpleSpanProcessor` at the fixture's ~9000 spans / iteration. Variance is wide (per-iteration flush + drop jitter) — the ratio band is the load-bearing number, not the absolute time.
+
+**Substrate notes:**
+
+- The sync `BatchSpanProcessor` uses a dedicated background **OS thread** for the drain (NOT a tokio task). The bench and test wrap iteration in a multi-thread tokio runtime so the `SdkTracerProvider` is BUILT inside a runtime context — parity with the production-side `opentelemetry_otlp::SpanExporter::with_tonic()` constraint that the provider be created inside a tokio runtime so the `grpc-tonic` channel can initialize. The processor itself does not need the runtime.
+- `BatchSpanProcessor::shutdown()` and `force_flush()` are both **blocking** under the sync variant. The bench wraps shutdown in `tokio::task::spawn_blocking` per the upstream warning at `opentelemetry_sdk-0.31.0/src/trace/span_processor.rs:279-282` (calling from a current-thread tokio main thread deadlocks). The test uses the same wrap for `force_flush` so a multi-thread worker can park while the blocking call joins.
+- The test reads `get_finished_spans()` AFTER `force_flush` but BEFORE `shutdown` because `InMemorySpanExporter::shutdown` by default RESETS its internal buffer (`should_reset_on_shutdown=true`). Calling shutdown first would clear the spans the assertion needs.
+
+**Run locally:**
+
+```bash
+cargo test  -p graphreact-observer --features otel-test --test otel_sink case_g_batch_no_loss
+cargo bench -p graphreact-observer --features otel-test --bench scheduler_overhead case_g_batch -- --warm-up-time 1 --measurement-time 5
+```
+
+**BatchSpanProcessor connect handle for readyz:** unchanged. The bench/test use `InMemorySpanExporter`, which has no connect handle. The "OTel exporter reachable" readyz extension at the bottom of [Open work in #5](#open-work-in-5) stays deferred — exposing connect-state from `opentelemetry_otlp::SpanExporter` is its own next slice.
+
 ## Open work in #5
 
 - ~~**`docs/SLO.md`**: not yet authored~~ — **SHIPPED 2026-06-17.** See [`docs/SLO.md`](../../docs/SLO.md). Engine-attributed rows are explicitly marked `BLOCKED ON M17/M22 per-engine cardinality lock`.
 - ~~**mpsc::Sender uniform backpressure audit**~~ — **SHIPPED 2026-06-17 (residual slice).** Ingress endpoints (`POST /v1/nodes/:id/{messages,call,messages/bulk}`) now use `try_send`→503 + `Retry-After: 1` via [`bridge_saturated_response`](../../crates/graphreact-observer/src/management_api.rs). Read-snapshot bridges (`nodes_list` / `node_detail` / `supervisor_tree`) keep `send().await` — those are internal observer→scheduler reads with bounded depth; blocking briefly is preferable to a 503 cascade on the snapshot surface. The bulk-response body `out_tx` (`mpsc::channel(64)`) also keeps `send().await` — that's slow-HTTP-client flow control, NOT scheduler backpressure; converting it to `try_send` would silently drop NDJSON result lines.
 - ~~**Cluster-membership readyz extension**~~ — **SHIPPED 2026-06-17 (residual slice).** See predicate row above. Probe is a lock-free `Arc<dyn Fn() -> bool>` capturing `configured_peers + Arc<AtomicUsize>` so `/v1/readyz` doesn't pay any allocation per request.
-- **OTel `case_g_batch` bench variant**: the current `case_g_otel_sink` uses SimpleSpanProcessor and overstates per-emit cost. The production path uses BatchSpanProcessor; needs a parallel bench cell to measure it honestly.
+- ~~**OTel `case_g_batch` bench variant**: the current `case_g_otel_sink` uses SimpleSpanProcessor and overstates per-emit cost. The production path uses BatchSpanProcessor; needs a parallel bench cell to measure it honestly.~~ — **SHIPPED 2026-06-18 (Phase B).** See [Shipped — `case_g_batch` bench](#shipped--case_g_batch-bench) above. Measured ratio drops from +33% (`case_g_otel_sink`) to +12% (`case_g_batch`) over the trait-not-attached baseline.
 - ~~**Per-route 503-vs-429 ordering audit** (joint contract with sub-track #6 rate-limiter): when both fire under saturation, which precedence does the operator see? Need a single policy locked between #5 and #6.~~ — **SHIPPED 2026-06-18 (#6 Phase A).** Precedence ladder `drain > rate_limit > auth > bridge_saturated` is documented in [`m-prod-rate-limit.md`](m-prod-rate-limit.md). 429 fires before 503 when both could apply: "going too fast" is actionable client-side, "scheduler slow" is operator-side; surfacing 429 first means the client backs off without waking the operator. Canonical response envelope (same JSON shape across `rate_limited` / `bridge_saturated` / `draining` / `scheduler_first_batch_pending` / `cluster_no_peers_connected`) is unit-test-pinned via `rate_limited_response_shape_matches_bridge_saturated_envelope`.
 - **Readiness predicate extensions** (deferred inside #5 until sub-track dependencies land):
   - TLS cert loaded / not-in-rotation — needs sub-track #2 SIGHUP reload primitive.
