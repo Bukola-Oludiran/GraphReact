@@ -60,14 +60,59 @@ The existing `deny` CI job (EmbarkStudios/cargo-deny-action@v2) runs `check advi
 
 The CycloneDX SBOM rides on top of this: the SBOM describes the dep tree, `cargo-deny` enforces what's allowed in the dep tree.
 
+## Shipped — Group 2 batch (2026-06-17)
+
+### `grx version` advertises `GRX_SIGNATURE_URL`
+
+`crates/graphreact-cli/build.rs` reads `GRX_SIGNATURE_URL` from the build environment and emits `cargo:rustc-env=GRX_SIGNATURE_URL=<value>` (empty string when unset). `run_version()` reads the baked value via `option_env!()` and renders a `signature: <URL>\n` line ONLY when the value is non-empty.
+
+**Operator contract:**
+
+- absent at build time ⇒ `grx version` omits the signature line entirely (every dev build, every CI build that isn't a tagged release).
+- set at build time ⇒ `grx version` appends `signature: <URL>` after the cpython engine line; operators re-verify via `cosign verify-blob --signature <URL>.sig <URL>` (cosign + signing pipeline lands with sub-track #8 — the runbook documents the contract today).
+
+The legacy version output shape (`grx <ver>`, `parser`, `engine-trait`, `engine-null`, `engine-echo`, the long jsc + cpython lines) is preserved bit-for-bit — the signature line is purely additive. Unit test `commands::tests::version_omits_signature_when_unset` locks the absent contract; `version_shape_preserved` locks the legacy prefixes against regression. The env-var-set path is exercised by the same test via `option_env!()` branching, and end-to-end by the release pipeline (sub-track #8) when it ships.
+
+### Reproducible-build verifier CI cell
+
+A new `reproducible-build` job in `.github/workflows/ci.yml` twice-builds `target/release/grx` on a single runner and compares the SHA-256 hashes.
+
+**Knobs:**
+
+- `runs-on: ubuntu-latest`, `if: github.event_name == 'push'` (push-to-main + tags only — PRs would pay the ~6-8 min twice-build cost), `continue-on-error: true` (first-ship posture; see flip-to-hard-gate trigger below).
+- Toolchain: `dtolnay/rust-toolchain@stable` (NOT nightly — reproducibility is a stable-toolchain gate; same SHA across both builds in one job is guaranteed).
+- `SOURCE_DATE_EPOCH`: set from `$(git log -1 --pretty=%ct)` (HEAD's committer timestamp), surfaced via `$GITHUB_ENV` so both build steps see the same value.
+- `RUSTFLAGS`: `--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=${{ env.HOME }}/.cargo=/cargo` to strip the runner's homedir from debuginfo.
+- Zig static libs (`libgraphreact_jsc_zig.a`, `libgraphreact_cpython_zig.a`, `libgraphreact_echo_zig.a`) produced ONCE via `cargo xtask zig-build --release` and frozen between the two Rust builds (see "Phase A scope" below).
+- Compare: `sha256sum target/release/grx` after each build → if mismatch, `::warning::` + non-zero exit (so `continue-on-error: true` marks the job failed-but-non-blocking instead of falsely green).
+- Upload both `/tmp/grx-sha256-{1,2}.txt` as `reproducible-build-sha256-<sha-or-tag>` workflow artifact (90-day retention) for audit.
+
+**Phase A scope (today):** twice-build OF THE RUST TARGET ONLY. `SOURCE_DATE_EPOCH` + `--remap-path-prefix` do NOT propagate through `cargo xtask zig-build` (those would need separate zig-build env plumbing), so the `.a` files are produced once and frozen between the two Rust builds. Cross-host reproducibility is also out of scope: `crates/graphreact-cli/build.rs` bakes an absolute LC_RPATH to the libpython libdir (Homebrew on macOS, system on Linux) which is host-stable within a runner but host-specific across runners.
+
+**Phase B flip-to-hard-gate trigger:** drop `continue-on-error: true` AND flip the divergence path from `::warning::` to a hard fail once (a) the zig-build lane threads `SOURCE_DATE_EPOCH` / `--remap-path-prefix` through `zig build`, OR (b) the LC_RPATH bake is replaced with a relative `@rpath`-style lookup. Tracked alongside SLSA + per-arch SBOMs in the deferred-to-#8 list below.
+
+### Trivy SBOM vulnerability scan (SARIF → GitHub Security tab)
+
+A new `trivy-sbom-scan` job in `.github/workflows/ci.yml` depends on the existing `cyclonedx-sbom` job, downloads the SBOM artifact, runs Trivy in `scan-type: sbom` mode (severity HIGH+CRITICAL) and uploads SARIF to the GitHub Security tab via `github/codeql-action/upload-sarif@v3`.
+
+**Knobs:**
+
+- `needs: cyclonedx-sbom`, `if: github.event_name == 'push'`, `continue-on-error: true`.
+- `permissions: { security-events: write, contents: read }` scoped to THIS JOB ONLY — no workflow-level `permissions:` block is added; every other job continues to run under the default GITHUB_TOKEN posture. Matches the GitHub-Actions-hardening doc-comment at the top of `ci.yml`.
+- Action pinning: `aquasecurity/trivy-action@0.24.0` (upstream recommends `@master`; we pin to a tagged release like every other action in this workflow). Bump via deliberate PR.
+- `exit-code: 0` on the Trivy action itself + `continue-on-error: true` at the job level → Phase A is non-gating. SARIF is the operator-facing signal; Phase B flips both knobs to hard-fail once the CVE backlog is triaged.
+- Per-crate SBOM scan: the CycloneDX cell emits one `<crate>.cdx.json` per workspace member; Trivy's SBOM scanner accepts a directory of CycloneDX files and merges the findings — no `cyclonedx-cli` merge step needed.
+- Persists raw SARIF as `trivy-sarif-<sha-or-tag>` workflow artifact (90-day retention) in addition to the Security-tab upload, so operators can grab it via `gh run download` without going through the API.
+
 ## Open work in #7
 
-- **Sigstore-keyless signing of release artifacts** — blocked on sub-track #8 (Dockerfile + release.yml + tag triggers). Once #8 ships, add a `cosign sign` step to the release pipeline + GitHub Actions `permissions: id-token: write`.
-- **`grx --version` signature URL** — needs a `build.rs` env-var passthrough (`GRX_SIGNATURE_URL`) + one line in `run_version()` printing it when non-empty.
-- **Reproducible-build determinism verifier** — twice-build + diff CI cell. `[profile.release]` already pins `codegen-units = 1`; needs `SOURCE_DATE_EPOCH` + `--remap-path-prefix` RUSTFLAGS injection + an actual diff cell on a different host / timestamp.
+- ~~**`grx --version` signature URL**~~ — SHIPPED 2026-06-17 (Group 2 batch above).
+- ~~**Reproducible-build determinism verifier**~~ — SHIPPED 2026-06-17 (Group 2 batch above; Phase A scope: same-runner Rust-only twice-build, see flip-to-hard-gate trigger).
+- ~~**Vulnerability scanning of the CycloneDX output (Trivy)**~~ — SHIPPED 2026-06-17 (Group 2 batch above; Phase A non-gating, flip-to-hard-gate after CVE backlog triage).
+- **Sigstore-keyless signing of release artifacts** — blocked on sub-track #8 (Dockerfile + release.yml + tag triggers). Once #8 ships, add a `cosign sign` step to the release pipeline + GitHub Actions `permissions: id-token: write` (the only sub-track #7 deliverable that needs workflow-level permission widening — the Trivy cell's `security-events: write` is job-scoped).
 - **SLSA build provenance attestation** (`actions/attest-build-provenance@v1`) — pairs naturally with Sigstore-keyless. Same blocker: needs the release pipeline.
 - **Per-arch SBOMs** when the multi-arch matrix lands (sub-track #8).
-- **Vulnerability scanning** of the CycloneDX output (Grype / Trivy) — soft addition; not in the explicit acceptance gate but conventional pair.
+- **Cross-host / Phase B reproducible build** — threading `SOURCE_DATE_EPOCH` + `--remap-path-prefix` through `cargo xtask zig-build`, replacing the absolute LC_RPATH bake with `@rpath`-style lookup. Flip-to-hard-gate trigger for the repro cell.
 
 ## Verifying the SBOM locally
 
