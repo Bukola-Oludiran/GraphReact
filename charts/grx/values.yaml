@@ -50,14 +50,23 @@ affinity: {}
 
 runtime:
   # Engine kind: "jsc" | "cpython" | "go" | "mixed" | "null" — passed
-  # through as the daemon's `--engine` selector. The default `mixed`
-  # leaves engine selection to the .grx body's `lang:` attribute (matches
-  # M22 mixed-runtime semantics).
+  # through as the daemon's `--runtime` selector (cli.rs::RuntimeArg).
+  # The default `mixed` brings up every engine present in the .grx body
+  # (matches M22 mixed-runtime semantics).
   kind: "mixed"
 
-  # `args` passes additional CLI flags to `grx cluster daemon`. Defaults
-  # below already cover the M-Prod posture (drain deadline + observer
-  # bind); operators add more here (e.g. `--config /etc/grx/system.grx`).
+  # Path to the `.grx` system the daemon runs. REQUIRED for the default
+  # `grx run` entrypoint shipped in Phase A. Mount the .grx (and any
+  # imports) via a ConfigMap or PVC at this path before installing —
+  # the default below points at a placeholder ConfigMap path operators
+  # MUST override. (Cluster mode — `grx cluster daemon` — requires
+  # node-id / cookie / TLS material that doesn't sensibly default;
+  # cluster-mode preset ships in Phase B.)
+  scriptPath: "/etc/grx/system.grx"
+
+  # `args` passes additional CLI flags to `grx run`. Defaults above
+  # already cover the M-Prod posture (runtime, observer bind, audit
+  # log, token); operators add more here (e.g. `--watch`).
   args: []
 
 # -----------------------------------------------------------------------------
@@ -66,8 +75,11 @@ runtime:
 
 observer:
   # Bind for /v1/healthz, /v1/readyz, /metrics, /v1/nodes/:id/*.
-  # `:9090` matches the m-prod-observability.md reference port.
-  bind: ":9090"
+  # MUST be a fully-qualified `IP:port` — Rust's `SocketAddr` parser
+  # rejects the bare `:port` shorthand. `0.0.0.0:9090` exposes the
+  # observer to in-cluster traffic on the standard m-prod-observability
+  # reference port. Empty disables the management API entirely.
+  bind: "0.0.0.0:9090"
 
   token:
     # Auth bearer for the M-Ingress surface — read from an existing

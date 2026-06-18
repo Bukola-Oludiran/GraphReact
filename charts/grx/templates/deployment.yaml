@@ -35,44 +35,65 @@ spec:
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
 
-          # `grx cluster daemon` is the production server entrypoint.
-          # The Dockerfile defaults to `grx --help`; helm overrides
-          # explicitly here so the operator-visible command surface is
-          # in YAML, not buried in the image.
+          # `grx run` is the single-node entrypoint shipped by this
+          # chart in Phase A. Production multi-node `grx cluster
+          # daemon` requires operator-supplied node-id + listen + TLS
+          # cert/key/CA + cookie material — those secrets live outside
+          # what a chart can sensibly default; a cluster-mode preset
+          # ships in Phase B (charts/grx/values-cluster.yaml).
+          #
+          # The `--runtime` flag name matches the CLI (cli.rs:430);
+          # values.runtime.kind picks one of null/echo/jsc/cpython/go.
+          # The script path is mandatory positional for `grx run`.
           args:
-            - "cluster"
-            - "daemon"
+            - "run"
+            - {{ .Values.runtime.scriptPath | quote }}
+            - "--runtime"
+            - {{ .Values.runtime.kind | quote }}
+            {{- if .Values.observer.bind }}
             - "--observer-bind"
             - {{ .Values.observer.bind | quote }}
-            - "--drain-deadline-secs"
-            - "{{ .Values.lifecycle.drainDeadlineSecs }}"
-            {{- if ne .Values.runtime.kind "mixed" }}
-            - "--engine"
-            - {{ .Values.runtime.kind | quote }}
+            {{- end }}
+            {{- if .Values.observer.token.existingSecret }}
+            # --observer-token-env points clap at the env var name the
+            # binary should read; the env var itself is wired below
+            # via secretKeyRef so the token never appears in `ps`.
+            - "--observer-token-env"
+            - "GRX_OBSERVER_TOKEN"
+            {{- end }}
+            {{- if .Values.observer.audit.logPath }}
+            # --observer-audit-log opens a FileAuditSink (mode 0o600
+            # enforced by the binary, see m-prod-auth.md). The path
+            # must live on a writable mount; values.audit.volume
+            # provisions an emptyDir or PVC at the path's parent.
+            - "--observer-audit-log"
+            - {{ .Values.observer.audit.logPath | quote }}
             {{- end }}
             {{- with .Values.runtime.args }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
 
           env:
-            # Mirror the CLI flag into the env var that
-            # `commands.rs::resolve_drain_deadline()` reads when the
-            # CLI flag is not explicitly set. Belt-and-suspenders so a
-            # future args override doesn't silently drop the budget.
+            # Mirror the drain-deadline CLI flag into the env var the
+            # binary reads when --drain-deadline-secs is not set
+            # (commands.rs::resolve_drain_deadline). Belt-and-
+            # suspenders so a future args override doesn't silently
+            # drop the budget.
             - name: GRX_DRAIN_DEADLINE_SECS
               value: "{{ .Values.lifecycle.drainDeadlineSecs }}"
             - name: OBSERVER_SHUTDOWN_DEADLINE
               value: "{{ .Values.lifecycle.observerShutdownDeadline }}"
             {{- if .Values.observer.token.existingSecret }}
+            # Token-from-secret pattern: chart projects the secret
+            # value into GRX_OBSERVER_TOKEN, and --observer-token-env
+            # (set above) tells the binary to read that name. The
+            # binary's auth substrate (auth.rs::BearerToken::from_env)
+            # zeroizes the value on drop.
             - name: GRX_OBSERVER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.observer.token.existingSecret | quote }}
                   key: {{ .Values.observer.token.key | quote }}
-            {{- end }}
-            {{- if .Values.observer.audit.logPath }}
-            - name: GRX_AUDIT_LOG_PATH
-              value: {{ .Values.observer.audit.logPath | quote }}
             {{- end }}
 
           ports:

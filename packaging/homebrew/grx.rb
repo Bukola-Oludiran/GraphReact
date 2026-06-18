@@ -36,8 +36,10 @@ class Grx < Formula
   license "MIT"
   version "0.1.0"
 
-  # Phase A: no bottle pipeline yet — see top-of-file note.
-  bottle :unneeded
+  # Phase A: no bottle pipeline yet. Homebrew removed `bottle :unneeded`
+  # and `bottle :none` in brew 3.6.0 (Sep 2022); modern formulae simply
+  # omit the `bottle` block until a `bottle do ... end` is wired up.
+  # See `Open work in #8` in docs/backend/m-prod-packaging.md.
 
   # Build-time deps:
   #

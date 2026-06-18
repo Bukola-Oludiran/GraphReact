@@ -117,6 +117,7 @@ Phase B submits to a `graphreact/homebrew-tap` repo (with the `bottle` block pop
 
 | Item | Phase | Blocker |
 |---|---|---|
+| Pin Dockerfile base-stage SHAs (`gcr.io/distroless/cc-debian12@sha256:…`, `python:3.13-slim-bookworm@sha256:…`, `rust:1.83-bookworm@sha256:…`) | B | Phase A uses floating tags so the docker-load tars match whatever upstream ships at build time; Phase B digest-pins them and surfaces the digests in release-notes so the audit trail vouches for the final-image SHA, not just the binary bytes |
 | Sigstore-keyless signing of binary + OCI image | B | OIDC trust setup + `vars.PUSH_TO_GHCR` repo variable + `environment: production-release` approval gate |
 | SLSA build provenance attestation (`actions/attest-build-provenance@v1`) | B | Pairs with Sigstore-keyless — same blockers |
 | ghcr.io push of multi-arch images | B | Same blockers |
@@ -154,7 +155,17 @@ docker buildx build --platform=linux/amd64 -t grx:dev .
 # Run --help (sanity)
 docker run --rm grx:dev
 
-# Run the daemon with a port-forwarded observer
-docker run --rm -p 9090:9090 grx:dev cluster daemon --observer-bind ":9090"
+# Run the single-node entrypoint with a port-forwarded observer. `grx
+# run <system.grx>` needs a mounted .grx file — pass --runtime null
+# for the smoke test (no body execution; the management API binds + /
+# v1/readyz reflects scheduler boot). For a real run, mount the .grx
+# at /etc/grx/system.grx via -v or via the helm ConfigMap.
+docker run --rm -p 9090:9090 -v "$PWD/examples/null.grx:/etc/grx/system.grx:ro" \
+  grx:dev run /etc/grx/system.grx \
+  --runtime null --observer-bind 0.0.0.0:9090
 curl http://localhost:9090/v1/readyz
+
+# Cluster mode (multi-node) needs operator-supplied node-id +
+# cookie + TLS cert/key/CA; helm chart's cluster preset ships in
+# Phase B. For a one-off, see `docs/backend/m14-distribution.md`.
 ```
