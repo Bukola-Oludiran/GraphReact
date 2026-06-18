@@ -1252,6 +1252,25 @@ pub async fn spawn_with_options(
         rate_limit,
         rbac,
     } = opts;
+    // **Verify-finding patch (LOW).** Surface the config foot-gun where
+    // an operator wires BOTH a Phase A single-token (`bind.token =
+    // Some(...)`) AND a Phase B RBAC registry (`rbac = Some(...)`).
+    // `auth_layer` treats RBAC as precedence-winner so the single-token
+    // becomes dead config — log a boot-time warning so the operator
+    // knows their old `--observer-token-{env,file}` flag is silently
+    // ignored after the flip to RBAC. The warning rides the same
+    // `graphreact::observer::audit` target as the bind event so it
+    // shows up in the operator dashboard adjacent to the spawn record.
+    if bind.token.is_some() && rbac.is_some() {
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            event = "auth_config_conflict",
+            "both bind.token and rbac are wired — RBAC takes precedence \
+             and the single-token is silently ignored; remove the \
+             --observer-token-{{env,file}} flag once the operator has \
+             migrated to multi-token RBAC"
+        );
+    }
     let listener = TcpListener::bind(bind.addr).await?;
     let local_addr = listener.local_addr()?;
     crate::audit::log_bind(
@@ -2764,7 +2783,7 @@ async fn auth_layer_rbac(
         .map(SocketAddr::to_string)
         .unwrap_or_else(|| "<unknown>".into());
 
-    let snap = rbac.load();
+    let snap = rbac.current();
 
     let Some(candidate_bytes) = candidate else {
         tracing::warn!(
@@ -2805,10 +2824,18 @@ async fn auth_layer_rbac(
     };
 
     if snap.is_expired(entry, std::time::SystemTime::now()) {
+        // **Verify-finding patch (MED).** The expired path KNOWS the
+        // matched principal — emit `token_id` alongside `reason` so
+        // SOC pipelines can distinguish "known principal whose
+        // credential aged out" from "unknown wire-side junk that was
+        // expired-shaped" (= the missing/wrong arms above, which
+        // legitimately have no token_id to record).
+        let token_id_str = entry.id.0.as_str();
         tracing::warn!(
             target: "graphreact::observer::audit",
             peer = %peer_repr,
             reason = "expired",
+            token_id = token_id_str,
             "observer auth fail (expired)"
         );
         if let Some(sink) = state.audit_sink.as_ref() {
@@ -2817,6 +2844,7 @@ async fn auth_layer_rbac(
                 fields: serde_json::json!({
                     "peer": peer_repr,
                     "reason": "expired",
+                    "token_id": token_id_str,
                 }),
             });
         }

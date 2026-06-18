@@ -314,8 +314,8 @@ pub struct RotatableRegistry {
 impl RotatableRegistry {
     /// Wrap an initial `Arc<TokenRegistry>` for rotation.
     ///
-    /// The first [`Self::load`] call returns the supplied registry;
-    /// the first [`Self::store`] call replaces it.
+    /// The first [`Self::current`] call returns the supplied
+    /// registry; the first [`Self::rotate`] call replaces it.
     #[must_use]
     pub fn new(initial: Arc<TokenRegistry>) -> Self {
         Self {
@@ -331,18 +331,24 @@ impl RotatableRegistry {
     /// uses the resulting snapshot for both `match_token` and
     /// `check_route`, so a rotation between the match and the check
     /// can't tear the verdict.
+    ///
+    /// **Naming.** Mirrors [`crate::tls::RotatableServerConfig::current`]
+    /// (Group B-2 #2 verify-finding patch). Both sides of the
+    /// atomic-swap contract expose `current` / `rotate` so a future
+    /// SIGHUP handler driving both rotations sees one API shape.
     #[must_use]
-    pub fn load(&self) -> Arc<TokenRegistry> {
+    pub fn current(&self) -> Arc<TokenRegistry> {
         self.inner.load_full()
     }
 
     /// Atomically swap in a new `Arc<TokenRegistry>`. The next
-    /// [`Self::load`] call observes `next`; existing snapshots held
-    /// by in-flight requests keep serving the old registry until
-    /// they drop.
+    /// [`Self::current`] call observes `next`; existing snapshots
+    /// held by in-flight requests keep serving the old registry
+    /// until they drop.
     ///
+    /// **Naming.** Mirrors [`crate::tls::RotatableServerConfig::rotate`].
     /// Wired by the eventual SIGHUP handler (Phase B Part 2).
-    pub fn store(&self, next: Arc<TokenRegistry>) {
+    pub fn rotate(&self, next: Arc<TokenRegistry>) {
         self.inner.store(next);
     }
 }
@@ -558,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn rotatable_registry_load_returns_initial_then_store_replaces() {
+    fn rotatable_registry_current_returns_initial_then_rotate_replaces() {
         let reg_a = Arc::new(
             TokenRegistry::new(vec![mk_entry("admin1", b"AAAAAA", Role::Admin)]).unwrap(),
         );
@@ -570,12 +576,12 @@ mod tests {
             .unwrap(),
         );
         let rot = RotatableRegistry::new(reg_a.clone());
-        let snap = rot.load();
+        let snap = rot.current();
         assert!(Arc::ptr_eq(&snap, &reg_a));
         assert_eq!(snap.len(), 1);
 
-        rot.store(reg_b.clone());
-        let snap2 = rot.load();
+        rot.rotate(reg_b.clone());
+        let snap2 = rot.current();
         assert!(Arc::ptr_eq(&snap2, &reg_b));
         assert_eq!(snap2.len(), 2);
 
@@ -593,8 +599,8 @@ mod tests {
         );
         let rot1 = RotatableRegistry::new(reg_a);
         let rot2 = rot1.clone();
-        rot1.store(reg_b.clone());
-        let snap2 = rot2.load();
+        rot1.rotate(reg_b.clone());
+        let snap2 = rot2.current();
         assert!(Arc::ptr_eq(&snap2, &reg_b));
     }
 }
