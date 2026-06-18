@@ -1,0 +1,65 @@
+# **M-Prod sub-track #9 (chaos + fuzz) safe-slice manifest.**
+#
+# This `fuzz/` crate is a *standalone* workspace — note the empty
+# `[workspace]` table below. It is intentionally NOT a member of the
+# top-level `[workspace] members` list in `../Cargo.toml`. Three
+# load-bearing reasons (don't be tempted to "tidy" this by adding it):
+#
+#   1. `libfuzzer-sys` requires nightly Rust (uses `-Z sanitizer=address`
+#      style flags + private compiler intrinsics for the libFuzzer
+#      runtime). Every workspace member must build under the workspace
+#      toolchain (`rust-toolchain.toml` = stable); dragging libfuzzer
+#      into workspace members would force every `cargo check
+#      --workspace` invocation to require nightly.
+#   2. `cargo-fuzz` injects `RUSTFLAGS='-Cpasses=sancov-module ...'`
+#      which would pollute the shared build cache for non-fuzz
+#      workspace members and bust `clippy` / `test` / `sbom` caches.
+#   3. `cargo-fuzz` upstream documents this pattern explicitly:
+#      "cargo-fuzz puts its files in a fuzz/ subdirectory and is meant
+#      to be used at the workspace root, NOT as a workspace member."
+#
+# Workspace crates are referenced via `path = "../crates/..."` — the
+# fuzz targets call the same `serde_json::from_slice::<T>` deser path
+# the axum `Json<T>` extractor walks at the live HTTP boundary, so
+# bugs found here ARE bugs the real ingress would hit.
+
+[package]
+name = "graphreact-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace — do NOT merge into ../Cargo.toml [workspace]
+# members. See the file-level comment above for why.
+[workspace]
+
+[dependencies]
+# `libfuzzer-sys` ships the libFuzzer runtime + the `fuzz_target!`
+# macro. Requires nightly Rust. Pinned to the latest 0.4.x at slice
+# time (2026-06-17) so a future libfuzzer-sys bump is an explicit
+# PR change, matching the M-Prod #7 SBOM job's tool-pin posture.
+libfuzzer-sys = "0.4"
+
+# Direct dep — fuzz target calls `serde_json::from_slice` directly
+# (the axum `Json<T>` extractor does the same under the hood; we
+# fuzz the deserialiser without spinning up an axum runtime).
+serde_json = "1"
+
+# The crate whose request types we're fuzzing. Path dep into the
+# parent workspace. The three JSON ingress body shapes
+# (`InjectMessageBody`, `CallMessageBody`, `BulkLineBody` via
+# `parse_bulk_line`) are re-exported from
+# `graphreact_observer::management_api`; the fuzz target imports
+# them from the crate root.
+graphreact-observer = { path = "../crates/graphreact-observer" }
+
+[[bin]]
+name = "fuzz_management_api_bodies"
+path = "fuzz_targets/fuzz_management_api_bodies.rs"
+test = false
+doc = false
+bench = false

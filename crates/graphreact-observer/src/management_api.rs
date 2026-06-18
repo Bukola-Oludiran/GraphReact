@@ -1224,13 +1224,45 @@ fn timeout_response(timeout_ms: u64) -> Response {
 /// `idempotency_key` lives per-line because the
 /// `Idempotency-Key` HTTP header is single-valued and doesn't
 /// apply to a bulk request that carries many distinct messages.
+///
+/// Promoted to `pub` (M-Prod sub-track #9 / chaos+fuzz) so the
+/// out-of-workspace `fuzz/` substrate can target the same
+/// `serde_json::from_slice` path the live bulk handler walks
+/// without re-declaring the schema. Non-fuzz consumers should
+/// reach for [`parse_bulk_line`] instead of inspecting fields
+/// directly — the type's field shape is an HTTP wire-format
+/// detail, NOT a public API the runtime cares to stabilise.
 #[derive(Debug, Deserialize)]
-struct BulkLineBody {
-    r#type: String,
+pub struct BulkLineBody {
+    /// Inbound message type. Same allowlist semantics as
+    /// [`InjectMessageBody::type`]: runtime-checked against the
+    /// target's `manifest.accepts_external` at delivery time.
+    pub r#type: String,
+    /// Arbitrary JSON payload forwarded verbatim to the node's
+    /// inbox.
     #[serde(default)]
-    payload: Value,
+    pub payload: Value,
+    /// Per-line idempotency token. Header-level `Idempotency-Key`
+    /// does not apply to bulk requests; clients carry the token
+    /// inline per record instead.
     #[serde(default)]
-    idempotency_key: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
+/// **M-Prod sub-track #9 (chaos + fuzz).** Thin, allocation-free
+/// wrapper around `serde_json::from_slice::<BulkLineBody>` that
+/// the out-of-workspace `fuzz/` substrate calls. Keeps the public
+/// surface narrow — fuzz targets do not need (or want) the rest
+/// of the management-API runtime, just the deserialisation path
+/// the bulk handler walks per NDJSON line.
+///
+/// This is the third ingress JSON layer (alongside
+/// [`InjectMessageBody`] and [`CallMessageBody`]) and is the only
+/// one whose body type is otherwise file-private — exposing this
+/// shim is the lower-blast-radius alternative to widening the
+/// struct itself to `pub(crate)` re-export.
+pub fn parse_bulk_line(bytes: &[u8]) -> Result<BulkLineBody, serde_json::Error> {
+    serde_json::from_slice::<BulkLineBody>(bytes)
 }
 
 /// **M-Ingress phase 3.** `POST /v1/nodes/:id/messages/bulk` —

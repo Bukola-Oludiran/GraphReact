@@ -1,0 +1,1 @@
+{"type":"audit","payload":{"who":"u1","what":{"verb":"create","target":{"id":1,"tags":["a","b"]}}},"idempotency_key":""}
