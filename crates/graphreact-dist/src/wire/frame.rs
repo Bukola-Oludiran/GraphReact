@@ -127,6 +127,7 @@ mod tests {
             node_name: "alice@127.0.0.1".into(),
             creation: 42,
             capabilities: vec!["pg-v1".into(), "monitor-v1".into()],
+            capabilities_bitmap: 0,
         }));
     }
 
@@ -135,6 +136,7 @@ mod tests {
         roundtrip(Packet::ChallengeAck(ChallengeAck {
             digest: [7u8; 32],
             server_capabilities: vec!["pg-v1".into(), "reload-v1".into()],
+            capabilities_bitmap: 0,
         }));
     }
 
@@ -268,6 +270,7 @@ mod tests {
             node_name: "alice@host".into(),
             creation: 1,
             capabilities: vec![],
+            capabilities_bitmap: 0,
         });
         let mut full = BytesMut::new();
         codec.encode(packet.clone(), &mut full).unwrap();
@@ -322,10 +325,13 @@ mod tests {
     }
 
     #[test]
-    fn min_supported_version_matches_wire_version() {
-        // Equal today; widens on backwards-compatible extension.
-        // Asserting here so a future bump that breaks the invariant
-        // forces a deliberate code change.
-        assert_eq!(MIN_SUPPORTED_VERSION, WIRE_VERSION);
+    fn min_supported_version_is_one_below_wire_version() {
+        // Phase β (sub-track #4): one-bump compat window — the
+        // floor lags WIRE_VERSION by exactly one. Future bumps
+        // either move both constants together (no compat window)
+        // or move WIRE_VERSION only (widen the window by one).
+        // Asserting the +1 invariant here so any future bump that
+        // breaks it forces a deliberate code change.
+        assert_eq!(MIN_SUPPORTED_VERSION + 1, WIRE_VERSION);
     }
 }

@@ -92,6 +92,17 @@ where
         let _ = self.framed.send(Packet::Disconnect).await;
         self.framed.close().await
     }
+
+    /// **Phase β (sub-track #4) test-only.** Decompose the
+    /// connection into the underlying post-TLS stream plus the codec
+    /// plus any pending read/write buffers. Used by the
+    /// rolling-version handshake tests to ship raw bytes (a v4-shape
+    /// `Hello` payload that the v5 struct can't construct) through
+    /// the TLS layer.
+    #[cfg(test)]
+    pub(crate) fn into_parts(self) -> tokio_util::codec::FramedParts<S, WireFrame> {
+        self.framed.into_parts()
+    }
 }
 
 /// Server-side listener — wraps `tokio::net::TcpListener` + a

@@ -139,6 +139,7 @@ fn setup() -> Setup {
         cookie: SecretCookie::from_bytes(cookie_bytes.clone()).unwrap(),
         tls: bob_tls.clone(),
         capabilities: vec!["bench-v1".into()],
+        capabilities_bitmap: 0,
         net_tick: NetTickConfig::default(),
         net_split_policy: NetSplitPolicy::default(),
     };
@@ -170,6 +171,7 @@ fn setup() -> Setup {
         cookie: SecretCookie::from_bytes(cookie_bytes).unwrap(),
         tls: alice_tls,
         capabilities: vec!["bench-v1".into()],
+        capabilities_bitmap: 0,
         net_tick: NetTickConfig::default(),
         net_split_policy: NetSplitPolicy::default(),
     };

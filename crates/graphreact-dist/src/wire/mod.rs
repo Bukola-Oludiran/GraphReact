@@ -32,6 +32,6 @@ pub use frame::{WireFrame, MAX_FRAME_BYTES};
 pub use packet::{
     Challenge, ChallengeAck, ChallengeReply, Demonitor, Down, Exit, Hello, LinkRequest, Message,
     MonitorAck, MonitorRequest, Packet, PacketType, PgBroadcast, PgDiscover, PgJoin, PgLeave,
-    PgSync, ReloadModulePacket, Tick, TickAck, Unlink, WireExitReason, MIN_SUPPORTED_VERSION,
-    WIRE_VERSION,
+    PgSync, ReloadModulePacket, Tick, TickAck, Unlink, WireExitReason, CAP_AUDIT_CHAIN,
+    CAP_DELEGATED_RESTART, CAP_MIXED_RUNTIME, MIN_SUPPORTED_VERSION, WIRE_VERSION,
 };

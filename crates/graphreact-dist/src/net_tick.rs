@@ -334,7 +334,7 @@ mod tests {
     ) -> mpsc::Receiver<Packet> {
         let (tx, rx) = mpsc::channel(64);
         let node: NodeId = format!("{name}@127.0.0.1").parse().unwrap();
-        let h = Arc::new(PeerHandle::new(node, Creation(1), tx, Vec::new()));
+        let h = Arc::new(PeerHandle::new(node, Creation(1), tx, Vec::new(), 0));
         h.last_tick.store(last_tick_ms, Ordering::Relaxed);
         reg.insert(h).unwrap();
         rx

@@ -366,6 +366,47 @@ didn't depend on substrate that doesn't exist yet. The M14.10 slice
   3.14t is excluded until `actions/setup-python` ships support; Windows is
   excluded pending end-to-end verification of the pkg-config probe path.
 
+## Wire-version compatibility (Phase β safe-slice)
+
+**M-Prod sub-track #4 Phase β SHIPPED 2026-06-18.** The wire-version
+floor lags `WIRE_VERSION` by one for **one-bump rolling-upgrade
+compatibility** as of Phase β — daemons one bump back interop with
+the current bump, but not two bumps back, and not future versions
+above the local ceiling. Both ends of that range are policed by the
+server-side handshake; a peer above ceiling is rejected with
+`reason="wire_version_above_ceiling"` BEFORE the floor check.
+
+Capability negotiation rides on TWO parallel surfaces:
+
+- **`Vec<String>` per-feature opt-in flags** — `"reload-v1"`,
+  `"observer-otel-v1"`, `"ingress-call-v1"`. Open set; each
+  consumer owns its flag name. Used by capability-gated dispatch
+  (e.g. `Cluster::reload_module` ships only to peers advertising
+  `"reload-v1"`).
+- **`u64` capabilities bitmap** — typed substrate-level flag set
+  governed by the dist crate: `CAP_MIXED_RUNTIME`,
+  `CAP_DELEGATED_RESTART`, `CAP_AUDIT_CHAIN`. Effective set =
+  `our_local_bitmap & peer_advertised_bitmap`, queryable from
+  `Cluster::peer_effective_capabilities(name) -> Option<u64>`.
+
+v(N-1) peers that ship the old Hello/ChallengeAck shape (no
+trailing `capabilities_bitmap: u64`) are decoded via a dual-struct
+fallback path in `crate::wire::WireCodec::decode`; the missing
+field synthesises to `0`. Genuine wire corruption is NOT papered
+over — only `postcard::Error::DeserializeUnexpectedEnd` triggers the
+fallback; any other postcard error propagates.
+
+Pointers:
+
+- Constants + struct shapes:
+  [`crates/graphreact-dist/src/wire/packet.rs`](../../crates/graphreact-dist/src/wire/packet.rs)
+- Dual-struct fallback decode:
+  [`crates/graphreact-dist/src/wire/codec.rs`](../../crates/graphreact-dist/src/wire/codec.rs)
+- Floor/ceiling checks + audit events:
+  [`crates/graphreact-dist/src/handshake.rs`](../../crates/graphreact-dist/src/handshake.rs)
+- Full Phase β scope + audit-row contract:
+  [`docs/backend/m-prod-lifecycle.md#shipped--phase-β-rolling-version-handshake`](m-prod-lifecycle.md#shipped--phase-β-rolling-version-handshake)
+
 ## Cross-references
 
 - **Wire protocol byte layout**: [`crates/graphreact-dist/docs/wire-protocol.md`](../../crates/graphreact-dist/docs/wire-protocol.md)
