@@ -531,6 +531,22 @@ pub struct ApiState {
     /// keeps the count balanced). Read by the drain orchestrator
     /// to know when ingress quiesced. Clones share state.
     pub ingress_in_flight: IngressInFlight,
+    /// **M-Prod sub-track #1 Phase B Part 1.** Multi-token RBAC
+    /// registry behind an atomic-swap handle. `None` keeps the
+    /// legacy single-token Phase A path (see [`Self::token`])
+    /// bit-for-bit; `Some(rbac)` replaces it with the multi-token
+    /// + per-route ACL flow in [`auth_layer`].
+    ///
+    /// The handle is `Clone`-cheap (`Arc<ArcSwap<TokenRegistry>>`);
+    /// the auth middleware loads one snapshot per protected request
+    /// and uses it for both `match_token` and `check_route` so a
+    /// rotation between the match and the check can't tear the
+    /// verdict.
+    ///
+    /// SIGHUP-driven reload is deferred to Phase B Part 2 (rides
+    /// the same Group B-2 #2 SIGHUP topology the TLS rotation path
+    /// uses).
+    pub rbac: Option<crate::rbac::RotatableRegistry>,
 }
 
 /// **M-Prod sub-track #5.** Cluster-readiness probe shared by the
@@ -1134,6 +1150,10 @@ pub async fn spawn_with_cluster_readyz(
         audit_sink: None,
         draining: None,
         rate_limit: None,
+        // **M-Prod sub-track #1 Phase B Part 1.** Legacy
+        // `spawn_with_cluster_readyz` defaults rbac to `None`;
+        // callers opt in via the unified `spawn_with_options`.
+        rbac: None,
     })
     .await
 }
@@ -1165,6 +1185,10 @@ pub async fn spawn_with_drain(
         audit_sink: None,
         draining,
         rate_limit: None,
+        // **M-Prod sub-track #1 Phase B Part 1.** Legacy
+        // `spawn_with_drain` defaults rbac to `None`; callers opt
+        // in via the unified `spawn_with_options`.
+        rbac: None,
     })
     .await
 }
@@ -1198,6 +1222,15 @@ pub struct SpawnOptions {
     /// runners don't collide on `GRX_RATE_LIMIT_PER_IP_*` env
     /// vars).
     pub rate_limit: Option<RateLimitConfig>,
+    /// **M-Prod sub-track #1 Phase B Part 1.** Multi-token RBAC
+    /// registry behind an atomic-swap handle. `None` (the legacy
+    /// default for [`spawn`] / [`spawn_with_cluster_readyz`] /
+    /// [`spawn_with_drain`]) keeps the Phase A single-token path
+    /// bit-for-bit. `Some(rbac)` replaces the [`auth_layer`]
+    /// dispatch with the multi-token + per-route ACL flow.
+    ///
+    /// SIGHUP-driven reload defers to Phase B Part 2.
+    pub rbac: Option<crate::rbac::RotatableRegistry>,
 }
 
 /// **M-Prod sub-track #1 Phase A + #4 Phase α.** Full-knob
@@ -1217,6 +1250,7 @@ pub async fn spawn_with_options(
         audit_sink,
         draining,
         rate_limit,
+        rbac,
     } = opts;
     let listener = TcpListener::bind(bind.addr).await?;
     let local_addr = listener.local_addr()?;
@@ -1266,6 +1300,11 @@ pub async fn spawn_with_options(
         // driven drain flips `/v1/readyz` to 503 `draining`.
         draining: draining.clone(),
         ingress_in_flight: ingress_in_flight.clone(),
+        // **M-Prod sub-track #1 Phase B Part 1.** RBAC handle —
+        // `None` keeps Phase A single-token auth bit-for-bit;
+        // `Some` swaps `auth_layer` into the multi-token + per-
+        // route ACL path.
+        rbac: rbac.clone(),
     };
     let rl = rate_limit.unwrap_or_else(RateLimitConfig::from_env);
     let router = build_router_with_rate_limit(state, rl);
@@ -2621,6 +2660,16 @@ async fn auth_layer(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
+    // **M-Prod sub-track #1 Phase B Part 1.** RBAC path takes
+    // precedence when wired. `state.rbac = None` (legacy spawn
+    // paths default) falls through to the Phase A single-token
+    // flow, bit-for-bit unchanged. `state.rbac = Some(...)`
+    // replaces `state.token` as the auth source — operators wire
+    // ONE or the OTHER, not both (Part 2's JWT-OIDC bridge folds
+    // both into the same registry).
+    if let Some(rbac) = state.rbac.as_ref() {
+        return auth_layer_rbac(state.clone(), rbac.clone(), req, next).await;
+    }
     let Some(expected) = state.token.as_ref() else {
         return next.run(req).await;
     };
@@ -2679,6 +2728,127 @@ async fn auth_layer(
     }
 }
 
+/// **M-Prod sub-track #1 Phase B Part 1.** Multi-token RBAC dispatch.
+/// Invoked from [`auth_layer`] when `state.rbac` is `Some(...)`.
+///
+/// Flow:
+/// 1. Classify the request URI to a `&'static str` route label.
+/// 2. Extract the bearer candidate from `Authorization: Bearer ...`.
+/// 3. Snapshot the registry (one `Arc::clone`).
+/// 4. Match the candidate against ALL entries — no early exit
+///    (timing-attack safety; see [`crate::rbac::TokenRegistry::match_token`]).
+/// 5. Check expiry against `SystemTime::now()`.
+/// 6. Dispatch via [`crate::rbac::TokenRegistry::check_route`] →
+///    [`crate::audit::log_auth_success`] on permit, or
+///    [`crate::audit::log_authz_deny`] + 403 on deny.
+///
+/// The auth-fail audit emissions (`missing` / `wrong` / `expired`)
+/// match the existing inline-tracing-line shape in [`auth_layer`]
+/// (using `peer_repr: String` rather than [`SocketAddr`]) so the
+/// audit record schema stays consistent with Phase A.
+async fn auth_layer_rbac(
+    state: ApiState,
+    rbac: crate::rbac::RotatableRegistry,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let route = classify_protected_path(req.uri().path());
+    let header = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let candidate = header.and_then(|v| v.strip_prefix("Bearer "));
+    let peer_repr = req
+        .extensions()
+        .get::<SocketAddr>()
+        .map(SocketAddr::to_string)
+        .unwrap_or_else(|| "<unknown>".into());
+
+    let snap = rbac.load();
+
+    let Some(candidate_bytes) = candidate else {
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            peer = %peer_repr,
+            reason = "missing",
+            "observer auth fail (missing)"
+        );
+        if let Some(sink) = state.audit_sink.as_ref() {
+            sink.append(crate::AuditRecordInput {
+                kind: "auth_fail",
+                fields: serde_json::json!({
+                    "peer": peer_repr,
+                    "reason": "missing",
+                }),
+            });
+        }
+        return challenge_response();
+    };
+
+    let Some(entry) = snap.match_token(candidate_bytes.as_bytes()) else {
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            peer = %peer_repr,
+            reason = "wrong",
+            "observer auth fail (wrong)"
+        );
+        if let Some(sink) = state.audit_sink.as_ref() {
+            sink.append(crate::AuditRecordInput {
+                kind: "auth_fail",
+                fields: serde_json::json!({
+                    "peer": peer_repr,
+                    "reason": "wrong",
+                }),
+            });
+        }
+        return challenge_response();
+    };
+
+    if snap.is_expired(entry, std::time::SystemTime::now()) {
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            peer = %peer_repr,
+            reason = "expired",
+            "observer auth fail (expired)"
+        );
+        if let Some(sink) = state.audit_sink.as_ref() {
+            sink.append(crate::AuditRecordInput {
+                kind: "auth_fail",
+                fields: serde_json::json!({
+                    "peer": peer_repr,
+                    "reason": "expired",
+                }),
+            });
+        }
+        return challenge_response();
+    }
+
+    let role_str = match &entry.role {
+        crate::rbac::Role::Admin => "admin",
+        crate::rbac::Role::ReadOnly => "read_only",
+        crate::rbac::Role::Custom(_) => "custom",
+    };
+
+    if snap.check_route(entry, route) {
+        crate::audit::log_auth_success(
+            &entry.id.0,
+            route,
+            role_str,
+            state.audit_sink.as_ref(),
+        );
+        next.run(req).await
+    } else {
+        crate::audit::log_authz_deny(
+            &entry.id.0,
+            route,
+            role_str,
+            "rbac",
+            state.audit_sink.as_ref(),
+        );
+        forbidden_response()
+    }
+}
+
 fn challenge_response() -> Response {
     let mut resp = (
         StatusCode::UNAUTHORIZED,
@@ -2691,6 +2861,26 @@ fn challenge_response() -> Response {
         HeaderValue::from_static("Bearer realm=\"graphreact-observer\""),
     );
     resp
+}
+
+/// **M-Prod sub-track #1 Phase B Part 1.** 403 Forbidden response
+/// for an authenticated principal that lacks authorization for the
+/// requested route (RBAC deny).
+///
+/// 403 is semantically distinct from [`challenge_response`]'s 401:
+/// the bearer authenticated cleanly + the principal is known; the
+/// role doesn't permit this route. No `WWW-Authenticate` header
+/// (the client doesn't have a different credential that would
+/// succeed — that's an operator-side RBAC config change). No
+/// `Retry-After` (not a backpressure response — retrying with the
+/// same credentials will deterministically deny again).
+fn forbidden_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "403 forbidden",
+    )
+        .into_response()
 }
 
 /// Drain pending [`SnapshotRequest`]s from the bridge channel, calling
@@ -2987,6 +3177,11 @@ mod rate_limit_tests {
             audit_sink: None,
             draining: None,
             ingress_in_flight: IngressInFlight::new(),
+            // M-Prod #1 Phase B Part 1 — None preserves the
+            // Phase A single-token path that this rate-limit
+            // test exercises (token is also None → no auth at
+            // all on this synthetic state).
+            rbac: None,
         };
         let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1, 2));
 

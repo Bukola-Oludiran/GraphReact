@@ -80,8 +80,10 @@ pub fn log_accept(peer: SocketAddr, path: &str, sink: Option<&Arc<dyn AuditSink>
 }
 
 /// Log an auth-failure event. `reason` is one of `"missing"` (no
-/// `Authorization` header) or `"wrong"` (header present but token
-/// didn't match). The token itself is NEVER included.
+/// `Authorization` header), `"wrong"` (header present but token
+/// didn't match), or — under Phase B Part 1's RBAC path —
+/// `"expired"` (matched a registry entry whose `expires_at` has
+/// passed). The token itself is NEVER included.
 #[inline]
 pub fn log_auth_fail(peer: SocketAddr, reason: &'static str, sink: Option<&Arc<dyn AuditSink>>) {
     tracing::warn!(
@@ -96,6 +98,94 @@ pub fn log_auth_fail(peer: SocketAddr, reason: &'static str, sink: Option<&Arc<d
             kind: "auth_fail",
             fields: serde_json::json!({
                 "peer": peer.to_string(),
+                "reason": reason,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 1.** Log a successful
+/// authentication + authorization verdict.
+///
+/// `token_id` is the operator-assigned [`crate::rbac::TokenId`]
+/// string (NOT a hash, NOT the raw bearer credential). The raw
+/// bearer is never logged. `route` is the
+/// [`crate::management_api::classify_protected_path`] label
+/// (`&'static str` from
+/// [`crate::management_api::PROTECTED_ROUTE_LABELS`] or `"unknown"`)
+/// + `role` is one of `"admin"` / `"read_only"` / `"custom"`.
+///
+/// Fires AT INFO level (a success on a protected route is not a
+/// warning condition; SOC pipelines that need only failures filter
+/// on the `auth_fail` / `authz_deny` kinds). Mirrors
+/// [`log_auth_fail`] bit-for-bit on the fan invariant: tracing line
+/// fires FIRST, sink fans AFTER, so a sink failure can never break
+/// the tracing-side stream.
+#[inline]
+pub fn log_auth_success(
+    token_id: &str,
+    route: &'static str,
+    role: &str,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::info!(
+        target: "graphreact::observer::audit",
+        token_id,
+        route,
+        role,
+        "observer auth success"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "auth_success",
+            fields: serde_json::json!({
+                "token_id": token_id,
+                "route": route,
+                "role": role,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 1.** Log an RBAC authorization
+/// denial: the bearer authenticated cleanly + the principal is
+/// known, but the matched [`crate::rbac::Role`] does not permit
+/// the requested route.
+///
+/// `token_id` / `route` / `role` are the same audit-side strings
+/// [`log_auth_success`] emits. `reason` is a `&'static str` so
+/// future denial reasons (e.g. `"per_node_acl"`, `"per_message_type_acl"`
+/// for Phase B Part 2) can be added without an enum + schema bump
+/// downstream. The Phase B Part 1 caller emits `"rbac"`.
+///
+/// Fires AT WARN level (mirrors [`log_auth_fail`]'s precedent —
+/// denied requests warrant operator attention). Fan invariant
+/// preserved: tracing first, sink after.
+#[inline]
+pub fn log_authz_deny(
+    token_id: &str,
+    route: &'static str,
+    role: &str,
+    reason: &'static str,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        token_id,
+        route,
+        role,
+        reason,
+        "observer authz deny"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "authz_deny",
+            fields: serde_json::json!({
+                "token_id": token_id,
+                "route": route,
+                "role": role,
                 "reason": reason,
             }),
         },

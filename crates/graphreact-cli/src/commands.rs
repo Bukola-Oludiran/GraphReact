@@ -2049,6 +2049,12 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 // Operators tune the cap without a daemon recompile;
                 // tests inject explicit caps via `Some(RateLimitConfig)`.
                 rate_limit: None,
+                // **M-Prod sub-track #1 Phase B Part 1.** CLI doesn't
+                // wire RBAC yet; SIGHUP-reload defers to Phase B
+                // Part 2. The daemon falls through to the Phase A
+                // single-bearer-token path defined by the
+                // `--observer-token-{env,file}` flags.
+                rbac: None,
             },
         )
         .await
