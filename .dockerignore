@@ -1,0 +1,55 @@
+# Mirrors .gitignore plus build-time-only directories that bloat the
+# build context (target/, zig cache, npm node_modules). Trimming the
+# context here is load-bearing — without it the `COPY . .` in the
+# zig-builder stage ships ~3-4GB of `target/` to the daemon.
+
+# Rust build output
+target/
+**/target/
+Cargo.lock.bak
+**/*.rs.bk
+
+# Zig bridge build output (regenerated INSIDE the zig-builder stage)
+zig/bridge/zig-out/
+zig/bridge/.zig-cache/
+
+# napi-rs build artifacts
+crates/graphreact-napi/*.node
+crates/graphreact-napi/index.js
+crates/graphreact-napi/index.d.ts
+crates/graphreact-napi/test-ts/node_modules/
+**/node_modules/
+
+# wasm-pack output
+crates/graphreact-wasm/pkg/
+
+# Test fixtures (regenerated)
+crates/graphreact-graspologic/fixtures/generated/
+crates/graphreact-cli/tests/fixtures/.grx-go-build-*/
+
+# Fuzzing — not needed in the release image
+fuzz/
+
+# Docs and developer-only directories — not needed in the release image,
+# don't change the binary's bytes.
+docs/
+scripts/
+
+# Git data — `cargo` doesn't need it for a release build, and shipping
+# `.git/` into the build context leaks 100s of MB of history.
+.git/
+.github/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp / scratch
+.scratch/
+*.swp
+*.swo
