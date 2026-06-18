@@ -79,6 +79,10 @@ async fn spawn_with_sink(
         // e2e path — drain is irrelevant here and a None flag keeps
         // the readyz + ingress fast-paths in their pre-#4 shape.
         draining: None,
+        // M-Prod #6 Phase A rate-limit is None on the audit-chain
+        // e2e path — these tests don't exercise the limiter and
+        // None falls through to the env-var defaults.
+        rate_limit: None,
     })
     .await
     .expect("spawn");

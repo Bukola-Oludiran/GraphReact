@@ -856,10 +856,83 @@ fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// **M-Prod sub-track #6 Phase A.** Per-IP rate-limit knob struct
+/// used by [`build_router_with_rate_limit`]. The legacy
+/// [`build_router`] entry point falls through to
+/// [`RateLimitConfig::from_env`] so production daemons (which
+/// build the router via [`spawn_with_options`]) automatically pick
+/// up `GRX_RATE_LIMIT_PER_IP_{PER_SEC,BURST}` without a callsite
+/// change.
+///
+/// Tests use [`Self::const_for_tests`] to inject a deterministic
+/// cap (low `per_second`, tiny `burst`) so a burst test reliably
+/// trips the limiter inside a sub-second window — without
+/// polluting process-global env state across parallel `cargo test`
+/// runners.
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitConfig {
+    /// Sustained per-source-IP request rate (tokens/sec).
+    pub per_second: u64,
+    /// Burst size (token bucket capacity).
+    pub burst: u32,
+}
+
+impl RateLimitConfig {
+    /// Read defaults from env once at build time. Falls back to
+    /// the in-code constants for unset / empty / unparseable /
+    /// zero values. This is the production path —
+    /// [`spawn_with_options`] threads `Self::from_env()` through
+    /// [`build_router`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            per_second: parse_env_u64(
+                "GRX_RATE_LIMIT_PER_IP_PER_SEC",
+                DEFAULT_RATE_LIMIT_PER_IP_PER_SEC,
+            ),
+            burst: parse_env_u32(
+                "GRX_RATE_LIMIT_PER_IP_BURST",
+                DEFAULT_RATE_LIMIT_PER_IP_BURST,
+            ),
+        }
+    }
+
+    /// **For tests only.** Hand-pick a `(per_second, burst)` pair
+    /// that exercises a specific cap. Production callers should
+    /// use [`Self::from_env`].
+    #[must_use]
+    pub const fn for_tests(per_second: u64, burst: u32) -> Self {
+        Self { per_second, burst }
+    }
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            per_second: DEFAULT_RATE_LIMIT_PER_IP_PER_SEC,
+            burst: DEFAULT_RATE_LIMIT_PER_IP_BURST,
+        }
+    }
+}
+
 /// Build the management API router. The router is the public seam
 /// for tests + future P5+ extensions; spawning the listener is
 /// a separate concern (see [`spawn`]).
+///
+/// **M-Prod sub-track #6 Phase A.** Defaults the rate limit
+/// configuration to [`RateLimitConfig::from_env`] — the production
+/// path. Tests that need a deterministic cap call
+/// [`build_router_with_rate_limit`] directly.
 pub fn build_router(state: ApiState) -> Router {
+    build_router_with_rate_limit(state, RateLimitConfig::from_env())
+}
+
+/// **M-Prod sub-track #6 Phase A.** Variant of [`build_router`]
+/// that accepts an explicit [`RateLimitConfig`]. Used by the
+/// rate-limit integration tests to pin a deterministic cap
+/// without polluting the env-var process state across parallel
+/// test runners.
+pub fn build_router_with_rate_limit(state: ApiState, rl: RateLimitConfig) -> Router {
     use axum::middleware;
 
     // /v1/healthz bypasses auth (liveness probe-friendly).
@@ -874,9 +947,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/v1/readyz", get(readyz));
 
     // **M-Prod sub-track #6 Phase A.** Per-IP rate limiter for
-    // protected routes. Defaults read from env once at build time
-    // (positive integer or fall back to the in-code constants);
-    // operators tune via `GRX_RATE_LIMIT_PER_IP_PER_SEC` +
+    // protected routes. `RateLimitConfig` defaults read from env
+    // once at build time (positive integer or fall back to the
+    // in-code constants); operators tune via
+    // `GRX_RATE_LIMIT_PER_IP_PER_SEC` +
     // `GRX_RATE_LIMIT_PER_IP_BURST` (no daemon recompile).
     //
     // `PeerIpKeyExtractor` (the default) reads
@@ -888,25 +962,17 @@ pub fn build_router(state: ApiState) -> Router {
     // `error_handler` (below) re-emits a matching `Retry-After`
     // explicitly so the contract survives a future tower_governor
     // shape change.
-    let burst = parse_env_u32(
-        "GRX_RATE_LIMIT_PER_IP_BURST",
-        DEFAULT_RATE_LIMIT_PER_IP_BURST,
-    );
-    let per_second = parse_env_u64(
-        "GRX_RATE_LIMIT_PER_IP_PER_SEC",
-        DEFAULT_RATE_LIMIT_PER_IP_PER_SEC,
-    );
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(per_second)
-            .burst_size(burst)
+            .per_second(rl.per_second)
+            .burst_size(rl.burst)
             .use_headers()
             // Custom 429 body shape mirrors `bridge_saturated_response`'s
             // operator contract: same JSON envelope, same
             // `Retry-After` header semantics, only the `error`
             // discriminator changes (`bridge_saturated` →
-            // `rate_limited`). See [`rate_limited_response`] for
-            // the symmetry rationale.
+            // `rate_limited`). See [`rate_limited_response_from_error`]
+            // for the symmetry rationale.
             .error_handler(|err: tower_governor::GovernorError| {
                 rate_limited_response_from_error(err)
             })
@@ -1067,6 +1133,7 @@ pub async fn spawn_with_cluster_readyz(
         cluster_readyz,
         audit_sink: None,
         draining: None,
+        rate_limit: None,
     })
     .await
 }
@@ -1097,6 +1164,7 @@ pub async fn spawn_with_drain(
         cluster_readyz,
         audit_sink: None,
         draining,
+        rate_limit: None,
     })
     .await
 }
@@ -1123,6 +1191,13 @@ pub struct SpawnOptions {
     /// have the management API observe it on the readyz + ingress
     /// hot paths.
     pub draining: Option<DrainFlag>,
+    /// **M-Prod sub-track #6 Phase A.** Per-IP rate-limit override.
+    /// `None` reads [`RateLimitConfig::from_env`] — production
+    /// shape. `Some(cfg)` pins the cap explicitly (used by the
+    /// rate-limit integration tests so parallel `cargo test`
+    /// runners don't collide on `GRX_RATE_LIMIT_PER_IP_*` env
+    /// vars).
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// **M-Prod sub-track #1 Phase A + #4 Phase α.** Full-knob
@@ -1141,6 +1216,7 @@ pub async fn spawn_with_options(
         cluster_readyz,
         audit_sink,
         draining,
+        rate_limit,
     } = opts;
     let listener = TcpListener::bind(bind.addr).await?;
     let local_addr = listener.local_addr()?;
@@ -1191,7 +1267,8 @@ pub async fn spawn_with_options(
         draining: draining.clone(),
         ingress_in_flight: ingress_in_flight.clone(),
     };
-    let router = build_router(state);
+    let rl = rate_limit.unwrap_or_else(RateLimitConfig::from_env);
+    let router = build_router_with_rate_limit(state, rl);
 
     // **M-Prod sub-track #2 Phase A.** Hold the rotatable TLS
     // handle (NOT a pre-built `TlsAcceptor`) — the per-connection
@@ -2639,5 +2716,302 @@ mod tests {
         assert_eq!(v["process_start_id"], 1234);
         assert_eq!(v["version"], "0.1.0");
         assert_eq!(v["api_version"], 1);
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    //! **M-Prod sub-track #6 Phase A** — fast in-process unit
+    //! tests for the rate-limit classifier + the
+    //! `rate_limited_response_from_error` shape. End-to-end (HTTP
+    //! over a real listener with burst behavior + per-source-IP
+    //! discrimination) lives in `tests/rate_limit.rs`; the unit
+    //! coverage here keeps the cheap shape checks adjacent to the
+    //! code they exercise.
+
+    use super::*;
+
+    #[test]
+    fn classify_known_protected_routes_round_trip() {
+        // Every registered protected-route pattern in
+        // PROTECTED_ROUTE_LABELS must classify to itself when the
+        // path is its concrete instantiation. Without this,
+        // grx_rate_limit_blocked_total{route} would emit labels
+        // for the raw-path variant (`/v1/nodes/abc`) instead of
+        // the bounded pattern (`/v1/nodes/:id`).
+        assert_eq!(classify_protected_path("/v1/identity"), "/v1/identity");
+        assert_eq!(classify_protected_path("/v1/metrics"), "/v1/metrics");
+        assert_eq!(classify_protected_path("/v1/nodes"), "/v1/nodes");
+        assert_eq!(
+            classify_protected_path("/v1/supervisor/tree"),
+            "/v1/supervisor/tree"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/observer/events"),
+            "/v1/observer/events"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/observer/events.sse"),
+            "/v1/observer/events.sse"
+        );
+        assert_eq!(classify_protected_path("/v1/nodes/abc"), "/v1/nodes/:id");
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/messages"),
+            "/v1/nodes/:id/messages"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/messages/recent"),
+            "/v1/nodes/:id/messages/recent"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/messages/bulk"),
+            "/v1/nodes/:id/messages/bulk"
+        );
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/call"),
+            "/v1/nodes/:id/call"
+        );
+    }
+
+    #[test]
+    fn classify_unknown_paths_collapse_to_sentinel() {
+        // Routes outside the registered table — typos,
+        // adversarial paths, anything not in
+        // `PROTECTED_ROUTE_LABELS` — collapse to a single
+        // `"unknown"` label so an attacker can't inflate the
+        // metric's cardinality by hammering random URIs.
+        assert_eq!(classify_protected_path("/v1/foo"), "unknown");
+        assert_eq!(classify_protected_path("/v1/nodes/"), "unknown");
+        assert_eq!(
+            classify_protected_path("/v1/nodes/abc/weird"),
+            "unknown"
+        );
+        assert_eq!(classify_protected_path("/"), "unknown");
+        assert_eq!(classify_protected_path(""), "unknown");
+    }
+
+    #[test]
+    fn classify_returns_static_str_so_metric_label_is_zero_alloc() {
+        // The metric callsite stores the label as `&'static str`
+        // — verify the return type at compile time by passing it
+        // through a function bound. If the classifier ever
+        // returned an owned `String` (or `Cow`), this would
+        // refuse to compile, surfacing the cardinality
+        // regression at build time rather than at scrape time.
+        fn static_label_only(_s: &'static str) {}
+        static_label_only(classify_protected_path("/v1/identity"));
+        static_label_only(classify_protected_path("/v1/nodes/abc"));
+        static_label_only(classify_protected_path("/random"));
+    }
+
+    #[test]
+    fn rate_limited_response_shape_matches_bridge_saturated_envelope() {
+        // Operator contract: every back-pressure-class response
+        // ships the SAME JSON envelope + Retry-After header
+        // semantics; only the `error` discriminator changes.
+        // Drift here breaks operator grep scripts that index on
+        // `error` to triage `{rate_limited, bridge_saturated,
+        // draining, scheduler_first_batch_pending,
+        // cluster_no_peers_connected}`.
+        let resp = rate_limited_response_from_error(
+            tower_governor::GovernorError::TooManyRequests {
+                wait_time: 7,
+                headers: None,
+            },
+        );
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After header required on rate_limited")
+            .to_str()
+            .unwrap();
+        assert_eq!(retry_after, "7");
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("Content-Type required")
+            .to_str()
+            .unwrap();
+        assert_eq!(content_type, "application/json");
+    }
+
+    #[test]
+    fn rate_limited_response_clamps_zero_wait_to_one_second_minimum() {
+        // A `wait_time` of 0 would tell a client to retry
+        // immediately, which spins. Clamp at 1s to match
+        // bridge_saturated_response's `Retry-After: 1` baseline.
+        let resp = rate_limited_response_from_error(
+            tower_governor::GovernorError::TooManyRequests {
+                wait_time: 0,
+                headers: None,
+            },
+        );
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(retry_after, "1");
+    }
+
+    #[test]
+    fn rate_limited_response_unable_to_extract_key_surfaces_500() {
+        // Should be unreachable under the Phase A wiring (the
+        // accept loop injects ConnectInfo per accept) but lock
+        // the shape so a regression that drops the inject site
+        // surfaces as a loud 500 in audit logs rather than a
+        // silent 200.
+        let resp = rate_limited_response_from_error(
+            tower_governor::GovernorError::UnableToExtractKey,
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn protected_route_labels_table_matches_registered_routes() {
+        // `PROTECTED_ROUTE_LABELS` must list exactly the 11
+        // protected paths the router registers. If a new
+        // protected route lands without updating the table, the
+        // classifier collapses it to `"unknown"` and operators
+        // lose per-route observability — surface that drift here
+        // at unit-test time.
+        let expected: std::collections::HashSet<&'static str> = [
+            "/v1/identity",
+            "/v1/metrics",
+            "/v1/nodes",
+            "/v1/nodes/:id",
+            "/v1/nodes/:id/messages",
+            "/v1/nodes/:id/messages/recent",
+            "/v1/nodes/:id/messages/bulk",
+            "/v1/nodes/:id/call",
+            "/v1/supervisor/tree",
+            "/v1/observer/events",
+            "/v1/observer/events.sse",
+        ]
+        .into_iter()
+        .collect();
+        let actual: std::collections::HashSet<&'static str> =
+            PROTECTED_ROUTE_LABELS.iter().copied().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_is_per_source_ip() {
+        // **Per-IP key extractor invariant.** Two distinct source
+        // IPs each driving below-cap traffic should NEVER produce
+        // 429 — the limiter is per-IP, not global. This test can't
+        // be written as an HTTP integration test on a single host
+        // (every loopback request comes from 127.0.0.1, so they
+        // all share one bucket), so it pokes the router directly
+        // via `tower::Service::oneshot` and crafts requests with
+        // hand-rolled `ConnectInfo<SocketAddr>` extensions —
+        // exactly what the `accept_loop` does per accept under
+        // real traffic.
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use std::net::{Ipv4Addr, SocketAddr};
+        use tower::ServiceExt;
+
+        // Tight cap: per_second=1, burst=2 — three requests from
+        // one IP would 429 on the third. Sending TWO from each of
+        // TWO different IPs must yield 0 429s.
+        let metrics = Arc::new(MetricsInner::new());
+        let snapshot_tx = mpsc::channel(1).0;
+        let state = ApiState {
+            metrics: metrics.clone(),
+            snapshot_tx,
+            token: None,
+            identity: Arc::new(Identity {
+                process_start_id: 1,
+                version: "test",
+                api_version: 1,
+            }),
+            ring: Arc::new(RingBufferTelemetry::new()),
+            websocket: None,
+            idempotency_cache: Arc::new(IdempotencyCache::new()),
+            pending_calls: PendingCalls::new(),
+            cluster_readyz: None,
+            audit_sink: None,
+            draining: None,
+            ingress_in_flight: IngressInFlight::new(),
+        };
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1, 2));
+
+        let alice: SocketAddr = (Ipv4Addr::new(10, 0, 0, 1), 30_000).into();
+        let bob: SocketAddr = (Ipv4Addr::new(10, 0, 0, 2), 30_001).into();
+
+        let mut alice_statuses = Vec::new();
+        let mut bob_statuses = Vec::new();
+        for _ in 0..2 {
+            // Alice's request
+            let mut req = Request::builder()
+                .uri("/v1/identity")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(alice);
+            req.extensions_mut().insert(ConnectInfo(alice));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            alice_statuses.push(resp.status().as_u16());
+
+            // Bob's request
+            let mut req = Request::builder()
+                .uri("/v1/identity")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(bob);
+            req.extensions_mut().insert(ConnectInfo(bob));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            bob_statuses.push(resp.status().as_u16());
+        }
+        let alice_429 = alice_statuses.iter().filter(|s| **s == 429).count();
+        let bob_429 = bob_statuses.iter().filter(|s| **s == 429).count();
+        assert_eq!(alice_429, 0, "alice (10.0.0.1) under cap, got {alice_statuses:?}");
+        assert_eq!(bob_429, 0, "bob (10.0.0.2) under cap, got {bob_statuses:?}");
+        // Now a 3rd request from alice — same IP, over burst —
+        // MUST 429. This locks the per-IP discrimination: if the
+        // limiter were global, the 4 already-spent tokens (2
+        // alice + 2 bob) would have exhausted a burst=2 bucket
+        // long ago.
+        let mut req = Request::builder()
+            .uri("/v1/identity")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(alice);
+        req.extensions_mut().insert(ConnectInfo(alice));
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            429,
+            "alice's 3rd request over burst MUST 429"
+        );
+    }
+
+    #[test]
+    fn rate_limit_blocked_metric_uses_static_route_label() {
+        // Mechanically verify the metric increment + bounded
+        // label: feed a known route through the classifier into
+        // the counter, then walk the DashMap to confirm exactly
+        // one series exists with the expected label value.
+        let m = MetricsInner::new();
+        assert!(m.rate_limit_blocked.is_empty());
+
+        let route = classify_protected_path("/v1/nodes/abc/messages");
+        m.rate_limit_blocked_inc(route);
+        m.rate_limit_blocked_inc(route);
+
+        assert_eq!(m.rate_limit_blocked.len(), 1);
+        let entry = m.rate_limit_blocked.iter().next().unwrap();
+        let label = entry.value();
+        assert_eq!(label.counter.get(), 2);
+        let lv = label
+            .labels
+            .iter()
+            .find(|(k, _)| *k == "route")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(lv, "/v1/nodes/:id/messages");
     }
 }

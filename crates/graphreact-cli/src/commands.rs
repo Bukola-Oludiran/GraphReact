@@ -1898,6 +1898,12 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 // SIGTERM-driven flip emitted by
                 // DaemonHandle::start_drain (commands.rs:start_drain).
                 draining: Some(drain_flag.clone()),
+                // **M-Prod sub-track #6 Phase A.** `None` = read the
+                // per-IP cap from `GRX_RATE_LIMIT_PER_IP_{PER_SEC,BURST}`
+                // env vars (or fall back to the in-code defaults).
+                // Operators tune the cap without a daemon recompile;
+                // tests inject explicit caps via `Some(RateLimitConfig)`.
+                rate_limit: None,
             },
         )
         .await
