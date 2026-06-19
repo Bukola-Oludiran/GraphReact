@@ -4498,4 +4498,571 @@ mod tests {
         let local = wire_to_local(without_cid, "bob", "alice").expect("decode");
         assert_eq!(local.correlation_id, None);
     }
+
+    // -----------------------------------------------------------------
+    // **M-Prod sub-track #4 Phase γ (M14.11).** Cross-node
+    // delegated-restart integration tests.
+    // -----------------------------------------------------------------
+
+    mod delegated_restart {
+        use super::*;
+        use crate::wire::CAP_DELEGATED_RESTART;
+        use graphreact_core::runtime::types::PermissionManifest;
+        use graphreact_core::{
+            ChildSpec, RestartPolicy, RestartStrategy, RestartTracker, Supervisor,
+        };
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::Arc as StdArc;
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+
+        async fn drive_until<F: FnMut() -> bool>(
+            schedulers: &mut [&mut Scheduler],
+            mut cond: F,
+            timeout: Duration,
+        ) -> bool {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                for s in schedulers.iter_mut() {
+                    s.process_batch().expect("process_batch");
+                }
+                if cond() {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// Happy-path: both peers advertise CAP_DELEGATED_RESTART.
+        /// alice issues a delegated restart for a supervised child on
+        /// bob. The child is restarted (mount counter increments),
+        /// the Ack reports `Accepted`, the Result reports `Completed`.
+        #[tokio::test]
+        async fn happy_path_delegated_restart_through_supervisor() {
+            let alice_id: NodeId = "alice@127.0.0.1".parse().unwrap();
+            let bob_id: NodeId = "bob@127.0.0.1".parse().unwrap();
+            let (alice_tls, bob_tls) = dev_tls::pair("alice", "bob").unwrap();
+            let cookie = b"shared".to_vec();
+
+            // Bob: install a supervisor + supervise one child "worker".
+            // The child's mount counter lets us verify the restart fired.
+            let mut bob_scheduler = Scheduler::new(CommunicationGraph::new());
+            bob_scheduler.start().unwrap();
+            let runs = Rc::new(Cell::new(0u32));
+            let runs_clone = Rc::clone(&runs);
+            let sup = bob_scheduler.install_supervisor(Supervisor::new(
+                RestartStrategy::OneForOne,
+                RestartTracker::new(5, Duration::from_secs(60)),
+            ));
+            let worker_def = NodeDefinition::new("worker", move |_ctx| {
+                runs_clone.set(runs_clone.get() + 1);
+                PermissionManifest::default()
+            });
+            bob_scheduler
+                .supervise(
+                    sup,
+                    ChildSpec {
+                        id: "worker".into(),
+                        policy: RestartPolicy::Permanent,
+                        definition: worker_def,
+                        props: Attrs::new(),
+                        connect_to: vec![],
+                        height: 0,
+                    },
+                )
+                .expect("supervise worker");
+            bob_scheduler.process_batch().expect("bob initial batch");
+            assert_eq!(runs.get(), 1, "worker mounted once before restart");
+
+            let bob_cfg = ClusterConfig {
+                node_id: bob_id.clone(),
+                creation: Creation(1),
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
+                tls: bob_tls.config.clone(),
+                capabilities: vec![],
+                capabilities_bitmap: CAP_DELEGATED_RESTART,
+                net_tick: NetTickConfig::default(),
+                net_split_policy: NetSplitPolicy::default(),
+            };
+            let bob_cluster = Cluster::start(bob_cfg, &mut bob_scheduler)
+                .await
+                .expect("bob cluster start");
+            let bob_addr = bob_cluster.local_addr();
+
+            // Alice: trivial scheduler (no children — alice is the
+            // originator only).
+            let mut alice_scheduler = Scheduler::new(CommunicationGraph::new());
+            alice_scheduler.start().unwrap();
+            let alice_cfg = ClusterConfig {
+                node_id: alice_id.clone(),
+                creation: Creation(2),
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                cookie: SecretCookie::from_bytes(cookie).unwrap(),
+                tls: alice_tls.config.clone(),
+                capabilities: vec![],
+                capabilities_bitmap: CAP_DELEGATED_RESTART,
+                net_tick: NetTickConfig::default(),
+                net_split_policy: NetSplitPolicy::default(),
+            };
+            let alice_cluster = Cluster::start(alice_cfg, &mut alice_scheduler)
+                .await
+                .expect("alice cluster start");
+            alice_cluster
+                .connect(bob_addr, bob_id.clone())
+                .await
+                .expect("alice → bob connect");
+
+            // Wait for handshake completion on alice's side AND for the
+            // negotiated bitmap to settle (it's set inside
+            // promote_connection_client, which races with the await
+            // return; bob will also have promoted at this point).
+            for _ in 0..50 {
+                if alice_cluster
+                    .peer_effective_capabilities("bob")
+                    .map(|c| c & CAP_DELEGATED_RESTART != 0)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                alice_cluster
+                    .peer_effective_capabilities("bob")
+                    .map(|c| c & CAP_DELEGATED_RESTART != 0)
+                    .unwrap_or(false),
+                "expected CAP_DELEGATED_RESTART negotiated with bob"
+            );
+
+            // Issue the delegated restart.
+            let handle = alice_cluster
+                .send_delegated_restart_request(
+                    "bob",
+                    "worker",
+                    DelegatedRestartReasonCode::OperatorRequest,
+                    "token-id-test",
+                )
+                .expect("delegated_restart issued");
+            let correlation_id = handle.correlation_id;
+
+            // Drive bob's scheduler so dispatch_inbound queues the
+            // restart, drain fires unmount_with_reason → supervisor
+            // plan → re-mount. Then the outcome poller (50ms tick)
+            // ships the Result back to alice.
+            let ack_handle = handle.ack;
+            let result_handle = handle.result;
+            // Spawn a tokio task on a LocalSet so we can keep driving
+            // bob's scheduler from this thread. The scheduler is !Send.
+            let restart_ok = drive_until(
+                &mut [&mut bob_scheduler, &mut alice_scheduler],
+                || runs.get() >= 2,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(restart_ok, "worker should have remounted within 5s");
+            assert_eq!(runs.get(), 2, "worker mount counter incremented");
+
+            // Drain alice's outbound by repeatedly processing batches
+            // until the Ack + Result oneshots resolve.
+            let ack = tokio::time::timeout(Duration::from_secs(2), ack_handle)
+                .await
+                .expect("ack timeout")
+                .expect("ack channel closed");
+            assert!(
+                matches!(ack, DelegatedRestartAckOutcome::Accepted),
+                "ack outcome should be Accepted, got {ack:?}"
+            );
+            let result = tokio::time::timeout(Duration::from_secs(2), result_handle)
+                .await
+                .expect("result timeout")
+                .expect("result channel closed");
+            assert!(
+                matches!(result.outcome, DelegatedRestartResultOutcome::Completed),
+                "result outcome should be Completed, got {:?}",
+                result.outcome
+            );
+            let _ = correlation_id; // diagnostics-only
+
+            bob_cluster.shutdown();
+            alice_cluster.shutdown();
+        }
+
+        /// Capability-negotiation regression: alice advertises
+        /// CAP_DELEGATED_RESTART but bob does NOT. Alice's outbound
+        /// API must refuse with `CapabilityNotNegotiated` and emit
+        /// `delegated_restart_blocked reason=cap_not_negotiated`. No
+        /// wire packet is shipped.
+        #[tokio::test]
+        async fn capability_not_negotiated_blocks_outbound() {
+            let alice_id: NodeId = "alice@127.0.0.1".parse().unwrap();
+            let bob_id: NodeId = "bob@127.0.0.1".parse().unwrap();
+            let (alice_tls, bob_tls) = dev_tls::pair("alice", "bob").unwrap();
+            let cookie = b"shared".to_vec();
+
+            // Bob: NO CAP_DELEGATED_RESTART.
+            let mut bob_scheduler = Scheduler::new(CommunicationGraph::new());
+            bob_scheduler.start().unwrap();
+            let bob_cfg = ClusterConfig {
+                node_id: bob_id.clone(),
+                creation: Creation(1),
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
+                tls: bob_tls.config.clone(),
+                capabilities: vec![],
+                capabilities_bitmap: 0,
+                net_tick: NetTickConfig::default(),
+                net_split_policy: NetSplitPolicy::default(),
+            };
+            let bob_cluster = Cluster::start(bob_cfg, &mut bob_scheduler)
+                .await
+                .expect("bob start");
+            let bob_addr = bob_cluster.local_addr();
+
+            // Alice: CAP_DELEGATED_RESTART advertised.
+            let mut alice_scheduler = Scheduler::new(CommunicationGraph::new());
+            alice_scheduler.start().unwrap();
+            let alice_cfg = ClusterConfig {
+                node_id: alice_id.clone(),
+                creation: Creation(2),
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                cookie: SecretCookie::from_bytes(cookie).unwrap(),
+                tls: alice_tls.config.clone(),
+                capabilities: vec![],
+                capabilities_bitmap: CAP_DELEGATED_RESTART,
+                net_tick: NetTickConfig::default(),
+                net_split_policy: NetSplitPolicy::default(),
+            };
+            let alice_cluster = Cluster::start(alice_cfg, &mut alice_scheduler)
+                .await
+                .expect("alice start");
+            alice_cluster
+                .connect(bob_addr, bob_id.clone())
+                .await
+                .expect("alice → bob connect");
+
+            // Wait for the registry insert.
+            for _ in 0..50 {
+                if alice_cluster.registry().get_by_name("bob").is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            // Sanity: negotiated bitmap is 0 (alice's CAP_DELEGATED_RESTART
+            // AND bob's 0 = 0).
+            assert_eq!(
+                alice_cluster
+                    .peer_effective_capabilities("bob")
+                    .unwrap_or(0xFFFF_FFFF_FFFF_FFFF)
+                    & CAP_DELEGATED_RESTART,
+                0,
+                "expected CAP_DELEGATED_RESTART NOT negotiated"
+            );
+
+            let err = alice_cluster
+                .send_delegated_restart_request(
+                    "bob",
+                    "worker",
+                    DelegatedRestartReasonCode::OperatorRequest,
+                    "",
+                )
+                .expect_err("outbound should fail");
+            match err {
+                DelegatedRestartError::CapabilityNotNegotiated { peer, missing_bit } => {
+                    assert_eq!(peer, "bob");
+                    assert_eq!(missing_bit, "CAP_DELEGATED_RESTART");
+                }
+                other => panic!("expected CapabilityNotNegotiated, got {other:?}"),
+            }
+
+            bob_cluster.shutdown();
+            alice_cluster.shutdown();
+        }
+
+        /// Unknown peer: outbound on a name that is not in the
+        /// registry returns `UnknownPeer` and audits
+        /// `delegated_restart_blocked reason=unknown_peer`.
+        #[tokio::test]
+        async fn unknown_peer_blocks_outbound() {
+            let alice_id: NodeId = "alice@127.0.0.1".parse().unwrap();
+            let (alice_tls, _bob_tls) = dev_tls::pair("alice", "bob").unwrap();
+            let cookie = b"shared".to_vec();
+
+            let mut alice_scheduler = Scheduler::new(CommunicationGraph::new());
+            alice_scheduler.start().unwrap();
+            let alice_cfg = ClusterConfig {
+                node_id: alice_id.clone(),
+                creation: Creation(2),
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                cookie: SecretCookie::from_bytes(cookie).unwrap(),
+                tls: alice_tls.config.clone(),
+                capabilities: vec![],
+                capabilities_bitmap: CAP_DELEGATED_RESTART,
+                net_tick: NetTickConfig::default(),
+                net_split_policy: NetSplitPolicy::default(),
+            };
+            let alice_cluster = Cluster::start(alice_cfg, &mut alice_scheduler)
+                .await
+                .expect("alice start");
+
+            let err = alice_cluster
+                .send_delegated_restart_request(
+                    "ghost",
+                    "worker",
+                    DelegatedRestartReasonCode::OperatorRequest,
+                    "",
+                )
+                .expect_err("outbound should fail");
+            match err {
+                DelegatedRestartError::UnknownPeer { peer } => assert_eq!(peer, "ghost"),
+                other => panic!("expected UnknownPeer, got {other:?}"),
+            }
+            alice_cluster.shutdown();
+        }
+
+        /// Unknown child: alice issues a restart for a child that
+        /// doesn't exist on bob. Bob's drain reports
+        /// `unknown_child`. Alice's Result resolves with
+        /// `Failed { error_kind: \"unknown_child\" }`.
+        #[tokio::test]
+        async fn unknown_child_completes_with_failed_unknown_child() {
+            let alice_id: NodeId = "alice@127.0.0.1".parse().unwrap();
+            let bob_id: NodeId = "bob@127.0.0.1".parse().unwrap();
+            let (alice_tls, bob_tls) = dev_tls::pair("alice", "bob").unwrap();
+            let cookie = b"shared".to_vec();
+
+            let mut bob_scheduler = Scheduler::new(CommunicationGraph::new());
+            bob_scheduler.start().unwrap();
+            let bob_cfg = ClusterConfig {
+                node_id: bob_id.clone(),
+                creation: Creation(1),
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                cookie: SecretCookie::from_bytes(cookie.clone()).unwrap(),
+                tls: bob_tls.config.clone(),
+                capabilities: vec![],
+                capabilities_bitmap: CAP_DELEGATED_RESTART,
+                net_tick: NetTickConfig::default(),
+                net_split_policy: NetSplitPolicy::default(),
+            };
+            let bob_cluster = Cluster::start(bob_cfg, &mut bob_scheduler)
+                .await
+                .expect("bob start");
+            let bob_addr = bob_cluster.local_addr();
+
+            let mut alice_scheduler = Scheduler::new(CommunicationGraph::new());
+            alice_scheduler.start().unwrap();
+            let alice_cfg = ClusterConfig {
+                node_id: alice_id.clone(),
+                creation: Creation(2),
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                cookie: SecretCookie::from_bytes(cookie).unwrap(),
+                tls: alice_tls.config.clone(),
+                capabilities: vec![],
+                capabilities_bitmap: CAP_DELEGATED_RESTART,
+                net_tick: NetTickConfig::default(),
+                net_split_policy: NetSplitPolicy::default(),
+            };
+            let alice_cluster = Cluster::start(alice_cfg, &mut alice_scheduler)
+                .await
+                .expect("alice start");
+            alice_cluster
+                .connect(bob_addr, bob_id.clone())
+                .await
+                .expect("connect");
+
+            for _ in 0..50 {
+                if alice_cluster
+                    .peer_effective_capabilities("bob")
+                    .map(|c| c & CAP_DELEGATED_RESTART != 0)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            let handle = alice_cluster
+                .send_delegated_restart_request(
+                    "bob",
+                    "no-such-child",
+                    DelegatedRestartReasonCode::OperatorRequest,
+                    "",
+                )
+                .expect("issued");
+
+            // Drive both schedulers so bob's drain runs + alice
+            // surfaces the inbound Result.
+            let received_result: StdArc<StdMutex<Option<DelegatedRestartResultEvent>>> =
+                StdArc::new(StdMutex::new(None));
+            let result_handle = handle.result;
+            let _ack_handle = handle.ack;
+            // Drive both schedulers, polling for the result. Since
+            // bob's scheduler is `!Send`, we can't spawn the driver
+            // onto the runtime — we interleave it inline.
+            let mut schedulers: [&mut Scheduler; 2] =
+                [&mut bob_scheduler, &mut alice_scheduler];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut result_handle = result_handle;
+            let mut maybe_result: Option<DelegatedRestartResultEvent> = None;
+            loop {
+                for s in schedulers.iter_mut() {
+                    s.process_batch().expect("process_batch");
+                }
+                tokio::select! {
+                    r = &mut result_handle => {
+                        maybe_result = Some(r.expect("result channel closed"));
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            let result = maybe_result.expect("result didn't arrive within budget");
+            *received_result.lock().unwrap() = Some(result.clone());
+
+            match result.outcome {
+                DelegatedRestartResultOutcome::Failed { error_kind, .. } => {
+                    assert_eq!(error_kind, "unknown_child");
+                }
+                other => panic!("expected Failed{{unknown_child}}, got {other:?}"),
+            }
+
+            bob_cluster.shutdown();
+            alice_cluster.shutdown();
+        }
+
+        /// Forgery rejection: a peer that did NOT advertise
+        /// CAP_DELEGATED_RESTART (so on the receiver we DID NOT
+        /// advertise it either since the test asymmetry has bob with
+        /// no cap), if a packet with our `origin_peer` somehow lands
+        /// on bob, the dispatch arm drops + audits without sending
+        /// an Ack. We exercise this at the codec layer by simulating
+        /// the inbound packet through a hand-crafted call to
+        /// `dispatch_inbound` — verifying drop semantics without
+        /// requiring a malicious peer to actually ship the bytes.
+        ///
+        /// (A full network-level forgery rig would require either
+        /// rebuilding handshake bytes or a permissive `Cluster`
+        /// constructor. The unit-level test exercises the same
+        /// validation path.)
+        #[tokio::test]
+        async fn dispatch_inbound_rejects_packet_when_local_cap_not_advertised() {
+            // Build a minimal scheduler + handle so dispatch_inbound's
+            // SchedulerHandle is non-trivially shaped.
+            let scheduler = Scheduler::new(CommunicationGraph::new());
+            let handle = scheduler.handle();
+            // Construct a fresh in-memory pending map (we don't go
+            // through Cluster::start for this).
+            let pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>> =
+                Arc::new(PLMutex::new(HashMap::new()));
+            let (outbound_tx, mut outbound_rx) = mpsc::channel::<Packet>(8);
+            // Local supervision / dist_groups / reload_sink /
+            // telemetry — empty instances are fine; we never reach
+            // their arms.
+            let supervision = RemoteSupervision::new(
+                handle.clone(),
+                NodeRegistry::new(),
+                "bob".to_string(),
+                Creation(1),
+            );
+            let dist_groups = DistGroups::new(
+                handle.clone(),
+                NodeRegistry::new(),
+                "bob".to_string(),
+            );
+            let reload_sink = RemoteReloadSink::new();
+            let telemetry_sink = TelemetrySinkSlot::new();
+
+            let req = RestartDelegationRequest {
+                origin: "alice".into(),
+                target_node: "bob".into(),
+                child_node_id: "worker".into(),
+                reason_code: DelegatedRestartReasonCode::OperatorRequest,
+                correlation_id: 1,
+                token_id: "".into(),
+                version: 1,
+            };
+            // Local bitmap = 0 (we did NOT advertise CAP_DELEGATED_RESTART).
+            // dispatch should drop without ever sending an Ack.
+            dispatch_inbound(
+                Packet::RestartDelegationRequest(req),
+                "alice",
+                "bob",
+                &handle,
+                &supervision,
+                &dist_groups,
+                &reload_sink,
+                &telemetry_sink,
+                0, // our_capabilities_bitmap — DOES NOT include CAP
+                &outbound_tx,
+                &pending,
+            );
+            // No Ack must have been queued on the outbound side.
+            assert!(
+                outbound_rx.try_recv().is_err(),
+                "no Ack should be shipped when local CAP_DELEGATED_RESTART not advertised"
+            );
+        }
+
+        /// Forgery: wire `origin` != authenticated peer name. The
+        /// dispatch arm drops + audits `delegated_restart_rejected
+        /// reason=forged_origin` and ships no Ack.
+        #[tokio::test]
+        async fn dispatch_inbound_rejects_origin_mismatch() {
+            let scheduler = Scheduler::new(CommunicationGraph::new());
+            let handle = scheduler.handle();
+            let pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>> =
+                Arc::new(PLMutex::new(HashMap::new()));
+            let (outbound_tx, mut outbound_rx) = mpsc::channel::<Packet>(8);
+            let supervision = RemoteSupervision::new(
+                handle.clone(),
+                NodeRegistry::new(),
+                "bob".to_string(),
+                Creation(1),
+            );
+            let dist_groups = DistGroups::new(
+                handle.clone(),
+                NodeRegistry::new(),
+                "bob".to_string(),
+            );
+            let reload_sink = RemoteReloadSink::new();
+            let telemetry_sink = TelemetrySinkSlot::new();
+
+            // Authenticated peer name is "alice"; wire origin is
+            // "mallory" — drop + audit + no Ack.
+            let req = RestartDelegationRequest {
+                origin: "mallory".into(),
+                target_node: "bob".into(),
+                child_node_id: "worker".into(),
+                reason_code: DelegatedRestartReasonCode::OperatorRequest,
+                correlation_id: 42,
+                token_id: "".into(),
+                version: 1,
+            };
+            dispatch_inbound(
+                Packet::RestartDelegationRequest(req),
+                "alice",
+                "bob",
+                &handle,
+                &supervision,
+                &dist_groups,
+                &reload_sink,
+                &telemetry_sink,
+                CAP_DELEGATED_RESTART,
+                &outbound_tx,
+                &pending,
+            );
+            assert!(
+                outbound_rx.try_recv().is_err(),
+                "no Ack should be shipped on forged-origin packet"
+            );
+        }
+    }
 }
