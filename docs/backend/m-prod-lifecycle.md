@@ -1,6 +1,6 @@
 # M-Prod — Lifecycle (sub-track #4)
 
-**Status:** SHIPPED Phase α 2026-06-17 — SIGTERM drain primitive landed (drain bit + `/v1/readyz` extension + ingress 503 `draining` + `DaemonHandle::start_drain`); rolling-version negotiation (Phase β) + M14.11 delegated-restart (Phase γ) deferred; Phase β SHIPPED 2026-06-18 — WIRE_VERSION bumped to 5 + MIN_SUPPORTED_VERSION at 4 (one-bump rolling-upgrade compat) + per-engine capability bitmap.
+**Status:** SHIPPED Phase α 2026-06-17 — SIGTERM drain primitive landed (drain bit + `/v1/readyz` extension + ingress 503 `draining` + `DaemonHandle::start_drain`); rolling-version negotiation (Phase β) + M14.11 delegated-restart (Phase γ) deferred; Phase β SHIPPED 2026-06-18 — WIRE_VERSION bumped to 5 + MIN_SUPPORTED_VERSION at 4 (one-bump rolling-upgrade compat) + per-engine capability bitmap; **Phase γ SHIPPED 2026-06-18** — WIRE_VERSION bumped to 6 + MIN_SUPPORTED_VERSION at 5 (rolling-upgrade window preserved) + M14.11 cross-node delegated-restart wire protocol (Request/Ack/Result packets gated on `CAP_DELEGATED_RESTART`; responder-side `SchedulerHandle::request_delegated_restart` entry point drives the existing `unmount_with_reason` → supervisor-plan path; four new audit events on `graphreact::observer::audit`).
 
 This document covers sub-track #4 of the M-Prod milestone (production-hardening): orderly daemon lifecycle — graceful drain on SIGTERM, rolling-version handshake compatibility, and delegated restart for the M14.11 hot-reload escalation path. Sibling tracks (#2 TLS / SIGHUP topology, #5 observability `/v1/readyz`, #1 audit-sink for drain events, #9 chaos arms) reference this substrate; see [Cross-track contracts](#cross-track-contracts).
 
@@ -23,7 +23,7 @@ Phase α ships the **SIGTERM drain primitive** — every future drain trigger (k
 | `--drain-deadline-secs` / `GRX_DRAIN_DEADLINE_SECS` / `DEFAULT_DRAIN_DEADLINE_SECS=20` | SHIPPED | `cli.rs` + `commands.rs` |
 | Integration tests (5 observer + 3 CLI + 4 unit) | SHIPPED | [`crates/graphreact-observer/tests/drain.rs`](../../crates/graphreact-observer/tests/drain.rs), [`crates/graphreact-cli/tests/drain_orchestration.rs`](../../crates/graphreact-cli/tests/drain_orchestration.rs) |
 | Rolling-version handshake (`WIRE_VERSION` floor relax) | SHIPPED — Phase β 2026-06-18 | [`crates/graphreact-dist/src/handshake.rs`](../../crates/graphreact-dist/src/handshake.rs) + `wire/packet.rs` |
-| M14.11 delegated-restart (reload-driven drain → spawn) | DEFERRED → Phase γ | n/a |
+| M14.11 delegated-restart (reload-driven drain → spawn) | SHIPPED — Phase γ 2026-06-18 | [`crates/graphreact-dist/src/wire/packet.rs`](../../crates/graphreact-dist/src/wire/packet.rs) + [`cluster.rs`](../../crates/graphreact-dist/src/cluster.rs) + [`crates/graphreact-core/src/runtime/scheduler.rs`](../../crates/graphreact-core/src/runtime/scheduler.rs) |
 | Cluster handshake quiescence (`Cluster::begin_drain`) | DEFERRED → Phase β | n/a |
 | SIGTERM on Windows (named-event or REST endpoint) | DEFERRED → Phase β | n/a |
 | Per-connection 5-min `MAX_CALL_TIMEOUT_MS` interplay with drain | KNOWN GAP (see [Drain-vs-MAX_CALL_TIMEOUT](#drain-vs-max_call_timeout-interaction)) | n/a |
@@ -334,6 +334,208 @@ safe-slice on top of Phase α's drain primitive.
 - Back-pressure response envelope + precedence ladder — unaffected
   (handshake is the dist layer, not the ingress layer).
 - mode 0o600 — unaffected.
+
+## Shipped — Phase γ: M14.11 cross-node delegated-restart
+
+Phase γ SHIPPED 2026-06-18 (sub-track #4 Group B-4b). Lands the
+M14.11 cross-node delegated-restart wire protocol on top of Phase β's
+rolling-version + capability-bitmap substrate.
+
+**Scope:**
+
+- `WIRE_VERSION` bumped 5 → **6**
+  ([`crates/graphreact-dist/src/wire/packet.rs`](../../crates/graphreact-dist/src/wire/packet.rs)).
+- `MIN_SUPPORTED_VERSION` bumped 4 → **5** — the rolling-upgrade
+  invariant `MIN_SUPPORTED_VERSION + 1 == WIRE_VERSION` is preserved
+  (asserted in `wire/frame.rs::tests::min_supported_version_is_one_below_wire_version`).
+  v4 peers (Phase α / pre-bitmap) are RETIRED — they get rejected
+  with `wire_version_below_floor` per the existing reject branch.
+- Three new packet variants — `RestartDelegationRequest` (0x50),
+  `RestartDelegationAck` (0x51), `RestartDelegationResult` (0x52) —
+  added to `PacketType` + `Packet` enums + `Packet::packet_type` +
+  `WireCodec::encode/decode` arms. New 0x50 discriminant range
+  leaves headroom above `ReloadModule = 0x40` for future delegation
+  packets.
+- Typed enums (snake_case serde rename, postcard-stable append-only
+  discriminants):
+  - `DelegatedRestartReasonCode` — `SupervisorEscalation`,
+    `OperatorRequest`, `ReloadDriven`, `HealthCheckFailure`.
+  - `DelegatedRestartAckOutcome` — `Accepted`, `RejectedNotPermitted`,
+    `RejectedUnknownChild`, `RejectedCapNotNegotiated`,
+    `RejectedDraining`.
+  - `DelegatedRestartResultOutcome` — `Completed`,
+    `Failed { reason: String, error_kind: String }`, `TimedOut`.
+- Hello / ChallengeAck wire shapes are **unchanged** at v6 — no new
+  fields. The Phase β dual-struct fallback in `WireCodec::decode`
+  continues to serve v5 peers correctly without modification.
+  Mixed v5/v6 clusters interop at the wire layer; Phase γ feature
+  gating happens via the capability bitmap (v5 peers advertise
+  bitmap=0 from a hardcoded default, so the AND with v6's bitmap
+  always = 0 → v6 outbound check refuses to ship before a v5 peer
+  ever sees a 0x50 type code).
+
+**Cluster API surface (graphreact-dist/src/cluster.rs):**
+
+- `Cluster::send_delegated_restart_request(peer_name, child_node_id,
+  reason_code, token_id) -> Result<DelegatedRestartHandle,
+  DelegatedRestartError>`. Validates (in this order):
+  1. Peer registered in the cluster registry. Missing →
+     `UnknownPeer` + audit `delegated_restart_blocked reason=unknown_peer`.
+  2. Negotiated `effective_capabilities & CAP_DELEGATED_RESTART != 0`.
+     Missing → `CapabilityNotNegotiated` + audit
+     `delegated_restart_blocked reason=cap_not_negotiated`.
+  3. Outbound channel has space. Full/closed → `OutboundChannel` +
+     audit `delegated_restart_blocked reason=outbound_channel`.
+  4. On success, audit `delegated_restart_issued`, register the
+     in-flight entry in `delegated_restart_pending`, return
+     `DelegatedRestartHandle` carrying `correlation_id` + `peer_name`
+     + `ack` (oneshot::Receiver<DelegatedRestartAckOutcome>) + `result`
+     (oneshot::Receiver<DelegatedRestartResultEvent>).
+- New types: `DelegatedRestartHandle`, `DelegatedRestartError`,
+  `DelegatedRestartIssued` (audit shape),
+  `DelegatedRestartResultEvent` (originator post-restart event).
+- Per-Cluster bookkeeping: monotonic `delegated_restart_counter`
+  (Arc<AtomicU64>) + in-flight `delegated_restart_pending`
+  (Arc<Mutex<HashMap<correlation_id, PendingDelegatedRestart>>>).
+  **No new substrate-level `PeerCapabilityMap`** — Phase β's
+  `PeerHandle::effective_capabilities` already stores the per-peer
+  negotiated bitmap (registry.rs:68); the dispatch arm consults it
+  via `Cluster::peer_effective_capabilities(name)`.
+
+**Inbound dispatch (graphreact-dist/src/cluster.rs::dispatch_inbound):**
+
+Three new arms for the new packet types:
+
+- `Packet::RestartDelegationRequest`: validates forgery (wire
+  `origin == authenticated peer_name`), local capability gate
+  (`our_capabilities_bitmap & CAP_DELEGATED_RESTART != 0`; drop +
+  audit `delegated_restart_rejected reason=cap_not_advertised`
+  without sending an Ack — peer should not have asked), and
+  `target_node == our_name`. On success: audits
+  `delegated_restart_received outcome=accepted`, ships
+  `RestartDelegationAck { outcome: Accepted }` via the held
+  outbound_tx, queues the local restart on the scheduler via
+  `SchedulerHandle::request_delegated_restart`.
+- `Packet::RestartDelegationAck`: looks up the pending entry by
+  `correlation_id`, resolves the originator's ack one-shot. Late or
+  duplicate Acks log + drop.
+- `Packet::RestartDelegationResult`: looks up the pending entry,
+  resolves the originator's result one-shot, removes the entry,
+  audits `delegated_restart_completed` with
+  `outcome ∈ {completed, failed, timed_out}` + `error_kind` +
+  `duration_ms`.
+
+**Responder-side local restart entry point
+(graphreact-core/src/runtime/scheduler.rs):**
+
+The graphreact-core supervisor module is data-only (the
+`Supervisor::plan` pure function). The only public restart entry
+point is the existing `unmount_with_reason` → supervisor-plan path.
+The minimal additive surface introduced by Phase γ:
+
+- `SchedulerHandle::request_delegated_restart(child_node_id,
+  reason_code, origin_peer, correlation_id)` — Send+Sync; pushes
+  onto a new `pending_delegated_restarts` cross-thread queue +
+  `notify.notify_one()`. Same shape as Phase β's
+  `pending_remote_demonitors` / `pending_remote_unlinks`.
+- `SchedulerHandle::poll_delegated_restart_outcomes()` —
+  cross-thread drain of the matching outcome queue.
+- `Scheduler::drain_pending_delegated_restarts` — drains the
+  request queue at the head of every `process_batch`. For each
+  request: looks up `id_to_key` + `node_to_supervisor`. Missing
+  child → outcome `error_kind = "unknown_child"`. Not supervised →
+  outcome `error_kind = "not_supervised"`. Otherwise synthesizes
+  `ExitReason::Crashed { detail: "delegated_restart from <peer>
+  (corr=<id>, reason=<code>)" }` and calls `unmount_with_reason`.
+  The existing path drives `execute_supervisor_plan` automatically;
+  the `RestartPolicy::should_restart` / `Strategy` / `RestartTracker`
+  contract is preserved bit-for-bit. Post-call,
+  `id_to_key.contains_key(child_id)` is the success indicator.
+
+**Outcome poller task (Cluster::start):**
+
+A 50ms-interval tokio task drains
+`SchedulerHandle::poll_delegated_restart_outcomes`, builds a
+`RestartDelegationResult` per outcome (Completed | Failed {
+reason, error_kind } depending on the `completed` flag +
+`error_kind`), looks up the matching origin peer in the registry,
+and ships via `peer.send_tx.try_send`. Origin-peer disconnects
+between request and outcome drop with `reason=origin_peer_disconnected`.
+
+**Audit events** (all on `tracing` target
+`graphreact::observer::audit`, matching Phase β
+`cluster_handshake_complete` style):
+
+- `delegated_restart_issued` (info, originator-side) — fields:
+  `peer`, `child_node_id`, `reason_code`, `token_id`,
+  `correlation_id`, `version`.
+- `delegated_restart_blocked` (warn, originator-side) — fields:
+  `peer`, `child_node_id`, `reason ∈
+  {cap_not_negotiated, unknown_peer, outbound_channel}`, optional
+  `detail`.
+- `delegated_restart_received` (info, responder-side) — fields:
+  `origin_peer`, `child_node_id`, `reason_code`, `token_id`,
+  `correlation_id`, `outcome ∈ {accepted}`. Phase γ ships only the
+  `accepted` outcome on this event; future variants land if/when
+  responder-side ACL gating is added.
+- `delegated_restart_rejected` (warn, responder-side, wire-level
+  rejection) — fields: `peer`, `correlation_id`,
+  `reason ∈ {forged_origin, cap_not_advertised, target_node_mismatch}`.
+  No Ack is shipped.
+- `delegated_restart_ack` (info, originator-side, on inbound Ack).
+- `delegated_restart_completed` (info, both sides) — fields:
+  `peer`, `correlation_id`, `outcome ∈ {completed, failed, timed_out}`,
+  `error_kind`, `duration_ms`.
+
+**RBAC seam (deferred to Phase γ.next):**
+
+The wire-level `token_id` is **informational + audited end-to-end**.
+The responder cannot independently validate the issuer's token
+(graphreact-dist is below graphreact-observer in the dep graph and
+has no access to `ApiState::rbac`). The load-bearing originator-side
+RBAC gate lives at the management API layer, in a future REST
+endpoint that consults `TokenRegistry` for `Role::Admin` before
+calling `Cluster::send_delegated_restart_request`. Phase γ ships the
+seam (`Cluster::send_delegated_restart_request` accepts a `token_id`
+arg + audits it); the REST handler lands in Phase γ.next alongside
+the management API ingress wiring. Cluster-internal supervisor-driven
+paths pass an empty `token_id` (legacy auth) and rely on the cluster
+handshake (mTLS + shared cookie) for authorization.
+
+**Cross-track contract integrity** (Phase γ):
+
+- Audit-target convention (`graphreact::observer::audit`) preserved —
+  six new audit-event subtargets ride the same target.
+- ApiState additive-only contract — unaffected; Phase γ does not
+  touch ApiState (the responder-side seam lives entirely in the dist
+  crate; the originator-side REST handler is deferred).
+- Atomic-swap pattern — unaffected (no rotatable shared state added).
+- Drain-budget math — unaffected.
+- Precedence ladder (`drain > rate_limit::per_token >
+  rate_limit::per_ip > auth > bridge_saturated`) — unchanged; Phase γ
+  has no REST surface to interact with the ladder. The deferred
+  γ.next REST endpoint will sit at the `auth` level (Admin-role
+  required); drain state already shields the originator-side
+  `Cluster::send_delegated_restart_request` if the daemon is
+  draining (the API itself does not check drain; the caller in the
+  drain-aware management API context does).
+- Phase β rolling-version invariant preserved
+  (`MIN_SUPPORTED_VERSION + 1 == WIRE_VERSION` asserted in
+  `wire/frame.rs::tests`).
+- Phase β codec dual-struct fallback unchanged (Hello / ChallengeAck
+  wire layouts did not change in v6).
+- mode 0o600 — unaffected.
+
+**Local restart contract preservation:**
+
+The responder-side path goes through the EXISTING
+`unmount_with_reason` → `execute_supervisor_plan` machinery with a
+synthesized `ExitReason::Crashed { detail }`. The
+`RestartPolicy::should_restart` policy gate + `RestartTracker`
+intensity tracker + `Strategy::OneForOne | OneForAll | RestForOne`
+sibling-restart logic all run unchanged. Operator-driven restart is
+treated as the same abnormal exit shape any local fault would
+produce.
 
 ## References
 

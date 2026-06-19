@@ -268,11 +268,23 @@ The M14.8.x-followon slice (2026-05-05) closed every M14.x deferral that
 didn't depend on substrate that doesn't exist yet. The M14.10 slice
 (2026-05-06) closed the supervisor-decision integration. Items remaining:
 
-- **Cross-node remote restart.** "Supervisor on alice restarts a child
-  on bob" requires a delegated-restart wire protocol that does not
-  exist today. M14.10 adds local **deferral** of supervisor decisions
-  whose dependencies span partitioned peers, but the actual restart
-  still happens locally. Tracked as M14.11 follow-on.
+- ✅ **Cross-node remote restart — M14.11 SHIPPED 2026-06-18 (closed
+  by M-Prod sub-track #4 Phase γ).** Cross-node delegated restart
+  now rides three new wire packets (`RestartDelegationRequest` /
+  `Ack` / `Result` at PacketType discriminants 0x50 / 0x51 / 0x52),
+  gated on the `CAP_DELEGATED_RESTART` bit in the negotiated
+  capability bitmap on both outbound and inbound paths. Responder-
+  side restart goes through a minimal additive
+  `SchedulerHandle::request_delegated_restart` entry point that
+  queues into a new `pending_delegated_restarts` Send+Sync queue
+  drained at the head of every `process_batch`; drain synthesizes
+  `ExitReason::Crashed { detail }` and drives the EXISTING
+  `unmount_with_reason` → `execute_supervisor_plan` path, preserving
+  the `RestartPolicy::should_restart` / `Strategy` / `RestartTracker`
+  contract bit-for-bit. WIRE_VERSION bumped 5 → 6 (MIN_SUPPORTED at
+  5; Phase β one-bump rolling-upgrade window preserved). See
+  [`m-prod-lifecycle.md` §Shipped — Phase γ](m-prod-lifecycle.md#shipped--phase-γ-m1411-cross-node-delegated-restart)
+  for the wire-protocol + RBAC + audit-event detail.
 
 ### Closed by M14.10 (2026-05-06)
 

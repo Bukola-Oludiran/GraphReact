@@ -2020,7 +2020,7 @@ fn dispatch_inbound(
                 pending.get_mut(&ack.correlation_id).and_then(|p| p.ack_tx.take())
             };
             if let Some(sender) = entry_ack {
-                let _ = sender.send(ack.outcome.clone());
+                let _ = sender.send(ack.outcome);
                 tracing::info!(
                     target: "graphreact::observer::audit",
                     event = "delegated_restart_ack",
@@ -4910,7 +4910,7 @@ mod tests {
             let mut result_handle = result_handle;
             let mut maybe_result: Option<DelegatedRestartResultEvent> = None;
             loop {
-                for s in schedulers.iter_mut() {
+                for s in &mut schedulers {
                     s.process_batch().expect("process_batch");
                 }
                 tokio::select! {
@@ -4918,7 +4918,7 @@ mod tests {
                         maybe_result = Some(r.expect("result channel closed"));
                         break;
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    () = tokio::time::sleep(Duration::from_millis(20)) => {}
                 }
                 if tokio::time::Instant::now() >= deadline {
                     break;
@@ -4986,7 +4986,7 @@ mod tests {
                 child_node_id: "worker".into(),
                 reason_code: DelegatedRestartReasonCode::OperatorRequest,
                 correlation_id: 1,
-                token_id: "".into(),
+                token_id: String::new(),
                 version: 1,
             };
             // Local bitmap = 0 (we did NOT advertise CAP_DELEGATED_RESTART).
@@ -5043,7 +5043,7 @@ mod tests {
                 child_node_id: "worker".into(),
                 reason_code: DelegatedRestartReasonCode::OperatorRequest,
                 correlation_id: 42,
-                token_id: "".into(),
+                token_id: String::new(),
                 version: 1,
             };
             dispatch_inbound(

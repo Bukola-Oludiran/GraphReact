@@ -2931,7 +2931,8 @@ impl Scheduler {
                     completed: false,
                     error_kind: Some("unknown_child"),
                     reason: Some("child id not found in scheduler".to_string()),
-                    duration_ms: started.elapsed().as_millis() as u64,
+                    duration_ms: u64::try_from(started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
                 });
                 continue;
             };
@@ -2943,7 +2944,8 @@ impl Scheduler {
                     completed: false,
                     error_kind: Some("not_supervised"),
                     reason: Some("child is not governed by any supervisor".to_string()),
-                    duration_ms: started.elapsed().as_millis() as u64,
+                    duration_ms: u64::try_from(started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
                 });
                 continue;
             }
@@ -2980,7 +2982,8 @@ impl Scheduler {
                 completed,
                 error_kind,
                 reason,
-                duration_ms: started.elapsed().as_millis() as u64,
+                duration_ms: u64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
             });
         }
         if !outcomes.is_empty() {
