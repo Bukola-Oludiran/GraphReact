@@ -324,6 +324,63 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    /// **Phase γ (M14.11).** Round-trip the three new delegated-restart
+    /// wire packets through the postcard codec + length-prefix
+    /// framing layer.
+    #[test]
+    fn roundtrip_restart_delegation_request() {
+        roundtrip(Packet::RestartDelegationRequest(
+            crate::wire::RestartDelegationRequest {
+                origin: "alice".into(),
+                target_node: "bob".into(),
+                child_node_id: "worker".into(),
+                reason_code:
+                    crate::wire::DelegatedRestartReasonCode::SupervisorEscalation,
+                correlation_id: 7,
+                token_id: "token-id-123".into(),
+                version: 7,
+            },
+        ));
+    }
+
+    #[test]
+    fn roundtrip_restart_delegation_ack() {
+        roundtrip(Packet::RestartDelegationAck(
+            crate::wire::RestartDelegationAck {
+                origin: "bob".into(),
+                correlation_id: 7,
+                outcome: crate::wire::DelegatedRestartAckOutcome::Accepted,
+            },
+        ));
+    }
+
+    #[test]
+    fn roundtrip_restart_delegation_result_completed() {
+        roundtrip(Packet::RestartDelegationResult(
+            crate::wire::RestartDelegationResult {
+                origin: "bob".into(),
+                correlation_id: 7,
+                outcome: crate::wire::DelegatedRestartResultOutcome::Completed,
+                duration_ms: 42,
+            },
+        ));
+    }
+
+    #[test]
+    fn roundtrip_restart_delegation_result_failed() {
+        roundtrip(Packet::RestartDelegationResult(
+            crate::wire::RestartDelegationResult {
+                origin: "bob".into(),
+                correlation_id: 9,
+                outcome: crate::wire::DelegatedRestartResultOutcome::Failed {
+                    reason: "child not supervised".into(),
+                    error_kind: "not_supervised".into(),
+                },
+                duration_ms: 13,
+            },
+        ));
+    }
+
     #[test]
     fn min_supported_version_is_one_below_wire_version() {
         // Phase β (sub-track #4): one-bump compat window — the

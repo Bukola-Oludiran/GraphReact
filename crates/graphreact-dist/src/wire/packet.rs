@@ -86,16 +86,43 @@ use serde::{Deserialize, Serialize};
 ///   (to widen the window). Planned consumers: #4 Phase γ
 ///   (cross-node delegated-restart, [`CAP_DELEGATED_RESTART`]) and
 ///   #1 Phase B (multi-token audit-chain, [`CAP_AUDIT_CHAIN`]).
-pub const WIRE_VERSION: u16 = 5;
+/// - `6` — **M-Prod sub-track #4 Phase γ.** Cross-node delegated-
+///   restart wire protocol. Adds [`PacketType::RestartDelegationRequest`],
+///   [`PacketType::RestartDelegationAck`], and
+///   [`PacketType::RestartDelegationResult`] (and their respective
+///   [`RestartDelegationRequest`] / [`RestartDelegationAck`] /
+///   [`RestartDelegationResult`] payload structs). Dispatch is gated
+///   on the [`CAP_DELEGATED_RESTART`] bit in the negotiated
+///   capability bitmap on BOTH the outbound and inbound paths
+///   (handshake.rs::HandshakeResult::effective_capabilities surface,
+///   queryable via [`crate::Cluster::peer_effective_capabilities`]).
+///   Same one-bump rolling-upgrade window contract as v5: floor
+///   ([`MIN_SUPPORTED_VERSION`]) bumps to `5`, so v4 peers are
+///   no longer interop-compatible. The Hello / ChallengeAck wire
+///   layouts are UNCHANGED at v6 (no new fields) — the dual-struct
+///   fallback in [`crate::wire::WireCodec::decode`] continues to
+///   serve v5 peers correctly. The new RestartDelegation* packets
+///   use stable discriminants in the `0x50` range (chosen to leave
+///   headroom above ReloadModule=0x40 for future delegation packets).
+///   Mixed v5/v6 clusters are interop-safe at the wire layer (v5
+///   daemons advertise bitmap with no CAP_DELEGATED_RESTART; the
+///   v6 outbound gate refuses to ship before a v5 peer ever sees a
+///   0x50 type code). Phase γ's next consumer (planned) is M19
+///   persistence segment-header coordination, which will either
+///   bump together or open a fresh compat window depending on the
+///   on-disk segment-header shape.
+pub const WIRE_VERSION: u16 = 6;
 /// Minimum protocol version this build will accept on a Hello/Challenge.
 ///
 /// Lags [`WIRE_VERSION`] by one for one-bump rolling-upgrade
-/// compatibility as of Phase β (sub-track #4). Future bumps either
-/// move both constants together (no compat window) OR move
+/// compatibility — phase β established this invariant; phase γ
+/// preserves it. As of Phase γ (sub-track #4, 2026-06-18) the floor
+/// is **5**, retiring v4 peers (Phase α). Future bumps either move
+/// both constants together (no compat window) OR move
 /// [`WIRE_VERSION`] only (widen the window by one). The handshake
 /// also rejects peers ABOVE [`WIRE_VERSION`] (future peers we don't
 /// understand) — see [`crate::handshake::server_handshake`].
-pub const MIN_SUPPORTED_VERSION: u16 = 4;
+pub const MIN_SUPPORTED_VERSION: u16 = 5;
 
 /// **Phase β (sub-track #4).** Per-engine capability bitmap exchanged in
 /// [`Hello::capabilities_bitmap`] / [`ChallengeAck::capabilities_bitmap`].
@@ -165,6 +192,28 @@ pub enum PacketType {
     /// trip on the unknown type code.
     ReloadModule = 0x40,
 
+    /// **M-Prod sub-track #4 Phase γ (M14.11).** Cross-node delegated
+    /// restart request — supervisor on the origin asks the target
+    /// peer to restart a named child under the target's local
+    /// supervision tree. Gated on the [`CAP_DELEGATED_RESTART`]
+    /// negotiated bitmap bit on BOTH sender (outbound refusal at
+    /// [`crate::Cluster::send_delegated_restart_request`]) and
+    /// receiver (inbound drop + audit at `dispatch_inbound`).
+    RestartDelegationRequest = 0x50,
+    /// **M-Prod sub-track #4 Phase γ (M14.11).** Synchronous-ish
+    /// acknowledgement of a [`Self::RestartDelegationRequest`].
+    /// Sent immediately on receipt (before the actual restart
+    /// kicks off) so the originator knows the peer received the
+    /// request and decided to proceed (or refuse — see
+    /// [`DelegatedRestartAckOutcome`]).
+    RestartDelegationAck = 0x51,
+    /// **M-Prod sub-track #4 Phase γ (M14.11).** Final outcome of a
+    /// delegated restart attempt. Sent AFTER the responder's local
+    /// restart path completes (or fails). The originator may have
+    /// timed out by then — in which case the late Result is logged
+    /// and dropped.
+    RestartDelegationResult = 0x52,
+
     Disconnect = 0xFF,
 }
 
@@ -195,6 +244,9 @@ impl PacketType {
             0x30 => Self::Tick,
             0x31 => Self::TickAck,
             0x40 => Self::ReloadModule,
+            0x50 => Self::RestartDelegationRequest,
+            0x51 => Self::RestartDelegationAck,
+            0x52 => Self::RestartDelegationResult,
             0xFF => Self::Disconnect,
             _ => return None,
         })
@@ -558,6 +610,169 @@ pub struct ReloadModulePacket {
 }
 
 // ---------------------------------------------------------------------
+// Delegated restart — M14.11 / M-Prod sub-track #4 Phase γ
+// ---------------------------------------------------------------------
+
+/// **Phase γ.** Reason the originator gives for asking a peer to
+/// restart a child. Informational on the wire — the responder does
+/// NOT consult this to decide whether to accept; the gate is purely
+/// capability + RBAC + drain state. Audited end-to-end for forensic
+/// trails. Append-only — variants get stable serde discriminants and
+/// MUST NOT be reordered. Add new variants at the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegatedRestartReasonCode {
+    /// Supervisor on the originator decided the child needs to
+    /// restart on the responder side — typically because a local
+    /// supervisor escalation policy fired (e.g. restart-intensity
+    /// exceeded locally and the operator delegated the recovery).
+    SupervisorEscalation,
+    /// Operator-driven request — typically via a future REST
+    /// endpoint on the management API.
+    OperatorRequest,
+    /// Triggered by a cluster-wide hot-reload pipeline (M15).
+    ReloadDriven,
+    /// Cluster-health driven (e.g. a liveness check failed on the
+    /// originator side and a healing supervisor chose to restart).
+    HealthCheckFailure,
+}
+
+/// **Phase γ.** Outcome reported in the immediate [`RestartDelegationAck`]
+/// after the responder validates the request but BEFORE the local
+/// restart runs. Distinct from [`DelegatedRestartResultOutcome`] (the
+/// post-restart outcome). Append-only discriminants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegatedRestartAckOutcome {
+    /// The responder accepted the request and will attempt the
+    /// local restart. A subsequent [`RestartDelegationResult`]
+    /// reports the post-restart outcome.
+    Accepted,
+    /// The responder refused due to authorization policy. v1 of the
+    /// substrate never produces this on the inbound path (the
+    /// originator-side RBAC gate catches before sending); reserved
+    /// for future per-responder ACL.
+    RejectedNotPermitted,
+    /// The named child does not exist on the responder side.
+    RejectedUnknownChild,
+    /// The responder did not advertise [`CAP_DELEGATED_RESTART`] in
+    /// its negotiated capability bitmap with us. The responder
+    /// SHOULD never emit this on the wire (it drops + audits instead
+    /// of acking) — but the variant is reserved for symmetry and
+    /// future use.
+    RejectedCapNotNegotiated,
+    /// The responder is in drain state.
+    RejectedDraining,
+}
+
+/// **Phase γ.** Post-restart outcome. Sent in [`RestartDelegationResult`]
+/// after the responder's supervisor finishes (succeeds, fails, or
+/// times out). Append-only discriminants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegatedRestartResultOutcome {
+    /// The supervisor successfully unmounted + remounted the child.
+    Completed,
+    /// The supervisor's restart policy or intensity tracker refused
+    /// to restart, OR the child remount itself errored. `reason` is
+    /// a human-readable description and `error_kind` is a stable
+    /// machine-grep tag (e.g. `"unknown_child"`, `"not_supervised"`,
+    /// `"policy_temporary"`, `"intensity_exceeded"`).
+    Failed { reason: String, error_kind: String },
+    /// The responder did not complete the restart within its local
+    /// timeout. Reserved for future use; v1 ships this only when the
+    /// supervisor decision deferred indefinitely.
+    TimedOut,
+}
+
+/// **Phase γ.** Cross-node delegated restart request packet.
+///
+/// The originator (supervisor on alice) asks the responder (peer
+/// bob) to restart a named child under bob's local supervision
+/// tree. The responder validates capability + forgery + drain state
+/// + child existence before acknowledging.
+///
+/// `origin` is the bare authenticated peer name (e.g. `alice`, not
+/// `alice@127.0.0.1`) — receivers compare directly against the
+/// authenticated peer name from the cluster handshake (forgery
+/// rejection pattern mirrors [`ReloadModulePacket::origin`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestartDelegationRequest {
+    /// Bare origin-node name. Receivers reject if the wire `origin`
+    /// doesn't match the authenticated peer name from the handshake
+    /// (mirrors [`ReloadModulePacket::origin`]'s forgery-rejection
+    /// pattern). Audited end-to-end.
+    pub origin: String,
+    /// Bare target-node name (e.g. `bob`). Informational — the
+    /// authenticated TCP connection identity already addresses the
+    /// request to us. Receivers verify `target_node == our_name`;
+    /// mismatches drop + audit (defense-in-depth against
+    /// misconfigured routing).
+    pub target_node: String,
+    /// Child node id as known to the responder's
+    /// `graphreact_core::Scheduler::id_to_key` table. Serialised as
+    /// `String` for wire stability — typed `NodeId` shapes would
+    /// re-couple wire layout to graphreact-core's internal slotmap
+    /// versioning.
+    pub child_node_id: String,
+    /// Why the originator is requesting the restart. Informational —
+    /// the responder does NOT consult this for accept/reject.
+    /// Audited end-to-end.
+    pub reason_code: DelegatedRestartReasonCode,
+    /// Monotonic per-origin correlation id. Echoed verbatim in the
+    /// matching [`RestartDelegationAck`] + [`RestartDelegationResult`]
+    /// so the originator can correlate outcomes with in-flight
+    /// requests.
+    pub correlation_id: u64,
+    /// The issuer's RBAC token id (per
+    /// `graphreact_observer::rbac::TokenId`). Empty string for
+    /// cluster-internal supervisor-driven paths that did not flow
+    /// through an authenticated REST endpoint. INFORMATIONAL on the
+    /// responder side (the responder cannot independently validate
+    /// the token id — the dist crate sits below
+    /// `graphreact-observer` in the dep graph); audited end-to-end
+    /// for SOC pipelines.
+    pub token_id: String,
+    /// Per-origin monotonic version. Mirrors
+    /// [`ReloadModulePacket::version`] for transit-integrity
+    /// logging. M-Prod will harden with signed packets + replay
+    /// defence.
+    pub version: u64,
+}
+
+/// **Phase γ.** Immediate acknowledgement of a
+/// [`RestartDelegationRequest`]. Carries the
+/// [`DelegatedRestartAckOutcome`] decided after capability + forgery
+/// + drain validation but BEFORE the actual restart attempt runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestartDelegationAck {
+    /// Bare responder peer name. Audited end-to-end.
+    pub origin: String,
+    /// Echoes the matching request's correlation id.
+    pub correlation_id: u64,
+    /// Receipt-time outcome.
+    pub outcome: DelegatedRestartAckOutcome,
+}
+
+/// **Phase γ.** Post-restart outcome packet. Sent AFTER the responder's
+/// supervisor finishes its restart attempt. The originator may have
+/// given up by then (timed out client-side); late Results are logged
+/// + dropped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestartDelegationResult {
+    /// Bare responder peer name. Audited end-to-end.
+    pub origin: String,
+    /// Echoes the matching request's correlation id.
+    pub correlation_id: u64,
+    /// Post-restart outcome.
+    pub outcome: DelegatedRestartResultOutcome,
+    /// Responder-measured wall-clock span between request-accepted
+    /// and result-emitted. Lets the originator-side audit log
+    /// capture cross-node restart latency.
+    pub duration_ms: u64,
+}
+
+// ---------------------------------------------------------------------
 // Liveness — net-tick (M14.7)
 // ---------------------------------------------------------------------
 
@@ -606,6 +821,13 @@ pub enum Packet {
     /// **M15 Phase 10.** Cluster-wide hot reload payload.
     ReloadModule(ReloadModulePacket),
 
+    /// **Phase γ.** Cross-node delegated-restart request.
+    RestartDelegationRequest(RestartDelegationRequest),
+    /// **Phase γ.** Receipt-time ack for a delegated-restart request.
+    RestartDelegationAck(RestartDelegationAck),
+    /// **Phase γ.** Post-restart outcome for a delegated-restart request.
+    RestartDelegationResult(RestartDelegationResult),
+
     /// Graceful disconnect — peer announces it's leaving the cluster.
     /// Carries no payload; the type code is sufficient.
     Disconnect,
@@ -634,6 +856,9 @@ impl Packet {
             Self::Tick(_) => PacketType::Tick,
             Self::TickAck(_) => PacketType::TickAck,
             Self::ReloadModule(_) => PacketType::ReloadModule,
+            Self::RestartDelegationRequest(_) => PacketType::RestartDelegationRequest,
+            Self::RestartDelegationAck(_) => PacketType::RestartDelegationAck,
+            Self::RestartDelegationResult(_) => PacketType::RestartDelegationResult,
             Self::Disconnect => PacketType::Disconnect,
         }
     }

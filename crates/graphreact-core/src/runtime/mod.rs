@@ -29,9 +29,9 @@ pub use node_instance::{
 };
 pub use permissions::{node_accepts, node_can_emit, resolve_channel_policy, ResolvedPolicy};
 pub use scheduler::{
-    GroupOp, NodeKey, RemoteBroadcastSink, RemoteGroupSink, RemoteLinkSink, RemoteMonitorSink,
-    RemoteSink, RemoteUnlinkSink, Scheduler, SchedulerHandle, SuperviseDecision,
-    SuperviseDecisionHook, SupervisorKey, UnmountHook,
+    DelegatedRestartOutcome, DelegatedRestartRequest, GroupOp, NodeKey, RemoteBroadcastSink,
+    RemoteGroupSink, RemoteLinkSink, RemoteMonitorSink, RemoteSink, RemoteUnlinkSink, Scheduler,
+    SchedulerHandle, SuperviseDecision, SuperviseDecisionHook, SupervisorKey, UnmountHook,
 };
 pub use sources::{delay_source, timer_source, EventSource, EventSourceFactory};
 pub use supervision::{
