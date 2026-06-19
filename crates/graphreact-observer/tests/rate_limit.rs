@@ -97,6 +97,10 @@ async fn spawn_with_limit(
         // auth path under test stays in the Phase A single-token
         // shape.
         rbac: None,
+        // **M-Prod sub-track #6 Phase B Part 1.** Phase A
+        // back-compat — None means X-Forwarded-For is IGNORED
+        // (the loopback peer IP is the bucket key).
+        trusted_proxies: None,
     })
     .await
     .expect("spawn");
@@ -293,9 +297,16 @@ async fn grx_rate_limit_blocked_total_counter_increments() {
             break;
         }
     }
+    // **Phase B Part 1.** The counter now carries a 2-label
+    // vocabulary `{route, bucket}`. Phase A path → `bucket="per_ip"`.
+    // Substring check is order-independent — Prometheus text format
+    // serializes labels in alphabetic order so the actual line is
+    // `grx_rate_limit_blocked_total{bucket="per_ip",route="/v1/identity"}`.
     assert!(
-        metrics_body.contains("grx_rate_limit_blocked_total{route=\"/v1/identity\"}"),
-        "expected counter line for /v1/identity in the Prometheus scrape; got body:\n{metrics_body}"
+        metrics_body.contains("grx_rate_limit_blocked_total{")
+            && metrics_body.contains("route=\"/v1/identity\"")
+            && metrics_body.contains("bucket=\"per_ip\""),
+        "expected counter line for /v1/identity + bucket=per_ip in the Prometheus scrape; got body:\n{metrics_body}"
     );
 
     server.shutdown().await;
@@ -350,6 +361,15 @@ async fn rate_limit_blocked_audit_event_fires() {
         .as_str()
         .expect("route field is a string");
     assert_eq!(route, "/v1/identity");
+    // **Phase B Part 1.** Audit shape now also carries a closed-
+    // vocabulary `bucket` field. Phase A path (RBAC = None) means
+    // every 429 has `bucket = "per_ip"` because the per-IP layer
+    // is the only one that ever fires (the per-token layer is
+    // dormant with the `for_tests` 1_000_000/1_000_000 defaults).
+    let bucket = first.fields["bucket"]
+        .as_str()
+        .expect("bucket field is a string");
+    assert_eq!(bucket, "per_ip");
     // Defensive — confirm the audit shape does NOT leak the
     // bearer token or any payload bytes via stringly-typed field
     // names operators might trust.

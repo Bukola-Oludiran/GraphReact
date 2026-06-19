@@ -51,6 +51,7 @@ pub mod multiplex;
 pub mod otel;
 pub mod prometheus;
 pub mod prometheus_sink;
+pub mod rate_limit_keys;
 pub mod rbac;
 pub mod ring_buffer;
 pub mod tls;
@@ -96,8 +97,9 @@ pub use graphreact_core::TelemetrySink;
 pub use http_server::{spawn as spawn_http_server, ServerHandle};
 pub use json_logs::JsonLogTelemetry;
 pub use management_api::{
-    build_router, build_router_with_rate_limit, classify_protected_path, drain_snapshot_requests,
-    parse_bulk_line, spawn as spawn_management_api,
+    build_router, build_router_with_rate_limit, build_router_with_rate_limit_and_proxies,
+    classify_protected_path, drain_snapshot_requests, parse_bulk_line,
+    spawn as spawn_management_api,
     spawn_with_cluster_readyz as spawn_management_api_with_cluster_readyz,
     spawn_with_drain as spawn_management_api_with_drain,
     spawn_with_options as spawn_management_api_with_options, ApiServerHandle, ApiState,
@@ -105,8 +107,14 @@ pub use management_api::{
     IdempotencyCache, Identity, InjectMessageBody, InjectMessageWithReplyDisposition, InjectResult,
     PendingCallGuard, PendingCalls, RateLimitConfig, SnapshotRequest, SpawnOptions,
     BULK_MAX_BODY_BYTES, BULK_MAX_LINE_BYTES, DEFAULT_BULK_LINE_CAP,
-    DEFAULT_RATE_LIMIT_PER_IP_BURST, DEFAULT_RATE_LIMIT_PER_IP_PER_SEC, PROTECTED_ROUTE_LABELS,
-    SNAPSHOT_CHANNEL_CAPACITY,
+    DEFAULT_RATE_LIMIT_PER_IP_BURST, DEFAULT_RATE_LIMIT_PER_IP_PER_SEC,
+    DEFAULT_RATE_LIMIT_PER_TOKEN_BURST, DEFAULT_RATE_LIMIT_PER_TOKEN_PER_SEC,
+    PROTECTED_ROUTE_LABELS, SNAPSHOT_CHANNEL_CAPACITY,
+};
+pub use rate_limit_keys::{
+    EffectivePeerIp, PerRequestRateLimitCtx, PerTokenBucketHintMarker, RateLimitDeniedBucket,
+    TokenIdKey, TokenIdKeyExtractor, TrustedNet, TrustedProxyAwarePeerIpExtractor,
+    TrustedProxyConfig, TrustedProxyParseError,
 };
 pub use metrics::{Counter, Gauge, Histogram, HistogramSnapshot, LabeledCounter, MetricsInner};
 pub use multiplex::MultiplexSink;

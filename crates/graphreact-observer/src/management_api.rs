@@ -599,6 +599,23 @@ pub const DEFAULT_RATE_LIMIT_PER_IP_PER_SEC: u64 = 50;
 /// the `GRX_RATE_LIMIT_PER_IP_BURST` env var.
 pub const DEFAULT_RATE_LIMIT_PER_IP_BURST: u32 = 100;
 
+/// **M-Prod sub-track #6 Phase B Part 1.** Default sustained
+/// request rate per AUTHENTICATED PRINCIPAL (per [`crate::rbac::TokenId`])
+/// for the protected `/v1/*` routes, in requests per second. The
+/// picked baseline (20 req/s) is TIGHTER than the per-IP cap because
+/// per-token traffic is single-identity by construction — one
+/// principal's normal operation rarely needs to sustain 50 req/s,
+/// and a tighter cap catches stolen/leaked credentials sooner
+/// without affecting legitimate operators. Tunable at boot via
+/// the `GRX_RATE_LIMIT_PER_TOKEN_PER_SEC` env var.
+pub const DEFAULT_RATE_LIMIT_PER_TOKEN_PER_SEC: u64 = 20;
+
+/// **M-Prod sub-track #6 Phase B Part 1.** Default per-token burst
+/// — token bucket capacity per principal. 40 = 2× the sustained
+/// per-second rate, mirroring the per-IP convention. Tunable at
+/// boot via the `GRX_RATE_LIMIT_PER_TOKEN_BURST` env var.
+pub const DEFAULT_RATE_LIMIT_PER_TOKEN_BURST: u32 = 40;
+
 /// **M-Prod sub-track #6 Phase A.** Static table of protected
 /// route patterns that map raw URI paths back to bounded labels
 /// for the `grx_rate_limit_blocked_total{route}` counter + the
@@ -880,7 +897,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// up `GRX_RATE_LIMIT_PER_IP_{PER_SEC,BURST}` without a callsite
 /// change.
 ///
-/// Tests use [`Self::const_for_tests`] to inject a deterministic
+/// Tests use [`Self::for_tests`] to inject a deterministic
 /// cap (low `per_second`, tiny `burst`) so a burst test reliably
 /// trips the limiter inside a sub-second window — without
 /// polluting process-global env state across parallel `cargo test`
@@ -889,8 +906,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 pub struct RateLimitConfig {
     /// Sustained per-source-IP request rate (tokens/sec).
     pub per_second: u64,
-    /// Burst size (token bucket capacity).
+    /// Per-source-IP burst size (token bucket capacity).
     pub burst: u32,
+    /// **M-Prod sub-track #6 Phase B Part 1.** Sustained
+    /// per-authenticated-principal request rate (tokens/sec). When
+    /// RBAC is wired ([`SpawnOptions::rbac = Some(...)`]) each
+    /// [`crate::rbac::TokenId`] gets its own bucket keyed by the
+    /// custom [`crate::rate_limit_keys::TokenIdKeyExtractor`]. When
+    /// RBAC is NOT wired the per-token layer is effectively dormant
+    /// — every request shares the `NoMatch` bucket which is bounded
+    /// by this rate as a coarse safety net.
+    pub per_token_per_sec: u64,
+    /// **M-Prod sub-track #6 Phase B Part 1.** Per-principal burst.
+    pub per_token_burst: u32,
 }
 
 impl RateLimitConfig {
@@ -910,15 +938,60 @@ impl RateLimitConfig {
                 "GRX_RATE_LIMIT_PER_IP_BURST",
                 DEFAULT_RATE_LIMIT_PER_IP_BURST,
             ),
+            per_token_per_sec: parse_env_u64(
+                "GRX_RATE_LIMIT_PER_TOKEN_PER_SEC",
+                DEFAULT_RATE_LIMIT_PER_TOKEN_PER_SEC,
+            ),
+            per_token_burst: parse_env_u32(
+                "GRX_RATE_LIMIT_PER_TOKEN_BURST",
+                DEFAULT_RATE_LIMIT_PER_TOKEN_BURST,
+            ),
         }
     }
 
-    /// **For tests only.** Hand-pick a `(per_second, burst)` pair
-    /// that exercises a specific cap. Production callers should
-    /// use [`Self::from_env`].
+    /// **For tests only.** Hand-pick a per-IP `(per_second, burst)`
+    /// pair while leaving the per-token layer effectively dormant
+    /// (`per_token_per_sec = 1`, `per_token_burst = 1_000_000` — the
+    /// burst is huge enough no sub-second test ever exhausts the
+    /// per-token bucket). Note: `per_second` on the governor builder
+    /// is the PERIOD in seconds between token replenishes, NOT
+    /// requests-per-second; we pick `1` so the refill rate is "1 token
+    /// every second" — the bucket starts full at `burst` and the
+    /// burst easily covers anything a sub-second integration test
+    /// throws at it.
+    ///
+    /// Existing Phase A tests use this arity-2 helper unchanged;
+    /// Phase B tests opt in via [`Self::for_tests_with_per_token`].
+    ///
+    /// Production callers should use [`Self::from_env`].
     #[must_use]
     pub const fn for_tests(per_second: u64, burst: u32) -> Self {
-        Self { per_second, burst }
+        Self {
+            per_second,
+            burst,
+            per_token_per_sec: 1,
+            per_token_burst: 1_000_000,
+        }
+    }
+
+    /// **M-Prod sub-track #6 Phase B Part 1, for tests only.**
+    /// Like [`Self::for_tests`] but pins ALL FOUR knobs — per-IP +
+    /// per-token. The Phase B per-token integration tests use this
+    /// to exercise the per-token bucket with a deterministic cap
+    /// while leaving the per-IP cap loose.
+    #[must_use]
+    pub const fn for_tests_with_per_token(
+        per_second: u64,
+        burst: u32,
+        per_token_per_sec: u64,
+        per_token_burst: u32,
+    ) -> Self {
+        Self {
+            per_second,
+            burst,
+            per_token_per_sec,
+            per_token_burst,
+        }
     }
 }
 
@@ -927,6 +1000,8 @@ impl Default for RateLimitConfig {
         Self {
             per_second: DEFAULT_RATE_LIMIT_PER_IP_PER_SEC,
             burst: DEFAULT_RATE_LIMIT_PER_IP_BURST,
+            per_token_per_sec: DEFAULT_RATE_LIMIT_PER_TOKEN_PER_SEC,
+            per_token_burst: DEFAULT_RATE_LIMIT_PER_TOKEN_BURST,
         }
     }
 }
@@ -948,7 +1023,67 @@ pub fn build_router(state: ApiState) -> Router {
 /// rate-limit integration tests to pin a deterministic cap
 /// without polluting the env-var process state across parallel
 /// test runners.
+///
+/// **Phase B Part 1 (Group B-4a).** This thunks through
+/// [`build_router_with_rate_limit_and_proxies`] with
+/// `trusted_proxies = None` so `X-Forwarded-For` is IGNORED —
+/// bit-for-bit Phase A behavior. The new signature lives at
+/// [`build_router_with_rate_limit_and_proxies`].
 pub fn build_router_with_rate_limit(state: ApiState, rl: RateLimitConfig) -> Router {
+    build_router_with_rate_limit_and_proxies(state, rl, None)
+}
+
+/// **M-Prod sub-track #6 Phase B Part 1 (Group B-4a).** Variant of
+/// [`build_router_with_rate_limit`] that ALSO accepts an explicit
+/// [`crate::rate_limit_keys::TrustedProxyConfig`] for `X-Forwarded-For`
+/// opt-in honoring.
+///
+/// `trusted_proxies = None` keeps the per-IP layer keyed on the TCP
+/// peer (= Phase A behavior). `Some(cfg)` enables the injector to
+/// resolve a trusted-proxy `X-Forwarded-For` leftmost IP into an
+/// [`crate::rate_limit_keys::EffectivePeerIp`] request extension —
+/// the per-IP extractor then keys on the resolved client IP rather
+/// than the proxy's TCP IP. The trust gate is the load-bearing
+/// silent-spoofing footgun guard.
+///
+/// **Layer ordering (outermost → innermost):**
+///
+/// 1. `rate_limit_observer` — captures peer + path classification
+///    AFTER the chain runs so a 429 returned by either governor below
+///    fires the audit event + metric. Reads the
+///    `RateLimitDeniedBucket` response extension stamped by the
+///    governor's error_handler to disambiguate per-IP vs per-token vs
+///    per-token-no-match.
+/// 2. `rate_limit_injector` — Phase B Part 1 state-injector.
+///    Reads `ApiState.rbac` (snapshotted via `Arc::clone`) +
+///    trusted-proxy config, matches the bearer token ONCE in
+///    constant time, and inserts `PerRequestRateLimitCtx`
+///    (precomputed `TokenIdKey` + bucket hint) plus
+///    `EffectivePeerIp` (resolved client IP when `X-Forwarded-For`
+///    is honored). Sits OUTSIDE both governor layers so the
+///    extensions are present when their `extract` closures run.
+/// 3. `token_governor_layer` — per-token bucket. Tighter cap; reads
+///    [`crate::rate_limit_keys::TokenIdKeyExtractor`].
+/// 4. `governor_layer` — per-IP bucket (now trusted-proxy aware).
+///    Reads [`crate::rate_limit_keys::TrustedProxyAwarePeerIpExtractor`]
+///    which falls back to `ConnectInfo<SocketAddr>` if no
+///    `EffectivePeerIp` extension was set (= Phase A semantics).
+/// 5. `auth_layer` — bearer-token check. Wrapped per-route via
+///    `route_layer` so it composes with the merged router's CORS
+///    layer without affecting the public branch.
+///
+/// **Denial precedence:** the OUTER layer fires its 429 FIRST, so
+/// the order above means `per_token > per_ip`. A request blocked by
+/// the per-token cap never reaches the per-IP layer. This matches
+/// the operator contract — when a known principal exceeds their
+/// tighter per-token quota, the 429 attributes the block to
+/// `bucket="per_token"` so operators can find the noisy principal in
+/// the audit log without sifting through IP-keyed buckets.
+pub fn build_router_with_rate_limit_and_proxies(
+    state: ApiState,
+    rl: RateLimitConfig,
+    trusted_proxies: Option<Arc<crate::rate_limit_keys::TrustedProxyConfig>>,
+) -> Router {
     use axum::middleware;
 
     // /v1/healthz bypasses auth (liveness probe-friendly).
@@ -962,59 +1097,80 @@ pub fn build_router_with_rate_limit(state: ApiState, rl: RateLimitConfig) -> Rou
         .route("/v1/healthz", get(healthz))
         .route("/v1/readyz", get(readyz));
 
-    // **M-Prod sub-track #6 Phase A.** Per-IP rate limiter for
-    // protected routes. `RateLimitConfig` defaults read from env
-    // once at build time (positive integer or fall back to the
-    // in-code constants); operators tune via
-    // `GRX_RATE_LIMIT_PER_IP_PER_SEC` +
-    // `GRX_RATE_LIMIT_PER_IP_BURST` (no daemon recompile).
+    // **M-Prod sub-track #6 Phase A → Phase B Part 1.** Per-IP rate
+    // limiter for protected routes. Now keyed by
+    // `TrustedProxyAwarePeerIpExtractor` (Phase B Part 1) instead of
+    // the upstream `PeerIpKeyExtractor`. Behavior is bit-for-bit
+    // identical when no `EffectivePeerIp` extension is present —
+    // the new extractor's fallback path reads `ConnectInfo<SocketAddr>`
+    // exactly the same way as the upstream.
     //
-    // `PeerIpKeyExtractor` (the default) reads
-    // `ConnectInfo<SocketAddr>` from request extensions — the
-    // accept loop in `accept_loop` inserts that extension per
-    // accept so the extractor never falls back to
-    // `UnableToExtractKey`. `use_headers()` enables the
-    // `x-ratelimit-*` family + `retry-after`; our custom
-    // `error_handler` (below) re-emits a matching `Retry-After`
-    // explicitly so the contract survives a future tower_governor
-    // shape change.
-    let governor_conf = Arc::new(
+    // `use_headers()` enables the `x-ratelimit-*` family + `retry-after`;
+    // our custom `error_handler` (below) re-emits a matching
+    // `Retry-After` explicitly so the contract survives a future
+    // tower_governor shape change, AND stamps the response extension
+    // `RateLimitDeniedBucket("per_ip")` so the outer
+    // `rate_limit_observer` can attribute the 429 to the per-IP bucket.
+    let per_ip_governor_conf = Arc::new(
         GovernorConfigBuilder::default()
             .per_second(rl.per_second)
             .burst_size(rl.burst)
+            .key_extractor(crate::rate_limit_keys::TrustedProxyAwarePeerIpExtractor)
             .use_headers()
-            // Custom 429 body shape mirrors `bridge_saturated_response`'s
-            // operator contract: same JSON envelope, same
-            // `Retry-After` header semantics, only the `error`
-            // discriminator changes (`bridge_saturated` →
-            // `rate_limited`). See [`rate_limited_response_from_error`]
-            // for the symmetry rationale.
             .error_handler(|err: tower_governor::GovernorError| {
-                rate_limited_response_from_error(err)
+                rate_limited_response_from_error_with_bucket(err, "per_ip")
             })
             .finish()
-            .expect("rate-limit config: per_second + burst_size both nonzero"),
+            .expect("per-IP rate-limit config: per_second + burst_size both nonzero"),
     );
-    let governor_layer = GovernorLayer {
-        config: governor_conf,
+    let per_ip_governor_layer = GovernorLayer {
+        config: per_ip_governor_conf,
     };
 
-    // Auth-protected routes. The middleware fires before each
-    // handler; missing/wrong token short-circuits with 401.
-    //
-    // **Layer ordering (outermost → innermost):**
-    //
-    // 1. `rate_limit_observer` — captures peer + path classification
-    //    AFTER the chain runs so a 429 returned by the governor below
-    //    fires the audit event + metric. Sits outside everything else
-    //    so it always observes the final response status.
-    // 2. `governor_layer` — per-IP token bucket. Rejected requests
-    //    short-circuit BEFORE auth runs (per the M-Prod #6 brief:
-    //    "unauthenticated floods don't burn auth CPU"). 429 returned
-    //    here flows back through (1) for instrumentation.
-    // 3. `auth_layer` — bearer-token check. Wrapped per-route via
-    //    `route_layer` so it composes with the merged router's CORS
-    //    layer without affecting the public branch.
+    // **M-Prod sub-track #6 Phase B Part 1.** Per-token rate
+    // limiter. ONLY mounted when RBAC is wired (`state.rbac =
+    // Some(...)`) — otherwise every request maps to the same
+    // `NoMatch` sentinel and the per-token cap would degrade to a
+    // global cap with the tighter per-token defaults (20 req/s + 40
+    // burst), which would break Phase A-style legacy spawn paths
+    // that only carry a single bearer token (pre-RBAC era). When
+    // RBAC IS wired, this layer sits ABOVE the per-IP limiter so
+    // its 429 fires FIRST — locks the `per_token > per_ip` denial
+    // precedence. The custom `TokenIdKeyExtractor` reads the
+    // precomputed `TokenIdKey` from the `PerRequestRateLimitCtx`
+    // extension injected by `rate_limit_injector` below — so we
+    // don't pay the registry walk twice (the auth_layer_rbac path
+    // walks it again, but the cost is bounded by the registry size
+    // <= 32 entries soft cap).
+    let per_token_governor_layer = state.rbac.as_ref().map(|_| {
+        let conf = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_second(rl.per_token_per_sec)
+                .burst_size(rl.per_token_burst)
+                .key_extractor(crate::rate_limit_keys::TokenIdKeyExtractor)
+                .use_headers()
+                .error_handler(|err: tower_governor::GovernorError| {
+                    rate_limited_response_from_error_with_bucket(err, "per_token")
+                })
+                .finish()
+                .expect("per-token rate-limit config: per_second + burst_size both nonzero"),
+        );
+        GovernorLayer { config: conf }
+    });
+
+    // **M-Prod sub-track #6 Phase B Part 1.** State-injector
+    // middleware. Sits OUTSIDE both governor layers so its
+    // extensions are present when the extractors run. Snapshots
+    // `state.rbac` once, walks the registry in constant time, and
+    // stashes the precomputed `TokenIdKey` + bucket hint into the
+    // request extensions. Also resolves the effective client IP
+    // when `trusted_proxies` is wired AND the peer is in the
+    // trusted set.
+    let injector_state = RateLimitInjectorState {
+        rbac: state.rbac.clone(),
+        trusted_proxies,
+    };
+
     let protected_routes = Router::new()
         .route("/v1/identity", get(identity))
         .route("/v1/metrics", get(metrics))
@@ -1056,16 +1212,29 @@ pub fn build_router_with_rate_limit(state: ApiState, rl: RateLimitConfig) -> Rou
             get(crate::websocket::sse_handler),
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer))
-        // **M-Prod sub-track #6 Phase A.** Per-IP rate limiter +
-        // observer middleware. `governor_layer` first (inner of
-        // the two) so it sees requests before observer's
-        // `next.run` returns; `rate_limit_observer` second
-        // (outermost) so it observes the 429 response coming back
-        // through the chain. axum applies layers in the order
-        // they're added: each call to `.layer()` wraps the
-        // previous one (the latest `.layer()` is the new
-        // outermost). See `Router::layer` docs.
-        .layer(governor_layer)
+        // **Stack** (top-to-bottom in source = inner-to-outer in axum):
+        //   per_ip_governor_layer  (deepest of the rate-limit layers)
+        //   per_token_governor_layer (ONLY when RBAC is wired; above
+        //                             per-IP; denial precedence
+        //                             `per_token > per_ip`)
+        //   rate_limit_injector    (provides extensions BEFORE either
+        //                           extractor runs)
+        //   rate_limit_observer    (outermost — fires audit/metric on
+        //                           the final 429, reads the
+        //                           `RateLimitDeniedBucket` response
+        //                           extension stamped by each layer's
+        //                           error_handler)
+        .layer(per_ip_governor_layer);
+    let protected_routes = if let Some(token_layer) = per_token_governor_layer {
+        protected_routes.layer(token_layer)
+    } else {
+        protected_routes
+    };
+    let protected_routes = protected_routes
+        .layer(middleware::from_fn_with_state(
+            injector_state,
+            rate_limit_injector,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_observer,
@@ -1092,6 +1261,175 @@ pub fn build_router_with_rate_limit(state: ApiState, rl: RateLimitConfig) -> Rou
         .merge(protected_routes)
         .with_state(state)
         .layer(cors)
+}
+
+/// **M-Prod sub-track #6 Phase B Part 1.** State held by the
+/// `rate_limit_injector` middleware. Cloned once per request via
+/// `from_fn_with_state`; the inner `Option<RotatableRegistry>` is
+/// already `Arc`-backed, and `Option<Arc<TrustedProxyConfig>>` is
+/// just an `Arc` clone. No per-request allocation.
+#[derive(Clone)]
+struct RateLimitInjectorState {
+    rbac: Option<crate::rbac::RotatableRegistry>,
+    trusted_proxies: Option<Arc<crate::rate_limit_keys::TrustedProxyConfig>>,
+}
+
+/// **M-Prod sub-track #6 Phase B Part 1.** State-injector
+/// middleware. Per-request work:
+///
+/// 1. Snapshot the RBAC registry once (`Arc::clone` is cheap).
+/// 2. Constant-time match the `Authorization: Bearer <token>` against
+///    every registry entry (mirrors [`crate::rbac::TokenRegistry::match_token`]).
+/// 3. Stash a [`crate::rate_limit_keys::PerRequestRateLimitCtx`] in
+///    request extensions — the per-token extractor reads it.
+/// 4. Optionally resolve a trusted-proxy `X-Forwarded-For` leftmost IP
+///    into [`crate::rate_limit_keys::EffectivePeerIp`] — the per-IP
+///    extractor reads it.
+///
+/// Cost when neither RBAC nor trusted-proxies are wired: one
+/// extension insert for the per-token sentinel (`NoMatch`) — the
+/// per-token layer is dormant in this configuration. The per-IP
+/// layer falls back to `ConnectInfo<SocketAddr>` (= Phase A).
+async fn rate_limit_injector(
+    State(s): State<RateLimitInjectorState>,
+    mut req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    use crate::rate_limit_keys::{
+        EffectivePeerIp, PerRequestRateLimitCtx, PerTokenBucketHintMarker, TokenIdKey,
+    };
+
+    // ----- per-token resolution -----
+    let token_ctx = if let Some(rbac) = s.rbac.as_ref() {
+        let header = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        let candidate = header.and_then(|v| v.strip_prefix("Bearer "));
+        match candidate {
+            Some(c) => {
+                let snap = rbac.current();
+                // Constant-time walk — matches the auth-layer
+                // discipline (no early-exit timing leak across
+                // matched-vs-N-matched-vs-no-match).
+                match snap.match_token(c.as_bytes()) {
+                    Some(entry) => {
+                        // **Verify-finding patch (LOW integration).**
+                        // Symmetric with auth_layer_rbac: a leaked-and-
+                        // expired credential MUST be attributed to the
+                        // per_token_no_match bucket here so the 429
+                        // bucket field is honest. Otherwise the expired
+                        // credential would consume the matched
+                        // principal's per-token bucket capacity AND
+                        // attribute the 429 to `bucket=per_token`,
+                        // even though auth_layer_rbac is about to
+                        // reject it as auth_fail/reason=expired one
+                        // layer down. The rate-limit gate is
+                        // intentionally conservative — expired = no
+                        // match, joins the global NoMatch sentinel
+                        // bucket.
+                        if snap.is_expired(entry, std::time::SystemTime::now()) {
+                            PerRequestRateLimitCtx {
+                                token_key: TokenIdKey::NoMatch,
+                                bucket_hint: "per_token_no_match",
+                            }
+                        } else {
+                            PerRequestRateLimitCtx {
+                                token_key: TokenIdKey::Matched(entry.id.clone()),
+                                bucket_hint: "per_token",
+                            }
+                        }
+                    }
+                    None => PerRequestRateLimitCtx {
+                        token_key: TokenIdKey::NoMatch,
+                        bucket_hint: "per_token_no_match",
+                    },
+                }
+            }
+            None => PerRequestRateLimitCtx {
+                token_key: TokenIdKey::NoMatch,
+                bucket_hint: "per_token_no_match",
+            },
+        }
+    } else {
+        // No RBAC wired — per-token layer is dormant. Every
+        // request shares the NoMatch sentinel, which gets bounded
+        // by the per-token cap as a global safety net. Bucket hint
+        // is `per_token_no_match` so a 429 attribution is honest.
+        PerRequestRateLimitCtx {
+            token_key: TokenIdKey::NoMatch,
+            bucket_hint: "per_token_no_match",
+        }
+    };
+    let bucket_hint = token_ctx.bucket_hint;
+    req.extensions_mut().insert(token_ctx);
+
+    // ----- trusted-proxy X-Forwarded-For resolution -----
+    if let Some(trusted) = s.trusted_proxies.as_ref() {
+        let peer_ip = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip());
+        if let Some(peer_ip) = peer_ip {
+            if trusted.contains(peer_ip) {
+                // Read leftmost IP from X-Forwarded-For.
+                if let Some(forwarded) = req
+                    .headers()
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    if let Some(leftmost) = parse_xff_leftmost(forwarded) {
+                        req.extensions_mut().insert(EffectivePeerIp(leftmost));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut resp = next.run(req).await;
+    // **Phase B Part 1.** Stamp the bucket-hint onto the response
+    // so the outer `rate_limit_observer` can refine a per-token
+    // 429 to `per_token_no_match` for unauthenticated / garbage-
+    // token requests. The per-token governor's error_handler
+    // closure only knows the layer-level discriminator (`"per_token"`);
+    // we know the sub-discriminator because we just walked the
+    // RBAC registry above.
+    resp.extensions_mut()
+        .insert(PerTokenBucketHintMarker(bucket_hint));
+    resp
+}
+
+/// **M-Prod sub-track #6 Phase B Part 1.** Parse the leftmost IP
+/// from an `X-Forwarded-For` header value. Returns `None` for
+/// empty / malformed input.
+///
+/// Format per RFC 7239 / common usage: comma-separated list of
+/// `client[, proxy1[, proxy2…]]`. Each entry is either `addr` or
+/// `addr:port`. IPv6 addresses are wrapped in square brackets when a
+/// port is present (`[::1]:80`); bare IPv6 is just `::1`. We try
+/// parsing the raw token first, then fall back to stripping a final
+/// `:port` suffix for IPv4 + bracketed IPv6.
+fn parse_xff_leftmost(header_value: &str) -> Option<std::net::IpAddr> {
+    let first = header_value.split(',').next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    // Try the raw token first — covers bare IPv4 / bare IPv6.
+    if let Ok(ip) = first.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+    // Bracketed IPv6 with optional port: `[::1]` or `[::1]:80`.
+    if let Some(rest) = first.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].parse::<std::net::IpAddr>().ok();
+        }
+    }
+    // IPv4 with port: `1.2.3.4:80`.
+    if let Some(idx) = first.rfind(':') {
+        let addr = &first[..idx];
+        return addr.parse::<std::net::IpAddr>().ok();
+    }
+    None
 }
 
 /// **M-Prod sub-track #6 Phase A.** Parse a positive-integer env
@@ -1154,6 +1492,12 @@ pub async fn spawn_with_cluster_readyz(
         // `spawn_with_cluster_readyz` defaults rbac to `None`;
         // callers opt in via the unified `spawn_with_options`.
         rbac: None,
+        // **M-Prod sub-track #6 Phase B Part 1.** Legacy spawn
+        // path defaults trusted_proxies to `None` —
+        // `spawn_with_options` falls back to reading
+        // `GRX_TRUSTED_PROXIES` env var (or, if unset, ignores
+        // `X-Forwarded-For` = Phase A behavior).
+        trusted_proxies: None,
     })
     .await
 }
@@ -1189,6 +1533,11 @@ pub async fn spawn_with_drain(
         // `spawn_with_drain` defaults rbac to `None`; callers opt
         // in via the unified `spawn_with_options`.
         rbac: None,
+        // **M-Prod sub-track #6 Phase B Part 1.** Legacy spawn
+        // path defaults trusted_proxies to `None` —
+        // `spawn_with_options` falls back to reading
+        // `GRX_TRUSTED_PROXIES`.
+        trusted_proxies: None,
     })
     .await
 }
@@ -1231,6 +1580,27 @@ pub struct SpawnOptions {
     ///
     /// SIGHUP-driven reload defers to Phase B Part 2.
     pub rbac: Option<crate::rbac::RotatableRegistry>,
+    /// **M-Prod sub-track #6 Phase B Part 1 (Group B-4a).** Trusted-
+    /// proxy CIDR set governing whether `X-Forwarded-For` is honored
+    /// for the per-IP rate-limit key.
+    ///
+    /// `None` (the production default unless an operator wires
+    /// `GRX_TRUSTED_PROXIES`) → `X-Forwarded-For` is IGNORED; the
+    /// per-IP bucket keys on the TCP peer IP (`ConnectInfo<SocketAddr>`),
+    /// bit-for-bit Phase A behavior.
+    ///
+    /// `Some(cfg)` → `X-Forwarded-For` is honored ONLY when the TCP
+    /// peer is in `cfg`. This is the silent-spoofing footgun guard
+    /// — a request arriving from an untrusted peer carrying
+    /// `X-Forwarded-For: <any IP>` keys on the peer's IP (not the
+    /// header), so an attacker can't bypass the per-IP cap by
+    /// crafting the header.
+    ///
+    /// Production path: `spawn_with_options` defaults this to
+    /// `TrustedProxyConfig::parse(env!("GRX_TRUSTED_PROXIES"))` when
+    /// the caller passes `None`. Tests pin a deterministic config
+    /// here (avoiding the env-var race across parallel runners).
+    pub trusted_proxies: Option<Arc<crate::rate_limit_keys::TrustedProxyConfig>>,
 }
 
 /// **M-Prod sub-track #1 Phase A + #4 Phase α.** Full-knob
@@ -1251,6 +1621,7 @@ pub async fn spawn_with_options(
         draining,
         rate_limit,
         rbac,
+        trusted_proxies,
     } = opts;
     // **Verify-finding patch (LOW).** Surface the config foot-gun where
     // an operator wires BOTH a Phase A single-token (`bind.token =
@@ -1326,7 +1697,35 @@ pub async fn spawn_with_options(
         rbac: rbac.clone(),
     };
     let rl = rate_limit.unwrap_or_else(RateLimitConfig::from_env);
-    let router = build_router_with_rate_limit(state, rl);
+    // **M-Prod sub-track #6 Phase B Part 1.** Resolve the trusted-
+    // proxy config. Callers (typically `start_daemon` going through
+    // the legacy `spawn_with_drain` thunk) pass `None`; we read
+    // `GRX_TRUSTED_PROXIES` here and fail-closed on parse error
+    // (logged at audit target, then treated as "no trusted proxies").
+    // Tests pin a deterministic config via `SpawnOptions::trusted_proxies`
+    // to avoid the env-var race across parallel runners.
+    let trusted = trusted_proxies.or_else(|| {
+        std::env::var("GRX_TRUSTED_PROXIES")
+            .ok()
+            .and_then(|s| {
+                if s.trim().is_empty() {
+                    return None;
+                }
+                match crate::rate_limit_keys::TrustedProxyConfig::parse(&s) {
+                    Ok(cfg) => Some(Arc::new(cfg)),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "graphreact::observer::audit",
+                            event = "trusted_proxies_parse_failure",
+                            detail = %err,
+                            "failed to parse GRX_TRUSTED_PROXIES — X-Forwarded-For will be ignored"
+                        );
+                        None
+                    }
+                }
+            })
+    });
+    let router = build_router_with_rate_limit_and_proxies(state, rl, trusted);
 
     // **M-Prod sub-track #2 Phase A.** Hold the rotatable TLS
     // handle (NOT a pre-built `TlsAcceptor`) — the per-connection
@@ -2501,11 +2900,34 @@ fn bridge_saturated_response() -> Response {
 /// explicitly rather than relying on tower_governor's default
 /// `Retry-After` so a future shape change inside the layer cannot
 /// silently downgrade the operator-visible back-off contract.
+#[cfg(test)]
 fn rate_limited_response_from_error(
     err: tower_governor::GovernorError,
 ) -> Response {
+    // Phase A back-compat wrapper. Defaults the bucket discriminator
+    // to `"per_ip"` so the existing in-module unit-test surface stays
+    // bit-for-bit (those tests don't pass through the per-layer
+    // error_handler closures + don't read the bucket extension).
+    rate_limited_response_from_error_with_bucket(err, "per_ip")
+}
+
+/// **M-Prod sub-track #6 Phase B Part 1 (Group B-4a).** Identical to
+/// [`rate_limited_response_from_error`] except it ALSO stamps the
+/// response with the [`crate::rate_limit_keys::RateLimitDeniedBucket`]
+/// extension carrying the `bucket` discriminator. The outer
+/// `rate_limit_observer` middleware reads that extension to attribute
+/// the 429 to the right bucket on both the audit record + the
+/// `grx_rate_limit_blocked_total{route,bucket}` Prometheus counter.
+///
+/// `bucket` MUST be one of the closed-over `&'static str`s
+/// `{"per_ip", "per_token", "per_token_no_match"}`. Each per-layer
+/// `error_handler` closure passes its own discriminator.
+fn rate_limited_response_from_error_with_bucket(
+    err: tower_governor::GovernorError,
+    bucket: &'static str,
+) -> Response {
     use tower_governor::GovernorError;
-    match err {
+    let mut resp = match err {
         GovernorError::TooManyRequests { wait_time, headers } => {
             // `wait_time` is duration-until-next-token in whole
             // seconds (matches RFC 7231 §7.1.3 delta-seconds and
@@ -2560,13 +2982,16 @@ fn rate_limited_response_from_error(
         GovernorError::UnableToExtractKey => {
             // Should be impossible under our wiring — the
             // `accept_loop` injects `ConnectInfo<SocketAddr>` per
-            // accept, so `PeerIpKeyExtractor` always finds a key.
-            // If we ever hit this branch it means the inject point
-            // regressed; surface a 500 with the operator-facing
-            // discriminator so the regression is loud in audit logs.
+            // accept, AND the Phase B Part 1 injector middleware
+            // installs `PerRequestRateLimitCtx` for the per-token
+            // extractor. If we ever hit this branch it means an
+            // injection point regressed; surface a 500 with the
+            // operator-facing discriminator so the regression is
+            // loud in audit logs.
             tracing::error!(
                 target: "graphreact::observer::audit",
-                "rate-limit key extraction failed — ConnectInfo<SocketAddr> missing from request extensions"
+                bucket = %bucket,
+                "rate-limit key extraction failed — required request extension missing"
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2580,11 +3005,10 @@ fn rate_limited_response_from_error(
         }
         GovernorError::Other { code, msg, headers } => {
             // Reserved for custom key extractors that return their
-            // own errors — Phase A uses the built-in
-            // `PeerIpKeyExtractor` so this branch is unreachable in
-            // the current shape; surface the structured shape
-            // anyway so a Phase B per-token extractor lights up
-            // here without a callsite change.
+            // own errors — neither of our extractors uses this
+            // branch (both return either a key or
+            // UnableToExtractKey), but keep the structured shape
+            // for future-proofing.
             let body = serde_json::json!({
                 "error": "rate_limit_other",
                 "detail": msg.unwrap_or_default(),
@@ -2603,7 +3027,14 @@ fn rate_limited_response_from_error(
             }
             resp
         }
-    }
+    };
+    // **Phase B Part 1.** Stamp the bucket discriminator on the
+    // response so the outer `rate_limit_observer` can attribute
+    // the 429 to the right bucket. Defaults to `"per_ip"` for
+    // back-compat at the observer site if the extension is missing.
+    resp.extensions_mut()
+        .insert(crate::rate_limit_keys::RateLimitDeniedBucket(bucket));
+    resp
 }
 
 /// **M-Prod sub-track #6 Phase A.** Observer middleware that wraps
@@ -2649,15 +3080,38 @@ async fn rate_limit_observer(
 
     let resp = next.run(req).await;
     if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        // **Phase B Part 1.** Read the bucket discriminator stamped
+        // by the per-layer error_handler. Defaults to `"per_ip"` —
+        // back-compat in case a regression strips the extension.
+        // When the per-token bucket fires, the injector also stamps
+        // its bucket_hint onto the response so `"per_token"` can
+        // refine to `"per_token_no_match"` for unauthenticated /
+        // garbage-token requests.
+        let raw_bucket = resp
+            .extensions()
+            .get::<crate::rate_limit_keys::RateLimitDeniedBucket>()
+            .map(|b| b.0)
+            .unwrap_or("per_ip");
+        let hinted_no_match = resp
+            .extensions()
+            .get::<crate::rate_limit_keys::PerTokenBucketHintMarker>()
+            .map(|m| m.0)
+            .unwrap_or("per_token_no_match");
+        let bucket = if raw_bucket == "per_token" {
+            hinted_no_match
+        } else {
+            raw_bucket
+        };
         // Audit fan + metric bump. Token / cert / payload bytes
-        // are NEVER included — only peer + route + the literal
-        // event name. Substrate-not-MVP: the tracing line is the
-        // canonical surface, the sink is a parallel fan, the
-        // metric is the cumulative aggregate.
+        // are NEVER included — only peer + route + bucket + the
+        // literal event name. Substrate-not-MVP: the tracing line
+        // is the canonical surface, the sink is a parallel fan,
+        // the metric is the cumulative aggregate.
         tracing::warn!(
             target: "graphreact::observer::audit",
             peer = %peer,
             route = %route,
+            bucket = %bucket,
             "rate_limit_blocked"
         );
         if let Some(sink) = state.audit_sink.as_ref() {
@@ -2666,10 +3120,11 @@ async fn rate_limit_observer(
                 fields: serde_json::json!({
                     "peer": peer,
                     "route": route,
+                    "bucket": bucket,
                 }),
             });
         }
-        state.metrics.rate_limit_blocked_inc(route);
+        state.metrics.rate_limit_blocked_inc(route, bucket);
     }
     resp
 }
@@ -3272,19 +3727,44 @@ mod rate_limit_tests {
         assert!(m.rate_limit_blocked.is_empty());
 
         let route = classify_protected_path("/v1/nodes/abc/messages");
-        m.rate_limit_blocked_inc(route);
-        m.rate_limit_blocked_inc(route);
+        m.rate_limit_blocked_inc(route, "per_ip");
+        m.rate_limit_blocked_inc(route, "per_ip");
+        // Same route, different bucket — must produce a SEPARATE
+        // series under the 2-label vocabulary.
+        m.rate_limit_blocked_inc(route, "per_token");
 
-        assert_eq!(m.rate_limit_blocked.len(), 1);
-        let entry = m.rate_limit_blocked.iter().next().unwrap();
-        let label = entry.value();
-        assert_eq!(label.counter.get(), 2);
-        let lv = label
-            .labels
+        assert_eq!(m.rate_limit_blocked.len(), 2);
+        let entries: Vec<_> = m
+            .rate_limit_blocked
             .iter()
-            .find(|(k, _)| *k == "route")
-            .map(|(_, v)| v.as_str())
-            .unwrap();
-        assert_eq!(lv, "/v1/nodes/:id/messages");
+            .map(|e| {
+                let v = e.value();
+                let bucket = v
+                    .labels
+                    .iter()
+                    .find(|(k, _)| *k == "bucket")
+                    .map(|(_, v)| v.clone())
+                    .unwrap();
+                let route_lv = v
+                    .labels
+                    .iter()
+                    .find(|(k, _)| *k == "route")
+                    .map(|(_, v)| v.clone())
+                    .unwrap();
+                (route_lv, bucket, v.counter.get())
+            })
+            .collect();
+        let per_ip = entries
+            .iter()
+            .find(|(_, b, _)| b == "per_ip")
+            .expect("per_ip series present");
+        let per_token = entries
+            .iter()
+            .find(|(_, b, _)| b == "per_token")
+            .expect("per_token series present");
+        assert_eq!(per_ip.0, "/v1/nodes/:id/messages");
+        assert_eq!(per_ip.2, 2);
+        assert_eq!(per_token.0, "/v1/nodes/:id/messages");
+        assert_eq!(per_token.2, 1);
     }
 }

@@ -2055,6 +2055,13 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 // single-bearer-token path defined by the
                 // `--observer-token-{env,file}` flags.
                 rbac: None,
+                // **M-Prod sub-track #6 Phase B Part 1.** `None`
+                // = read the trusted-proxy CIDR set from the
+                // `GRX_TRUSTED_PROXIES` env var (or, if unset,
+                // ignore `X-Forwarded-For` — bit-for-bit Phase A
+                // semantics, per the silent-spoofing footgun
+                // guard documented in `m-prod-rate-limit.md`).
+                trusted_proxies: None,
             },
         )
         .await

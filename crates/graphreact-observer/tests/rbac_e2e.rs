@@ -89,6 +89,9 @@ async fn spawn_with_rbac(
         draining: None,
         rate_limit: None,
         rbac: Some(rbac),
+        // M-Prod #6 Phase B Part 1 — RBAC tests don't exercise
+        // the X-Forwarded-For opt-in path.
+        trusted_proxies: None,
     })
     .await
     .expect("spawn");
