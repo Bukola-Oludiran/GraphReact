@@ -339,16 +339,18 @@ pub struct MetricsInner {
     /// round duration (tick_start → tick_end delta in nanoseconds).
     pub process_batch_duration: Histogram,
 
-    /// **M-Prod sub-track #6 Phase A.** `grx_rate_limit_blocked_total{route}` —
-    /// per-route count of HTTP requests rejected by `tower_governor`
-    /// with `429 Too Many Requests`. `route` is bounded to the 11
-    /// protected route patterns the management API registers (no
-    /// `:id` substitution — the rate-limit observer middleware
-    /// classifies the raw URI path back to its pattern), so
-    /// cardinality is bounded by the protected-route count plus a
-    /// single `"unknown"` sentinel for routes outside the table.
-    /// See [`crate::management_api::build_router`] for the
-    /// observer middleware that increments this counter.
+    /// **M-Prod sub-track #6 Phase A → Phase B Part 1.**
+    /// `grx_rate_limit_blocked_total{route,bucket}` — per-(route,bucket)
+    /// count of HTTP requests rejected by `tower_governor` with
+    /// `429 Too Many Requests`. `route` is bounded to the 11 protected
+    /// route patterns the management API registers (no `:id`
+    /// substitution — the rate-limit observer middleware classifies the
+    /// raw URI path back to its pattern), and `bucket` is bounded to a
+    /// 3-entry vocabulary `{"per_ip", "per_token", "per_token_no_match"}`
+    /// stamped by the per-layer error_handler closures. Total cardinality
+    /// is bounded by `(protected_routes + 1) × 3 = 12 × 3 = 36` series.
+    /// See [`crate::management_api::build_router`] for the observer
+    /// middleware that increments this counter.
     pub rate_limit_blocked: DashMap<u64, Arc<LabeledCounter>>,
 }
 
@@ -546,21 +548,23 @@ impl MetricsInner {
             .inc();
     }
 
-    /// **M-Prod sub-track #6 Phase A.** Increment the per-route
-    /// rate-limit-blocked counter. `route` is the protected-route
-    /// pattern (`&'static str`) classified by the rate-limit
-    /// observer middleware in
-    /// [`crate::management_api::build_router`]; pattern cardinality
-    /// is bounded by the registered route table (≤ 11 protected
-    /// routes plus a single `"unknown"` sentinel).
+    /// **M-Prod sub-track #6 Phase A → Phase B Part 1.** Increment the
+    /// per-(route, bucket) rate-limit-blocked counter. `route` is the
+    /// protected-route pattern (`&'static str`) classified by the
+    /// rate-limit observer middleware in
+    /// [`crate::management_api::build_router`]; `bucket` is the
+    /// closed-over `&'static str` discriminator
+    /// `{"per_ip", "per_token", "per_token_no_match"}` stamped by the
+    /// per-layer governor `error_handler` closure (defaults to
+    /// `"per_ip"` for back-compat if the bucket extension is missing).
+    /// Total cardinality is bounded by `(routes + 1) × 3 ≤ 36` series.
     ///
     /// Hot-path inline + get-then-insert avoids the DashMap shard
     /// write lock on cache hit — same pattern as
-    /// [`Self::messages_dropped_inc`] and the M22-phase-4 per-engine
-    /// counters.
+    /// [`Self::remote_messages_routed_inc`] (the other 2-label family).
     #[inline]
-    pub fn rate_limit_blocked_inc(&self, route: &'static str) {
-        let key = hash1(route);
+    pub fn rate_limit_blocked_inc(&self, route: &'static str, bucket: &'static str) {
+        let key = hash2(route, bucket);
         if let Some(c) = self.rate_limit_blocked.get(&key) {
             c.counter.inc();
             return;
@@ -568,7 +572,10 @@ impl MetricsInner {
         self.rate_limit_blocked
             .entry(key)
             .or_insert_with(|| {
-                Arc::new(LabeledCounter::new(vec![("route", route.to_string())]))
+                Arc::new(LabeledCounter::new(vec![
+                    ("route", route.to_string()),
+                    ("bucket", bucket.to_string()),
+                ]))
             })
             .counter
             .inc();

@@ -88,6 +88,9 @@ async fn spawn_with_sink(
         // flow + the strict-additive guarantee that a Phase A
         // daemon spawn keeps producing the same chain shape.
         rbac: None,
+        // M-Prod #6 Phase B Part 1 trusted_proxies is None — the
+        // audit-chain test isn't about X-Forwarded-For honoring.
+        trusted_proxies: None,
     })
     .await
     .expect("spawn");
