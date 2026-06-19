@@ -1313,10 +1313,33 @@ async fn rate_limit_injector(
                 // discipline (no early-exit timing leak across
                 // matched-vs-N-matched-vs-no-match).
                 match snap.match_token(c.as_bytes()) {
-                    Some(entry) => PerRequestRateLimitCtx {
-                        token_key: TokenIdKey::Matched(entry.id.clone()),
-                        bucket_hint: "per_token",
-                    },
+                    Some(entry) => {
+                        // **Verify-finding patch (LOW integration).**
+                        // Symmetric with auth_layer_rbac: a leaked-and-
+                        // expired credential MUST be attributed to the
+                        // per_token_no_match bucket here so the 429
+                        // bucket field is honest. Otherwise the expired
+                        // credential would consume the matched
+                        // principal's per-token bucket capacity AND
+                        // attribute the 429 to `bucket=per_token`,
+                        // even though auth_layer_rbac is about to
+                        // reject it as auth_fail/reason=expired one
+                        // layer down. The rate-limit gate is
+                        // intentionally conservative — expired = no
+                        // match, joins the global NoMatch sentinel
+                        // bucket.
+                        if snap.is_expired(entry, std::time::SystemTime::now()) {
+                            PerRequestRateLimitCtx {
+                                token_key: TokenIdKey::NoMatch,
+                                bucket_hint: "per_token_no_match",
+                            }
+                        } else {
+                            PerRequestRateLimitCtx {
+                                token_key: TokenIdKey::Matched(entry.id.clone()),
+                                bucket_hint: "per_token",
+                            }
+                        }
+                    }
                     None => PerRequestRateLimitCtx {
                         token_key: TokenIdKey::NoMatch,
                         bucket_hint: "per_token_no_match",
