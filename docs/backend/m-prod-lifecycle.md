@@ -487,6 +487,18 @@ between request and outcome drop with `reason=origin_peer_disconnected`.
   `peer`, `correlation_id`, `outcome ∈ {completed, failed, timed_out}`,
   `error_kind`, `duration_ms`.
 
+> **Operator note** — successful-receive and rejection are split
+> across two distinct event names (`delegated_restart_received` for
+> `outcome=accepted` only; `delegated_restart_rejected` for every
+> wire-level refusal: `forged_origin`, `cap_not_advertised`,
+> `target_node_mismatch`). Audit-log queries that grep only
+> `event=delegated_restart_received` will miss rejection rows —
+> subscribe to BOTH event names to capture the full responder-side
+> ledger. The split is deliberate (warn-level for rejection vs
+> info-level for the happy path); normalization to a single event
+> with `outcome` variants is catalogued in the Phase γ.next residual
+> below.
+
 **RBAC seam (deferred to Phase γ.next):**
 
 The wire-level `token_id` is **informational + audited end-to-end**.
@@ -536,6 +548,102 @@ intensity tracker + `Strategy::OneForOne | OneForAll | RestForOne`
 sibling-restart logic all run unchanged. Operator-driven restart is
 treated as the same abnormal exit shape any local fault would
 produce.
+
+## Phase γ.next residual catalogue
+
+Phase γ ships the wire-protocol substrate + responder-side scheduler
+entry point + originator-side Cluster API. The deferred-to-γ.next
+slice is everything that the dist crate cannot reach across the
+dep-graph (graphreact-dist sits below graphreact-observer), plus the
+robustness polish noted by the verify pass:
+
+1. **REST endpoint at `management_api.rs`** — `POST
+   /v1/admin/cluster/delegated-restart` that consults
+   `TokenRegistry::Role::Admin` via the existing `auth_layer_rbac`
+   shape (from B-3) before calling
+   `Cluster::send_delegated_restart_request`. The Cluster seam is
+   shipped (accepts `token_id`, audits it end-to-end); only the REST
+   handler + axum route wiring + Admin-role gate remain.
+2. **Drain-state gate on `Cluster::send_delegated_restart_request`** —
+   the in-dist API currently does NOT consult the `DrainFlag`
+   (`DrainFlag` lives in graphreact-observer, below which dist sits
+   in the dep graph). The cluster-internal supervisor-driven path
+   shipped here has no external HTTP edge that requires drain
+   shielding (drain shields ingress, not internal supervisor
+   decisions). When the γ.next REST endpoint lands, the management
+   API layer will gate by drain BEFORE calling the Cluster API
+   (precedence ladder `drain > rate_limit > auth > bridge_saturated`
+   stays load-bearing at the HTTP edge). If a future cluster-internal
+   caller demands its own drain shielding, thread a `DrainFlag` Arc
+   into `ClusterConfig` rather than punching a layer-violation hole.
+3. **Originator-side `TimedOut` outcome synthesis** — Phase γ ships
+   the responder-side `TimedOut` wire-enum variant but no
+   originator-side local timeout wrapper. Callers wrap
+   `DelegatedRestartHandle::result` in `tokio::time::timeout` if they
+   want a deadline. γ.next: extend
+   `Cluster::send_delegated_restart_request` with an explicit
+   deadline arg + auto-fire `delegated_restart_completed
+   outcome=timed_out` on the originator side when the deadline
+   elapses (discarding any late-arriving wire Result).
+4. **`DelegatedRestartHandle` `Drop` impl** — if the originator drops
+   the handle before awaiting `.result()`, the corresponding entry in
+   `delegated_restart_pending` stays resident until a late-arriving
+   Result clears it (or the peer disconnects and the connection task
+   tears down its pending map — but peer disconnect doesn't
+   automatically clear the originator-side pending map today). γ.next
+   adds a `Drop` impl that removes the correlation_id from the
+   pending map on early-drop, plus a periodic GC pass keyed by
+   deadline. Practical leak is bounded (entries are ~64 bytes), but
+   the explicit GC closes the gap.
+5. **Audit-emit level normalization** —
+   `delegated_restart_issued` + `delegated_restart_received` +
+   `delegated_restart_ack` + `delegated_restart_completed` (success
+   path) currently emit at `tracing::info!`, while
+   `delegated_restart_blocked` + `delegated_restart_rejected` use
+   `tracing::warn!`. All six events emit on the
+   `graphreact::observer::audit` target (the load-bearing invariant
+   for hash-chain capture), but normalizing the success-path events
+   to `warn!` would match Phase β `cluster_handshake_complete` style
+   exactly. AuditSink subscribers that capture INFO+ already get all
+   six rows today.
+6. **Event-name normalization** — collapse
+   `delegated_restart_received` (accepted-only) +
+   `delegated_restart_rejected` (refusals) into a single
+   `delegated_restart_received` event with an `outcome` discriminant
+   covering both paths, so operators don't have to subscribe to two
+   names to capture the responder-side ledger. Requires a
+   coordinated AuditSink consumer update; deferred to the same
+   slice as the REST endpoint.
+7. **Originator-side AuditSink fan-out** —
+   `delegated_restart_ack` + `delegated_restart_completed` events
+   fire on `tracing::info!` only today; the dist crate cannot reach
+   the hash-chained `AuditSink` directly (B-1 sink lives in
+   graphreact-observer). When B-1 Phase B Part 2 lands a sink
+   reachable from dist (or a tracing-layer bridge that captures the
+   audit target into the sink), these events can fan to the
+   hash-chain ledger.
+8. **Cluster handshake quiescence (`Cluster::begin_drain`)** —
+   softer shutdown path for cluster connections: announce drain to
+   peers BEFORE closing the socket so they can fail outbound
+   delegated-restart calls fast rather than timing out on the
+   wire. Composes with the Phase α SIGTERM drain primitive.
+9. **Per-call drain-aware timeout truncation** — when the daemon
+   enters drain mid-call, in-flight `DelegatedRestartHandle` futures
+   should auto-cancel with `outcome=timed_out reason=drain_started`
+   rather than waiting for the wire Result. Phase α drain budget +
+   Phase γ correlation_id machinery compose; the work is wiring
+   them up.
+10. **Windows SIGTERM equivalent** — the lifecycle drain primitive
+    currently triggers on Unix `SIGTERM`; the Windows equivalent
+    (CTRL_SHUTDOWN_EVENT / service stop) is unwired. Cross-cuts
+    with #2 SIGHUP Phase B Windows path.
+11. **M19 persistence segment-header version coordination** — the
+    next `WIRE_VERSION` consumer named in the v6 doc-comment is
+    M19's segment-header version, which must coordinate with the
+    wire-protocol ceiling so a v(N+1) daemon mounting a v(N)
+    segment knows which schema to expect. No code change in this
+    slice; the marker establishes the upgrade-coordination
+    expectation for that future work.
 
 ## References
 
