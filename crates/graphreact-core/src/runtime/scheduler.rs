@@ -276,6 +276,31 @@ pub struct Scheduler {
     /// `pending_remote_demonitors`.
     pending_remote_unlinks: Arc<Mutex<Vec<NodeKey>>>,
 
+    /// **M-Prod sub-track #4 Phase γ (M14.11).** `Send + Sync` queue of
+    /// cross-node delegated-restart requests pushed by the dist
+    /// crate's `dispatch_inbound` arm via
+    /// [`SchedulerHandle::request_delegated_restart`]. Drained at the
+    /// head of every `process_batch` round. The drain logic looks up
+    /// the named child via `id_to_key` + `node_to_supervisor` and
+    /// drives the EXISTING `unmount_with_reason` → supervisor-plan
+    /// path with an `ExitReason::Crashed { detail }` synthesizing the
+    /// origin peer + correlation id — this PRESERVES the existing
+    /// `Supervisor::Strategy` / `should_restart` contract bit-for-bit;
+    /// the operator-driven restart is treated as the same abnormal
+    /// exit shape any local fault would produce, gated by the same
+    /// `RestartPolicy` + intensity tracker. Per-request outcomes are
+    /// pushed onto [`Self::pending_delegated_restart_outcomes`] for
+    /// the dist crate to drain + ship as `RestartDelegationResult`
+    /// packets.
+    pending_delegated_restarts: Arc<Mutex<Vec<DelegatedRestartRequest>>>,
+
+    /// **Phase γ (M14.11).** `Send + Sync` queue of outcomes from
+    /// the [`Self::pending_delegated_restarts`] drain. Pushed by the
+    /// scheduler thread after each drain; polled from the dist
+    /// crate's per-connection task via
+    /// [`SchedulerHandle::poll_delegated_restart_outcomes`].
+    pending_delegated_restart_outcomes: Arc<Mutex<Vec<DelegatedRestartOutcome>>>,
+
     /// **M14.5 distribution hook.** Callbacks fired from
     /// [`Self::unmount_with_reason`] after the local DOWN/EXIT
     /// fan-out completes. The dist crate registers one hook to
@@ -431,6 +456,67 @@ pub type SuperviseDecisionHook = std::sync::Arc<
     dyn Fn(SupervisorKey, &str, &ExitReason) -> SuperviseDecision + Send + Sync,
 >;
 
+/// **M-Prod sub-track #4 Phase γ (M14.11).** Cross-node delegated-
+/// restart request — pushed by the dist crate's per-connection
+/// `dispatch_inbound` arm onto the
+/// [`SchedulerHandle::request_delegated_restart`] cross-thread
+/// queue, drained by the scheduler thread at the head of
+/// `process_batch`. The drain looks up the named child via
+/// `id_to_key` + `node_to_supervisor`, then calls the existing
+/// `unmount_with_reason` → `execute_supervisor_plan` path with a
+/// synthesized `ExitReason::Crashed { detail }` that names the
+/// origin peer + correlation id. The existing `Supervisor::Strategy`
+/// / `RestartPolicy::should_restart` contract is preserved
+/// bit-for-bit — the operator-driven restart is the same abnormal
+/// exit shape a local fault would produce.
+#[derive(Debug, Clone)]
+pub struct DelegatedRestartRequest {
+    /// Bare authenticated peer name of the originator.
+    pub origin_peer: String,
+    /// Per-origin correlation id (carried for outcome correlation +
+    /// audit trails).
+    pub correlation_id: u64,
+    /// Child node id to restart on this node. Looked up via
+    /// `id_to_key`; missing children resolve to
+    /// [`DelegatedRestartOutcome`] with `error_kind = "unknown_child"`.
+    pub child_node_id: String,
+    /// Stable string form of the reason code (snake_case, matches
+    /// the wire enum's serde rename — Phase γ uses
+    /// `"supervisor_escalation"`, `"operator_request"`,
+    /// `"reload_driven"`, `"health_check_failure"`).
+    pub reason_code: &'static str,
+}
+
+/// **Phase γ (M14.11).** Outcome of a single
+/// [`DelegatedRestartRequest`] drain. Pushed onto
+/// [`Scheduler::pending_delegated_restart_outcomes`] by the
+/// scheduler thread; drained by the dist crate's per-connection
+/// task via
+/// [`SchedulerHandle::poll_delegated_restart_outcomes`].
+#[derive(Debug, Clone)]
+pub struct DelegatedRestartOutcome {
+    /// Echoes [`DelegatedRestartRequest::origin_peer`].
+    pub origin_peer: String,
+    /// Echoes [`DelegatedRestartRequest::correlation_id`].
+    pub correlation_id: u64,
+    /// Echoes [`DelegatedRestartRequest::child_node_id`].
+    pub child_node_id: String,
+    /// `true` if the supervisor's restart plan ran successfully
+    /// (the child re-appeared in `id_to_key` after `unmount_with_reason`
+    /// fired). `false` if the child was missing, not supervised, or
+    /// the supervisor's policy/intensity refused.
+    pub completed: bool,
+    /// Stable machine-grep tag describing the failure mode. `None`
+    /// when `completed = true`.
+    pub error_kind: Option<&'static str>,
+    /// Human-readable failure description. `None` when
+    /// `completed = true`.
+    pub reason: Option<String>,
+    /// Wall-clock duration of the local restart attempt (from the
+    /// drain entry through the post-`unmount_with_reason` check).
+    pub duration_ms: u64,
+}
+
 /// **M14.10.** Internal record of a supervisor decision that the
 /// hook deferred. Kept on the scheduler; re-evaluated at the head
 /// of every `process_batch`.
@@ -540,6 +626,8 @@ impl Scheduler {
             remote_unlink_sink: parking_lot::RwLock::new(None),
             pending_remote_demonitors: Arc::new(Mutex::new(Vec::new())),
             pending_remote_unlinks: Arc::new(Mutex::new(Vec::new())),
+            pending_delegated_restarts: Arc::new(Mutex::new(Vec::new())),
+            pending_delegated_restart_outcomes: Arc::new(Mutex::new(Vec::new())),
             unmount_hooks: parking_lot::RwLock::new(Vec::new()),
             remote_group_sink: parking_lot::RwLock::new(None),
             remote_broadcast_sink: parking_lot::RwLock::new(None),
@@ -1006,6 +1094,10 @@ impl Scheduler {
             stop_flag: Arc::clone(&self.stop_flag),
             pending_remote_demonitors: Arc::clone(&self.pending_remote_demonitors),
             pending_remote_unlinks: Arc::clone(&self.pending_remote_unlinks),
+            pending_delegated_restarts: Arc::clone(&self.pending_delegated_restarts),
+            pending_delegated_restart_outcomes: Arc::clone(
+                &self.pending_delegated_restart_outcomes,
+            ),
         }
     }
 
@@ -1091,6 +1183,14 @@ impl Scheduler {
             // their stale refs.
             self.drain_pending_remote_supervision();
 
+            // Phase γ (M14.11): drain queued cross-node delegated-
+            // restart requests pushed by the dist crate's
+            // `dispatch_inbound`. Synthesizes `ExitReason::Crashed`
+            // and drives the existing `unmount_with_reason` →
+            // `execute_supervisor_plan` path, preserving the
+            // `RestartPolicy` / `should_restart` contract.
+            self.drain_pending_delegated_restarts();
+
             // M14.10: re-evaluate supervisor decisions parked by
             // the partition-aware decision hook. Either runs the
             // plan (hook now says Proceed, or retry_after elapsed)
@@ -1147,6 +1247,7 @@ impl Scheduler {
                 && self.pending_mutations.borrow().is_empty()
                 && self.pending_remote_demonitors.lock().is_empty()
                 && self.pending_remote_unlinks.lock().is_empty()
+                && self.pending_delegated_restarts.lock().is_empty()
             {
                 break;
             }
@@ -1220,6 +1321,14 @@ impl Scheduler {
             // path — tokio workers push here when peers disconnect.
             self.drain_pending_remote_supervision();
 
+            // Phase γ (M14.11): drain queued cross-node delegated-
+            // restart requests pushed by the dist crate's
+            // `dispatch_inbound`. Synthesizes `ExitReason::Crashed`
+            // and drives the existing `unmount_with_reason` →
+            // `execute_supervisor_plan` path, preserving the
+            // `RestartPolicy` / `should_restart` contract.
+            self.drain_pending_delegated_restarts();
+
             // M14.10: re-evaluate parked supervisor decisions —
             // mirrored from the sync path.
             self.drain_pending_supervisor_decisions();
@@ -1276,6 +1385,7 @@ impl Scheduler {
                 && self.pending_mutations.borrow().is_empty()
                 && self.pending_remote_demonitors.lock().is_empty()
                 && self.pending_remote_unlinks.lock().is_empty()
+                && self.pending_delegated_restarts.lock().is_empty()
             {
                 break;
             }
@@ -2778,6 +2888,108 @@ impl Scheduler {
         }
     }
 
+    /// **M-Prod sub-track #4 Phase γ (M14.11).** Drain
+    /// [`Self::pending_delegated_restarts`] — cross-node
+    /// delegated-restart requests pushed by the dist crate's
+    /// `dispatch_inbound` via
+    /// [`SchedulerHandle::request_delegated_restart`].
+    ///
+    /// Per entry: look up the child via `id_to_key`. If absent →
+    /// outcome `Failed { error_kind = "unknown_child" }`. Look up
+    /// the governing supervisor via `node_to_supervisor`. If absent
+    /// → outcome `Failed { error_kind = "not_supervised" }`.
+    /// Otherwise synthesize `ExitReason::Crashed { detail }` (the
+    /// origin peer + correlation id + reason code are folded into
+    /// `detail` for human visibility) and call
+    /// `unmount_with_reason`. The existing path drives
+    /// `execute_supervisor_plan` automatically (preserving the
+    /// `RestartPolicy` / intensity tracker contract). Post-call,
+    /// `id_to_key.contains_key(child_id)` is the success
+    /// indicator — re-mounted children re-populate the id at the
+    /// same key.
+    ///
+    /// Outcomes are pushed onto
+    /// [`Self::pending_delegated_restart_outcomes`] for the dist
+    /// crate to drain via
+    /// [`SchedulerHandle::poll_delegated_restart_outcomes`] and
+    /// ship as `RestartDelegationResult` packets.
+    fn drain_pending_delegated_restarts(&mut self) {
+        let requests: Vec<DelegatedRestartRequest> =
+            std::mem::take(&mut *self.pending_delegated_restarts.lock());
+        if requests.is_empty() {
+            return;
+        }
+        let mut outcomes: Vec<DelegatedRestartOutcome> = Vec::with_capacity(requests.len());
+        for req in requests {
+            let started = std::time::Instant::now();
+            let key_opt = self.id_to_key.get(&req.child_node_id).copied();
+            let Some(node_key) = key_opt else {
+                outcomes.push(DelegatedRestartOutcome {
+                    origin_peer: req.origin_peer,
+                    correlation_id: req.correlation_id,
+                    child_node_id: req.child_node_id,
+                    completed: false,
+                    error_kind: Some("unknown_child"),
+                    reason: Some("child id not found in scheduler".to_string()),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                });
+                continue;
+            };
+            if !self.node_to_supervisor.contains_key(&node_key) {
+                outcomes.push(DelegatedRestartOutcome {
+                    origin_peer: req.origin_peer,
+                    correlation_id: req.correlation_id,
+                    child_node_id: req.child_node_id,
+                    completed: false,
+                    error_kind: Some("not_supervised"),
+                    reason: Some("child is not governed by any supervisor".to_string()),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                });
+                continue;
+            }
+            let detail = format!(
+                "delegated_restart from `{}` (corr={}, reason={})",
+                req.origin_peer, req.correlation_id, req.reason_code
+            );
+            self.unmount_with_reason(
+                node_key,
+                crate::runtime::supervision::ExitReason::Crashed { detail },
+            );
+            // Success classification: the supervisor's plan
+            // re-mounts the child via `add_node_at_runtime`, which
+            // re-populates `id_to_key` with the same id (potentially
+            // a fresh `NodeKey`). Children whose policy is
+            // `Temporary` OR whose intensity tracker refused the
+            // restart leave `id_to_key` empty.
+            let completed = self.id_to_key.contains_key(&req.child_node_id);
+            let (error_kind, reason) = if completed {
+                (None, None)
+            } else {
+                (
+                    Some("policy_refused_or_intensity_exceeded"),
+                    Some(
+                        "supervisor policy or intensity tracker did not re-mount the child"
+                            .to_string(),
+                    ),
+                )
+            };
+            outcomes.push(DelegatedRestartOutcome {
+                origin_peer: req.origin_peer,
+                correlation_id: req.correlation_id,
+                child_node_id: req.child_node_id,
+                completed,
+                error_kind,
+                reason,
+                duration_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+        if !outcomes.is_empty() {
+            self.pending_delegated_restart_outcomes
+                .lock()
+                .extend(outcomes);
+        }
+    }
+
     /// **M14.10.** Walk
     /// [`Self::pending_supervisor_decisions`]; for each entry,
     /// either execute the plan (hook returned `Proceed` OR the
@@ -3207,6 +3419,17 @@ pub struct SchedulerHandle {
     /// whose link to the shared sentinel should be removed once
     /// their per-peer remote-link count drops to zero.
     pending_remote_unlinks: Arc<Mutex<Vec<NodeKey>>>,
+    /// **Phase γ (M14.11).** Cross-thread queue of inbound
+    /// delegated-restart requests. Pushed by the dist crate's
+    /// `dispatch_inbound`; drained at the head of each
+    /// `process_batch` via
+    /// [`Scheduler::drain_pending_delegated_restarts`].
+    pending_delegated_restarts: Arc<Mutex<Vec<DelegatedRestartRequest>>>,
+    /// **Phase γ (M14.11).** Cross-thread queue of outcomes from
+    /// completed delegated-restart drains. Drained from the dist
+    /// crate's per-connection task via
+    /// [`Self::poll_delegated_restart_outcomes`].
+    pending_delegated_restart_outcomes: Arc<Mutex<Vec<DelegatedRestartOutcome>>>,
 }
 
 impl SchedulerHandle {
@@ -3293,6 +3516,47 @@ impl SchedulerHandle {
     pub fn unlink_remote(&self, observer: NodeKey) {
         self.pending_remote_unlinks.lock().push(observer);
         self.notify.notify_one();
+    }
+
+    /// **M-Prod sub-track #4 Phase γ (M14.11).** Push a cross-node
+    /// delegated-restart request onto the scheduler's drain queue.
+    /// Drained at the head of the next `process_batch`; outcome is
+    /// pushed onto the outcome queue (polled by the dist crate via
+    /// [`Self::poll_delegated_restart_outcomes`]).
+    ///
+    /// Safe to call from any thread. Infallible — outcome is
+    /// asynchronous.
+    ///
+    /// The drain logic preserves the existing
+    /// `Supervisor::Strategy` / `RestartPolicy::should_restart`
+    /// contract by going through `unmount_with_reason` →
+    /// `execute_supervisor_plan` with a synthesized
+    /// `ExitReason::Crashed { detail }`. Operator-driven restarts
+    /// are treated as the same abnormal exit shape any local fault
+    /// would produce.
+    pub fn request_delegated_restart(
+        &self,
+        child_node_id: impl Into<String>,
+        reason_code: &'static str,
+        origin_peer: impl Into<String>,
+        correlation_id: u64,
+    ) {
+        let req = DelegatedRestartRequest {
+            origin_peer: origin_peer.into(),
+            correlation_id,
+            child_node_id: child_node_id.into(),
+            reason_code,
+        };
+        self.pending_delegated_restarts.lock().push(req);
+        self.notify.notify_one();
+    }
+
+    /// **Phase γ (M14.11).** Drain the scheduler's
+    /// delegated-restart outcome queue. Called by the dist crate's
+    /// per-connection task after each `process_batch` to ship
+    /// `RestartDelegationResult` packets back to originators.
+    pub fn poll_delegated_restart_outcomes(&self) -> Vec<DelegatedRestartOutcome> {
+        std::mem::take(&mut *self.pending_delegated_restart_outcomes.lock())
     }
 
     /// Signal the daemon loop to stop. No-op outside daemon mode.

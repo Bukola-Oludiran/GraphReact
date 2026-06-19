@@ -94,9 +94,15 @@ pub use telemetry::TelemetrySinkSlot;
 pub use tls_config::TlsConfig;
 pub use transport::{Connection, Listener};
 pub use wire::{
-    CAP_AUDIT_CHAIN, CAP_DELEGATED_RESTART, CAP_MIXED_RUNTIME, MAX_FRAME_BYTES,
-    MIN_SUPPORTED_VERSION, Packet, PacketType, PgBroadcast, ReloadModulePacket, WireCodec,
+    CAP_AUDIT_CHAIN, CAP_DELEGATED_RESTART, CAP_MIXED_RUNTIME, DelegatedRestartAckOutcome,
+    DelegatedRestartReasonCode, DelegatedRestartResultOutcome, MAX_FRAME_BYTES,
+    MIN_SUPPORTED_VERSION, Packet, PacketType, PgBroadcast, ReloadModulePacket,
+    RestartDelegationAck, RestartDelegationRequest, RestartDelegationResult, WireCodec,
     WireExitReason, WireFrame, WIRE_VERSION,
+};
+pub use cluster::{
+    DelegatedRestartError, DelegatedRestartHandle, DelegatedRestartIssued,
+    DelegatedRestartResultEvent,
 };
 
 /// Result alias used throughout the dist crate.

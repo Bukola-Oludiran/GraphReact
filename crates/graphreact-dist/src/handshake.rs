@@ -592,6 +592,11 @@ mod rolling_version_tests {
     /// using the [`HelloV4`] private struct. Returns the
     /// `[Type:u8][Len:u32 BE][Payload]` byte vector ready to be
     /// shipped via a raw `AsyncWrite::write_all`.
+    ///
+    /// Used for above-ceiling rejection (the codec doesn't care
+    /// which shape sent a too-high version) and the legacy v4
+    /// fallback test name. Phase γ floor-tests build the modern
+    /// (v5+) shape via [`build_v5_hello_frame`].
     fn build_v4_hello_frame(version: u16, node_name: &str, creation: u32) -> Vec<u8> {
         let payload = postcard::to_stdvec(&HelloV4 {
             version,
@@ -601,6 +606,32 @@ mod rolling_version_tests {
             capabilities: vec!["pg-v1".to_string()],
         })
         .expect("encode HelloV4");
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(PacketType::Hello as u8);
+        let len_u32: u32 = u32::try_from(payload.len()).unwrap();
+        frame.extend_from_slice(&len_u32.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// **Phase γ.** Build a v5-shape Hello frame (with
+    /// `capabilities_bitmap`). Used by the floor-peer tests now
+    /// that the v6 build's floor is `MIN_SUPPORTED_VERSION = 5`.
+    fn build_v5_hello_frame(
+        version: u16,
+        node_name: &str,
+        creation: u32,
+        capabilities_bitmap: u64,
+    ) -> Vec<u8> {
+        let payload = postcard::to_stdvec(&Hello {
+            version,
+            flags: 0,
+            node_name: node_name.to_string(),
+            creation,
+            capabilities: vec!["pg-v1".to_string()],
+            capabilities_bitmap,
+        })
+        .expect("encode Hello");
         let mut frame = Vec::with_capacity(5 + payload.len());
         frame.push(PacketType::Hello as u8);
         let len_u32: u32 = u32::try_from(payload.len()).unwrap();
@@ -728,14 +759,15 @@ mod rolling_version_tests {
         Registry::default().with(AuditLayer { buf: buf.clone() })
     }
 
-    /// Test 1: a v4 peer (one bump below WIRE_VERSION) ships a
-    /// Hello WITHOUT `capabilities_bitmap`. The v5 server-side
-    /// codec falls back to `HelloV4` decode → synthesises
-    /// `capabilities_bitmap = 0`. `server_handshake` MUST accept
-    /// the peer with `effective_capabilities = 0` AND fire the
-    /// `cluster_handshake_complete` audit event with
-    /// `peer_wire_version=4, local_wire_version=5,
-    /// negotiated_capabilities=0`.
+    /// Test 1: a floor peer (one bump below WIRE_VERSION) handshakes
+    /// successfully. Phase γ floor is `MIN_SUPPORTED_VERSION = 5`,
+    /// so the test ships a v5-shape Hello with
+    /// `capabilities_bitmap = 0`. The server's negotiated
+    /// `effective_capabilities` is `0 & our_bitmap = 0`. The
+    /// `cluster_handshake_complete` audit row carries
+    /// `peer_wire_version = MIN_SUPPORTED_VERSION = 5`,
+    /// `local_wire_version = WIRE_VERSION = 6`,
+    /// `negotiated_capabilities = 0`.
     #[tokio::test]
     async fn floor_minus_one_peer_handshakes_with_zero_bitmap() {
         assert_eq!(MIN_SUPPORTED_VERSION, WIRE_VERSION - 1);
@@ -787,7 +819,10 @@ mod rolling_version_tests {
             // we need the v4 trailing-u64-absent shape. Reach into
             // the framed stream's `get_mut` to grab the raw stream
             // and write the bytes.
-            let raw_frame = build_v4_hello_frame(MIN_SUPPORTED_VERSION, "bob@127.0.0.1", 2);
+            // Phase γ: floor is now MIN_SUPPORTED_VERSION=5, which is
+            // a v5-shape Hello (carries capabilities_bitmap).
+            let raw_frame =
+                build_v5_hello_frame(MIN_SUPPORTED_VERSION, "bob@127.0.0.1", 2, 0);
             // `Connection` does not expose its inner stream. We
             // work around by piggy-backing on `WireFrame`'s codec:
             // we can write the bytes via `framed.get_mut()` once
@@ -887,12 +922,14 @@ mod rolling_version_tests {
             .find(|l| l.contains("cluster_handshake_complete"))
             .expect("cluster_handshake_complete audit row");
         assert!(
-            complete.contains("\"peer_wire_version\":\"4\""),
-            "expected peer_wire_version=4 in {complete}"
+            complete.contains(&format!(
+                "\"peer_wire_version\":\"{MIN_SUPPORTED_VERSION}\""
+            )),
+            "expected peer_wire_version={MIN_SUPPORTED_VERSION} in {complete}"
         );
         assert!(
-            complete.contains("\"local_wire_version\":\"5\""),
-            "expected local_wire_version=5 in {complete}"
+            complete.contains(&format!("\"local_wire_version\":\"{WIRE_VERSION}\"")),
+            "expected local_wire_version={WIRE_VERSION} in {complete}"
         );
         assert!(
             complete.contains("\"negotiated_capabilities\":\"0\""),
@@ -900,9 +937,11 @@ mod rolling_version_tests {
         );
     }
 
-    /// Test 2: a v3 peer (two bumps below WIRE_VERSION) is REJECTED
-    /// at the floor with audit event `cluster_handshake_rejected`,
-    /// `reason="wire_version_below_floor"`.
+    /// Test 2: a v3 peer (two bumps below `MIN_SUPPORTED_VERSION`,
+    /// three bumps below `WIRE_VERSION` post-γ) is REJECTED at the
+    /// floor with audit event `cluster_handshake_rejected`,
+    /// `reason="wire_version_below_floor"`. Under v6 floor=5 the
+    /// reject is unambiguous.
     #[tokio::test]
     async fn floor_minus_two_peer_rejected_with_below_floor_audit() {
         let (alice, bob) = dev_tls::pair("alice", "bob").expect("pair");
@@ -934,7 +973,8 @@ mod rolling_version_tests {
 
         let client_task = tokio::spawn(async move {
             let conn = dial_over(bob_stream, "alice", &bob_cfg).await?;
-            // v3 — two bumps below the current WIRE_VERSION = 5.
+            // v3 — three bumps below the current WIRE_VERSION = 6,
+            // unambiguously below MIN_SUPPORTED_VERSION = 5.
             let frame = build_v4_hello_frame(3, "bob@127.0.0.1", 1);
             let parts = conn.into_parts();
             let mut tls_stream = parts.io;
@@ -975,8 +1015,8 @@ mod rolling_version_tests {
             "expected peer_wire_version=3 in {rejected}"
         );
         assert!(
-            rejected.contains("\"local_wire_version\":\"5\""),
-            "expected local_wire_version=5 in {rejected}"
+            rejected.contains(&format!("\"local_wire_version\":\"{WIRE_VERSION}\"")),
+            "expected local_wire_version={WIRE_VERSION} in {rejected}"
         );
         assert!(
             rejected.contains("wire_version_below_floor"),
@@ -986,12 +1026,13 @@ mod rolling_version_tests {
 
     /// Test 4 (verify-finding patch): above-ceiling peer rejection
     /// fires `wire_version_above_ceiling` audit row. Hand-encodes a
-    /// HelloV4-shape payload with `version = WIRE_VERSION + 1 = 6`
-    /// (postcard silently ignores trailing bytes when present, so
-    /// the v4 shape is sufficient — the server's strict ceiling
-    /// check fires on `hello.version > WIRE_VERSION` BEFORE any
-    /// floor logic). Symmetric to `floor_minus_two_peer_rejected`
-    /// but on the OTHER side of the wire-version window.
+    /// HelloV4-shape payload with `version = WIRE_VERSION + 1` (= 7
+    /// under v6). Postcard silently ignores trailing bytes when
+    /// present, so the v4 shape is sufficient — the server's
+    /// strict ceiling check fires on `hello.version > WIRE_VERSION`
+    /// BEFORE any floor logic. Symmetric to
+    /// `floor_minus_two_peer_rejected` but on the OTHER side of the
+    /// wire-version window.
     #[tokio::test]
     async fn above_ceiling_peer_rejected_with_above_ceiling_audit() {
         let (alice, bob) = dev_tls::pair("alice", "bob").expect("pair");
@@ -1023,11 +1064,11 @@ mod rolling_version_tests {
 
         let client_task = tokio::spawn(async move {
             let conn = dial_over(bob_stream, "alice", &bob_cfg).await?;
-            // version = WIRE_VERSION + 1 = 6 — one bump above the
-            // current ceiling. v4-shape encode is fine: postcard
-            // silently drops trailing bytes when the wire shape
-            // differs, and the server's ceiling check fires on the
-            // version field alone.
+            // version = WIRE_VERSION + 1 — one bump above the
+            // current ceiling (= 7 under v6). v4-shape encode is
+            // fine: postcard silently drops trailing bytes when
+            // the wire shape differs, and the server's ceiling
+            // check fires on the version field alone.
             let frame = build_v4_hello_frame(WIRE_VERSION + 1, "bob@127.0.0.1", 1);
             let parts = conn.into_parts();
             let mut tls_stream = parts.io;
@@ -1077,11 +1118,13 @@ mod rolling_version_tests {
         );
     }
 
-    /// Test 3: two v5 peers exchange bitmaps; the negotiated set is
-    /// the bitwise AND. Server advertises
+    /// Test 3: two same-version peers exchange bitmaps; the
+    /// negotiated set is the bitwise AND. Server advertises
     /// `CAP_DELEGATED_RESTART | CAP_AUDIT_CHAIN` and client
     /// advertises `CAP_AUDIT_CHAIN | CAP_MIXED_RUNTIME`; the
-    /// intersection is `CAP_AUDIT_CHAIN`.
+    /// intersection is `CAP_AUDIT_CHAIN`. (Originally named for
+    /// v5; the test is version-agnostic and continues to work at
+    /// v6.)
     #[tokio::test]
     async fn v5_peer_with_bitmap_intersects_correctly() {
         let (alice, bob) = dev_tls::pair("alice", "bob").expect("pair");

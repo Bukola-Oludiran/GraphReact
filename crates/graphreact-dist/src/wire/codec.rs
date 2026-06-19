@@ -10,7 +10,8 @@ use crate::Result;
 use super::packet::{
     Challenge, ChallengeAck, ChallengeAckV4, ChallengeReply, Demonitor, Down, Exit, Hello, HelloV4,
     LinkRequest, Message, MonitorAck, MonitorRequest, Packet, PacketType, PgBroadcast, PgDiscover,
-    PgJoin, PgLeave, PgSync, ReloadModulePacket, Tick, TickAck, Unlink,
+    PgJoin, PgLeave, PgSync, ReloadModulePacket, RestartDelegationAck, RestartDelegationRequest,
+    RestartDelegationResult, Tick, TickAck, Unlink,
 };
 
 pub struct WireCodec;
@@ -39,6 +40,9 @@ impl WireCodec {
             Packet::Tick(p) => postcard::to_stdvec(p)?,
             Packet::TickAck(p) => postcard::to_stdvec(p)?,
             Packet::ReloadModule(p) => postcard::to_stdvec(p)?,
+            Packet::RestartDelegationRequest(p) => postcard::to_stdvec(p)?,
+            Packet::RestartDelegationAck(p) => postcard::to_stdvec(p)?,
+            Packet::RestartDelegationResult(p) => postcard::to_stdvec(p)?,
             Packet::Disconnect => Vec::new(),
         };
         Ok((packet.packet_type(), bytes))
@@ -119,6 +123,15 @@ impl WireCodec {
             PacketType::ReloadModule => {
                 Packet::ReloadModule(postcard::from_bytes::<ReloadModulePacket>(payload)?)
             }
+            PacketType::RestartDelegationRequest => Packet::RestartDelegationRequest(
+                postcard::from_bytes::<RestartDelegationRequest>(payload)?,
+            ),
+            PacketType::RestartDelegationAck => Packet::RestartDelegationAck(
+                postcard::from_bytes::<RestartDelegationAck>(payload)?,
+            ),
+            PacketType::RestartDelegationResult => Packet::RestartDelegationResult(
+                postcard::from_bytes::<RestartDelegationResult>(payload)?,
+            ),
             PacketType::Disconnect => {
                 if !payload.is_empty() {
                     // Strict: a Disconnect packet has no payload. A

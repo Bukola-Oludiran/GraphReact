@@ -30,8 +30,10 @@ pub mod packet;
 pub use codec::WireCodec;
 pub use frame::{WireFrame, MAX_FRAME_BYTES};
 pub use packet::{
-    Challenge, ChallengeAck, ChallengeReply, Demonitor, Down, Exit, Hello, LinkRequest, Message,
-    MonitorAck, MonitorRequest, Packet, PacketType, PgBroadcast, PgDiscover, PgJoin, PgLeave,
-    PgSync, ReloadModulePacket, Tick, TickAck, Unlink, WireExitReason, CAP_AUDIT_CHAIN,
+    Challenge, ChallengeAck, ChallengeReply, DelegatedRestartAckOutcome,
+    DelegatedRestartReasonCode, DelegatedRestartResultOutcome, Demonitor, Down, Exit, Hello,
+    LinkRequest, Message, MonitorAck, MonitorRequest, Packet, PacketType, PgBroadcast, PgDiscover,
+    PgJoin, PgLeave, PgSync, ReloadModulePacket, RestartDelegationAck, RestartDelegationRequest,
+    RestartDelegationResult, Tick, TickAck, Unlink, WireExitReason, CAP_AUDIT_CHAIN,
     CAP_DELEGATED_RESTART, CAP_MIXED_RUNTIME, MIN_SUPPORTED_VERSION, WIRE_VERSION,
 };

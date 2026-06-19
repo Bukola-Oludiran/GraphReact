@@ -72,8 +72,15 @@ use crate::observability::{
 use crate::telemetry::TelemetrySinkSlot;
 use crate::tls_config::TlsConfig;
 use crate::transport::{accept_over, dial, dial_over, Connection, Listener};
-use crate::wire::{Message as WireMessage, Packet, ReloadModulePacket};
+use crate::wire::{
+    DelegatedRestartAckOutcome, DelegatedRestartReasonCode, DelegatedRestartResultOutcome,
+    Message as WireMessage, Packet, ReloadModulePacket, RestartDelegationAck,
+    RestartDelegationRequest, RestartDelegationResult, CAP_DELEGATED_RESTART,
+};
 use crate::DistError;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+use thiserror::Error;
 
 use sha2::{Digest, Sha256};
 
@@ -183,6 +190,110 @@ pub struct Cluster {
     /// via [`Self::install_wire_tracing_hook`]. Non-OTel deployments
     /// leave it empty; outbound messages get `trace_context: None`.
     wire_tracing_hook: WireTracingHookSlot,
+    /// **M-Prod sub-track #4 Phase γ (M14.11).** Monotonic per-origin
+    /// correlation-id counter used by
+    /// [`Self::send_delegated_restart_request`]. Bumped each
+    /// outbound send. Cloned into per-connection tasks so inbound
+    /// `RestartDelegationAck` / `RestartDelegationResult` arms can
+    /// look up the originating in-flight entry by `correlation_id`.
+    delegated_restart_counter: Arc<AtomicU64>,
+    /// **Phase γ (M14.11).** Per-origin in-flight delegated-restart
+    /// tracking — `correlation_id → PendingDelegatedRestart`. The
+    /// outbound API allocates an entry before sending the packet;
+    /// inbound dispatch arms for `RestartDelegationAck` /
+    /// `RestartDelegationResult` resolve the matching entry. Cloned
+    /// into per-connection tasks via Arc.
+    delegated_restart_pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
+}
+
+/// **Phase γ (M14.11).** Per-correlation-id in-flight state for an
+/// outbound delegated-restart request. The outbound API allocates
+/// this BEFORE shipping the packet; the inbound `Ack` arm fires
+/// `ack_tx` (one-shot), and the inbound `Result` arm fires
+/// `result_tx` (one-shot) + removes the entry.
+struct PendingDelegatedRestart {
+    /// One-shot sender for the receipt-time ack outcome.
+    ack_tx: Option<oneshot::Sender<DelegatedRestartAckOutcome>>,
+    /// One-shot sender for the post-restart result outcome.
+    result_tx: Option<oneshot::Sender<DelegatedRestartResultEvent>>,
+    /// The target peer's name — used by audit emits when we time
+    /// out or get a late Result. Held for forensic-trace tagging
+    /// purposes even when no late-Result fires (kept as a forensic
+    /// field so audit consumers see the original peer alongside
+    /// the correlation id).
+    #[allow(dead_code)]
+    peer_name: String,
+    /// The child node id that was requested. Audited end-to-end.
+    child_node_id: String,
+}
+
+/// **Phase γ (M14.11).** Caller-facing handle returned by
+/// [`Cluster::send_delegated_restart_request`]. Carries the
+/// correlation id assigned to the request + one-shot receivers
+/// for the ack and result outcomes.
+#[derive(Debug)]
+pub struct DelegatedRestartHandle {
+    /// Per-origin monotonic correlation id assigned to this request.
+    pub correlation_id: u64,
+    /// Target peer name (audit + ops surface).
+    pub peer_name: String,
+    /// Resolves when the responder's `RestartDelegationAck` arrives.
+    pub ack: oneshot::Receiver<DelegatedRestartAckOutcome>,
+    /// Resolves when the responder's `RestartDelegationResult`
+    /// arrives. Phase γ does NOT implement a local timeout —
+    /// callers wrap the receiver in `tokio::time::timeout` if they
+    /// want a deadline. Late `Result` packets that land after the
+    /// receiver is dropped log + drop on the inbound side.
+    pub result: oneshot::Receiver<DelegatedRestartResultEvent>,
+}
+
+/// **Phase γ (M14.11).** Cluster-side originator audit-shape carried
+/// by [`Cluster::send_delegated_restart_request`] on the
+/// `delegated_restart_issued` event. Re-exported so management API
+/// surfaces can structurally log the same fields.
+#[derive(Debug, Clone)]
+pub struct DelegatedRestartIssued {
+    pub peer: String,
+    pub child_node_id: String,
+    pub reason_code: DelegatedRestartReasonCode,
+    pub token_id: String,
+    pub correlation_id: u64,
+    pub version: u64,
+}
+
+/// **Phase γ (M14.11).** Originator-side post-restart event.
+/// Carried by the [`DelegatedRestartHandle::result`] one-shot.
+#[derive(Debug, Clone)]
+pub struct DelegatedRestartResultEvent {
+    pub outcome: DelegatedRestartResultOutcome,
+    pub duration_ms: u64,
+}
+
+/// **Phase γ (M14.11).** Error surface for
+/// [`Cluster::send_delegated_restart_request`]. Originator-side
+/// failure modes that never produce a wire packet.
+#[derive(Debug, Clone, Error)]
+pub enum DelegatedRestartError {
+    /// Negotiated capability bitmap does NOT include
+    /// [`crate::CAP_DELEGATED_RESTART`] for this peer — either we
+    /// didn't advertise it locally, or the peer didn't advertise it,
+    /// or both. Outbound is refused with no wire packet shipped.
+    /// Audited as `delegated_restart_blocked` with
+    /// `reason = "cap_not_negotiated"`.
+    #[error(
+        "delegated_restart: capability `{missing_bit}` not negotiated with peer `{peer}`"
+    )]
+    CapabilityNotNegotiated { peer: String, missing_bit: &'static str },
+    /// The named peer is not currently in the cluster registry.
+    /// Audited as `delegated_restart_blocked` with
+    /// `reason = "unknown_peer"`.
+    #[error("delegated_restart: unknown peer `{peer}`")]
+    UnknownPeer { peer: String },
+    /// Outbound channel to the named peer is full or closed.
+    /// Audited as `delegated_restart_blocked` with
+    /// `reason = "outbound_channel"`.
+    #[error("delegated_restart: outbound channel error to peer `{peer}`: {detail}")]
+    OutboundChannel { peer: String, detail: String },
 }
 
 impl Cluster {
@@ -323,6 +434,16 @@ impl Cluster {
         // tasks.
         let reload_sink_for_accept = RemoteReloadSink::new();
 
+        // Phase γ (M14.11): allocate the per-cluster delegated-
+        // restart bookkeeping (correlation-id counter +
+        // in-flight pending map). Cloned into the accept loop and
+        // per-connection tasks so inbound `Ack`/`Result` arms can
+        // resolve the matching originating entry.
+        let delegated_restart_counter = Arc::new(AtomicU64::new(0));
+        let delegated_restart_pending: Arc<
+            PLMutex<HashMap<u64, PendingDelegatedRestart>>,
+        > = Arc::new(PLMutex::new(HashMap::new()));
+
         // Spawn accept loop. Each accepted TCP connection runs
         // through TLS handshake + cookie handshake before being
         // promoted to a peer.
@@ -334,6 +455,7 @@ impl Cluster {
         let accept_abort_handles = Arc::clone(&abort_handles);
         let accept_reload_sink = reload_sink_for_accept.clone();
         let accept_telemetry_sink = telemetry_sink.clone();
+        let accept_delegated_pending = Arc::clone(&delegated_restart_pending);
         let listener_task = tokio::spawn(async move {
             run_accept_loop(
                 listener,
@@ -345,8 +467,95 @@ impl Cluster {
                 accept_abort_handles,
                 accept_reload_sink,
                 accept_telemetry_sink,
+                accept_delegated_pending,
             )
             .await;
+        });
+
+        // **Phase γ (M14.11).** Spawn the cross-node delegated-restart
+        // outcome poller. Polls the scheduler's outcome queue every
+        // 50ms (cheap when empty — `poll_delegated_restart_outcomes`
+        // is an `std::mem::take` under one mutex) and ships
+        // `RestartDelegationResult` packets back to each outcome's
+        // origin peer via the registry. The poller task runs for the
+        // life of the Cluster; the listener_task's abort is the
+        // canonical lifecycle hinge, but the poller task lives until
+        // the scheduler handle is dropped (which happens at Cluster
+        // teardown via `shutdown`).
+        let poller_scheduler = scheduler_handle.clone();
+        let poller_registry = registry.clone();
+        let poller_our_name = config.node_id.name().to_string();
+        let _delegated_outcome_poller: JoinHandle<()> = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+            interval.set_missed_tick_behavior(
+                tokio::time::MissedTickBehavior::Skip,
+            );
+            loop {
+                interval.tick().await;
+                let outcomes = poller_scheduler.poll_delegated_restart_outcomes();
+                if outcomes.is_empty() {
+                    continue;
+                }
+                for outcome in outcomes {
+                    let wire_outcome = if outcome.completed {
+                        DelegatedRestartResultOutcome::Completed
+                    } else {
+                        DelegatedRestartResultOutcome::Failed {
+                            reason: outcome
+                                .reason
+                                .unwrap_or_else(|| "restart attempt failed".to_string()),
+                            error_kind: outcome
+                                .error_kind
+                                .unwrap_or("unspecified")
+                                .to_string(),
+                        }
+                    };
+                    let result_packet = RestartDelegationResult {
+                        origin: poller_our_name.clone(),
+                        correlation_id: outcome.correlation_id,
+                        outcome: wire_outcome,
+                        duration_ms: outcome.duration_ms,
+                    };
+                    let Some(peer_handle) = poller_registry.get_by_name(&outcome.origin_peer)
+                    else {
+                        tracing::debug!(
+                            target: "graphreact::observer::audit",
+                            event = "delegated_restart_completed",
+                            peer = %outcome.origin_peer,
+                            correlation_id = outcome.correlation_id,
+                            reason = "origin_peer_disconnected",
+                            "delegated restart outcome dropped — origin peer no longer registered"
+                        );
+                        continue;
+                    };
+                    match peer_handle
+                        .send_tx
+                        .try_send(Packet::RestartDelegationResult(result_packet))
+                    {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                target: "graphreact::observer::audit",
+                                event = "delegated_restart_completed",
+                                peer = %outcome.origin_peer,
+                                correlation_id = outcome.correlation_id,
+                                reason = "outbound_channel_full",
+                                "delegated restart result drop — outbound channel full"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::debug!(
+                                target: "graphreact::observer::audit",
+                                event = "delegated_restart_completed",
+                                peer = %outcome.origin_peer,
+                                correlation_id = outcome.correlation_id,
+                                reason = "outbound_channel_closed",
+                                "delegated restart result drop — peer channel closed"
+                            );
+                        }
+                    }
+                }
+            }
         });
 
         // M14.10 — peer-state map. Populated by tick_pass; queried
@@ -419,6 +628,8 @@ impl Cluster {
             reload_sink: reload_sink_for_accept,
             telemetry_sink,
             wire_tracing_hook,
+            delegated_restart_counter,
+            delegated_restart_pending,
         })
     }
 
@@ -445,6 +656,141 @@ impl Cluster {
         self.registry
             .get_by_name(name)
             .map(|h| h.effective_capabilities)
+    }
+
+    /// **M-Prod sub-track #4 Phase γ (M14.11).** Issue a cross-node
+    /// delegated-restart request to the named peer.
+    ///
+    /// Validation order (precedence: cap > peer-presence > outbound):
+    /// 1. Look up the peer in the registry. Missing → `UnknownPeer`,
+    ///    audit `delegated_restart_blocked reason=unknown_peer`.
+    /// 2. Check the negotiated `effective_capabilities & CAP_DELEGATED_RESTART`.
+    ///    Missing → `CapabilityNotNegotiated`, audit
+    ///    `delegated_restart_blocked reason=cap_not_negotiated`.
+    /// 3. Allocate a fresh correlation id + version, build the
+    ///    `RestartDelegationRequest` packet, ship via `peer.send_tx.try_send`.
+    ///    On full/closed channel → `OutboundChannel`, audit
+    ///    `delegated_restart_blocked reason=outbound_channel`.
+    /// 4. On success, audit `delegated_restart_issued`, register the
+    ///    in-flight entry in `delegated_restart_pending`, return
+    ///    [`DelegatedRestartHandle`] with the `ack` and `result` one-shots.
+    ///
+    /// `token_id` is the originator's RBAC token id, audited
+    /// end-to-end. Empty string for cluster-internal supervisor-driven
+    /// paths.
+    pub fn send_delegated_restart_request(
+        &self,
+        peer_name: &str,
+        child_node_id: impl Into<String>,
+        reason_code: DelegatedRestartReasonCode,
+        token_id: impl Into<String>,
+    ) -> Result<DelegatedRestartHandle, DelegatedRestartError> {
+        let child_node_id = child_node_id.into();
+        let token_id = token_id.into();
+        let Some(peer_handle) = self.registry.get_by_name(peer_name) else {
+            tracing::warn!(
+                target: "graphreact::observer::audit",
+                event = "delegated_restart_blocked",
+                peer = peer_name,
+                child_node_id = %child_node_id,
+                reason = "unknown_peer",
+                "delegated restart blocked: peer not registered"
+            );
+            return Err(DelegatedRestartError::UnknownPeer {
+                peer: peer_name.to_string(),
+            });
+        };
+        if peer_handle.effective_capabilities & CAP_DELEGATED_RESTART == 0 {
+            tracing::warn!(
+                target: "graphreact::observer::audit",
+                event = "delegated_restart_blocked",
+                peer = peer_name,
+                child_node_id = %child_node_id,
+                reason = "cap_not_negotiated",
+                "delegated restart blocked: CAP_DELEGATED_RESTART not negotiated"
+            );
+            return Err(DelegatedRestartError::CapabilityNotNegotiated {
+                peer: peer_name.to_string(),
+                missing_bit: "CAP_DELEGATED_RESTART",
+            });
+        }
+        let correlation_id = self
+            .delegated_restart_counter
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1);
+        let version = correlation_id; // shared monotonic per-origin counter
+        let origin = self.config.node_id.name().to_string();
+        let (ack_tx, ack_rx) = oneshot::channel::<DelegatedRestartAckOutcome>();
+        let (result_tx, result_rx) = oneshot::channel::<DelegatedRestartResultEvent>();
+        // Register the pending entry BEFORE shipping so a fast
+        // Ack/Result from the peer always finds the slot.
+        {
+            let mut pending = self.delegated_restart_pending.lock();
+            pending.insert(
+                correlation_id,
+                PendingDelegatedRestart {
+                    ack_tx: Some(ack_tx),
+                    result_tx: Some(result_tx),
+                    peer_name: peer_name.to_string(),
+                    child_node_id: child_node_id.clone(),
+                },
+            );
+        }
+        let packet = RestartDelegationRequest {
+            origin: origin.clone(),
+            target_node: peer_name.to_string(),
+            child_node_id: child_node_id.clone(),
+            reason_code,
+            correlation_id,
+            token_id: token_id.clone(),
+            version,
+        };
+        match peer_handle
+            .send_tx
+            .try_send(Packet::RestartDelegationRequest(packet))
+        {
+            Ok(()) => {
+                tracing::info!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_issued",
+                    peer = peer_name,
+                    child_node_id = %child_node_id,
+                    reason_code = ?reason_code,
+                    token_id = %token_id,
+                    correlation_id,
+                    version,
+                    "delegated restart issued"
+                );
+                Ok(DelegatedRestartHandle {
+                    correlation_id,
+                    peer_name: peer_name.to_string(),
+                    ack: ack_rx,
+                    result: result_rx,
+                })
+            }
+            Err(err) => {
+                // Roll back the pending entry — neither Ack nor
+                // Result can land for a packet we couldn't ship.
+                self.delegated_restart_pending.lock().remove(&correlation_id);
+                let detail = match &err {
+                    mpsc::error::TrySendError::Full(_) => "channel_full".to_string(),
+                    mpsc::error::TrySendError::Closed(_) => "channel_closed".to_string(),
+                };
+                tracing::warn!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_blocked",
+                    peer = peer_name,
+                    child_node_id = %child_node_id,
+                    reason = "outbound_channel",
+                    detail = %detail,
+                    "delegated restart blocked: outbound channel error"
+                );
+                Err(DelegatedRestartError::OutboundChannel {
+                    peer: peer_name.to_string(),
+                    detail,
+                })
+            }
+        }
     }
 
     /// Outbound dial. Performs TLS handshake + OTP-style handshake;
@@ -479,6 +825,8 @@ impl Cluster {
             self.config.node_id.name().to_string(),
             self.reload_sink.clone(),
             self.telemetry_sink.clone(),
+            self.config.capabilities_bitmap,
+            Arc::clone(&self.delegated_restart_pending),
         );
         Ok(())
     }
@@ -526,6 +874,8 @@ impl Cluster {
             self.config.node_id.name().to_string(),
             self.reload_sink.clone(),
             self.telemetry_sink.clone(),
+            self.config.capabilities_bitmap,
+            Arc::clone(&self.delegated_restart_pending),
         );
         Ok(())
     }
@@ -566,6 +916,8 @@ impl Cluster {
             self.config.node_id.name().to_string(),
             self.reload_sink.clone(),
             self.telemetry_sink.clone(),
+            self.config.capabilities_bitmap,
+            Arc::clone(&self.delegated_restart_pending),
         );
         Ok(())
     }
@@ -879,6 +1231,19 @@ impl Cluster {
     }
 }
 
+/// **Phase γ (M14.11).** Map the typed wire reason-code enum to its
+/// stable snake_case string form, used inside the
+/// `ExitReason::Crashed { detail }` payload synthesized by the
+/// scheduler drain.
+fn reason_code_to_static(code: DelegatedRestartReasonCode) -> &'static str {
+    match code {
+        DelegatedRestartReasonCode::SupervisorEscalation => "supervisor_escalation",
+        DelegatedRestartReasonCode::OperatorRequest => "operator_request",
+        DelegatedRestartReasonCode::ReloadDriven => "reload_driven",
+        DelegatedRestartReasonCode::HealthCheckFailure => "health_check_failure",
+    }
+}
+
 /// **M15 Phase 10.** Render the first 8 bytes of a 32-byte
 /// SHA-256 as a hex string for tracing-friendly hash logging
 /// (full 64 chars is noisy in logs; 16 chars is unique enough
@@ -1106,6 +1471,7 @@ async fn run_accept_loop(
     abort_handles: AbortHandles,
     reload_sink: RemoteReloadSink,
     telemetry_sink: TelemetrySinkSlot,
+    delegated_restart_pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
 ) {
     loop {
         let conn = match listener.accept().await {
@@ -1123,6 +1489,7 @@ async fn run_accept_loop(
         let abort_handles = Arc::clone(&abort_handles);
         let reload_sink = reload_sink.clone();
         let telemetry_sink = telemetry_sink.clone();
+        let delegated_restart_pending = Arc::clone(&delegated_restart_pending);
         tokio::spawn(async move {
             handle_inbound(
                 conn,
@@ -1134,6 +1501,7 @@ async fn run_accept_loop(
                 abort_handles,
                 reload_sink,
                 telemetry_sink,
+                delegated_restart_pending,
             )
             .await;
         });
@@ -1151,6 +1519,7 @@ async fn handle_inbound(
     abort_handles: AbortHandles,
     reload_sink: RemoteReloadSink,
     telemetry_sink: TelemetrySinkSlot,
+    delegated_restart_pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
 ) {
     let result = match server_handshake(
         &mut conn,
@@ -1183,6 +1552,8 @@ async fn handle_inbound(
         config.node_id.name().to_string(),
         reload_sink,
         telemetry_sink,
+        config.capabilities_bitmap,
+        delegated_restart_pending,
     );
 }
 
@@ -1214,6 +1585,8 @@ fn promote_connection_server<S>(
     our_name: String,
     reload_sink: RemoteReloadSink,
     telemetry_sink: TelemetrySinkSlot,
+    our_capabilities_bitmap: u64,
+    delegated_restart_pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1251,6 +1624,8 @@ fn promote_connection_server<S>(
             abort_rx,
             peer_node,
             our_name,
+            our_capabilities_bitmap,
+            delegated_restart_pending,
         )
         .await;
         // M14.5: synthesize disconnect-driven `__DOWN__` /
@@ -1287,6 +1662,8 @@ fn promote_connection_client<S>(
     our_name: String,
     reload_sink: RemoteReloadSink,
     telemetry_sink: TelemetrySinkSlot,
+    our_capabilities_bitmap: u64,
+    delegated_restart_pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1322,6 +1699,8 @@ fn promote_connection_client<S>(
             abort_rx,
             peer_node,
             our_name,
+            our_capabilities_bitmap,
+            delegated_restart_pending,
         )
         .await;
         supervision.synthesize_disconnect(&peer_name);
@@ -1357,6 +1736,8 @@ async fn run_connection<S>(
     mut abort_rx: oneshot::Receiver<()>,
     peer_node: NodeId,
     our_name: String,
+    our_capabilities_bitmap: u64,
+    delegated_restart_pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1402,6 +1783,9 @@ async fn run_connection<S>(
                         &dist_groups,
                         &reload_sink,
                         &telemetry_sink,
+                        our_capabilities_bitmap,
+                        &outbound_tx,
+                        &delegated_restart_pending,
                     );
                 }
                 Ok(None) => break,
@@ -1438,6 +1822,9 @@ fn dispatch_inbound(
     dist_groups: &DistGroups,
     reload_sink: &RemoteReloadSink,
     telemetry_sink: &TelemetrySinkSlot,
+    our_capabilities_bitmap: u64,
+    outbound_tx: &mpsc::Sender<Packet>,
+    delegated_restart_pending: &Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
 ) {
     match packet {
         Packet::Message(wire) => match wire_to_local(wire, peer_name, our_name) {
@@ -1539,6 +1926,167 @@ fn dispatch_inbound(
                 &rm.ir_hash,
                 rm.version,
             );
+        }
+        // **M-Prod sub-track #4 Phase γ (M14.11).** Cross-node
+        // delegated-restart request. Validate forgery (wire
+        // `origin` == authenticated peer name) + our locally-
+        // advertised capability bit + target_node match, then
+        // ship Ack and queue the local restart via the scheduler
+        // handle. The actual `RestartDelegationResult` is shipped
+        // by the cluster-wide outcome poller (spawned in
+        // `Cluster::start`), which polls
+        // `SchedulerHandle::poll_delegated_restart_outcomes` and
+        // looks up the originator's peer name in the registry.
+        Packet::RestartDelegationRequest(req) => {
+            // Forgery rejection: wire `origin` MUST match the
+            // authenticated peer name. We drop + audit on mismatch
+            // and never ship an Ack back.
+            if req.origin != peer_name {
+                tracing::warn!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_rejected",
+                    wire_origin = %req.origin,
+                    authenticated_peer = peer_name,
+                    correlation_id = req.correlation_id,
+                    reason = "forged_origin",
+                    "dropping inbound RestartDelegationRequest — wire origin doesn't match authenticated peer"
+                );
+                return;
+            }
+            // Capability gate: did WE advertise CAP_DELEGATED_RESTART
+            // locally? If not, drop + audit + don't ship an Ack
+            // (matches the spec: "NEVER send an Ack/Result back to
+            // a peer that shouldn't have asked").
+            if our_capabilities_bitmap & CAP_DELEGATED_RESTART == 0 {
+                tracing::warn!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_rejected",
+                    origin_peer = peer_name,
+                    correlation_id = req.correlation_id,
+                    reason = "cap_not_advertised",
+                    "dropping inbound RestartDelegationRequest — local CAP_DELEGATED_RESTART not advertised"
+                );
+                return;
+            }
+            // Target-node sanity check. Mismatches indicate
+            // misconfigured routing on the origin's side. Drop +
+            // audit; no Ack.
+            if req.target_node != our_name {
+                tracing::warn!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_rejected",
+                    origin_peer = peer_name,
+                    target_node = %req.target_node,
+                    our_name = %our_name,
+                    correlation_id = req.correlation_id,
+                    reason = "target_node_mismatch",
+                    "dropping inbound RestartDelegationRequest — target_node doesn't match our name"
+                );
+                return;
+            }
+            tracing::info!(
+                target: "graphreact::observer::audit",
+                event = "delegated_restart_received",
+                origin_peer = peer_name,
+                child_node_id = %req.child_node_id,
+                reason_code = ?req.reason_code,
+                token_id = %req.token_id,
+                correlation_id = req.correlation_id,
+                outcome = "accepted",
+                "delegated restart received and accepted"
+            );
+            // Ship the Ack immediately. Best-effort — drop is
+            // non-fatal for the responder (Result will still be
+            // emitted by the outcome poller).
+            let ack = RestartDelegationAck {
+                origin: our_name.to_string(),
+                correlation_id: req.correlation_id,
+                outcome: DelegatedRestartAckOutcome::Accepted,
+            };
+            let _ = outbound_tx.try_send(Packet::RestartDelegationAck(ack));
+            // Queue the local restart on the scheduler. Outcome
+            // will be picked up by the cluster outcome poller.
+            scheduler_handle.request_delegated_restart(
+                req.child_node_id,
+                reason_code_to_static(req.reason_code),
+                peer_name.to_string(),
+                req.correlation_id,
+            );
+        }
+        Packet::RestartDelegationAck(ack) => {
+            // Resolve the originator's pending Ack one-shot.
+            let entry_ack = {
+                let mut pending = delegated_restart_pending.lock();
+                pending.get_mut(&ack.correlation_id).and_then(|p| p.ack_tx.take())
+            };
+            if let Some(sender) = entry_ack {
+                let _ = sender.send(ack.outcome.clone());
+                tracing::info!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_ack",
+                    peer = %ack.origin,
+                    correlation_id = ack.correlation_id,
+                    outcome = ?ack.outcome,
+                    "delegated restart ack received"
+                );
+            } else {
+                tracing::debug!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_ack",
+                    peer = %ack.origin,
+                    correlation_id = ack.correlation_id,
+                    outcome = ?ack.outcome,
+                    reason = "no_pending_entry",
+                    "late or duplicate delegated_restart_ack ignored"
+                );
+            }
+        }
+        Packet::RestartDelegationResult(res) => {
+            let (entry_result, child_id) = {
+                let mut pending = delegated_restart_pending.lock();
+                let entry = pending.remove(&res.correlation_id);
+                match entry {
+                    Some(mut p) => (p.result_tx.take(), p.child_node_id.clone()),
+                    None => (None, String::new()),
+                }
+            };
+            let outcome_kind = match &res.outcome {
+                DelegatedRestartResultOutcome::Completed => "completed",
+                DelegatedRestartResultOutcome::Failed { .. } => "failed",
+                DelegatedRestartResultOutcome::TimedOut => "timed_out",
+            };
+            let error_kind: Option<&str> = match &res.outcome {
+                DelegatedRestartResultOutcome::Failed { error_kind, .. } => Some(error_kind.as_str()),
+                _ => None,
+            };
+            if let Some(sender) = entry_result {
+                let _ = sender.send(DelegatedRestartResultEvent {
+                    outcome: res.outcome.clone(),
+                    duration_ms: res.duration_ms,
+                });
+                tracing::info!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_completed",
+                    peer = %res.origin,
+                    child_node_id = %child_id,
+                    correlation_id = res.correlation_id,
+                    outcome = outcome_kind,
+                    error_kind = error_kind.unwrap_or(""),
+                    duration_ms = res.duration_ms,
+                    "delegated restart completed"
+                );
+            } else {
+                tracing::debug!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_completed",
+                    peer = %res.origin,
+                    correlation_id = res.correlation_id,
+                    outcome = outcome_kind,
+                    duration_ms = res.duration_ms,
+                    reason = "no_pending_entry",
+                    "late or duplicate delegated_restart_result ignored"
+                );
+            }
         }
         // M14.7 + M14.8.x Phase B: Tick / TickAck handled in
         // `run_connection`'s inbound arm — Tick triggers a
