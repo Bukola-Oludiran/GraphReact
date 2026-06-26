@@ -92,6 +92,9 @@ async fn spawn_with_rbac(
         // M-Prod #6 Phase B Part 1 — RBAC tests don't exercise
         // the X-Forwarded-For opt-in path.
         trusted_proxies: None,
+        // M-Prod #1 Phase B Part 2 (Group 1c) — JWT bridge unwired
+        // for the static-token RBAC e2e.
+        jwt_verifier: None,
     })
     .await
     .expect("spawn");

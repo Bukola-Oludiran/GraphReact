@@ -1,6 +1,6 @@
 # M-Prod — Auth + audit-log chain (sub-track #1)
 
-**Status:** SHIPPED Phase A 2026-06-17 — hash-chained tamper-evident audit-log SINK substrate landed; SHIPPED Phase B Part 1 2026-06-18 — multi-token RBAC + per-route ACL + atomic-swap registry substrate landed; SHIPPED Phase B Part 2 (Group 1ab) 2026-06-26 — SIGHUP-driven token-registry reload + audit-log rotation + batched-fsync worker + `audit_sink_write_failures_total` counter + `grx admin reload-tokens` CLI landed. Phase B Part 2 Group 1cd (JWT-OIDC + audit forwarders), Phase C (`grx admin audit-verify` cron), and Phase D (ACME-style forwarders) remain deferred — see [Phase B/C/D scope](#phase-bcd-scope).
+**Status:** SHIPPED Phase A 2026-06-17 — hash-chained tamper-evident audit-log SINK substrate landed; SHIPPED Phase B Part 1 2026-06-18 — multi-token RBAC + per-route ACL + atomic-swap registry substrate landed; SHIPPED Phase B Part 2 (Group 1ab) 2026-06-26 — SIGHUP-driven token-registry reload + audit-log rotation + batched-fsync worker + `audit_sink_write_failures_total` counter + `grx admin reload-tokens` CLI landed; SHIPPED Phase B Part 2 (Group 1c) 2026-06-26 — JWT-OIDC bridge with file-based JWKS (`--observer-jwt-config` + `--observer-jwks` flags + `RotatableJwks` atomic-swap + SIGHUP-driven JWKS reload via the Group 1ab fan-out + claim-to-Role mapping + graceful coexistence with static tokens via the `eyJ` prefix discriminator). Phase B Part 2 Group 1d (audit forwarders), Phase C (`grx admin audit-verify` cron), and Phase D (ACME-style forwarders) remain deferred — see [Phase B/C/D scope](#phase-bcd-scope).
 
 This document covers sub-track #1 of the M-Prod milestone (production-hardening): operator-facing authentication, RBAC, and audit-log tamper-evidence for the observer HTTPS surface. Sibling tracks (#2 TLS rotation, #3 secrets keyring, #4 lifecycle / SIGHUP topology, #5 observability, #6 constant-time compares, #9 chaos arm) reference this substrate; see [Cross-track contracts](#cross-track-contracts).
 
@@ -187,10 +187,67 @@ Per the m-prod-auth.md cross-track contract: **"Atomic-swap semantics carry the 
 
 ### Open work for Phase B Part 2 Group 1cd
 
-- JWT-OIDC bridge (per-issuer config + JWKS fetch + subject-claim → `TokenId` mapping).
-- Audit forwarders (S3 / Loki / GCS / OpenSearch backends; each consumes the same `AuditSink` trait via a new fan-out sink).
+- ~~JWT-OIDC bridge (per-issuer config + JWKS fetch + subject-claim → `TokenId` mapping).~~ **SHIPPED Group 1c — see below.**
+- Audit forwarders (S3 / Loki / GCS / OpenSearch backends; each consumes the same `AuditSink` trait via a new fan-out sink). — Group 1d (deferred).
 - `grx audit verify` extension to walk rotated files in chronological order via the `audit_log_rotated` boundary markers (deferrable — operators run per-file today).
 - HTTP `/v1/admin/reload-tokens` endpoint paired with `grx admin reload-tokens --http=…` (today's surface is SIGHUP-only).
+- HTTP-based JWKS auto-fetch (`/.well-known/jwks.json` polling). — γ.next (operators today sidecar-write the JWKS JSON to disk + fire SIGHUP).
+
+## Shipped — Phase B Part 2 (Group 1c) (2026-06-26)
+
+Group 1c lands the **JWT-OIDC bridge with file-based JWKS** — external IdP-issued JWTs (Okta / Auth0 / Keycloak / AWS Cognito / Google etc.) dispatch through `JwtVerifier::verify` → claim-to-Role mapping → existing per-route ACL flow shipped in Group B Part 1. HTTP-based JWKS auto-fetch defers to γ.next; operators sidecar-write the JWKS JSON to disk + fire SIGHUP for rotation.
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `JwtVerifier` (config + RotatableJwks + Validation template) | SHIPPED | [`crates/graphreact-observer/src/jwt_oidc.rs`](../../crates/graphreact-observer/src/jwt_oidc.rs) |
+| `JwtVerifier::verify` (`eyJ` fast-bail + decode_header + kid lookup + alg whitelist + jsonwebtoken decode + non-empty sub check) | SHIPPED | `jwt_oidc.rs::JwtVerifier::verify` |
+| `JwtVerifyError` typed errors + `reason_str()` closed vocabulary | SHIPPED | `jwt_oidc.rs::JwtVerifyError` |
+| `JwksStore` (per-kid HashMap with pre-decoded `DecodingKey` cached at load time) | SHIPPED | `jwt_oidc.rs::JwksStore` |
+| `JwksStore::from_jwk_set` (per-key skip-and-warn on missing-kid / decode-err; duplicate-kid is hard error; empty store is hard error) | SHIPPED | `jwt_oidc.rs::JwksStore::from_jwk_set` |
+| `load_jwks_from_file` (NO mode-0o600 enforcement — JWKS keys are PUBLIC by convention; ADR-0010 documents the deliberate deviation) | SHIPPED | `jwt_oidc.rs::load_jwks_from_file` |
+| `JwksLoadError` typed errors + `kind_str()` closed vocabulary | SHIPPED | `jwt_oidc.rs::JwksLoadError` |
+| `RotatableJwks` (`Arc<ArcSwap<JwksStore>>` newtype mirroring `RotatableRegistry` / `RotatableServerConfig`) | SHIPPED | `jwt_oidc.rs::RotatableJwks` |
+| `RoleMapping` + `derive_role` (string + array claim values; admin > read_only > custom precedence; default-deny) | SHIPPED | `jwt_oidc.rs::RoleMapping`, `jwt_oidc.rs::derive_role` |
+| `check_route_for_role(&Role, route)` (per-route ACL helper that operates on a Role directly, no synthesized TokenEntry needed) | SHIPPED | `jwt_oidc.rs::check_route_for_role` |
+| `JwtOidcConfig` + `load_jwt_oidc_config_from_file` (JSON, **mode 0o600 enforced** — role mapping is operator-sensitive) | SHIPPED | `jwt_oidc.rs::JwtOidcConfig` |
+| HMAC algorithm strip at `JwtVerifier::new` (HMAC keys in a public JWKS would be a credential leak) | SHIPPED | `jwt_oidc.rs::JwtVerifier::new` |
+| `SpawnOptions::jwt_verifier` + `ApiState::jwt_verifier` + `ApiServerHandle::jwt_verifier` (additive `Option<Arc<JwtVerifier>>`) | SHIPPED | [`crates/graphreact-observer/src/management_api.rs`](../../crates/graphreact-observer/src/management_api.rs) |
+| `auth_layer_rbac` JWT dispatch (eyJ-prefixed bearers route through JwtVerifier::verify FIRST; non-eyJ bearers short-circuit to the static-token walk) | SHIPPED | `management_api.rs::auth_layer_rbac` |
+| `MissingKid` / `UnknownKid` fall-through to static-token walk (graceful coexistence during mid-rotation operator state) | SHIPPED | `management_api.rs::auth_layer_rbac` |
+| `jwt_config_without_rbac` boot-time WARN audit event (operator wired the bridge but forgot `--observer-tokens`) | SHIPPED | `management_api.rs::spawn_with_options` |
+| `log_jwt_auth_success` audit helper (WARN level; fields peer + sub + iss + route + role + kid + expires_at_unix_ms) | SHIPPED | [`crates/graphreact-observer/src/audit.rs`](../../crates/graphreact-observer/src/audit.rs) |
+| `log_jwt_auth_fail` audit helper (WARN; fields peer + reason + iss_claimed + kid_claimed) | SHIPPED | `audit.rs::log_jwt_auth_fail` |
+| `log_jwks_reloaded` / `log_jwks_reload_failed` / `log_jwks_reload_skipped` audit helpers | SHIPPED | `audit.rs` |
+| `DaemonOptions::observer_jwks_path` + `DaemonOptions::observer_jwt_config_path` (additive `Option<PathBuf>` fields) | SHIPPED | [`crates/graphreact-cli/src/commands.rs`](../../crates/graphreact-cli/src/commands.rs) |
+| `DaemonHandle::jwks_path` + `DaemonHandle::reload_jwks_from_disk` (mirrors `reload_tokens_from_disk` shape: drain-respect + Instant timing + atomic-swap on Ok + retain prior store on Err) | SHIPPED | `commands.rs::DaemonHandle` |
+| SIGHUP gate extended from `(tls_paths || tokens_path || audit_log_path)` to also include `jwks_path` | SHIPPED | `commands.rs::drive_handle_until` |
+| SIGHUP fan-out grows by ONE line (`handle.reload_jwks_from_disk()` between tokens and TLS; order = audit → tokens → jwks → TLS) | SHIPPED | `commands.rs::drive_handle_until` |
+| `--observer-jwks <PATH>` + `--observer-jwt-config <PATH>` CLI flags (clap `requires = "observer_jwks"` enforces the both-or-neither rule at parse time) | SHIPPED | [`crates/graphreact-cli/src/cli.rs`](../../crates/graphreact-cli/src/cli.rs) |
+| Boot-time half-config fail-fast (Some-cfg + None-jwks, or None-cfg + Some-jwks → daemon exits with `ClusterArg` error) | SHIPPED | `commands.rs::start_daemon` |
+| JWT bridge integration tests (7 e2e scenarios: happy-path admin / expired / wrong-issuer / unknown-kid fall-through / static-token coexistence / read-only POST denial / no-role-match) | SHIPPED | [`crates/graphreact-observer/tests/jwt_oidc_bridge.rs`](../../crates/graphreact-observer/tests/jwt_oidc_bridge.rs) |
+| SIGHUP-fires-JWKS-reload subprocess test + half-config fail-fast subprocess test | SHIPPED | [`crates/graphreact-cli/tests/sighup_jwks_reload_subprocess.rs`](../../crates/graphreact-cli/tests/sighup_jwks_reload_subprocess.rs) |
+| ADR-0010 documenting the bridge config + JWKS file format + the mode-0o600 deviation | SHIPPED | [`docs/decisions/0010-oidc-jwt-bridge-config-format.md`](../decisions/0010-oidc-jwt-bridge-config-format.md) |
+
+### What changed at the wire / contract level
+
+- **`SpawnOptions::jwt_verifier`** is additive (`Option<Arc<JwtVerifier>>`). Legacy spawn paths (`spawn`, `spawn_with_cluster_readyz`, `spawn_with_drain`) default it to `None`; spawn behavior is bit-for-bit identical when no JWT bridge is wired.
+- **`auth_layer_rbac`** gains the JWT dispatch INSIDE the existing function (not as a new layer). Static tokens still walk through `snap.match_token` unchanged — the JWT path is only reachable when (a) `state.jwt_verifier.is_some()` AND (b) the bearer starts with `eyJ`.
+- **`MissingKid` / `UnknownKid` fall-through** is deliberate: the bearer might be a static token that coincidentally starts with `eyJ`, or a JWT signed by a key the operator hasn't sidecar-refreshed yet (mid-rotation). All OTHER JWT failures (expired / invalid_signature / invalid_issuer / etc.) are terminal — `log_jwt_auth_fail` + 401 challenge, no double-emit with the static-token `auth_fail`.
+- **`grx-sighup-ready PID` readiness line stays emit-once** per process regardless of how many reload targets are wired. Group 1c extends the GATE from 3 conditions OR'd to 4 — the readiness contract is preserved.
+- **JWKS file is NOT mode-0o600 enforced** (JWKS keys are PUBLIC by RFC 7517 convention). The bridge config file IS mode-0o600 enforced (role mapping determines who becomes admin). See ADR-0010 for the rationale.
+- **Default-deny on unmatched role claims**: a JWT whose `role_claim` value matches none of `admin_values` / `read_only_values` / `custom_role_mappings` is denied with `jwt_auth_fail reason=no_role_claim_match` — no implicit Role fallback.
+- **Algorithm whitelist defaults to RS256 + ES256.** HMAC variants are stripped at `JwtVerifier::new` even if the operator listed them — HMAC keys in a public JWKS file would be a credential leak. `Algorithm::None` is rejected by jsonwebtoken's `Validation::new` automatically.
+- **`jsonwebtoken = "9"`** is the only new workspace dep. Transitive deps (ring, pem, simple_asn1, base64) are already in-tree via rustls / serde. `cargo deny check` baseline failures are pre-existing and not perturbed by this addition.
+
+### Open work for Phase B Part 2 Group 1d (audit forwarders, deferred)
+
+- S3 / Loki / GCS / OpenSearch audit-log forwarders — each consumes the same `AuditSink` trait via a new fan-out sink.
+- HTTP-based JWKS auto-fetch (γ.next) — operators today sidecar-write the JWKS JSON to disk + fire SIGHUP.
+- `grx audit verify` extension to walk rotated files in chronological order via the `audit_log_rotated` boundary markers.
+- HTTP `/v1/admin/reload-tokens` / `reload-jwks` endpoints paired with `grx admin --http=…` (today's surface is SIGHUP-only).
+- Per-issuer JWKS files (`--observer-jwks-dir <DIR>` glob) — multi-issuer deploys today union the keys into one file.
+- Dynamic role mapping (Lua / CEL expressions) — today's mapping is exact-string match.
+- Live JWT-OIDC bridge config reload (today SIGHUP reloads JWKS only; config changes need a daemon restart).
 
 ## On-disk record shape
 

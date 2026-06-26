@@ -91,6 +91,8 @@ async fn spawn_with_sink(
         // M-Prod #6 Phase B Part 1 trusted_proxies is None — the
         // audit-chain test isn't about X-Forwarded-For honoring.
         trusted_proxies: None,
+        // M-Prod #1 Phase B Part 2 (Group 1c) — JWT bridge unwired.
+        jwt_verifier: None,
     })
     .await
     .expect("spawn");

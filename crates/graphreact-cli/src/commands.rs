@@ -1284,6 +1284,35 @@ pub struct DaemonOptions {
     /// rotation. `None` (default) keeps the Phase B Part 1 surface
     /// (no SIGHUP token reload).
     pub observer_tokens_path: Option<std::path::PathBuf>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Path to
+    /// a JWKS JSON file (RFC 7517 §5) — the OIDC IdP's public
+    /// signing keys. Ships paired with
+    /// [`Self::observer_jwt_config_path`]; both are required to
+    /// enable the JWT-OIDC bridge.
+    ///
+    /// File mode is NOT enforced (the keys are public by JWKS
+    /// convention; ADR-0010 documents the deliberate deviation
+    /// from the audit-log + token-registry 0o600 rule). SIGHUP
+    /// (`kill -HUP <pid>` or `grx admin reload-tokens --pid <pid>`)
+    /// re-reads the JWKS file + atomic-swaps the in-memory store
+    /// without restarting the daemon. On parse / validate failure
+    /// the prior store keeps serving + an audit event of shape
+    /// `jwks_reload_failed` is emitted.
+    pub observer_jwks_path: Option<std::path::PathBuf>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Path to
+    /// the JWT-OIDC bridge config JSON (acceptable issuers,
+    /// audiences, algorithm whitelist, leeway, role mapping).
+    /// File mode 0o600 IS enforced on Unix — the role mapping is
+    /// operator-sensitive (it determines who becomes admin), so
+    /// it gets the same filesystem protection as the static-token
+    /// registry file.
+    ///
+    /// Config changes require a daemon restart; SIGHUP reloads
+    /// the JWKS file only. When `Some`, requires
+    /// [`Self::observer_jwks_path`] to also be set (the bridge
+    /// needs both halves; half-configured is a no-go state —
+    /// `start_daemon` fails fast on the half-config case).
+    pub observer_jwt_config_path: Option<std::path::PathBuf>,
     /// **M-Prod sub-track #4 Phase α.** Outer SIGTERM drain
     /// deadline (seconds). `None` falls through to
     /// `GRX_DRAIN_DEADLINE_SECS` env var, then to
@@ -1459,6 +1488,13 @@ pub struct DaemonHandle {
     /// audit-log rotation is a silent no-op (no operator-visible
     /// audit surface to rotate).
     audit_log_path: Option<std::path::PathBuf>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** JWKS
+    /// file path captured at boot for SIGHUP-triggered
+    /// `RotatableJwks::rotate(...)`. `Some(path)` enables
+    /// [`Self::reload_jwks_from_disk`] to re-read the JWKS JSON +
+    /// atomic-swap. `None` keeps SIGHUP JWKS reload a silent no-op
+    /// (no operator-visible JWT bridge surface).
+    jwks_path: Option<std::path::PathBuf>,
 }
 
 /// **M-Prod sub-track #4 Phase α.** Outcome of a graceful drain
@@ -1780,6 +1816,64 @@ impl DaemonHandle {
             }
             Err(err) => {
                 graphreact_observer::log_token_registry_reload_failed(
+                    err.kind_str(),
+                    &err.to_string(),
+                    sink,
+                );
+            }
+        }
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** SIGHUP
+    /// entry point for in-process JWKS reload. Drives the
+    /// substrate's [`graphreact_observer::RotatableJwks::rotate`]
+    /// atomic-swap against the JWT verifier wired through
+    /// `--observer-jwt-config` + `--observer-jwks`. Emits an
+    /// operator-facing `jwks_reloaded` audit row on success or
+    /// `jwks_reload_failed` on failure.
+    ///
+    /// Drain-respect: when a drain is in progress the rotation is
+    /// skipped + a `jwks_reload_skipped` `reason="draining"` audit
+    /// row is emitted in place of the reloaded/failed pair.
+    ///
+    /// No-op when `self.observer` is `None`, the observer's
+    /// `jwt_verifier` is `None`, or `self.jwks_path` is `None` —
+    /// matches the silent-no-op precedent from
+    /// [`Self::reload_tokens_from_disk`].
+    pub fn reload_jwks_from_disk(&self) {
+        let Some(observer) = self.observer.as_ref() else {
+            return;
+        };
+        let Some(verifier) = observer.jwt_verifier.as_ref() else {
+            return;
+        };
+        let Some(path) = self.jwks_path.as_ref() else {
+            return;
+        };
+        let sink = observer.audit_sink.as_ref();
+        if let Some(flag) = self.drain.as_ref() {
+            if flag.is_draining() {
+                graphreact_observer::log_jwks_reload_skipped("draining", sink);
+                return;
+            }
+        }
+        let start = std::time::Instant::now();
+        match graphreact_observer::load_jwks_from_file(path) {
+            Ok(store) => {
+                let key_count = store.key_count();
+                let kid_count = store.kid_count();
+                verifier.jwks().rotate(std::sync::Arc::new(store));
+                let duration_ms =
+                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                graphreact_observer::log_jwks_reloaded(
+                    key_count,
+                    kid_count,
+                    duration_ms,
+                    sink,
+                );
+            }
+            Err(err) => {
+                graphreact_observer::log_jwks_reload_failed(
                     err.kind_str(),
                     &err.to_string(),
                     sink,
@@ -2251,6 +2345,57 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 }
                 None => None,
             };
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Load
+        // the optional JWT-OIDC config + JWKS BEFORE the management
+        // API spawn so the very first protected request can
+        // dispatch through the JWT bridge. The two flags ship
+        // together — half-configured is a no-go state. fail-fast on
+        // either-but-not-both rather than silently degrade. Parse
+        // / mode / empty failures surface as daemon boot failure.
+        let jwt_verifier_handle: Option<std::sync::Arc<graphreact_observer::JwtVerifier>> =
+            match (
+                opts.observer_jwt_config_path.as_ref(),
+                opts.observer_jwks_path.as_ref(),
+            ) {
+                (Some(cfg_path), Some(jwks_path)) => {
+                    let cfg = graphreact_observer::load_jwt_oidc_config_from_file(cfg_path)
+                        .map_err(|e| {
+                            CommandError::ClusterArg(format!(
+                                "observer-jwt-config load {}: {e}",
+                                cfg_path.display()
+                            ))
+                        })?;
+                    let jwks = graphreact_observer::load_jwks_from_file(jwks_path)
+                        .map_err(|e| {
+                            CommandError::ClusterArg(format!(
+                                "observer-jwks load {}: {e}",
+                                jwks_path.display()
+                            ))
+                        })?;
+                    let rotatable =
+                        graphreact_observer::RotatableJwks::new(std::sync::Arc::new(jwks));
+                    Some(std::sync::Arc::new(graphreact_observer::JwtVerifier::new(
+                        cfg, rotatable,
+                    )))
+                }
+                (Some(cfg_path), None) => {
+                    return Err(CommandError::ClusterArg(format!(
+                        "observer-jwt-config {} requires --observer-jwks; \
+                         the JWT bridge needs both the bridge config (issuers \
+                         + role mapping) AND the IdP signing keys",
+                        cfg_path.display()
+                    )))
+                }
+                (None, Some(jwks_path)) => {
+                    return Err(CommandError::ClusterArg(format!(
+                        "observer-jwks {} requires --observer-jwt-config; \
+                         the JWT bridge needs both the IdP signing keys AND \
+                         the bridge config (issuers + role mapping)",
+                        jwks_path.display()
+                    )))
+                }
+                (None, None) => None,
+            };
         let server = graphreact_observer::spawn_management_api_with_options(
             graphreact_observer::SpawnOptions {
                 bind: bind_cfg,
@@ -2285,6 +2430,13 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 // semantics, per the silent-spoofing footgun
                 // guard documented in `m-prod-rate-limit.md`).
                 trusted_proxies: None,
+                // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).**
+                // Thread the in-process JWT-OIDC bridge verifier
+                // through SpawnOptions. `None` keeps the static-
+                // token-only path; `Some` enables eyJ-prefixed
+                // bearer dispatch through JwtVerifier::verify
+                // inside auth_layer_rbac.
+                jwt_verifier: jwt_verifier_handle.clone(),
             },
         )
         .await
@@ -2442,6 +2594,14 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // audit-log) whenever ANY of them is wired.
         tokens_path: opts.observer_tokens_path,
         audit_log_path: opts.observer_audit_log,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Retain
+        // the JWKS file path so the SIGHUP fan-out can call
+        // reload_jwks_from_disk + atomic-swap the in-memory
+        // RotatableJwks store without restarting the daemon. The
+        // bridge config path is NOT retained — config changes
+        // require a daemon restart (live config reload is deferred
+        // to gamma.next).
+        jwks_path: opts.observer_jwks_path,
     })
 }
 
@@ -2728,6 +2888,9 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         // token-reload + audit-rotate are no-ops on this path.
         tokens_path: None,
         audit_log_path: None,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** `connect`
+        // has no JWT bridge either; SIGHUP JWKS reload is a no-op.
+        jwks_path: None,
     };
     let _exit = drive_handle_until(&mut handle, duration).await?;
     handle.shutdown().await;
@@ -2814,6 +2977,7 @@ pub async fn drive_handle_until(
     let mut sighup = if handle.tls_paths.is_some()
         || handle.tokens_path.is_some()
         || handle.audit_log_path.is_some()
+        || handle.jwks_path.is_some()
     {
         use tokio::signal::unix::{signal, SignalKind};
         let stream = signal(SignalKind::hangup())
@@ -2883,15 +3047,19 @@ pub async fn drive_handle_until(
                     None => { std::future::pending::<()>().await; }
                 }
             }, if sighup.is_some() => {
-                // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab)
-                // fan-out.** Single SIGHUP signal arm reaches all
-                // three reload targets. Audit-log rotation FIRST so
-                // subsequent token / TLS reload audit events land
-                // in the FRESH file behind the chain-continuity
-                // marker. Each reload runs independently — failure
-                // in one does NOT short-circuit the rest.
+                // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab +
+                // 1c) fan-out.** Single SIGHUP signal arm reaches
+                // all four reload targets. Audit-log rotation
+                // FIRST so subsequent token / JWKS / TLS reload
+                // audit events land in the FRESH file behind the
+                // chain-continuity marker. JWKS reload sits BETWEEN
+                // tokens and TLS — config-shaped (like tokens),
+                // but distinct from the cert-handle TLS rotation.
+                // Each reload runs independently — failure in one
+                // does NOT short-circuit the rest.
                 handle.rotate_audit_log();
                 handle.reload_tokens_from_disk();
+                handle.reload_jwks_from_disk();
                 handle.reload_tls_from_disk();
             }
         }

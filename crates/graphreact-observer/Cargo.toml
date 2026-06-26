@@ -77,6 +77,15 @@ tower_governor = { version = "0.5", default-features = false, features = ["axum"
 # M-Ingress phase 2 — UUIDv4 correlation_id mint for `POST /v1/nodes/:id/call`.
 uuid.workspace = true
 
+# **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** JWT-OIDC bridge.
+# `jsonwebtoken 9` exposes:
+#   - `decode_header` (per-request) + `decode<Claims>` (per-request)
+#   - `Validation` (algorithm whitelist + iss/aud/exp/nbf/leeway)
+#   - `jwk::JwkSet` + `Jwk` + `DecodingKey::from_jwk` (per-rotation)
+# Default features ON (keeps `use_pem` for ASN.1 path on RSA keys).
+# License MIT — accepted by the existing cargo-deny allowlist.
+jsonwebtoken = { workspace = true }
+
 # M16-Backend P7 — WebSocket + SSE live event stream.
 futures.workspace = true
 

@@ -72,6 +72,16 @@ uuid = { version = "1", features = ["v4"] }
 tree-sitter = "0.25"
 tree-sitter-language = "0.1"
 
+# **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** JWT validation
+# substrate for the OIDC bridge. MIT-licensed; transitive deps are
+# ring (already vendored via rustls), serde / serde_json (already
+# workspace), base64 0.22 (already in-tree via rustls 0.23), pem 3
+# / simple_asn1 (ISC — both already on the cargo-deny allowlist).
+# Pinned at the v9 major (NOT v10) because v10 hasn't been audited
+# against our existing pem 3 / base64 0.22 / serde lock baseline.
+# ADR-0010 documents the upgrade rationale + landmines.
+jsonwebtoken = "9"
+
 # M14 — distribution layer (graphreact-dist).
 postcard = { version = "1", features = ["use-std"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
