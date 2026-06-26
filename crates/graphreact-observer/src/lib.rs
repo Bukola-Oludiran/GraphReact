@@ -37,6 +37,9 @@
 
 pub mod audit;
 pub mod audit_chain;
+pub mod audit_forwarder_spool;
+pub mod audit_forwarder_stderr;
+pub mod audit_forwarders;
 pub mod auth;
 pub mod bind;
 pub mod drain;
@@ -91,6 +94,14 @@ pub use audit_chain::{
     AuditRecordInput, AuditSink, FileAuditSink, FsyncMode, NopAuditSink, RotationOutcome,
     DEFAULT_BATCHED_FSYNC_INTERVAL_MS, DEFAULT_BATCHED_FSYNC_MAX_PENDING,
 };
+pub use audit_forwarder_spool::{SpoolFileForwarder, SPOOL_FORWARDER_NAME};
+pub use audit_forwarder_stderr::{StderrJsonLinesForwarder, STDERR_FORWARDER_NAME};
+pub use audit_forwarders::{
+    resolve_audit_forwarder_queue_depth, AuditForwarder, ForwarderHub,
+    ForwarderRotationOutcome, DEFAULT_AUDIT_FORWARDER_QUEUE_DEPTH,
+    FORWARDER_OUTCOME_DROPPED_QUEUE_FULL, FORWARDER_OUTCOME_DROPPED_SHUTDOWN,
+    FORWARDER_OUTCOME_FORWARDED, FORWARDER_OUTCOME_WRITE_FAILED,
+};
 pub use auth::{AuthError, BearerToken};
 pub use jwt_oidc::{
     check_route_for_role, derive_role, load_jwks_from_file, load_jwt_oidc_config_from_file,
@@ -130,7 +141,9 @@ pub use rate_limit_keys::{
     TokenIdKey, TokenIdKeyExtractor, TrustedNet, TrustedProxyAwarePeerIpExtractor,
     TrustedProxyConfig, TrustedProxyParseError,
 };
-pub use metrics::{Counter, Gauge, Histogram, HistogramSnapshot, LabeledCounter, MetricsInner};
+pub use metrics::{
+    Counter, Gauge, Histogram, HistogramSnapshot, LabeledCounter, LabeledGauge, MetricsInner,
+};
 pub use multiplex::MultiplexSink;
 pub use prometheus::encode_text;
 pub use prometheus_sink::PrometheusSink;

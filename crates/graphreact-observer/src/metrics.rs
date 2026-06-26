@@ -276,6 +276,27 @@ impl LabeledCounter {
     }
 }
 
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Gauge with
+/// attached label values. Mirror of [`LabeledCounter`] for the
+/// per-forwarder `audit_forwarder_queue_depth{forwarder}` series.
+/// Registered ONCE per forwarder at hub-construction time so the
+/// worker's `gauge.set()` is pure `AtomicU64::store(Relaxed)` with
+/// zero DashMap traffic after warm.
+pub struct LabeledGauge {
+    pub labels: Vec<(&'static str, String)>,
+    pub gauge: Gauge,
+}
+
+impl LabeledGauge {
+    #[must_use]
+    pub fn new(labels: Vec<(&'static str, String)>) -> Self {
+        Self {
+            labels,
+            gauge: Gauge::new(),
+        }
+    }
+}
+
 /// Aggregate metric storage shared between the `PrometheusSink`
 /// (writer) and the `prometheus.rs` text-format encoder (reader).
 /// Held behind `Arc` so the HTTP handler and the sink see the same
@@ -374,6 +395,33 @@ pub struct MetricsInner {
     /// alert when it sustains near the cap (worker too slow OR
     /// disk under pressure).
     pub audit_sink_pending_records: Gauge,
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).**
+    /// `grx_audit_forwarder_records_total{forwarder,outcome}` —
+    /// per-(forwarder, outcome) count of audit-record fan-out
+    /// attempts. `forwarder` is one of the 2-entry closed
+    /// vocabulary `{"spool_file", "stderr_jsonl"}` (extending
+    /// reference impls add labels); `outcome` is one of the
+    /// 4-entry closed vocabulary
+    /// `{"forwarded", "dropped_queue_full", "dropped_shutdown", "write_failed"}`.
+    /// Total cardinality bounded at 8 series. Family suppressed
+    /// until the first fan fires.
+    pub audit_forwarder_records: DashMap<u64, Arc<LabeledCounter>>,
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).**
+    /// `grx_audit_forwarder_queue_depth{forwarder}` — current
+    /// backlog of the per-forwarder bounded mpsc worker queue
+    /// (default cap 1024, env `GRX_AUDIT_FORWARDER_QUEUE_DEPTH`).
+    /// Sustained near cap signals a slow consumer. Cardinality
+    /// bounded at 2 series.
+    pub audit_forwarder_queue_depth: DashMap<u64, Arc<LabeledGauge>>,
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).**
+    /// `grx_audit_forwarder_drain_timeouts_total{forwarder}` —
+    /// per-forwarder count of drain operations that hit
+    /// `OBSERVER_SHUTDOWN_DEADLINE` before the in-flight queue
+    /// fully flushed. Operators alert on non-zero.
+    pub audit_forwarder_drain_timeouts: DashMap<u64, Arc<LabeledCounter>>,
 }
 
 impl Default for MetricsInner {
@@ -405,7 +453,103 @@ impl MetricsInner {
             rate_limit_blocked: DashMap::new(),
             audit_sink_write_failures: DashMap::new(),
             audit_sink_pending_records: Gauge::new(),
+            audit_forwarder_records: DashMap::new(),
+            audit_forwarder_queue_depth: DashMap::new(),
+            audit_forwarder_drain_timeouts: DashMap::new(),
         }
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Increment
+    /// the per-(forwarder, outcome) audit-forwarder records
+    /// counter. Both labels are `&'static str` so the closed
+    /// vocabulary (2 forwarders × 4 outcomes = 8 series) is
+    /// enforced at the type level.
+    #[inline]
+    pub fn audit_forwarder_records_inc(&self, forwarder: &'static str, outcome: &'static str) {
+        let key = hash2(forwarder, outcome);
+        if let Some(c) = self.audit_forwarder_records.get(&key) {
+            c.counter.inc();
+            return;
+        }
+        self.audit_forwarder_records
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledCounter::new(vec![
+                    ("forwarder", forwarder.to_string()),
+                    ("outcome", outcome.to_string()),
+                ]))
+            })
+            .counter
+            .inc();
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Register
+    /// + return the cached `Arc<LabeledGauge>` for one
+    /// forwarder's queue-depth series. Called ONCE per forwarder
+    /// at hub-construction time; the worker holds the returned
+    /// `Arc` and updates the gauge with pure
+    /// `AtomicU64::store(Relaxed)` — zero DashMap traffic on the
+    /// fan-out hot path.
+    pub fn audit_forwarder_queue_depth_register(
+        &self,
+        forwarder: &'static str,
+    ) -> Arc<LabeledGauge> {
+        let key = hash1(forwarder);
+        self.audit_forwarder_queue_depth
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledGauge::new(vec![(
+                    "forwarder",
+                    forwarder.to_string(),
+                )]))
+            })
+            .clone()
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Set the
+    /// queue-depth gauge for one forwarder. Cached `Arc` lookup
+    /// after warm; falls through to register-on-miss for the
+    /// first-event path.
+    #[inline]
+    pub fn audit_forwarder_queue_depth_set(&self, forwarder: &'static str, depth: u64) {
+        let key = hash1(forwarder);
+        if let Some(g) = self.audit_forwarder_queue_depth.get(&key) {
+            g.gauge.set(depth);
+            return;
+        }
+        self.audit_forwarder_queue_depth
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledGauge::new(vec![(
+                    "forwarder",
+                    forwarder.to_string(),
+                )]))
+            })
+            .gauge
+            .set(depth);
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Increment
+    /// the per-forwarder drain-timeout counter. Bumped when the
+    /// hub's drain exceeded `OBSERVER_SHUTDOWN_DEADLINE` for a
+    /// specific forwarder.
+    #[inline]
+    pub fn audit_forwarder_drain_timeouts_inc(&self, forwarder: &'static str) {
+        let key = hash1(forwarder);
+        if let Some(c) = self.audit_forwarder_drain_timeouts.get(&key) {
+            c.counter.inc();
+            return;
+        }
+        self.audit_forwarder_drain_timeouts
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledCounter::new(vec![(
+                    "forwarder",
+                    forwarder.to_string(),
+                )]))
+            })
+            .counter
+            .inc();
     }
 
     /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Increment
