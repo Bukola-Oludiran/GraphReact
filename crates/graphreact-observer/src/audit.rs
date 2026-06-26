@@ -381,6 +381,215 @@ pub fn log_tls_reload_skipped(reason: &'static str, sink: Option<&Arc<dyn AuditS
     );
 }
 
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** SIGHUP-driven
+/// token-registry reload succeeded; [`crate::rbac::RotatableRegistry`]
+/// was atomically swapped in. Fires at WARN level mirroring the
+/// existing `tls_reload_failure` / `cluster_handshake_complete`
+/// precedent — rotations are operator-visible events, not
+/// background INFO chatter.
+///
+/// Fields:
+/// - `tokens_count`: total entry count in the new registry
+/// - `admin_count`: entries with `Role::Admin`
+/// - `read_only_count`: entries with `Role::ReadOnly`
+/// - `custom_count`: entries with `Role::Custom(_)`
+/// - `duration_ms`: wall-clock span from "SIGHUP delivered" to
+///   "atomic swap completed"
+#[inline]
+pub fn log_token_registry_reloaded(
+    tokens_count: usize,
+    admin_count: usize,
+    read_only_count: usize,
+    custom_count: usize,
+    duration_ms: u64,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "token_registry_reloaded",
+        tokens_count,
+        admin_count,
+        read_only_count,
+        custom_count,
+        duration_ms,
+        "observer token registry reloaded"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "token_registry_reloaded",
+            fields: serde_json::json!({
+                "tokens_count": tokens_count,
+                "admin_count": admin_count,
+                "read_only_count": read_only_count,
+                "custom_count": custom_count,
+                "duration_ms": duration_ms,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** SIGHUP-driven
+/// token-registry reload failed. The PRIOR registry keeps serving
+/// (no partial swap); fires at WARN level so operators see the
+/// rejection in their SOC pipeline immediately.
+///
+/// `error_kind` is a `&'static str` drawn from the closed-over
+/// reload failure vocabulary: `"io"` (file unreadable),
+/// `"mode"` (file is group/world-readable),
+/// `"parse"` (NDJSON record didn't deserialize), or `"validate"`
+/// (TokenRegistry::new rejected the parsed entries — empty / too
+/// many / duplicate id).
+#[inline]
+pub fn log_token_registry_reload_failed(
+    error_kind: &'static str,
+    detail: &str,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "token_registry_reload_failed",
+        error_kind,
+        detail,
+        "observer token registry reload failed; prior registry retained"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "token_registry_reload_failed",
+            fields: serde_json::json!({
+                "error_kind": error_kind,
+                "detail": detail,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** SIGHUP-driven
+/// audit-log rotation succeeded. Emitted by the daemon's SIGHUP
+/// handler AFTER [`crate::FileAuditSink::rotate`] returns — the
+/// rotation itself writes two on-disk `audit_log_rotated` marker
+/// records (one as the tail of the old file, one as the head of
+/// the new file) so the chain is provably contiguous across the
+/// rename. This helper fires the OPERATOR-FACING audit event
+/// (tracing line + sink fan); it does NOT duplicate the on-disk
+/// markers.
+#[inline]
+pub fn log_audit_log_rotated(
+    rotated_from: &str,
+    rotated_to: &str,
+    prior_last_this_hash: &str,
+    new_first_prev_hash: &str,
+    records_in_prior_file: u64,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "audit_log_rotated",
+        rotated_from,
+        rotated_to,
+        prior_last_this_hash,
+        new_first_prev_hash,
+        records_in_prior_file,
+        "observer audit log rotated"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "audit_log_rotated",
+            fields: serde_json::json!({
+                "rotated_from": rotated_from,
+                "rotated_to": rotated_to,
+                "prior_last_this_hash": prior_last_this_hash,
+                "new_first_prev_hash": new_first_prev_hash,
+                "records_in_prior_file": records_in_prior_file,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** SIGHUP-driven
+/// audit-log rotation failed. The OLD file stays open + writable;
+/// the daemon continues serving appends against it. `error_kind`
+/// is one of `"rename"`, `"open"`, `"write"`, or `"runtime"`;
+/// `detail` carries the underlying error.
+#[inline]
+pub fn log_audit_log_rotation_failed(
+    error_kind: &'static str,
+    detail: &str,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "audit_log_rotation_failed",
+        error_kind,
+        detail,
+        "observer audit log rotation failed; prior file retained"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "audit_log_rotation_failed",
+            fields: serde_json::json!({
+                "error_kind": error_kind,
+                "detail": detail,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** SIGHUP-driven
+/// token-registry reload was triggered but skipped without
+/// entering the reload path (e.g. mid-drain). `reason` is a
+/// `&'static str` drawn from the same vocabulary as
+/// [`log_tls_reload_skipped`] — today `"draining"` is the only
+/// emit value.
+#[inline]
+pub fn log_token_registry_reload_skipped(
+    reason: &'static str,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "token_registry_reload_skipped",
+        reason,
+        "observer token registry reload skipped"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "token_registry_reload_skipped",
+            fields: serde_json::json!({
+                "reason": reason,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Audit-log
+/// rotation was triggered but skipped (today: drain in progress).
+#[inline]
+pub fn log_audit_log_rotation_skipped(
+    reason: &'static str,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "audit_log_rotation_skipped",
+        reason,
+        "observer audit log rotation skipped"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "audit_log_rotation_skipped",
+            fields: serde_json::json!({
+                "reason": reason,
+            }),
+        },
+    );
+}
+
 /// **M-Prod sub-track #4 Phase α.** SIGTERM (or operator-driven)
 /// drain entered. Emitted EXACTLY ONCE per daemon lifetime,
 /// BEFORE [`crate::DrainFlag`]'s AtomicBool flip becomes

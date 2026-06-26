@@ -1274,6 +1274,16 @@ pub struct DaemonOptions {
     /// sink — operator + test paths preserve the legacy
     /// tracing-only audit surface.
     pub observer_audit_log: Option<std::path::PathBuf>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** When
+    /// `Some(path)`, load a [`graphreact_observer::TokenRegistry`]
+    /// from `path` (NDJSON per ADR-0009) and wire it through
+    /// [`graphreact_observer::SpawnOptions::rbac`] as a
+    /// [`graphreact_observer::RotatableRegistry`]. The file path
+    /// is also retained on [`DaemonHandle::tokens_path`] so the
+    /// SIGHUP handler can re-read + atomic-swap on operator
+    /// rotation. `None` (default) keeps the Phase B Part 1 surface
+    /// (no SIGHUP token reload).
+    pub observer_tokens_path: Option<std::path::PathBuf>,
     /// **M-Prod sub-track #4 Phase α.** Outer SIGTERM drain
     /// deadline (seconds). `None` falls through to
     /// `GRX_DRAIN_DEADLINE_SECS` env var, then to
@@ -1436,6 +1446,19 @@ pub struct DaemonHandle {
     /// [`Self::reload_tls_from_disk`] to re-read the files and
     /// drive Phase A's `ApiServerHandle::reload_tls` substrate.
     tls_paths: Option<TlsPaths>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Token
+    /// registry file path captured at boot for SIGHUP-triggered
+    /// `RotatableRegistry::rotate(...)`. `None` when no RBAC
+    /// token-registry file was wired — SIGHUP token-reload is
+    /// then a silent no-op.
+    tokens_path: Option<std::path::PathBuf>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Audit
+    /// log file path captured at boot for SIGHUP-triggered
+    /// `FileAuditSink::rotate`. `Some` iff the daemon was booted
+    /// with `--observer-audit-log <PATH>`. When `None`, SIGHUP
+    /// audit-log rotation is a silent no-op (no operator-visible
+    /// audit surface to rotate).
+    audit_log_path: Option<std::path::PathBuf>,
 }
 
 /// **M-Prod sub-track #4 Phase α.** Outcome of a graceful drain
@@ -1705,6 +1728,128 @@ impl DaemonHandle {
         let _ = observer.reload_tls(&cert_bytes, &key_bytes);
     }
 
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** SIGHUP
+    /// entry point for the token-registry reload. Re-reads the
+    /// NDJSON file from `self.tokens_path` (when set), validates
+    /// it, and atomically swaps the result into the
+    /// [`graphreact_observer::RotatableRegistry`] via
+    /// [`graphreact_observer::RotatableRegistry::rotate`].
+    ///
+    /// On parse / validate failure the prior registry stays
+    /// serving + a `token_registry_reload_failed` audit event
+    /// fires. Drain-respect: when a drain is in progress the swap
+    /// is skipped + a `token_registry_reload_skipped`
+    /// `reason="draining"` audit row is emitted.
+    ///
+    /// No-op when `self.observer` is `None`, the observer's
+    /// `rbac` is `None`, or `self.tokens_path` is `None` —
+    /// matches the silent-no-op precedent from
+    /// [`Self::reload_tls_from_disk`].
+    pub fn reload_tokens_from_disk(&self) {
+        let Some(observer) = self.observer.as_ref() else {
+            return;
+        };
+        let Some(rbac) = observer.rbac.as_ref() else {
+            return;
+        };
+        let Some(path) = self.tokens_path.as_ref() else {
+            return;
+        };
+        let sink = observer.audit_sink.as_ref();
+        if let Some(flag) = self.drain.as_ref() {
+            if flag.is_draining() {
+                graphreact_observer::log_token_registry_reload_skipped("draining", sink);
+                return;
+            }
+        }
+        let start = std::time::Instant::now();
+        match graphreact_observer::load_registry_from_file(path) {
+            Ok(registry) => {
+                let counts = registry.role_counts();
+                rbac.rotate(std::sync::Arc::new(registry));
+                let duration_ms =
+                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                graphreact_observer::log_token_registry_reloaded(
+                    counts.total,
+                    counts.admin,
+                    counts.read_only,
+                    counts.custom,
+                    duration_ms,
+                    sink,
+                );
+            }
+            Err(err) => {
+                graphreact_observer::log_token_registry_reload_failed(
+                    err.kind_str(),
+                    &err.to_string(),
+                    sink,
+                );
+            }
+        }
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** SIGHUP
+    /// entry point for in-process audit-log rotation. Drives the
+    /// substrate's [`graphreact_observer::FileAuditSink::rotate`]
+    /// atomic-rename + chain-continuity flow against the audit
+    /// sink wired through `--observer-audit-log`. Emits an
+    /// operator-facing `audit_log_rotated` audit row on success or
+    /// `audit_log_rotation_failed` on failure (in addition to the
+    /// boundary marker records the substrate writes on-disk).
+    ///
+    /// Drain-respect: when a drain is in progress the rotation is
+    /// skipped + an `audit_log_rotation_skipped` `reason="draining"`
+    /// audit row is emitted in place of the
+    /// attempt/success/failure pair.
+    ///
+    /// No-op when no audit sink was wired at boot
+    /// (`self.observer.audit_sink == None` OR
+    /// `self.audit_log_path == None`).
+    pub fn rotate_audit_log(&self) {
+        let Some(observer) = self.observer.as_ref() else {
+            return;
+        };
+        let Some(sink) = observer.audit_sink.as_ref() else {
+            return;
+        };
+        let Some(path) = self.audit_log_path.as_ref() else {
+            return;
+        };
+        if let Some(flag) = self.drain.as_ref() {
+            if flag.is_draining() {
+                graphreact_observer::log_audit_log_rotation_skipped(
+                    "draining",
+                    Some(sink),
+                );
+                return;
+            }
+        }
+        match sink.rotate() {
+            Ok(Some(outcome)) => {
+                graphreact_observer::log_audit_log_rotated(
+                    &path.display().to_string(),
+                    &outcome.rotated_to.display().to_string(),
+                    &outcome.prior_last_this_hash,
+                    &outcome.new_first_prev_hash,
+                    outcome.records_in_prior_file,
+                    Some(sink),
+                );
+            }
+            Ok(None) => {
+                // Sink reported "rotation is a no-op for this
+                // backend flavor" (e.g. NopAuditSink). Nothing to
+                // emit — keep the audit stream uncluttered.
+            }
+            Err(err) => {
+                graphreact_observer::log_audit_log_rotation_failed(
+                    rotation_error_kind(&err),
+                    &err.to_string(),
+                    Some(sink),
+                );
+            }
+        }
+    }
+
     /// Drop the cluster and tear down the engine (if any).
     /// **M16-Backend P2:** also signals + joins the observer HTTP
     /// server (if one was spawned). **M16-Backend P10:** flushes
@@ -1773,6 +1918,33 @@ impl DaemonHandle {
                 }
             }
         }
+        // **Verify-finding MED 2 patch — M-Prod #1 Phase B Part 2
+        // (Group 1ab).** Drain pending records out of the
+        // batched-fsync worker BEFORE the observer server tears
+        // down. Bounded by `OBSERVER_SHUTDOWN_DEADLINE` (independent
+        // of the OTel deadline above — both run sequentially each
+        // with their own budget, matching the existing OTel pattern).
+        // In the default `FsyncMode::PerWrite` path this is a no-op
+        // (the worker is never spawned + drain returns immediately).
+        // In the opt-in `FsyncMode::Batched` path this fsyncs the
+        // final batch so an unclean OS crash mid-shutdown cannot lose
+        // the tail. The Phase A drain-budget math stays load-bearing:
+        // drain runs INSIDE OBSERVER_SHUTDOWN_DEADLINE so the total
+        // budget `drain_deadline + OBSERVER_SHUTDOWN_DEADLINE + slack`
+        // is unchanged.
+        if let Some(observer) = self.observer.as_ref() {
+            if let Some(sink) = observer.audit_sink.as_ref() {
+                let deadline = observer_shutdown_deadline();
+                if !sink.drain(deadline).await {
+                    tracing::warn!(
+                        target: "graphreact::observer::audit",
+                        event = "audit_log_drain_timeout",
+                        deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+                        "audit sink drain exceeded OBSERVER_SHUTDOWN_DEADLINE — pending records may not be fsynced",
+                    );
+                }
+            }
+        }
         // Stop the observer server FIRST so any in-flight scrape
         // serializes a final consistent view of the metrics
         // before the scheduler tears down.
@@ -1821,6 +1993,20 @@ impl DaemonHandle {
     #[must_use]
     pub fn observer_ingress_counter(&self) -> Option<graphreact_observer::IngressInFlight> {
         self.observer.as_ref().map(|_| self.ingress_in_flight.clone())
+    }
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Classify a
+/// rotation failure into the 4-entry closed `error_kind`
+/// vocabulary the `audit_log_rotation_failed` event consumes.
+fn rotation_error_kind(err: &graphreact_observer::AuditChainError) -> &'static str {
+    match err {
+        graphreact_observer::AuditChainError::Io { .. } => "open",
+        graphreact_observer::AuditChainError::Parse { .. } => "parse",
+        graphreact_observer::AuditChainError::TamperDetected { .. }
+        | graphreact_observer::AuditChainError::PrevHashMismatch { .. }
+        | graphreact_observer::AuditChainError::SequenceGap { .. } => "chain",
+        graphreact_observer::AuditChainError::Runtime { .. } => "runtime",
     }
 }
 
@@ -2017,19 +2203,54 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // (chain-head recovery picked up a tampered tail) — far
         // better than silently degrading to tracing-only audit at
         // start-up.
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Open
+        // the audit sink with the env-var-tunable
+        // [`graphreact_observer::AuditChainConfig`] so operators
+        // opt into batched-fsync mode via `GRX_AUDIT_FSYNC_MODE=batched`.
+        // Default stays PerWrite (bit-for-bit Phase A).
         let audit_sink: Option<
             std::sync::Arc<dyn graphreact_observer::AuditSink>,
         > = match opts.observer_audit_log.as_ref() {
-            Some(path) => Some(std::sync::Arc::new(
-                graphreact_observer::FileAuditSink::open(path).map_err(|e| {
-                    CommandError::ClusterArg(format!(
-                        "observer-audit-log open {}: {e}",
-                        path.display()
-                    ))
-                })?,
-            )),
+            Some(path) => {
+                let cfg = graphreact_observer::AuditChainConfig::new()
+                    .with_metrics(metrics.clone())
+                    .from_env_overlay();
+                Some(std::sync::Arc::new(
+                    graphreact_observer::FileAuditSink::open_with_config(path, cfg)
+                        .map_err(|e| {
+                            CommandError::ClusterArg(format!(
+                                "observer-audit-log open {}: {e}",
+                                path.display()
+                            ))
+                        })?,
+                ))
+            }
             None => None,
         };
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Load
+        // the optional on-disk token registry (NDJSON per ADR-0009)
+        // BEFORE the management API spawn so the very first
+        // protected request can dispatch through RBAC. A parse /
+        // validate failure here surfaces as a daemon boot failure
+        // (fail-fast) — the daemon refuses to start with a bogus
+        // registry file rather than silently degrading to "no
+        // RBAC".
+        let rbac_handle: Option<graphreact_observer::RotatableRegistry> =
+            match opts.observer_tokens_path.as_ref() {
+                Some(path) => {
+                    let registry = graphreact_observer::load_registry_from_file(path)
+                        .map_err(|e| {
+                            CommandError::ClusterArg(format!(
+                                "observer-tokens load {}: {e}",
+                                path.display()
+                            ))
+                        })?;
+                    Some(graphreact_observer::RotatableRegistry::new(
+                        std::sync::Arc::new(registry),
+                    ))
+                }
+                None => None,
+            };
         let server = graphreact_observer::spawn_management_api_with_options(
             graphreact_observer::SpawnOptions {
                 bind: bind_cfg,
@@ -2049,12 +2270,14 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 // Operators tune the cap without a daemon recompile;
                 // tests inject explicit caps via `Some(RateLimitConfig)`.
                 rate_limit: None,
-                // **M-Prod sub-track #1 Phase B Part 1.** CLI doesn't
-                // wire RBAC yet; SIGHUP-reload defers to Phase B
-                // Part 2. The daemon falls through to the Phase A
-                // single-bearer-token path defined by the
-                // `--observer-token-{env,file}` flags.
-                rbac: None,
+                // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).**
+                // Thread the on-disk-loaded RBAC registry through
+                // SpawnOptions. `None` keeps the legacy single-bearer
+                // Phase A path (`--observer-token-{env,file}`); `Some`
+                // dispatches every protected request through
+                // `RotatableRegistry::current()`, supporting SIGHUP
+                // reload via `DaemonHandle::reload_tokens_from_disk`.
+                rbac: rbac_handle.clone(),
                 // **M-Prod sub-track #6 Phase B Part 1.** `None`
                 // = read the trusted-proxy CIDR set from the
                 // `GRX_TRUSTED_PROXIES` env var (or, if unset,
@@ -2213,6 +2436,12 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         drain,
         ingress_in_flight,
         tls_paths: opts.observer_tls_paths,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Retain
+        // both SIGHUP reload targets — the SIGHUP arm at
+        // `drive_handle_until` fans to all three (TLS + tokens +
+        // audit-log) whenever ANY of them is wired.
+        tokens_path: opts.observer_tokens_path,
+        audit_log_path: opts.observer_audit_log,
     })
 }
 
@@ -2494,6 +2723,11 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         // **M-Prod sub-track #2 Phase B Part 1.** `connect` has no
         // observer-TLS surface to rotate; SIGHUP is a silent no-op.
         tls_paths: None,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** `connect`
+        // has no observer / RBAC / audit surface either; SIGHUP
+        // token-reload + audit-rotate are no-ops on this path.
+        tokens_path: None,
+        audit_log_path: None,
     };
     let _exit = drive_handle_until(&mut handle, duration).await?;
     handle.shutdown().await;
@@ -2568,8 +2802,19 @@ pub async fn drive_handle_until(
     // race-window between `start_daemon`'s `grx-observer-ready` and
     // this point is now operator-observable; production scripts that
     // watch stdout for `grx-sighup-ready` close the race.
+    //
+    // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab) gate
+    // extension.** The SIGHUP arm is the SHARED FAN-OUT POINT for
+    // every reload target (TLS cert + RBAC token registry +
+    // audit-log rotation). Register the signal stream when ANY of
+    // the three reload paths is wired — register a single SIGHUP
+    // handler regardless. Test rigs continue to wait for the same
+    // `grx-sighup-ready <PID>` readiness line.
     #[cfg(unix)]
-    let mut sighup = if handle.tls_paths.is_some() {
+    let mut sighup = if handle.tls_paths.is_some()
+        || handle.tokens_path.is_some()
+        || handle.audit_log_path.is_some()
+    {
         use tokio::signal::unix::{signal, SignalKind};
         let stream = signal(SignalKind::hangup())
             .map_err(|e| CommandError::ClusterArg(format!("SIGHUP register: {e}")))?;
@@ -2638,6 +2883,15 @@ pub async fn drive_handle_until(
                     None => { std::future::pending::<()>().await; }
                 }
             }, if sighup.is_some() => {
+                // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab)
+                // fan-out.** Single SIGHUP signal arm reaches all
+                // three reload targets. Audit-log rotation FIRST so
+                // subsequent token / TLS reload audit events land
+                // in the FRESH file behind the chain-continuity
+                // marker. Each reload runs independently — failure
+                // in one does NOT short-circuit the rest.
+                handle.rotate_audit_log();
+                handle.reload_tokens_from_disk();
                 handle.reload_tls_from_disk();
             }
         }

@@ -352,6 +352,28 @@ pub struct MetricsInner {
     /// See [`crate::management_api::build_router`] for the observer
     /// middleware that increments this counter.
     pub rate_limit_blocked: DashMap<u64, Arc<LabeledCounter>>,
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).**
+    /// `grx_audit_sink_write_failures_total{kind}` — per-kind count
+    /// of audit-sink I/O failures, where `kind` is one of
+    /// `{"open", "write", "fsync", "rotate"}` (closed 4-entry
+    /// vocabulary). Cardinality is bounded at 4 series.
+    /// Family is silent in steady state — only emitted on
+    /// `/metrics` once at least one failure has fired. Read by
+    /// operator dashboards alongside the existing
+    /// `audit_sink_write_failed` tracing line.
+    pub audit_sink_write_failures: DashMap<u64, Arc<LabeledCounter>>,
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).**
+    /// `grx_audit_sink_pending_records` — current size of the
+    /// in-flight batched-fsync buffer. Stays at 0 forever under
+    /// the default [`crate::audit_chain::FsyncMode::PerWrite`]
+    /// mode (no batching, no pending records). Under
+    /// [`crate::audit_chain::FsyncMode::Batched`] this gauge
+    /// fluctuates between 0 and `max_pending_records` — operators
+    /// alert when it sustains near the cap (worker too slow OR
+    /// disk under pressure).
+    pub audit_sink_pending_records: Gauge,
 }
 
 impl Default for MetricsInner {
@@ -381,7 +403,34 @@ impl MetricsInner {
             queue_depth_pending_mutations: Gauge::new(),
             process_batch_duration: Histogram::new(),
             rate_limit_blocked: DashMap::new(),
+            audit_sink_write_failures: DashMap::new(),
+            audit_sink_pending_records: Gauge::new(),
         }
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Increment
+    /// the per-`kind` audit-sink-write-failures counter. `kind` is
+    /// drawn from the closed 4-entry vocabulary
+    /// `{"open", "write", "fsync", "rotate"}`; the `&'static str`
+    /// signature enforces the cap at the type level.
+    ///
+    /// Hot-path inline + get-then-insert avoids the DashMap shard
+    /// write lock on cache hit — same pattern as
+    /// [`Self::rate_limit_blocked_inc`].
+    #[inline]
+    pub fn audit_sink_write_failures_inc(&self, kind: &'static str) {
+        let key = hash1(kind);
+        if let Some(c) = self.audit_sink_write_failures.get(&key) {
+            c.counter.inc();
+            return;
+        }
+        self.audit_sink_write_failures
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledCounter::new(vec![("kind", kind.to_string())]))
+            })
+            .counter
+            .inc();
     }
 
     /// **M22 phase 4.** Increment the per-engine mount counter. The

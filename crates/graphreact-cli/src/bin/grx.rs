@@ -130,6 +130,9 @@ fn dispatch(runtime: &tokio::runtime::Runtime, command: Command) -> Result<(), C
         Command::Audit { op } => {
             graphreact_cli::audit_commands::run_audit(op)?;
         }
+        Command::Admin { op } => {
+            graphreact_cli::admin_commands::run_admin(op)?;
+        }
     }
     Ok(())
 }
@@ -158,6 +161,7 @@ fn dispatch_cluster(
             observer_key,
             observer_json_logs,
             observer_audit_log,
+            observer_tokens,
             observer_otel_endpoint,
             observer_otel_service_name,
             debug,
@@ -245,6 +249,7 @@ fn dispatch_cluster(
                 observer_otel_endpoint,
                 observer_otel_service_name,
                 observer_audit_log,
+                observer_tokens_path: observer_tokens,
                 debug,
                 debug_wait: !debug_no_wait,
                 drain_deadline_secs,
@@ -342,7 +347,8 @@ fn associated_path(command: &Command) -> Option<&Path> {
         | Command::Trace { .. }
         | Command::Observer { .. }
         | Command::Secrets { .. }
-        | Command::Audit { .. } => None,
+        | Command::Audit { .. }
+        | Command::Admin { .. } => None,
     }
 }
 

@@ -62,10 +62,12 @@
 //! - Windows file-mode ACLs.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
+use serde::Deserialize;
 
 use crate::auth::BearerToken;
 
@@ -99,7 +101,7 @@ pub struct TokenId(pub String);
 /// Phase B Part 2's JWT-OIDC bridge will map every issuer subject
 /// claim into one of these three variants via a per-issuer config —
 /// no `Role` variant explosion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub enum Role {
     Admin,
     ReadOnly,
@@ -180,6 +182,191 @@ pub enum RegistryError {
     /// principal — duplicates would tear the audit trail.
     #[error("duplicate token id `{id}`")]
     DuplicateId { id: String },
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Failure modes
+/// for the SIGHUP-driven on-disk token-registry reload. ADR-0009
+/// specifies the file format (NDJSON one record per line); this
+/// enum mirrors the four ways the load path can reject the file
+/// while keeping the prior in-memory registry serving.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryLoadError {
+    /// File could not be opened / read (ENOENT, EACCES, EIO).
+    #[error("token registry I/O at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// File is group- or world-readable on Unix (mode != 0o600).
+    /// Refused at load to mirror the
+    /// [`crate::FileAuditSink::open`] / [`BearerToken::from_file`]
+    /// security discipline — operators store raw bearer credentials
+    /// in the file; a relaxed mode would let any unprivileged user
+    /// read them.
+    #[error("token registry file at {path} has mode {mode:o}, expected 0600")]
+    Mode { path: PathBuf, mode: u32 },
+    /// Every NDJSON line failed to parse (or the entire file was
+    /// empty after parse). `detail` carries the first parse error
+    /// for operator triage.
+    #[error("token registry parse: {detail}")]
+    Parse { detail: String },
+    /// File parsed but `TokenRegistry::new` rejected the entries
+    /// (empty / too many / duplicate id).
+    #[error("token registry validation: {0}")]
+    Validate(#[from] RegistryError),
+}
+
+impl RegistryLoadError {
+    /// Short `&'static str` discriminator for the
+    /// `token_registry_reload_failed` audit event's `error_kind`
+    /// field.
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Io { .. } => "io",
+            Self::Mode { .. } => "mode",
+            Self::Parse { .. } => "parse",
+            Self::Validate(_) => "validate",
+        }
+    }
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Per-record
+/// NDJSON schema for the on-disk token registry file (ADR-0009).
+///
+/// Each line is one `TokenFileRecord` serialized as JSON. The
+/// `role` field uses serde's default external tagging — Admin /
+/// ReadOnly are unit variants serialized as bare strings; Custom
+/// carries the explicit allowlist as `{"Custom": ["/v1/..."]}`.
+#[derive(Debug, Deserialize)]
+struct TokenFileRecord {
+    /// Operator-assigned token id (the audit-side principal name).
+    id: String,
+    /// Raw bearer credential bytes (UTF-8 string). Mode-0600
+    /// enforcement on the file makes this a secure storage shape.
+    token: String,
+    /// Role granted to the token. JSON shape is `"Admin"`,
+    /// `"ReadOnly"`, or `{"Custom": ["/v1/..."]}`.
+    role: Role,
+    /// Optional expiry in Unix-millis. `None` (or absent) means
+    /// never expires.
+    ///
+    /// Chosen over ISO8601 because parsing ISO8601 requires
+    /// `chrono` or `time` (neither in the workspace dep set). The
+    /// trade-off is operator-side ergonomics: integers are harder
+    /// to read at a glance. Future ADRs may add a sibling
+    /// `expires_at_iso8601` field once a date-parse dep is taken.
+    #[serde(default)]
+    expires_at_unix_ms: Option<u64>,
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Load a
+/// [`TokenRegistry`] from an on-disk NDJSON file (ADR-0009).
+///
+/// The file is read line-by-line; invalid lines are LOGGED + SKIPPED
+/// (defensive parse — operators editing the file by hand shouldn't
+/// blow up the whole reload over one bad row). If EVERY line fails
+/// to parse OR the resulting registry is empty,
+/// [`RegistryLoadError::Parse`] is returned and the caller keeps
+/// the prior registry.
+///
+/// Mode 0o600 is enforced on Unix BEFORE any read happens —
+/// matches the
+/// [`crate::FileAuditSink::open`] /
+/// [`crate::BearerToken::from_file`] security discipline.
+pub fn load_registry_from_file(path: &Path) -> Result<TokenRegistry, RegistryLoadError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).map_err(|err| RegistryLoadError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(RegistryLoadError::Mode {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|err| RegistryLoadError::Io {
+        path: path.to_path_buf(),
+        source: err,
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|err| RegistryLoadError::Parse {
+        detail: format!("file is not valid UTF-8: {err}"),
+    })?;
+    let mut entries = Vec::new();
+    let mut first_parse_err: Option<String> = None;
+    for (idx, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let rec: TokenFileRecord = match serde_json::from_str(line) {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    target: "graphreact::observer::audit",
+                    event = "token_registry_reload_skipped_line",
+                    line_index = idx,
+                    error = %err,
+                    "token registry parse error at line; skipping"
+                );
+                first_parse_err.get_or_insert_with(|| {
+                    format!("line {idx}: {err}")
+                });
+                continue;
+            }
+        };
+        let bearer = match BearerToken::from_bytes(rec.token.into_bytes()) {
+            Ok(t) => t,
+            Err(err) => {
+                tracing::warn!(
+                    target: "graphreact::observer::audit",
+                    event = "token_registry_reload_skipped_line",
+                    line_index = idx,
+                    error = %err,
+                    "token registry entry has an invalid bearer token; skipping"
+                );
+                first_parse_err.get_or_insert_with(|| {
+                    format!("line {idx}: invalid bearer token: {err}")
+                });
+                continue;
+            }
+        };
+        let expires_at = rec
+            .expires_at_unix_ms
+            .map(|ms| UNIX_EPOCH + Duration::from_millis(ms));
+        entries.push(TokenEntry {
+            id: TokenId(rec.id),
+            token: bearer,
+            role: rec.role,
+            expires_at,
+        });
+    }
+    if entries.is_empty() {
+        if let Some(detail) = first_parse_err {
+            return Err(RegistryLoadError::Parse { detail });
+        }
+        return Err(RegistryLoadError::Parse {
+            detail: "no token entries parsed (file empty or all lines invalid)".to_string(),
+        });
+    }
+    Ok(TokenRegistry::new(entries)?)
+}
+
+/// Per-role counts for the `token_registry_reloaded` audit event.
+/// Bounded vocabulary — the audit consumer wants to see at a
+/// glance how many of each role landed in the new registry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegistryCounts {
+    pub total: usize,
+    pub admin: usize,
+    pub read_only: usize,
+    pub custom: usize,
 }
 
 /// Owned multi-token registry. Held behind an [`Arc`] inside
@@ -286,6 +473,24 @@ impl TokenRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Per-role
+    /// counts for the `token_registry_reloaded` audit event.
+    #[must_use]
+    pub fn role_counts(&self) -> RegistryCounts {
+        let mut counts = RegistryCounts {
+            total: self.entries.len(),
+            ..RegistryCounts::default()
+        };
+        for entry in &self.entries {
+            match entry.role {
+                Role::Admin => counts.admin += 1,
+                Role::ReadOnly => counts.read_only += 1,
+                Role::Custom(_) => counts.custom += 1,
+            }
+        }
+        counts
     }
 }
 

@@ -36,6 +36,11 @@ pub mod secrets_commands;
 /// produced by `--observer-audit-log`. Phase B adds replay /
 /// inspect / report operations.
 pub mod audit_commands;
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** `grx admin …`
+/// dispatcher. Today's surface is the SIGHUP-driven
+/// `reload-tokens` operator command; Group 1cd adds JWT-OIDC
+/// reload + remote HTTP-driven admin endpoints.
+pub mod admin_commands;
 #[cfg(target_os = "macos")]
 pub mod jsruntime;
 #[cfg(target_os = "macos")]

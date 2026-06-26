@@ -764,6 +764,14 @@ pub struct ApiServerHandle {
     /// sink the accept-loop bind event lands on. `None` keeps the
     /// legacy tracing-only audit surface bit-for-bit unchanged.
     pub audit_sink: Option<Arc<dyn crate::AuditSink>>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Rotatable
+    /// RBAC registry surfaced so the SIGHUP-driven daemon-side
+    /// `reload_tokens_from_disk` can call `rbac.rotate(...)`
+    /// symmetrically to how `reload_tls_from_disk` calls
+    /// `tls.rotate(...)`. `None` when no RBAC was wired at
+    /// `spawn_with_options` time — SIGHUP reload-tokens is then a
+    /// silent no-op.
+    pub rbac: Option<crate::rbac::RotatableRegistry>,
     /// **M-Prod sub-track #4 Phase α.** Drain bit shared with the
     /// daemon's [`crate::DrainFlag::start`] orchestrator. `None`
     /// for spawn paths that didn't wire a drain bit
@@ -1766,6 +1774,11 @@ pub async fn spawn_with_options(
         // `reload_tls` can fan TLS-rotation events to the same sink
         // the accept-loop bind event already lands on.
         audit_sink,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Park
+        // the rotatable RBAC handle on the API handle so the
+        // SIGHUP-driven daemon-side `reload_tokens_from_disk` can
+        // call `rbac.rotate(...)` without re-investigating SpawnOptions.
+        rbac,
         draining,
         ingress_in_flight,
     })

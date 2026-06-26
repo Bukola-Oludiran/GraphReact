@@ -1,6 +1,6 @@
 # M-Prod — Auth + audit-log chain (sub-track #1)
 
-**Status:** SHIPPED Phase A 2026-06-17 — hash-chained tamper-evident audit-log SINK substrate landed; the existing tracing-side `target="graphreact::observer::audit"` stream STILL fires bit-for-bit unchanged. Multi-token RBAC (Phase B), batched-fsync worker task (Phase B), and SIGHUP atomic-swap of the audit-log file (Phase B) are deferred — see [Phase B/C/D scope](#phase-bcd-scope).
+**Status:** SHIPPED Phase A 2026-06-17 — hash-chained tamper-evident audit-log SINK substrate landed; SHIPPED Phase B Part 1 2026-06-18 — multi-token RBAC + per-route ACL + atomic-swap registry substrate landed; SHIPPED Phase B Part 2 (Group 1ab) 2026-06-26 — SIGHUP-driven token-registry reload + audit-log rotation + batched-fsync worker + `audit_sink_write_failures_total` counter + `grx admin reload-tokens` CLI landed. Phase B Part 2 Group 1cd (JWT-OIDC + audit forwarders), Phase C (`grx admin audit-verify` cron), and Phase D (ACME-style forwarders) remain deferred — see [Phase B/C/D scope](#phase-bcd-scope).
 
 This document covers sub-track #1 of the M-Prod milestone (production-hardening): operator-facing authentication, RBAC, and audit-log tamper-evidence for the observer HTTPS surface. Sibling tracks (#2 TLS rotation, #3 secrets keyring, #4 lifecycle / SIGHUP topology, #5 observability, #6 constant-time compares, #9 chaos arm) reference this substrate; see [Cross-track contracts](#cross-track-contracts).
 
@@ -130,6 +130,67 @@ The Phase A `auth_fail` kind grows a third `reason` value `"expired"` alongside 
 | Per-node / per-message-type ACL | Richer dispatch on top of the same Role substrate. |
 | Windows file-mode ACLs | Deferred from Phase A; same surface. |
 | `/v1/admin/*` route family | Operator-only routes (token reload, audit verify, etc.). |
+
+## Shipped — Phase B Part 2 (Group 1ab) (2026-06-26)
+
+Phase B Part 2 Group 1ab lands the **four foundational deliverables of sub-track #1's Phase B Part 2 operator-experience layer**: SIGHUP-driven token-registry reload + audit-log rotation + batched-fsync worker + a Prometheus failure counter. Group 1cd (JWT-OIDC bridge + audit forwarders) is the remaining Part 2 work, queued for a follow-on group.
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `FsyncMode { PerWrite | Batched { interval_ms, max_pending_records } }` + `AuditChainConfig` + `FileAuditSink::open_with_config` | SHIPPED | [`crates/graphreact-observer/src/audit_chain.rs`](../../crates/graphreact-observer/src/audit_chain.rs) |
+| Batched-fsync worker task (tokio mpsc + drain via `FileAuditSink::drain(deadline)`) | SHIPPED | `audit_chain.rs::spawn_batched_fsync_worker` |
+| `FileAuditSink::rotate_now` atomic-rename + chain-continuity rotation; `AuditSink::rotate` trait method | SHIPPED | `audit_chain.rs::FileAuditSink::rotate_now` |
+| `RotationOutcome { rotated_to, prior_last_this_hash, new_first_prev_hash, records_in_prior_file }` | SHIPPED | `audit_chain.rs::RotationOutcome` |
+| `MetricsInner::audit_sink_write_failures{kind}` counter (4-entry closed vocab `{open, write, fsync, rotate}`) | SHIPPED | [`crates/graphreact-observer/src/metrics.rs`](../../crates/graphreact-observer/src/metrics.rs) |
+| `MetricsInner::audit_sink_pending_records` gauge | SHIPPED | `metrics.rs` |
+| `grx_audit_sink_write_failures_total{kind}` + `grx_audit_sink_pending_records` on `/metrics` | SHIPPED | [`crates/graphreact-observer/src/prometheus.rs`](../../crates/graphreact-observer/src/prometheus.rs) |
+| `audit::log_token_registry_reloaded` / `log_token_registry_reload_failed` (WARN, target `graphreact::observer::audit`) | SHIPPED | [`crates/graphreact-observer/src/audit.rs`](../../crates/graphreact-observer/src/audit.rs) |
+| `audit::log_audit_log_rotated` / `log_audit_log_rotation_failed` (WARN) | SHIPPED | `audit.rs` |
+| `audit::log_token_registry_reload_skipped` / `log_audit_log_rotation_skipped` (drain-respect) | SHIPPED | `audit.rs` |
+| `load_registry_from_file(path) -> Result<TokenRegistry, RegistryLoadError>` — defensive NDJSON parser (ADR-0009) | SHIPPED | [`crates/graphreact-observer/src/rbac.rs`](../../crates/graphreact-observer/src/rbac.rs) |
+| `RegistryLoadError { Io, Mode, Parse, Validate }` + `kind_str` discriminator | SHIPPED | `rbac.rs::RegistryLoadError` |
+| `TokenRegistry::role_counts()` for the reload audit event | SHIPPED | `rbac.rs::TokenRegistry::role_counts` |
+| `serde::Deserialize` derive on `Role` so the file parser can deserialize Custom variants directly | SHIPPED | `rbac.rs::Role` |
+| `ApiServerHandle::rbac` field — surfaces the rotatable registry to the daemon-side SIGHUP fan-out | SHIPPED | [`crates/graphreact-observer/src/management_api.rs`](../../crates/graphreact-observer/src/management_api.rs) |
+| `--observer-tokens <PATH>` daemon CLI flag | SHIPPED | [`crates/graphreact-cli/src/cli.rs`](../../crates/graphreact-cli/src/cli.rs) |
+| `DaemonOptions::observer_tokens_path` + `DaemonHandle::tokens_path` / `audit_log_path` | SHIPPED | [`crates/graphreact-cli/src/commands.rs`](../../crates/graphreact-cli/src/commands.rs) |
+| `DaemonHandle::reload_tokens_from_disk` — SIGHUP-driven `RotatableRegistry::rotate`; drain-respect | SHIPPED | `commands.rs::DaemonHandle::reload_tokens_from_disk` |
+| `DaemonHandle::rotate_audit_log` — SIGHUP-driven `AuditSink::rotate`; drain-respect | SHIPPED | `commands.rs::DaemonHandle::rotate_audit_log` |
+| SIGHUP gate extended: `tls_paths.is_some() || tokens_path.is_some() || audit_log_path.is_some()` — single signal arm fans to all three reload targets in deterministic order (audit-rotate → tokens → TLS) | SHIPPED | `commands.rs::drive_handle_until` |
+| `grx admin reload-tokens [--pid <N> | --pid-file <PATH>]` operator CLI (unix-only, inline FFI `kill(2)` — no new workspace dep) | SHIPPED | [`crates/graphreact-cli/src/admin_commands.rs`](../../crates/graphreact-cli/src/admin_commands.rs) |
+| `Command::Admin { op: AdminOp::ReloadTokens { … } }` clap variant | SHIPPED | `cli.rs::Command::Admin` |
+| Environment-variable batched-fsync knobs (`GRX_AUDIT_FSYNC_MODE` / `GRX_AUDIT_FSYNC_INTERVAL_MS` / `GRX_AUDIT_FSYNC_MAX_PENDING`) | SHIPPED | `audit_chain.rs::AuditChainConfig::from_env_overlay` |
+| Integration tests — rotation chain continuity (3 tests), batched-fsync drain/timer/size (3 tests), `audit_sink_write_failures_total` counter (1 test) | SHIPPED | `crates/graphreact-observer/tests/audit_rotation_and_batched_fsync.rs` |
+| Integration tests — token-file load happy + malformed-skip + empty-error + mode-0o600 + RotatableRegistry round-trip + invalid-token-skip | SHIPPED | `crates/graphreact-observer/tests/rbac_file_reload.rs` |
+| Subprocess SIGHUP token-reload integration test | SHIPPED | `crates/graphreact-cli/tests/sighup_token_reload_subprocess.rs` |
+| **ADR-0009 — Multi-token registry file format** | SHIPPED | [`docs/decisions/0009-token-registry-file-format.md`](../decisions/0009-token-registry-file-format.md) |
+
+### Cross-rotation chain continuity invariant
+
+Per the m-prod-auth.md cross-track contract: **"Atomic-swap semantics carry the prior file's last `this_hash` as the new file's first `prev_hash` so the chain spans rotations."** Group 1ab ships this with a small adjustment for compatibility with the existing single-file `replay` / `grx audit verify` workflow:
+
+- Each rotated file is a **standalone Phase-A-compliant chain** (`seq` resets to 0, `prev_hash` of the first record is `GENESIS_PREV_HASH`). The existing `replay(path)` walker works against either file unchanged.
+- Cross-file continuity is encoded in the **`audit_log_rotated` boundary records' `fields` blob**: every rotation writes two markers — one as the *final* line of the prior file (carrying `prior_last_this_hash`), one as the *first* line of the new file (carrying `new_first_prev_hash = prior_last_this_hash`). A future multi-file verifier walks rotated files in order via these markers.
+- Operators using `grx audit verify <PATH>` get exit 0 + `audit chain OK: <N> records` per file independently — no behavior change.
+
+### Cross-track contracts preserved bit-for-bit
+
+- **Hash-chain integrity under batched fsync**: `this_hash` is computed sequentially under the writer lock. Only `sync_data` is deferred to the worker. Append-side returns to the caller after the bytes are in the OS page cache; the worker fsyncs to the disk surface on its cadence.
+- **Audit target convention** (`tracing::warn!(target: "graphreact::observer::audit", event = "…", …)`): all new emits use this exact target + WARN level. Six new event kinds: `token_registry_reloaded`, `token_registry_reload_failed`, `token_registry_reload_skipped`, `audit_log_rotated`, `audit_log_rotation_failed`, `audit_log_rotation_skipped`.
+- **AuditSink trait `append` API** (Phase A): unchanged. New `rotate` trait method has a default `Ok(None)` implementation so existing test sinks compile unmodified.
+- **ApiState additive-only**: new `ApiServerHandle::rbac: Option<RotatableRegistry>` field; legacy spawn paths default it to `None`. No removal.
+- **RotatableRegistry naming**: `current` / `rotate` preserved verbatim; the SIGHUP reload calls `rbac.rotate(Arc::new(new_registry))`.
+- **mode 0o600 enforcement** preserved bit-for-bit on both create AND open-existing AND rotation's new file.
+- **SIGHUP gate extension**: register the stream + emit `grx-sighup-ready PID` exactly once per process whenever ANY reload target is wired. Existing `sighup_cert_rotation_subprocess` test rigs continue to wait for the same line.
+- **Drain-budget math** (sub-track #4 Phase α): batched-fsync drain on shutdown runs INSIDE `OBSERVER_SHUTDOWN_DEADLINE` (default 5s). Total budget vs k8s `terminationGracePeriodSeconds` math is unchanged (20 + 5 + 5 = 30s).
+- **Default fsync mode stays PerWrite**: operators opt into Batched via env vars (`GRX_AUDIT_FSYNC_MODE=batched`); existing daemons see byte-for-byte identical fsync semantics.
+
+### Open work for Phase B Part 2 Group 1cd
+
+- JWT-OIDC bridge (per-issuer config + JWKS fetch + subject-claim → `TokenId` mapping).
+- Audit forwarders (S3 / Loki / GCS / OpenSearch backends; each consumes the same `AuditSink` trait via a new fan-out sink).
+- `grx audit verify` extension to walk rotated files in chronological order via the `audit_log_rotated` boundary markers (deferrable — operators run per-file today).
+- HTTP `/v1/admin/reload-tokens` endpoint paired with `grx admin reload-tokens --http=…` (today's surface is SIGHUP-only).
 
 ## On-disk record shape
 
