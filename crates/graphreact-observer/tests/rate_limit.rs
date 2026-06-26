@@ -101,6 +101,8 @@ async fn spawn_with_limit(
         // back-compat — None means X-Forwarded-For is IGNORED
         // (the loopback peer IP is the bucket key).
         trusted_proxies: None,
+        // M-Prod #1 Phase B Part 2 (Group 1c) — JWT bridge unwired.
+        jwt_verifier: None,
     })
     .await
     .expect("spawn");

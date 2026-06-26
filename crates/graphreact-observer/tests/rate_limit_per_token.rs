@@ -109,6 +109,8 @@ async fn spawn_rich(
         rate_limit: Some(rate_limit),
         rbac,
         trusted_proxies,
+        // M-Prod #1 Phase B Part 2 (Group 1c) — JWT bridge unwired.
+        jwt_verifier: None,
     })
     .await
     .expect("spawn");

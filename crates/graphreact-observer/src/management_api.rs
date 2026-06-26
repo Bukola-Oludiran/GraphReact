@@ -547,6 +547,22 @@ pub struct ApiState {
     /// the same Group B-2 #2 SIGHUP topology the TLS rotation path
     /// uses).
     pub rbac: Option<crate::rbac::RotatableRegistry>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** JWT-OIDC
+    /// bridge verifier behind an atomic-swap JWKS handle. `None`
+    /// keeps Phase A / Phase B Part 1 auth bit-for-bit (no JWT
+    /// path); `Some(verifier)` enables eyJ-prefixed bearers to
+    /// route through the JWT verify → role mapping → existing
+    /// per-route ACL flow in [`auth_layer_rbac`].
+    ///
+    /// The JWT bridge SITS INSIDE [`auth_layer_rbac`] — it does
+    /// NOT add a new layer to the rate-limit / auth / bridge ladder.
+    /// Static tokens (no `eyJ` prefix) short-circuit the JWT path
+    /// and dispatch through the existing
+    /// [`crate::rbac::TokenRegistry`] walk unchanged.
+    ///
+    /// SIGHUP-driven JWKS reload rides the Group 1ab fan-out via
+    /// `DaemonHandle::reload_jwks_from_disk`.
+    pub jwt_verifier: Option<Arc<crate::jwt_oidc::JwtVerifier>>,
 }
 
 /// **M-Prod sub-track #5.** Cluster-readiness probe shared by the
@@ -772,6 +788,15 @@ pub struct ApiServerHandle {
     /// `spawn_with_options` time — SIGHUP reload-tokens is then a
     /// silent no-op.
     pub rbac: Option<crate::rbac::RotatableRegistry>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** JWT-OIDC
+    /// bridge verifier surfaced so the daemon-side
+    /// `reload_jwks_from_disk` can reach the inner
+    /// [`crate::jwt_oidc::RotatableJwks`] handle and call
+    /// `jwks().rotate(...)` symmetrically to how
+    /// `reload_tokens_from_disk` calls `rbac.rotate(...)`. `None`
+    /// when no JWT bridge was wired at `spawn_with_options` time —
+    /// SIGHUP JWKS reload is then a silent no-op.
+    pub jwt_verifier: Option<Arc<crate::jwt_oidc::JwtVerifier>>,
     /// **M-Prod sub-track #4 Phase α.** Drain bit shared with the
     /// daemon's [`crate::DrainFlag::start`] orchestrator. `None`
     /// for spawn paths that didn't wire a drain bit
@@ -1506,6 +1531,10 @@ pub async fn spawn_with_cluster_readyz(
         // `GRX_TRUSTED_PROXIES` env var (or, if unset, ignores
         // `X-Forwarded-For` = Phase A behavior).
         trusted_proxies: None,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).**
+        // Legacy spawn path defaults jwt_verifier to `None`;
+        // callers opt in via the unified `spawn_with_options`.
+        jwt_verifier: None,
     })
     .await
 }
@@ -1546,6 +1575,9 @@ pub async fn spawn_with_drain(
         // `spawn_with_options` falls back to reading
         // `GRX_TRUSTED_PROXIES`.
         trusted_proxies: None,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).**
+        // Legacy spawn path defaults jwt_verifier to `None`.
+        jwt_verifier: None,
     })
     .await
 }
@@ -1588,6 +1620,16 @@ pub struct SpawnOptions {
     ///
     /// SIGHUP-driven reload defers to Phase B Part 2.
     pub rbac: Option<crate::rbac::RotatableRegistry>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** JWT-OIDC
+    /// bridge verifier. `None` (the legacy default) keeps the JWT
+    /// path off. `Some(verifier)` enables the bridge: eyJ-prefixed
+    /// bearers dispatch through [`crate::jwt_oidc::JwtVerifier::verify`]
+    /// before the static-token walk.
+    ///
+    /// The verifier itself owns the [`crate::jwt_oidc::RotatableJwks`]
+    /// handle (so the daemon-side SIGHUP fan-out can rotate JWKS
+    /// without re-investigating SpawnOptions).
+    pub jwt_verifier: Option<Arc<crate::jwt_oidc::JwtVerifier>>,
     /// **M-Prod sub-track #6 Phase B Part 1 (Group B-4a).** Trusted-
     /// proxy CIDR set governing whether `X-Forwarded-For` is honored
     /// for the per-IP rate-limit key.
@@ -1630,6 +1672,7 @@ pub async fn spawn_with_options(
         rate_limit,
         rbac,
         trusted_proxies,
+        jwt_verifier,
     } = opts;
     // **Verify-finding patch (LOW).** Surface the config foot-gun where
     // an operator wires BOTH a Phase A single-token (`bind.token =
@@ -1648,6 +1691,24 @@ pub async fn spawn_with_options(
              and the single-token is silently ignored; remove the \
              --observer-token-{{env,file}} flag once the operator has \
              migrated to multi-token RBAC"
+        );
+    }
+    // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Surface
+    // the foot-gun where an operator wires the JWT-OIDC bridge but
+    // forgot to wire RBAC. The JWT bridge dispatches INSIDE
+    // `auth_layer_rbac` — without an `rbac` registry the static-
+    // token path is the Phase A single-token flow which has NO
+    // JWT awareness, so the JWT verifier becomes dead config.
+    // A WARN-level audit event mirrors the
+    // `auth_config_conflict` precedent.
+    if jwt_verifier.is_some() && rbac.is_none() {
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            event = "jwt_config_without_rbac",
+            "JWT-OIDC bridge wired but RBAC is not — JWT path is \
+             only reachable through auth_layer_rbac; pass \
+             --observer-tokens to enable RBAC dispatch (the JWT \
+             verifier is silently ignored otherwise)"
         );
     }
     let listener = TcpListener::bind(bind.addr).await?;
@@ -1703,6 +1764,12 @@ pub async fn spawn_with_options(
         // `Some` swaps `auth_layer` into the multi-token + per-
         // route ACL path.
         rbac: rbac.clone(),
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** JWT
+        // bridge verifier — `None` keeps the Phase B Part 1
+        // static-token-only path; `Some` enables eyJ-prefixed
+        // bearer dispatch through JwtVerifier::verify inside
+        // auth_layer_rbac.
+        jwt_verifier: jwt_verifier.clone(),
     };
     let rl = rate_limit.unwrap_or_else(RateLimitConfig::from_env);
     // **M-Prod sub-track #6 Phase B Part 1.** Resolve the trusted-
@@ -1779,6 +1846,12 @@ pub async fn spawn_with_options(
         // SIGHUP-driven daemon-side `reload_tokens_from_disk` can
         // call `rbac.rotate(...)` without re-investigating SpawnOptions.
         rbac,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Park
+        // the JWT verifier on the API handle so the SIGHUP-driven
+        // daemon-side `reload_jwks_from_disk` can reach the inner
+        // `RotatableJwks` and call `jwks().rotate(...)` without
+        // re-investigating SpawnOptions.
+        jwt_verifier,
         draining,
         ingress_in_flight,
     })
@@ -3272,6 +3345,93 @@ async fn auth_layer_rbac(
         return challenge_response();
     };
 
+    // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** JWT-OIDC
+    // bridge dispatch. eyJ-prefixed bearers route through
+    // JwtVerifier::verify FIRST. The static-token walk below stays
+    // bit-for-bit unchanged for non-eyJ bearers.
+    //
+    // Verify-failure semantics: emit `jwt_auth_fail` with the
+    // closed-vocabulary reason tag from JwtVerifyError::reason_str
+    // and return challenge_response — do NOT fall through to the
+    // static-token walk (would double-emit auth_fail for the same
+    // request). EXCEPTION: a MissingKid failure could legitimately
+    // be a static-token coincidence that happens to start with
+    // `eyJ`; in that case fall through silently and let the
+    // existing match_token / auth_fail path handle it. UnknownKid
+    // also falls through (operator may be mid-rotation; the static
+    // token might still be the right credential during the
+    // transition).
+    if candidate_bytes.starts_with("eyJ") {
+        if let Some(verifier) = state.jwt_verifier.as_ref() {
+            match verifier.verify(candidate_bytes) {
+                Ok(verified) => match crate::jwt_oidc::derive_role(
+                    &verified,
+                    verifier.role_mapping(),
+                ) {
+                    Ok(role) => {
+                        let role_str: &str = match &role {
+                            crate::rbac::Role::Admin => "admin",
+                            crate::rbac::Role::ReadOnly => "read_only",
+                            crate::rbac::Role::Custom(_) => "custom",
+                        };
+                        if crate::jwt_oidc::check_route_for_role(&role, route) {
+                            crate::audit::log_jwt_auth_success(
+                                &peer_repr,
+                                &verified.sub,
+                                &verified.iss,
+                                route,
+                                role_str,
+                                Some(verified.kid.as_str()),
+                                verified.exp_unix_ms,
+                                state.audit_sink.as_ref(),
+                            );
+                            return next.run(req).await;
+                        }
+                        crate::audit::log_jwt_auth_fail(
+                            &peer_repr,
+                            "authz_deny",
+                            Some(verified.iss.as_str()),
+                            Some(verified.kid.as_str()),
+                            state.audit_sink.as_ref(),
+                        );
+                        return forbidden_response();
+                    }
+                    Err(err) => {
+                        crate::audit::log_jwt_auth_fail(
+                            &peer_repr,
+                            err.reason_str(),
+                            Some(verified.iss.as_str()),
+                            Some(verified.kid.as_str()),
+                            state.audit_sink.as_ref(),
+                        );
+                        return challenge_response();
+                    }
+                },
+                Err(
+                    crate::jwt_oidc::JwtVerifyError::MissingKid
+                    | crate::jwt_oidc::JwtVerifyError::UnknownKid,
+                ) => {
+                    // Could be a static token that coincidentally
+                    // starts with eyJ, or a token signed by a key
+                    // we don't have yet (operator mid-rotation).
+                    // Fall through to the static-token walk; if
+                    // the static path also fails, the standard
+                    // auth_fail emits there.
+                }
+                Err(err) => {
+                    crate::audit::log_jwt_auth_fail(
+                        &peer_repr,
+                        err.reason_str(),
+                        None,
+                        None,
+                        state.audit_sink.as_ref(),
+                    );
+                    return challenge_response();
+                }
+            }
+        }
+    }
+
     let Some(entry) = snap.match_token(candidate_bytes.as_bytes()) else {
         tracing::warn!(
             target: "graphreact::observer::audit",
@@ -3678,6 +3838,9 @@ mod rate_limit_tests {
             // test exercises (token is also None → no auth at
             // all on this synthetic state).
             rbac: None,
+            // M-Prod #1 Phase B Part 2 (Group 1c) — JWT bridge
+            // is unwired for this rate-limit substrate test.
+            jwt_verifier: None,
         };
         let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1, 2));
 
