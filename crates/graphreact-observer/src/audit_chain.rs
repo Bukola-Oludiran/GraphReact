@@ -176,6 +176,26 @@ pub trait AuditSink: std::fmt::Debug + Send + Sync {
     fn rotate(&self) -> Result<Option<RotationOutcome>, AuditChainError> {
         Ok(None)
     }
+
+    /// **Verify-finding MED 2 patch — M-Prod #1 Phase B Part 2
+    /// (Group 1ab).** Drain pending records bound by `deadline`.
+    /// Returns `true` if the drain completed within the deadline,
+    /// `false` if it exceeded it. Trivial sinks ([`NopAuditSink`],
+    /// in-memory test sinks, and [`FileAuditSink`] in `PerWrite`
+    /// mode) have no pending records and return `true` immediately.
+    /// Only [`FileAuditSink`] in `FsyncMode::Batched` overrides
+    /// with a real fsync-the-final-batch drain.
+    ///
+    /// Returned as a boxed future so the trait stays
+    /// dyn-compatible (the workspace doesn't pull in `async-trait`
+    /// and the dyn-AuditSink call site needs the method via the
+    /// trait object).
+    fn drain<'a>(
+        &'a self,
+        _deadline: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async { true })
+    }
 }
 
 /// Default backend: discards every record. Wired as the
@@ -567,6 +587,32 @@ impl FileAuditSink {
                 });
             }
         };
+
+        // **Verify-finding LOW 1 patch.** Force the terminal
+        // `audit_log_rotated` marker to disk BEFORE rename so an
+        // OS-level crash mid-rotation doesn't lose the prior file's
+        // tail. `append_one_locked` intentionally skipped fsync for
+        // rotation markers (deferred to the next normal append-cycle);
+        // for the prior file there IS no next append-cycle (the
+        // writer pivots to the fresh file after rename), so we must
+        // fsync here. On failure we increment the rotate counter +
+        // log + continue: rename can still succeed because the page
+        // cache holds the bytes; the marker durability is best-effort
+        // beyond the page cache.
+        if let Err(err) = state.writer.get_ref().sync_data() {
+            if let Some(m) = self.metrics.as_ref() {
+                m.audit_sink_write_failures_inc("rotate");
+            }
+            tracing::warn!(
+                target: "graphreact::observer::audit",
+                event = "audit_sink_write_failed",
+                error_kind = "rotate",
+                stage = "terminal_marker_fsync",
+                path = %prior_path.display(),
+                error = %err,
+                "audit sink terminal-marker fsync failed pre-rename; continuing with rename",
+            );
+        }
 
         // 2. Atomic rename of the OLD file to its timestamped
         //    backup path. POSIX guarantees rename is atomic on
@@ -1067,6 +1113,18 @@ impl AuditSink for FileAuditSink {
 
     fn rotate(&self) -> Result<Option<RotationOutcome>, AuditChainError> {
         self.rotate_now().map(Some)
+    }
+
+    /// **Verify-finding MED 2 patch — M-Prod #1 Phase B Part 2
+    /// (Group 1ab).** Route the trait-object `drain` call into the
+    /// existing `FileAuditSink::drain` async impl. The trait method
+    /// returns a boxed future for dyn-compatibility; `Box::pin`
+    /// preserves the bool outcome bit-for-bit.
+    fn drain<'a>(
+        &'a self,
+        deadline: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(FileAuditSink::drain(self, deadline))
     }
 }
 

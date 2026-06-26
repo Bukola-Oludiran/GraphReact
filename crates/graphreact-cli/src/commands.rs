@@ -1918,6 +1918,33 @@ impl DaemonHandle {
                 }
             }
         }
+        // **Verify-finding MED 2 patch — M-Prod #1 Phase B Part 2
+        // (Group 1ab).** Drain pending records out of the
+        // batched-fsync worker BEFORE the observer server tears
+        // down. Bounded by `OBSERVER_SHUTDOWN_DEADLINE` (independent
+        // of the OTel deadline above — both run sequentially each
+        // with their own budget, matching the existing OTel pattern).
+        // In the default `FsyncMode::PerWrite` path this is a no-op
+        // (the worker is never spawned + drain returns immediately).
+        // In the opt-in `FsyncMode::Batched` path this fsyncs the
+        // final batch so an unclean OS crash mid-shutdown cannot lose
+        // the tail. The Phase A drain-budget math stays load-bearing:
+        // drain runs INSIDE OBSERVER_SHUTDOWN_DEADLINE so the total
+        // budget `drain_deadline + OBSERVER_SHUTDOWN_DEADLINE + slack`
+        // is unchanged.
+        if let Some(observer) = self.observer.as_ref() {
+            if let Some(sink) = observer.audit_sink.as_ref() {
+                let deadline = observer_shutdown_deadline();
+                if !sink.drain(deadline).await {
+                    tracing::warn!(
+                        target: "graphreact::observer::audit",
+                        event = "audit_log_drain_timeout",
+                        deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+                        "audit sink drain exceeded OBSERVER_SHUTDOWN_DEADLINE — pending records may not be fsynced",
+                    );
+                }
+            }
+        }
         // Stop the observer server FIRST so any in-flight scrape
         // serializes a final consistent view of the metrics
         // before the scheduler tears down.
