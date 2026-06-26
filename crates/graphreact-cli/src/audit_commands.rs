@@ -86,6 +86,9 @@ fn run_verify(path: &std::path::Path) -> CommandResult<()> {
                 AuditChainError::Io { path, source } => {
                     writeln!(stderr, "audit chain I/O at {}: {}", path.display(), source)?;
                 }
+                AuditChainError::Runtime { detail } => {
+                    writeln!(stderr, "audit chain runtime requirement: {detail}")?;
+                }
             }
             stderr.flush()?;
             Err(CommandError::AuditVerify(err))

@@ -78,10 +78,15 @@ pub use otel::{
 #[cfg(feature = "otel")]
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 
-pub use audit::{log_auth_success, log_authz_deny, log_tls_reload_skipped};
+pub use audit::{
+    log_audit_log_rotated, log_audit_log_rotation_failed, log_audit_log_rotation_skipped,
+    log_auth_success, log_authz_deny, log_tls_reload_skipped, log_token_registry_reload_failed,
+    log_token_registry_reload_skipped, log_token_registry_reloaded,
+};
 pub use audit_chain::{
-    replay as replay_audit_chain, AuditChainError, AuditRecord, AuditRecordInput, AuditSink,
-    FileAuditSink, NopAuditSink,
+    replay as replay_audit_chain, AuditChainConfig, AuditChainError, AuditRecord,
+    AuditRecordInput, AuditSink, FileAuditSink, FsyncMode, NopAuditSink, RotationOutcome,
+    DEFAULT_BATCHED_FSYNC_INTERVAL_MS, DEFAULT_BATCHED_FSYNC_MAX_PENDING,
 };
 pub use auth::{AuthError, BearerToken};
 pub use rbac::{

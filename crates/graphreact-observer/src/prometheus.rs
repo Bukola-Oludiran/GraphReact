@@ -188,6 +188,37 @@ pub fn encode_text(inner: &MetricsInner) -> String {
         &inner.rate_limit_blocked,
     );
 
+    // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Per-kind
+    // audit-sink-write-failures counter. kind label is bounded to
+    // the closed 4-entry vocabulary {open, write, fsync, rotate};
+    // family is suppressed entirely until the first failure fires
+    // so steady-state daemons don't pay even a HELP+TYPE line.
+    encode_labeled_counter(
+        &mut s,
+        "grx_audit_sink_write_failures_total",
+        "Per-kind count of audit-sink I/O failures. kind label is \
+         one of {open, write, fsync, rotate} (closed 4-entry \
+         vocabulary). Operators alert on non-zero values to \
+         inspect the audit ledger for gaps. Family is suppressed \
+         until the first failure fires.",
+        &inner.audit_sink_write_failures,
+    );
+
+    // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Gauge of
+    // the current batched-fsync buffer depth. 0 forever under the
+    // default PerWrite fsync mode (no batching). Under batched
+    // mode this fluctuates between 0 and max_pending_records.
+    encode_gauge(
+        &mut s,
+        "grx_audit_sink_pending_records",
+        "Current count of pending audit records in the \
+         batched-fsync buffer. 0 in PerWrite fsync mode; up to \
+         max_pending_records in Batched mode. Operators alert when \
+         it sustains near the cap (worker too slow OR disk under \
+         pressure).",
+        inner.audit_sink_pending_records.get(),
+    );
+
     s
 }
 
