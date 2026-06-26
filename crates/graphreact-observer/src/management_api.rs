@@ -563,6 +563,18 @@ pub struct ApiState {
     /// SIGHUP-driven JWKS reload rides the Group 1ab fan-out via
     /// `DaemonHandle::reload_jwks_from_disk`.
     pub jwt_verifier: Option<Arc<crate::jwt_oidc::JwtVerifier>>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Audit-log
+    /// forwarder hub. `None` (the legacy default) keeps the audit
+    /// sink writing only to the in-process file/tracing surfaces.
+    /// `Some(hub)` enables a fan-out: every successful audit
+    /// append is also delivered to every registered AuditForwarder
+    /// via bounded mpsc channels. Shared with the
+    /// [`crate::FileAuditSink`] via
+    /// [`crate::FileAuditSink::with_forwarder_hub`]; surfaced on
+    /// [`ApiState`] so the SIGHUP-driven daemon-side
+    /// `rotate_audit_forwarder_spool` can reach the spool
+    /// forwarder without re-investigating SpawnOptions.
+    pub forwarder_hub: Option<Arc<crate::audit_forwarders::ForwarderHub>>,
 }
 
 /// **M-Prod sub-track #5.** Cluster-readiness probe shared by the
@@ -797,6 +809,16 @@ pub struct ApiServerHandle {
     /// when no JWT bridge was wired at `spawn_with_options` time —
     /// SIGHUP JWKS reload is then a silent no-op.
     pub jwt_verifier: Option<Arc<crate::jwt_oidc::JwtVerifier>>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Audit-log
+    /// forwarder hub surfaced on the API handle so the SIGHUP-
+    /// driven daemon-side `rotate_audit_forwarder_spool` can call
+    /// `hub.spool_forwarder().rotate()` symmetrically to how
+    /// `reload_tokens_from_disk` calls `rbac.rotate(...)`. `None`
+    /// when no forwarder hub was wired at `spawn_with_options`
+    /// time — SIGHUP spool rotation is then a silent no-op. Also
+    /// drives drain composition inside
+    /// `OBSERVER_SHUTDOWN_DEADLINE`.
+    pub forwarder_hub: Option<Arc<crate::audit_forwarders::ForwarderHub>>,
     /// **M-Prod sub-track #4 Phase α.** Drain bit shared with the
     /// daemon's [`crate::DrainFlag::start`] orchestrator. `None`
     /// for spawn paths that didn't wire a drain bit
@@ -1604,6 +1626,10 @@ pub async fn spawn_with_cluster_readyz(
         // Legacy spawn path defaults jwt_verifier to `None`;
         // callers opt in via the unified `spawn_with_options`.
         jwt_verifier: None,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).**
+        // Legacy spawn path defaults forwarder_hub to `None`;
+        // callers opt in via the unified `spawn_with_options`.
+        forwarder_hub: None,
     })
     .await
 }
@@ -1647,6 +1673,9 @@ pub async fn spawn_with_drain(
         // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).**
         // Legacy spawn path defaults jwt_verifier to `None`.
         jwt_verifier: None,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).**
+        // Legacy spawn path defaults forwarder_hub to `None`.
+        forwarder_hub: None,
     })
     .await
 }
@@ -1720,6 +1749,18 @@ pub struct SpawnOptions {
     /// the caller passes `None`. Tests pin a deterministic config
     /// here (avoiding the env-var race across parallel runners).
     pub trusted_proxies: Option<Arc<crate::rate_limit_keys::TrustedProxyConfig>>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Audit-log
+    /// forwarder hub. `None` (the legacy default) keeps audit
+    /// fan-out limited to the in-process file + tracing surfaces.
+    /// `Some(hub)` enables per-forwarder bounded mpsc + worker
+    /// fan-out for downstream sidecars (fluentd / vector /
+    /// promtail / opentelemetry-collector / fluent-bit /
+    /// aws-for-fluent-bit / google-cloud-ops-agent), which then
+    /// ship to S3 / Loki / GCS / OpenSearch / Splunk / Datadog
+    /// without the daemon ever needing its own outbound HTTP path.
+    /// The hub itself owns the `Vec<Arc<dyn AuditForwarder>>` list
+    /// + per-forwarder worker tasks.
+    pub forwarder_hub: Option<Arc<crate::audit_forwarders::ForwarderHub>>,
 }
 
 /// **M-Prod sub-track #1 Phase A + #4 Phase α.** Full-knob
@@ -1742,6 +1783,7 @@ pub async fn spawn_with_options(
         rbac,
         trusted_proxies,
         jwt_verifier,
+        forwarder_hub,
     } = opts;
     // **Verify-finding patch (LOW).** Surface the config foot-gun where
     // an operator wires BOTH a Phase A single-token (`bind.token =
@@ -1839,6 +1881,11 @@ pub async fn spawn_with_options(
         // bearer dispatch through JwtVerifier::verify inside
         // auth_layer_rbac.
         jwt_verifier: jwt_verifier.clone(),
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).**
+        // Forwarder hub — `None` keeps audit fan-out limited to
+        // the in-process file; `Some` enables per-forwarder
+        // bounded mpsc + worker fan-out for downstream sidecars.
+        forwarder_hub: forwarder_hub.clone(),
     };
     let rl = rate_limit.unwrap_or_else(RateLimitConfig::from_env);
     // **M-Prod sub-track #6 Phase B Part 1.** Resolve the trusted-
@@ -1921,6 +1968,14 @@ pub async fn spawn_with_options(
         // `RotatableJwks` and call `jwks().rotate(...)` without
         // re-investigating SpawnOptions.
         jwt_verifier,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Park
+        // the forwarder hub on the API handle so the SIGHUP-
+        // driven daemon-side `rotate_audit_forwarder_spool` can
+        // call `hub.spool_forwarder().rotate()` symmetrically to
+        // how `reload_tokens_from_disk` calls `rbac.rotate(...)`.
+        // Also drives drain composition inside
+        // OBSERVER_SHUTDOWN_DEADLINE.
+        forwarder_hub,
         draining,
         ingress_in_flight,
     })
@@ -3929,6 +3984,9 @@ mod rate_limit_tests {
             // M-Prod #1 Phase B Part 2 (Group 1c) — JWT bridge
             // is unwired for this rate-limit substrate test.
             jwt_verifier: None,
+            // M-Prod #1 Phase B Part 2 (Group 1d) — forwarder hub
+            // unwired for this rate-limit substrate test.
+            forwarder_hub: None,
         };
         let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1, 2));
 

@@ -35,7 +35,9 @@
 
 use std::fmt::Write;
 
-use crate::metrics::{HistogramSnapshot, LabeledCounter, MetricsInner, HISTOGRAM_BUCKETS_NS};
+use crate::metrics::{
+    HistogramSnapshot, LabeledCounter, LabeledGauge, MetricsInner, HISTOGRAM_BUCKETS_NS,
+};
 
 /// Encode the entire [`MetricsInner`] into the Prometheus text
 /// exposition format. Returns a `String` ready to be served as the
@@ -219,6 +221,54 @@ pub fn encode_text(inner: &MetricsInner) -> String {
         inner.audit_sink_pending_records.get(),
     );
 
+    // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Per-
+    // (forwarder, outcome) audit-record forwarder counter. Bounded
+    // at 2 × 4 = 8 series; family suppressed until the first fan
+    // fires so steady-state daemons don't pay even a HELP+TYPE
+    // line. Cross-track contract: the closed `outcome` vocabulary
+    // is `{forwarded, dropped_queue_full, dropped_shutdown,
+    // write_failed}` — operators alert on the non-`forwarded`
+    // rows.
+    encode_labeled_counter(
+        &mut s,
+        "grx_audit_forwarder_records_total",
+        "Per-(forwarder, outcome) count of audit-record fan-out \
+         attempts. forwarder label is one of {spool_file, \
+         stderr_jsonl} (closed vocabulary); outcome label is one \
+         of {forwarded, dropped_queue_full, dropped_shutdown, \
+         write_failed}. Total cardinality 8. Family suppressed \
+         until the first fan fires.",
+        &inner.audit_forwarder_records,
+    );
+
+    // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Per-
+    // forwarder bounded mpsc queue depth gauge. Bounded at 2
+    // series; family suppressed until the first forwarder
+    // registers.
+    encode_labeled_gauge(
+        &mut s,
+        "grx_audit_forwarder_queue_depth",
+        "Current backlog of the per-forwarder bounded mpsc worker \
+         queue (default cap 1024, env \
+         GRX_AUDIT_FORWARDER_QUEUE_DEPTH). Sustained near cap \
+         signals slow consumer.",
+        &inner.audit_forwarder_queue_depth,
+    );
+
+    // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Per-
+    // forwarder drain-timeout counter. Bumped when the hub's
+    // drain exceeded OBSERVER_SHUTDOWN_DEADLINE for the labeled
+    // forwarder during graceful shutdown. Operators alert on
+    // non-zero.
+    encode_labeled_counter(
+        &mut s,
+        "grx_audit_forwarder_drain_timeouts_total",
+        "Per-forwarder count of drain operations that hit \
+         OBSERVER_SHUTDOWN_DEADLINE before the in-flight queue \
+         fully flushed. Operators alert on non-zero.",
+        &inner.audit_forwarder_drain_timeouts,
+    );
+
     s
 }
 
@@ -243,6 +293,29 @@ fn encode_labeled_counter(
     for entry in map {
         let lc = entry.value();
         write_metric_with_labels(s, name, &lc.labels, lc.counter.get());
+    }
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Emit one
+/// labeled gauge family. Mirrors [`encode_labeled_counter`] but
+/// for [`LabeledGauge`] (the gauge analog of the labeled-counter
+/// pattern used by `audit_forwarder_queue_depth{forwarder}`).
+/// Skips the family entirely when the DashMap is empty (Prometheus
+/// best practice: don't emit empty families).
+fn encode_labeled_gauge(
+    s: &mut String,
+    name: &str,
+    help: &str,
+    map: &dashmap::DashMap<u64, std::sync::Arc<LabeledGauge>>,
+) {
+    if map.is_empty() {
+        return;
+    }
+    write_help(s, name, help);
+    write_type(s, name, "gauge");
+    for entry in map {
+        let lg = entry.value();
+        write_metric_with_labels(s, name, &lg.labels, lg.gauge.get());
     }
 }
 

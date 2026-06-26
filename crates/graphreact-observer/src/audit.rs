@@ -590,6 +590,97 @@ pub fn log_audit_log_rotation_skipped(
     );
 }
 
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** SIGHUP-driven
+/// audit-log forwarder spool file rotation succeeded. Mirrors
+/// [`log_audit_log_rotated`]'s shape for the spool target — minus
+/// the cross-file chain markers (the spool's chain continuity
+/// rides via the in-process `audit_log_rotated` boundary records
+/// that get forwarded through the normal fan-out path).
+#[inline]
+pub fn log_audit_forwarder_spool_rotated(
+    rotated_from: &str,
+    rotated_to: &str,
+    records_in_prior_file: u64,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "audit_forwarder_spool_rotated",
+        rotated_from,
+        rotated_to,
+        records_in_prior_file,
+        "observer audit forwarder spool rotated"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "audit_forwarder_spool_rotated",
+            fields: serde_json::json!({
+                "rotated_from": rotated_from,
+                "rotated_to": rotated_to,
+                "records_in_prior_file": records_in_prior_file,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** SIGHUP-driven
+/// audit-log forwarder spool file rotation failed. The OLD spool
+/// file stays in use; the daemon continues forwarding to it.
+/// `error_kind` reuses the existing
+/// [`crate::audit_chain::AuditChainError`] vocabulary
+/// (`"open"`, `"parse"`, `"chain"`, `"runtime"`).
+#[inline]
+pub fn log_audit_forwarder_spool_rotation_failed(
+    error_kind: &'static str,
+    detail: &str,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "audit_forwarder_spool_rotation_failed",
+        error_kind,
+        detail,
+        "observer audit forwarder spool rotation failed; prior spool retained"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "audit_forwarder_spool_rotation_failed",
+            fields: serde_json::json!({
+                "error_kind": error_kind,
+                "detail": detail,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Audit-log
+/// forwarder spool rotation was triggered but skipped
+/// (today: drain in progress). Mirrors the existing
+/// [`log_audit_log_rotation_skipped`] for the spool target.
+#[inline]
+pub fn log_audit_forwarder_spool_rotation_skipped(
+    reason: &'static str,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "audit_forwarder_spool_rotation_skipped",
+        reason,
+        "observer audit forwarder spool rotation skipped"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "audit_forwarder_spool_rotation_skipped",
+            fields: serde_json::json!({
+                "reason": reason,
+            }),
+        },
+    );
+}
+
 /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Successful
 /// JWT verification + role mapping + per-route ACL grant. Mirrors
 /// [`log_auth_success`] bit-for-bit on the fan invariant: tracing

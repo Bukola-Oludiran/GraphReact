@@ -190,6 +190,8 @@ async fn boot_tls_daemon(initial: &TestCert) -> TlsBooted {
         observer_tokens_path: None,
         observer_jwks_path: None,
         observer_jwt_config_path: None,
+        observer_audit_forwarder_spool: None,
+        observer_audit_forwarder_stderr: false,
         drain_deadline_secs: None,
     };
     let handle = start_daemon(opts).await.expect("daemon start");

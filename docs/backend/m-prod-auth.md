@@ -1,6 +1,6 @@
 # M-Prod — Auth + audit-log chain (sub-track #1)
 
-**Status:** SHIPPED Phase A 2026-06-17 — hash-chained tamper-evident audit-log SINK substrate landed; SHIPPED Phase B Part 1 2026-06-18 — multi-token RBAC + per-route ACL + atomic-swap registry substrate landed; SHIPPED Phase B Part 2 (Group 1ab) 2026-06-26 — SIGHUP-driven token-registry reload + audit-log rotation + batched-fsync worker + `audit_sink_write_failures_total` counter + `grx admin reload-tokens` CLI landed; SHIPPED Phase B Part 2 (Group 1c) 2026-06-26 — JWT-OIDC bridge with file-based JWKS (`--observer-jwt-config` + `--observer-jwks` flags + `RotatableJwks` atomic-swap + SIGHUP-driven JWKS reload via the Group 1ab fan-out + claim-to-Role mapping + graceful coexistence with static tokens via the `eyJ` prefix discriminator). Phase B Part 2 Group 1d (audit forwarders), Phase C (`grx admin audit-verify` cron), and Phase D (ACME-style forwarders) remain deferred — see [Phase B/C/D scope](#phase-bcd-scope).
+**Status:** SHIPPED Phase A 2026-06-17 — hash-chained tamper-evident audit-log SINK substrate landed; SHIPPED Phase B Part 1 2026-06-18 — multi-token RBAC + per-route ACL + atomic-swap registry substrate landed; SHIPPED Phase B Part 2 (Group 1ab) 2026-06-26 — SIGHUP-driven token-registry reload + audit-log rotation + batched-fsync worker + `audit_sink_write_failures_total` counter + `grx admin reload-tokens` CLI landed; SHIPPED Phase B Part 2 (Group 1c) 2026-06-26 — JWT-OIDC bridge with file-based JWKS (`--observer-jwt-config` + `--observer-jwks` flags + `RotatableJwks` atomic-swap + SIGHUP-driven JWKS reload via the Group 1ab fan-out + claim-to-Role mapping + graceful coexistence with static tokens via the `eyJ` prefix discriminator); SHIPPED Phase B Part 2 (Group 1d) 2026-06-26 — audit-log forwarder substrate (`AuditForwarder` trait + `ForwarderHub` + `SpoolFileForwarder` + `StderrJsonLinesForwarder` reference impls + `--observer-audit-forwarder-spool` / `--observer-audit-forwarder-stderr` flags + SIGHUP-driven spool rotation via the Group 1ab fan-out + per-forwarder Prometheus metrics). Sub-track #1 Phase B Part 2 is now COMPLETE. Phase C (`grx admin audit-verify` cron) and Phase D (bundled S3 / Loki / GCS / OpenSearch SDK backends) remain deferred — see [Phase B/C/D scope](#phase-bcd-scope).
 
 This document covers sub-track #1 of the M-Prod milestone (production-hardening): operator-facing authentication, RBAC, and audit-log tamper-evidence for the observer HTTPS surface. Sibling tracks (#2 TLS rotation, #3 secrets keyring, #4 lifecycle / SIGHUP topology, #5 observability, #6 constant-time compares, #9 chaos arm) reference this substrate; see [Cross-track contracts](#cross-track-contracts).
 
@@ -239,15 +239,65 @@ Group 1c lands the **JWT-OIDC bridge with file-based JWKS** — external IdP-iss
 - **Algorithm whitelist defaults to RS256 + ES256.** HMAC variants are stripped at `JwtVerifier::new` even if the operator listed them — HMAC keys in a public JWKS file would be a credential leak. `Algorithm::None` is rejected by jsonwebtoken's `Validation::new` automatically.
 - **`jsonwebtoken = "9"`** is the only new workspace dep. Transitive deps (ring, pem, simple_asn1, base64) are already in-tree via rustls / serde. `cargo deny check` baseline failures are pre-existing and not perturbed by this addition.
 
-### Open work for Phase B Part 2 Group 1d (audit forwarders, deferred)
+### Open work catalogue post-1d (deferred to γ.next / Phase C / Phase D)
 
-- S3 / Loki / GCS / OpenSearch audit-log forwarders — each consumes the same `AuditSink` trait via a new fan-out sink.
+- Bundled S3 / Loki / GCS / OpenSearch / Splunk / Datadog SDK backends — today these reach via the sidecar pattern documented under [§Shipped — Phase B Part 2 (Group 1d)](#shipped--phase-b-part-2-group-1d-2026-06-26); operators wire fluentd / vector / promtail / fluent-bit / opentelemetry-collector / aws-for-fluent-bit / google-cloud-ops-agent against the spool file or process stderr. Per-forwarder retry-with-backoff + connection pooling come with the bundled SDK route when it lands; deferred until operator demand surfaces.
 - HTTP-based JWKS auto-fetch (γ.next) — operators today sidecar-write the JWKS JSON to disk + fire SIGHUP.
 - `grx audit verify` extension to walk rotated files in chronological order via the `audit_log_rotated` boundary markers.
 - HTTP `/v1/admin/reload-tokens` / `reload-jwks` endpoints paired with `grx admin --http=…` (today's surface is SIGHUP-only).
 - Per-issuer JWKS files (`--observer-jwks-dir <DIR>` glob) — multi-issuer deploys today union the keys into one file.
 - Dynamic role mapping (Lua / CEL expressions) — today's mapping is exact-string match.
 - Live JWT-OIDC bridge config reload (today SIGHUP reloads JWKS only; config changes need a daemon restart).
+- Per-forwarder rate-limiting beyond the bounded queue (token-bucket / leaky-bucket); the current drop-newest on full-queue is the operator-observable rate-limit shape.
+- A `--observer-audit-forwarder-config <PATH>` JSON file shape for configuring multiple forwarders in one place; the current two-flag interface scales to the 2-impl vocabulary, deferred until the reference-impl list grows.
+
+## Shipped — Phase B Part 2 (Group 1d) (2026-06-26)
+
+Group 1d lands the **audit-log forwarder substrate** — a pluggable trait + reference impls instead of bundled S3 / Loki / GCS / OpenSearch SDKs. Operators reach those backends today via the sidecar pattern (fluentd / vector / promtail / fluent-bit / opentelemetry-collector / aws-for-fluent-bit / google-cloud-ops-agent / etc.) tailing the spool file or container stderr; bundled SDK backends defer to γ.next pending operator demand. See [ADR-0011](../decisions/0011-audit-log-forwarder-substrate.md) for the decisions.
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `AuditForwarder` trait (object-safe, infallible `forward`, dyn-compatible `drain` + `rotate`) | SHIPPED | [`crates/graphreact-observer/src/audit_forwarders.rs`](../../crates/graphreact-observer/src/audit_forwarders.rs) |
+| `ForwarderHub` composable fan-out (one tokio worker per forwarder, bounded mpsc, drop-newest on full) | SHIPPED | `audit_forwarders.rs::ForwarderHub` |
+| `SpoolFileForwarder` reference impl (NDJSON spool file, **mode 0o600 enforced on Unix**, atomic-rename rotation) | SHIPPED | [`crates/graphreact-observer/src/audit_forwarder_spool.rs`](../../crates/graphreact-observer/src/audit_forwarder_spool.rs) |
+| `StderrJsonLinesForwarder` reference impl (kubernetes-native; sidecar DaemonSets tail container stderr) | SHIPPED | [`crates/graphreact-observer/src/audit_forwarder_stderr.rs`](../../crates/graphreact-observer/src/audit_forwarder_stderr.rs) |
+| `FileAuditSink::append` fan-out (every successful in-process write fans to `ForwarderHub::fan_out` AFTER the writer lock is released) | SHIPPED | `audit_chain.rs` |
+| Rotation boundary marker fan-out (both `audit_log_rotated` markers go to forwarders so external verifiers see the same chain markers) | SHIPPED | `audit_chain.rs::rotate_now` |
+| `AuditChainConfig::with_forwarder_hub` + `FileAuditSink::with_forwarder_hub` builder seams | SHIPPED | `audit_chain.rs` |
+| `SpawnOptions::forwarder_hub` + `ApiState::forwarder_hub` + `ApiServerHandle::forwarder_hub` (additive Phase A back-compat) | SHIPPED | `management_api.rs` |
+| `--observer-audit-forwarder-spool <PATH>` + `--observer-audit-forwarder-stderr` CLI flags | SHIPPED | [`crates/graphreact-cli/src/cli.rs`](../../crates/graphreact-cli/src/cli.rs) |
+| `DaemonHandle::rotate_audit_forwarder_spool()` + SIGHUP gate extension (5-way OR) + fan-out arm (audit-rotate → spool-rotate → tokens → JWKS → TLS) | SHIPPED | [`crates/graphreact-cli/src/commands.rs`](../../crates/graphreact-cli/src/commands.rs) |
+| `DaemonHandle::shutdown` drain extension (forwarder hub drain races sink drain under a single `OBSERVER_SHUTDOWN_DEADLINE` read via `tokio::join!`) | SHIPPED | `commands.rs::shutdown` |
+| `audit_forwarder_spool_rotated` / `audit_forwarder_spool_rotation_failed` / `audit_forwarder_spool_rotation_skipped` audit events | SHIPPED | [`crates/graphreact-observer/src/audit.rs`](../../crates/graphreact-observer/src/audit.rs) |
+| `grx_audit_forwarder_records_total{forwarder,outcome}` Prometheus counter (8 series, bounded by `&'static str`) | SHIPPED | [`crates/graphreact-observer/src/metrics.rs`](../../crates/graphreact-observer/src/metrics.rs) |
+| `grx_audit_forwarder_queue_depth{forwarder}` Prometheus gauge (2 series; `LabeledGauge` mirror of `LabeledCounter`) | SHIPPED | `metrics.rs` + [`crates/graphreact-observer/src/prometheus.rs`](../../crates/graphreact-observer/src/prometheus.rs) |
+| `grx_audit_forwarder_drain_timeouts_total{forwarder}` Prometheus counter (2 series) | SHIPPED | `metrics.rs` + `prometheus.rs` |
+| Integration tests (6 in `audit_forwarders.rs` + 1 SIGHUP subprocess) | SHIPPED | `crates/graphreact-observer/tests/audit_forwarders.rs` + `crates/graphreact-cli/tests/sighup_audit_forwarder_spool_rotation_subprocess.rs` |
+| ADR-0011 — pluggable trait + reference impls vs bundled SDKs | SHIPPED | [`docs/decisions/0011-audit-log-forwarder-substrate.md`](../decisions/0011-audit-log-forwarder-substrate.md) |
+
+### Sidecar operator path (canonical to S3 / Loki / GCS / OpenSearch / Splunk / Datadog)
+
+Operators bridge the forwarder output to any backend via the log-collector sidecar pattern they already run:
+
+| Sidecar | Deployment shape | Backends shipped to |
+|---|---|---|
+| `fluentd` | k8s DaemonSet, systemd unit | S3, OpenSearch, Loki, Splunk, Datadog, ELK |
+| `fluent-bit` | k8s DaemonSet, systemd unit | S3, OpenSearch, Loki, Splunk, Datadog, GCP Cloud Logging |
+| `vector` | k8s DaemonSet, systemd unit | S3, OpenSearch, Loki, GCS, Splunk, Datadog, Kafka |
+| `promtail` | k8s DaemonSet, systemd unit | Loki (and downstream Loki→S3/GCS via Loki's ruler) |
+| `opentelemetry-collector` | k8s DaemonSet, sidecar | OTLP backends, S3, OpenSearch, Loki, Splunk |
+| `aws-for-fluent-bit` | k8s DaemonSet, ECS sidecar | S3, CloudWatch, Kinesis, OpenSearch |
+| `google-cloud-ops-agent` | systemd unit on GCE VMs | GCS, Cloud Logging |
+
+Each sidecar tails either (a) the spool file at `--observer-audit-forwarder-spool <PATH>` or (b) the container's stderr when `--observer-audit-forwarder-stderr` is set. Zero daemon-side credential management.
+
+### Back-pressure response (drop-newest on full)
+
+Each registered forwarder gets its own bounded `tokio::sync::mpsc::channel` (default depth 1024, tunable via `GRX_AUDIT_FORWARDER_QUEUE_DEPTH`). On full, the producer drops the new record + bumps `grx_audit_forwarder_records_total{forwarder,outcome="dropped_queue_full"}` rather than blocking the audit-sink hot path. Operators alert on sustained `audit_forwarder_queue_depth{forwarder}` near cap OR a non-zero `dropped_queue_full` rate. The sidecar's downstream retry is the persistence layer.
+
+### Drain budget composition
+
+Forwarder hub drain runs INSIDE `OBSERVER_SHUTDOWN_DEADLINE` (5s default, env-tunable), in PARALLEL with the in-process audit sink drain via `tokio::join!`. The locked drain-budget math from [m-prod-lifecycle.md](m-prod-lifecycle.md) — drain (20s) + OBSERVER_SHUTDOWN_DEADLINE (5s) + slack (5s) ≤ k8s terminationGracePeriodSeconds (30s) — stays bit-for-bit unchanged. Per-forwarder drain timeouts surface as `audit_forwarder_drain_timeouts_total{forwarder}` + an `audit_forwarder_drain_timeout` warn on the canonical audit target; the aggregate is `audit_forwarder_drain_timeout_aggregate`.
 
 ## On-disk record shape
 

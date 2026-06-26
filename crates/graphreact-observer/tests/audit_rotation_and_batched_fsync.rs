@@ -192,6 +192,7 @@ async fn batched_fsync_drain_flushes_on_shutdown() {
             max_pending_records: 1_000_000,
         }),
         metrics: Some(metrics.clone()),
+        forwarder_hub: None,
     };
     let sink = FileAuditSink::open_with_config(&path, cfg).expect("open");
     for i in 0..8u32 {
@@ -220,6 +221,7 @@ async fn batched_fsync_flushes_on_size_threshold() {
             max_pending_records: 2,
         }),
         metrics: None,
+        forwarder_hub: None,
     };
     let sink = FileAuditSink::open_with_config(&path, cfg).expect("open");
     for i in 0..6u32 {
@@ -248,6 +250,7 @@ fn audit_sink_write_failures_counter_increments_on_failure() {
     let cfg = AuditChainConfig {
         fsync_mode: None,
         metrics: Some(metrics.clone()),
+        forwarder_hub: None,
     };
     let sink = FileAuditSink::open_with_config(&path, cfg).expect("open");
     // Sanity: the failures family is silent initially.

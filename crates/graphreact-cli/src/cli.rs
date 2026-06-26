@@ -580,6 +580,35 @@ pub enum ClusterOp {
         /// existing static-token walk unchanged.
         #[arg(long, requires = "observer_jwks")]
         observer_jwt_config: Option<PathBuf>,
+        /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Path
+        /// to an audit-log forwarder spool file. When set, every
+        /// fully-stamped audit record (the in-process audit log's
+        /// AuditRecord shape) is ALSO written as NDJSON to the
+        /// spool with mode 0o600 enforcement on Unix. Sidecars
+        /// (fluentd / vector / promtail / fluent-bit /
+        /// opentelemetry-collector / aws-for-fluent-bit /
+        /// google-cloud-ops-agent) tail the spool and ship to S3 /
+        /// Loki / GCS / OpenSearch / Splunk / Datadog without the
+        /// daemon ever needing its own outbound HTTP path.
+        ///
+        /// SIGHUP rotates the spool atomically (renames to
+        /// `<spool>.YYYY-MM-DDTHH-MM-SS-Z` + reopens a fresh file
+        /// with 0o600). The chain markers ride via the in-process
+        /// `audit_log_rotated` records that are forwarded through
+        /// the normal fan-out.
+        #[arg(long)]
+        observer_audit_forwarder_spool: Option<PathBuf>,
+        /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** When
+        /// set, write every fully-stamped audit record as a JSON
+        /// line to the daemon's stderr stream. Kubernetes-native:
+        /// every node runs a log-collector DaemonSet (fluentd /
+        /// fluent-bit / vector / opentelemetry-collector /
+        /// aws-for-fluent-bit / google-cloud-ops-agent) that tails
+        /// container stderr and ships to any backend (S3 / Loki /
+        /// GCS / OpenSearch / Splunk / Datadog) — zero-config for
+        /// the k8s-shaped operator path.
+        #[arg(long, default_value_t = false)]
+        observer_audit_forwarder_stderr: bool,
         /// **M16-Backend P10.** Export OpenTelemetry traces to the
         /// given OTLP/gRPC endpoint (e.g. `http://localhost:4317`
         /// for a local OTel collector). When set, the daemon

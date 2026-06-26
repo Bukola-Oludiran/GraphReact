@@ -100,6 +100,8 @@ async fn daemon_accepts_peer_with_matching_cookie() {
         observer_tokens_path: None,
         observer_jwks_path: None,
         observer_jwt_config_path: None,
+        observer_audit_forwarder_spool: None,
+        observer_audit_forwarder_stderr: false,
         drain_deadline_secs: None,
     };
     let alice = start_daemon(alice_opts).await.expect("alice daemon start");
@@ -128,6 +130,8 @@ async fn daemon_accepts_peer_with_matching_cookie() {
         observer_tokens_path: None,
         observer_jwks_path: None,
         observer_jwt_config_path: None,
+        observer_audit_forwarder_spool: None,
+        observer_audit_forwarder_stderr: false,
         drain_deadline_secs: None,
     };
     let bob = start_daemon(bob_opts).await.expect("bob daemon start");
@@ -179,6 +183,8 @@ async fn daemon_rejects_peer_with_cookie_mismatch() {
         observer_tokens_path: None,
         observer_jwks_path: None,
         observer_jwt_config_path: None,
+        observer_audit_forwarder_spool: None,
+        observer_audit_forwarder_stderr: false,
         drain_deadline_secs: None,
     };
     let alice = start_daemon(alice_opts).await.expect("alice daemon start");
@@ -205,6 +211,8 @@ async fn daemon_rejects_peer_with_cookie_mismatch() {
         observer_tokens_path: None,
         observer_jwks_path: None,
         observer_jwt_config_path: None,
+        observer_audit_forwarder_spool: None,
+        observer_audit_forwarder_stderr: false,
         drain_deadline_secs: None,
     };
     let result = start_daemon(bob_opts).await;

@@ -111,6 +111,8 @@ async fn pubsub_demo_two_daemons_jsc_grx_broadcast_fans_out() {
         observer_tokens_path: None,
         observer_jwks_path: None,
         observer_jwt_config_path: None,
+        observer_audit_forwarder_spool: None,
+        observer_audit_forwarder_stderr: false,
         drain_deadline_secs: None,
     };
     let mut alice = start_daemon(alice_opts).await.expect("alice daemon start");
@@ -140,6 +142,8 @@ async fn pubsub_demo_two_daemons_jsc_grx_broadcast_fans_out() {
         observer_tokens_path: None,
         observer_jwks_path: None,
         observer_jwt_config_path: None,
+        observer_audit_forwarder_spool: None,
+        observer_audit_forwarder_stderr: false,
         drain_deadline_secs: None,
     };
     let mut bob = start_daemon(bob_opts).await.expect("bob daemon start");
