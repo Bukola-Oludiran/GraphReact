@@ -609,20 +609,26 @@ impl FileAuditSink {
                 return Err(err);
             }
         };
-        // 4. Swap the BufWriter; chain head's `prev_hash` is
-        //    inherited so the NEW file's first record links to
-        //    the OLD file's tail. The same Phase A append() flow
-        //    will use it as soon as we drop the lock.
+        // 4. Swap the BufWriter + reset the chain head so the NEW
+        //    file parses as a standalone Phase-A-compliant chain
+        //    (seq starts at 0, prev_hash = GENESIS). Cross-file
+        //    continuity is preserved via the `audit_log_rotated`
+        //    boundary records' `prior_last_this_hash` /
+        //    `new_first_prev_hash` field pair — a multi-file
+        //    verifier walks rotated files in order via those
+        //    markers without depending on cross-file prev_hash
+        //    linkage. This keeps the existing single-file
+        //    `replay` / `grx audit verify` workflow bit-for-bit
+        //    unchanged.
         state.writer = BufWriter::new(fresh_file);
-        // `next_seq` continues monotonically across rotations —
-        // this preserves the verifier's "no sequence gap"
-        // invariant when walking multiple files.
+        state.next_seq = 0;
+        let new_first_prev_hash = prior_terminal_hash.clone();
+        state.prev_hash = GENESIS_PREV_HASH.to_string();
 
         // 5. Write the FIRST record of the new file: the second
-        //    `audit_log_rotated` marker. `prev_hash` equals the
-        //    OLD file's terminal record's `this_hash` (which is
-        //    the value currently sitting in `state.prev_hash`).
-        let new_first_prev_hash = state.prev_hash.clone();
+        //    `audit_log_rotated` marker. The on-wire `prev_hash`
+        //    is GENESIS (standalone chain); the marker's `fields`
+        //    embed the cross-file linkage data.
         let first_fields = serde_json::json!({
             "rotated_from": prior_path.display().to_string(),
             "rotated_to": backup_path.display().to_string(),
