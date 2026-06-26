@@ -1202,6 +1202,13 @@ pub fn build_router_with_rate_limit_and_proxies(
     let injector_state = RateLimitInjectorState {
         rbac: state.rbac.clone(),
         trusted_proxies,
+        // **Verify-finding MED patch — M-Prod #1 Phase B Part 2
+        // (Group 1c).** Thread the JWT verifier into the
+        // rate-limit injector so per-token bucketing recognises
+        // JWT principals by their verified `sub` claim. The
+        // verified JWT is stashed in request extensions so
+        // `auth_layer_rbac` does not re-verify.
+        jwt_verifier: state.jwt_verifier.clone(),
     };
 
     let protected_routes = Router::new()
@@ -1305,7 +1312,27 @@ pub fn build_router_with_rate_limit_and_proxies(
 struct RateLimitInjectorState {
     rbac: Option<crate::rbac::RotatableRegistry>,
     trusted_proxies: Option<Arc<crate::rate_limit_keys::TrustedProxyConfig>>,
+    /// **Verify-finding MED patch — M-Prod #1 Phase B Part 2 (Group 1c).**
+    /// JWT verifier handle so JWT-bearing requests get bucketed by
+    /// the verified `sub` claim (= `TokenId`) instead of collapsing
+    /// into `per_token_no_match`. The injector runs the verify
+    /// FIRST, stashes the [`PreVerifiedJwt`] in request extensions
+    /// for `auth_layer_rbac` to consume, and emits
+    /// `TokenIdKey::Matched(TokenId(sub))` so the per-token
+    /// governor enforces per-principal fairness for JWT principals
+    /// the same way it does for static-token principals (B-4a
+    /// contract). Single-verify cost preserved across the two
+    /// middleware layers via the extension cache.
+    jwt_verifier: Option<Arc<crate::jwt_oidc::JwtVerifier>>,
 }
+
+/// **Verify-finding MED patch — M-Prod #1 Phase B Part 2 (Group 1c).**
+/// Request-extension marker: rate_limit_injector successfully ran
+/// the JWT verify; auth_layer_rbac reads this BEFORE calling
+/// `JwtVerifier::verify` and skips the second verify when present.
+/// Single-verify cost preserved across the two middleware layers.
+#[derive(Clone)]
+pub(crate) struct PreVerifiedJwt(pub(crate) crate::jwt_oidc::VerifiedJwt);
 
 /// **M-Prod sub-track #6 Phase B Part 1.** State-injector
 /// middleware. Per-request work:
@@ -1333,7 +1360,49 @@ async fn rate_limit_injector(
     };
 
     // ----- per-token resolution -----
-    let token_ctx = if let Some(rbac) = s.rbac.as_ref() {
+    // **Verify-finding MED patch — M-Prod #1 Phase B Part 2
+    // (Group 1c).** JWT-first dispatch: when the bearer starts
+    // with the JWT discriminator `eyJ` AND a verifier is wired,
+    // run the verify here so per-token rate-limit bucketing
+    // recognises the JWT principal (= sub claim) the same way it
+    // recognises a static-token principal. The verified JWT is
+    // stashed in [`PreVerifiedJwt`] for `auth_layer_rbac` to
+    // consume — single-verify cost across the two middleware
+    // layers. On verify failure / MissingKid / UnknownKid the
+    // dispatch falls through to the static-token walk (graceful
+    // coexistence during mid-rotation, matching
+    // `auth_layer_rbac`'s discipline). A static-token bearer that
+    // happens to start with `eyJ` would fail the JWT verify with
+    // `MalformedJwt` and route through the same fall-through
+    // path. Computed BEFORE the rbac fork so the JWT bridge works
+    // even in a deploy that wires `jwt_verifier` without `rbac`
+    // (boot WARN `jwt_config_without_rbac` already documents
+    // this combo).
+    let jwt_verified_token_ctx: Option<PerRequestRateLimitCtx> = {
+        let header = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        let candidate = header.and_then(|v| v.strip_prefix("Bearer "));
+        let mut out: Option<PerRequestRateLimitCtx> = None;
+        if let (Some(c), Some(verifier)) = (candidate, s.jwt_verifier.as_ref()) {
+            if c.starts_with("eyJ") {
+                if let Ok(v) = verifier.verify(c) {
+                    let token_id = crate::rbac::TokenId(v.sub.clone());
+                    req.extensions_mut().insert(PreVerifiedJwt(v));
+                    out = Some(PerRequestRateLimitCtx {
+                        token_key: TokenIdKey::Matched(token_id),
+                        bucket_hint: "per_token",
+                    });
+                }
+            }
+        }
+        out
+    };
+
+    let token_ctx = if let Some(ctx) = jwt_verified_token_ctx {
+        ctx
+    } else if let Some(rbac) = s.rbac.as_ref() {
         let header = req
             .headers()
             .get(axum::http::header::AUTHORIZATION)
@@ -3363,7 +3432,26 @@ async fn auth_layer_rbac(
     // transition).
     if candidate_bytes.starts_with("eyJ") {
         if let Some(verifier) = state.jwt_verifier.as_ref() {
-            match verifier.verify(candidate_bytes) {
+            // **Verify-finding MED patch — M-Prod #1 Phase B Part 2
+            // (Group 1c).** `rate_limit_injector` runs JWT verify
+            // before us and stashes the result in `PreVerifiedJwt`;
+            // consume it here and skip the second verify to keep
+            // single-verify cost across the rate-limit + auth
+            // middleware layers. If the cache is absent (e.g. a
+            // route bypasses the rate-limit middleware), fall back
+            // to running the verify directly.
+            let cached: Option<crate::jwt_oidc::VerifiedJwt> = req
+                .extensions()
+                .get::<PreVerifiedJwt>()
+                .map(|p| p.0.clone());
+            let verify_outcome: Result<
+                crate::jwt_oidc::VerifiedJwt,
+                crate::jwt_oidc::JwtVerifyError,
+            > = match cached {
+                Some(v) => Ok(v),
+                None => verifier.verify(candidate_bytes),
+            };
+            match verify_outcome {
                 Ok(verified) => match crate::jwt_oidc::derive_role(
                     &verified,
                     verifier.role_mapping(),
