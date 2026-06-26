@@ -484,7 +484,7 @@ impl MetricsInner {
     }
 
     /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Register
-    /// + return the cached `Arc<LabeledGauge>` for one
+    /// and return the cached `Arc<LabeledGauge>` for one
     /// forwarder's queue-depth series. Called ONCE per forwarder
     /// at hub-construction time; the worker holds the returned
     /// `Arc` and updates the gauge with pure

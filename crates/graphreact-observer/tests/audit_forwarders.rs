@@ -339,7 +339,7 @@ async fn rotation_boundary_markers_fan_to_forwarders() {
 /// iterate.
 fn sum_counter(metrics: &Arc<MetricsInner>, forwarder: &str, outcome: &str) -> u64 {
     let mut total = 0u64;
-    for entry in metrics.audit_forwarder_records.iter() {
+    for entry in &metrics.audit_forwarder_records {
         let lc = entry.value();
         let mut matches = false;
         let mut hit_fwd = false;

@@ -28,7 +28,7 @@
 //! `GRX_AUDIT_FORWARDER_QUEUE_DEPTH`). On full the producer calls
 //! `try_send` → `Err(TrySendError::Full(_))` → counter bump for
 //! `audit_forwarder_records_total{forwarder, outcome="dropped_queue_full"}`
-//! + DROP THE NEW record (drop-newest; matches tokio idioms). Slow
+//! and DROP THE NEW record (drop-newest; matches tokio idioms). Slow
 //! consumers can never starve fast ones because each forwarder
 //! drains its own channel on a dedicated worker task.
 //!

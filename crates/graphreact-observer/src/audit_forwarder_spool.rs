@@ -339,7 +339,7 @@ mod tests {
     fn rec(seq: u64) -> AuditRecord {
         AuditRecord {
             seq,
-            ts_ms: 1700000000000 + (seq as u128) * 1000,
+            ts_ms: 1_700_000_000_000 + u128::from(seq) * 1000,
             prev_hash: "0".repeat(64),
             kind: "bind".to_string(),
             fields: serde_json::json!({"i": seq}),

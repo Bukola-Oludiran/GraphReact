@@ -184,7 +184,7 @@ fn grx_daemon_sighup_rotates_audit_forwarder_spool_subprocess() {
     // as prefix + a timestamp suffix exists in the dir.
     let entries: Vec<_> = std::fs::read_dir(dir.path())
         .expect("readdir")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().into_string().unwrap_or_default())
         .collect();
     let rotated = entries
