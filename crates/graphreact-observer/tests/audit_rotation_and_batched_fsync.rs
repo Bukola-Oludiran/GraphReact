@@ -265,7 +265,7 @@ fn audit_sink_write_failures_counter_increments_on_failure() {
         std::fs::set_permissions(tmp.path(), perms).expect("restore");
         // Look up the rotate counter
         let mut found_rotate = false;
-        for entry in metrics.audit_sink_write_failures.iter() {
+        for entry in &metrics.audit_sink_write_failures {
             for (k, v) in &entry.value().labels {
                 if *k == "kind" && v == "rotate" {
                     found_rotate = true;

@@ -48,8 +48,8 @@ fn write_cluster_pem(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 fn write_0600(path: &std::path::Path, body: &str) {
-    std::fs::write(path, body).expect("write");
     use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).expect("write");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 }
 

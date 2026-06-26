@@ -100,6 +100,7 @@ fn empty_file_returns_parse_error() {
 #[cfg(unix)]
 #[test]
 fn refuses_world_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = TempDir::new("grx-rbac-mode");
     let path = tmp.path().join("tokens.ndjson");
     std::fs::write(
@@ -108,7 +109,6 @@ fn refuses_world_readable_file() {
 "#,
     )
     .expect("write");
-    use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
     let err = load_registry_from_file(&path).unwrap_err();
     assert!(matches!(err, RegistryLoadError::Mode { .. }));
