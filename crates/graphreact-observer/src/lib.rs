@@ -44,6 +44,7 @@ pub mod events;
 pub mod http_server;
 pub mod json_escape;
 pub mod json_logs;
+pub mod jwt_oidc;
 pub mod management_api;
 pub mod metrics;
 pub mod multiplex;
@@ -80,8 +81,10 @@ pub use opentelemetry_sdk::trace::SdkTracerProvider;
 
 pub use audit::{
     log_audit_log_rotated, log_audit_log_rotation_failed, log_audit_log_rotation_skipped,
-    log_auth_success, log_authz_deny, log_tls_reload_skipped, log_token_registry_reload_failed,
-    log_token_registry_reload_skipped, log_token_registry_reloaded,
+    log_auth_success, log_authz_deny, log_jwks_reload_failed, log_jwks_reload_skipped,
+    log_jwks_reloaded, log_jwt_auth_fail, log_jwt_auth_success, log_tls_reload_skipped,
+    log_token_registry_reload_failed, log_token_registry_reload_skipped,
+    log_token_registry_reloaded,
 };
 pub use audit_chain::{
     replay as replay_audit_chain, AuditChainConfig, AuditChainError, AuditRecord,
@@ -89,6 +92,12 @@ pub use audit_chain::{
     DEFAULT_BATCHED_FSYNC_INTERVAL_MS, DEFAULT_BATCHED_FSYNC_MAX_PENDING,
 };
 pub use auth::{AuthError, BearerToken};
+pub use jwt_oidc::{
+    check_route_for_role, derive_role, load_jwks_from_file, load_jwt_oidc_config_from_file,
+    ClaimMappingError, JwksKey, JwksLoadError, JwksStore, JwtOidcConfig, JwtOidcConfigLoadError,
+    JwtVerifier, JwtVerifyError, RoleMapping, RotatableJwks, VerifiedJwt,
+    DEFAULT_JWT_LEEWAY_SECONDS,
+};
 pub use rbac::{
     load_registry_from_file, RegistryCounts, RegistryError, RegistryLoadError, Role,
     RotatableRegistry, TokenEntry, TokenId, TokenRegistry, MAX_TOKENS, READ_ONLY_ROUTES,

@@ -590,6 +590,200 @@ pub fn log_audit_log_rotation_skipped(
     );
 }
 
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Successful
+/// JWT verification + role mapping + per-route ACL grant. Mirrors
+/// [`log_auth_success`] bit-for-bit on the fan invariant: tracing
+/// line FIRST, sink fans AFTER.
+///
+/// `peer` is the `SocketAddr::to_string()` form already used by the
+/// auth_layer_rbac inline tracing lines (NOT a `SocketAddr`
+/// directly — the dispatch site only has a `String`). `sub` is the
+/// JWT `sub` claim → becomes the audit-side principal name (and
+/// the [`crate::rbac::TokenId`] inner string for downstream
+/// per-token-rate-limit keying). `iss` is the JWT issuer. `role`
+/// is one of `"admin"` / `"read_only"` / `"custom"`. `kid` is the
+/// signing key id from the JWT header. `expires_at_unix_ms` is the
+/// JWT `exp` claim denormalized.
+#[inline]
+#[allow(clippy::too_many_arguments)] // audit fan-out shape is contract-bound
+pub fn log_jwt_auth_success(
+    peer: &str,
+    sub: &str,
+    iss: &str,
+    route: &'static str,
+    role: &str,
+    kid: Option<&str>,
+    expires_at_unix_ms: i64,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "jwt_auth_success",
+        peer,
+        sub,
+        iss,
+        route,
+        role,
+        kid,
+        expires_at_unix_ms,
+        "observer jwt auth success"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "jwt_auth_success",
+            fields: serde_json::json!({
+                "peer": peer,
+                "sub": sub,
+                "iss": iss,
+                "route": route,
+                "role": role,
+                "kid": kid,
+                "expires_at_unix_ms": expires_at_unix_ms,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** JWT
+/// verification or role mapping failed. `reason` is one of the
+/// closed-vocabulary tags emitted by
+/// [`crate::jwt_oidc::JwtVerifyError::reason_str`] or
+/// [`crate::jwt_oidc::ClaimMappingError::reason_str`], plus
+/// `"authz_deny"` when the role's per-route ACL refused the
+/// request after a clean verify.
+///
+/// `iss_claimed` / `kid_claimed` are the unverified header values
+/// when the JWT was at least header-parseable — they help SOC
+/// pipelines triage "is this a stale token from issuer X" vs
+/// "is this random wire junk". Both `None` when the JWT didn't
+/// even header-parse.
+#[inline]
+pub fn log_jwt_auth_fail(
+    peer: &str,
+    reason: &'static str,
+    iss_claimed: Option<&str>,
+    kid_claimed: Option<&str>,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "jwt_auth_fail",
+        peer,
+        reason,
+        iss_claimed,
+        kid_claimed,
+        "observer jwt auth fail"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "jwt_auth_fail",
+            fields: serde_json::json!({
+                "peer": peer,
+                "reason": reason,
+                "iss_claimed": iss_claimed,
+                "kid_claimed": kid_claimed,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** SIGHUP-driven
+/// JWKS reload succeeded; [`crate::jwt_oidc::RotatableJwks`] was
+/// atomically swapped. Mirrors [`log_token_registry_reloaded`]
+/// shape — WARN level, same fan_to_sink discipline.
+///
+/// Fields:
+/// - `key_count`: total entry count in the new JWKS store
+/// - `kid_count`: distinct `kid` values (equal to `key_count` by
+///   construction — duplicate-kid is a load-time error; kept
+///   distinct for forward-compat with future per-kid sub-counts)
+/// - `duration_ms`: wall-clock span from SIGHUP arm to atomic
+///   swap completion
+#[inline]
+pub fn log_jwks_reloaded(
+    key_count: usize,
+    kid_count: usize,
+    duration_ms: u64,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "jwks_reloaded",
+        key_count,
+        kid_count,
+        duration_ms,
+        "observer jwks reloaded"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "jwks_reloaded",
+            fields: serde_json::json!({
+                "key_count": key_count,
+                "kid_count": kid_count,
+                "duration_ms": duration_ms,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** SIGHUP-driven
+/// JWKS reload failed. The PRIOR JwksStore keeps serving (no
+/// partial swap). `error_kind` is a `&'static str` drawn from
+/// [`crate::jwt_oidc::JwksLoadError::kind_str`]: `"io"` (file
+/// unreadable), `"parse"` (JWKS JSON didn't deserialize),
+/// `"empty"` (zero usable keys), `"duplicate_kid"` (two keys
+/// share the same kid).
+#[inline]
+pub fn log_jwks_reload_failed(
+    error_kind: &'static str,
+    detail: &str,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "jwks_reload_failed",
+        error_kind,
+        detail,
+        "observer jwks reload failed; prior store retained"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "jwks_reload_failed",
+            fields: serde_json::json!({
+                "error_kind": error_kind,
+                "detail": detail,
+            }),
+        },
+    );
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** SIGHUP-driven
+/// JWKS reload was triggered but skipped (today: drain in
+/// progress). Mirrors [`log_token_registry_reload_skipped`] for
+/// the JWKS reload target.
+#[inline]
+pub fn log_jwks_reload_skipped(reason: &'static str, sink: Option<&Arc<dyn AuditSink>>) {
+    tracing::warn!(
+        target: "graphreact::observer::audit",
+        event = "jwks_reload_skipped",
+        reason,
+        "observer jwks reload skipped"
+    );
+    fan_to_sink(
+        sink,
+        AuditRecordInput {
+            kind: "jwks_reload_skipped",
+            fields: serde_json::json!({
+                "reason": reason,
+            }),
+        },
+    );
+}
+
 /// **M-Prod sub-track #4 Phase α.** SIGTERM (or operator-driven)
 /// drain entered. Emitted EXACTLY ONCE per daemon lifetime,
 /// BEFORE [`crate::DrainFlag`]'s AtomicBool flip becomes
