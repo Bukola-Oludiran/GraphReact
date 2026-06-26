@@ -161,6 +161,21 @@ struct AuditRecordHashInput<'a> {
 /// `tracing::warn!`).
 pub trait AuditSink: std::fmt::Debug + Send + Sync {
     fn append(&self, record: AuditRecordInput);
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Atomic
+    /// rotation entry point. Implementations that back a file
+    /// rotate it via [`FileAuditSink::rotate`]; trivial sinks
+    /// ([`NopAuditSink`], in-memory test sinks) return
+    /// `Ok(None)` to signal "rotation is a no-op for this sink
+    /// flavor — caller should skip the operator-facing audit
+    /// fan-out".
+    ///
+    /// Default impl returns `Ok(None)` so existing sinks compile
+    /// unchanged; only [`FileAuditSink`] needs an explicit
+    /// override.
+    fn rotate(&self) -> Result<Option<RotationOutcome>, AuditChainError> {
+        Ok(None)
+    }
 }
 
 /// Default backend: discards every record. Wired as the
@@ -446,11 +461,10 @@ impl FileAuditSink {
             (0, GENESIS_PREV_HASH.to_string())
         };
 
-        let file = open_audit_file(&path).map_err(|err| {
+        let file = open_audit_file(&path).inspect_err(|_err| {
             if let Some(m) = metrics.as_ref() {
                 m.audit_sink_write_failures_inc("open");
             }
-            err
         })?;
 
         let state = Arc::new(Mutex::new(FileAuditSinkInner {
@@ -511,7 +525,7 @@ impl FileAuditSink {
     /// `audit_sink_write_failures_total{kind="rotate"}` bumps.
     /// The sink continues serving appends against the unchanged
     /// old file.
-    pub fn rotate(&self) -> Result<RotationOutcome, AuditChainError> {
+    pub fn rotate_now(&self) -> Result<RotationOutcome, AuditChainError> {
         let mut state = match self.state.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -652,10 +666,7 @@ impl FileAuditSink {
             // signalled). Treat as cleanly drained.
             return true;
         }
-        match tokio::time::timeout(deadline, ack_rx).await {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+        tokio::time::timeout(deadline, ack_rx).await.is_ok()
     }
 }
 
@@ -720,6 +731,11 @@ fn rotation_timestamp() -> String {
 /// add a `chrono` workspace dep. Accuracy is sufficient for the
 /// rotation-suffix use case (operators only need monotonic +
 /// human-readable; sub-second precision isn't load-bearing).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 fn unix_secs_to_utc_components(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let sec = (secs % 60) as u32;
     let mins_total = secs / 60;
@@ -1041,6 +1057,10 @@ impl AuditSink for FileAuditSink {
                 }
             }
         }
+    }
+
+    fn rotate(&self) -> Result<Option<RotationOutcome>, AuditChainError> {
+        self.rotate_now().map(Some)
     }
 }
 

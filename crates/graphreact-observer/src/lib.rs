@@ -90,8 +90,8 @@ pub use audit_chain::{
 };
 pub use auth::{AuthError, BearerToken};
 pub use rbac::{
-    RegistryError, Role, RotatableRegistry, TokenEntry, TokenId, TokenRegistry, MAX_TOKENS,
-    READ_ONLY_ROUTES,
+    load_registry_from_file, RegistryCounts, RegistryError, RegistryLoadError, Role,
+    RotatableRegistry, TokenEntry, TokenId, TokenRegistry, MAX_TOKENS, READ_ONLY_ROUTES,
 };
 pub use bind::{BindConfig, BindConfigError, BindFlags, DEFAULT_BIND};
 pub use drain::{

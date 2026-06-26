@@ -240,6 +240,42 @@ pub enum Command {
         #[command(subcommand)]
         op: AuditOp,
     },
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Operator
+    /// admin surface for a running daemon. Today's surface:
+    /// - `grx admin reload-tokens` — fire SIGHUP at a target daemon
+    ///   PID so it re-reads the on-disk token-registry file
+    ///   (`--observer-tokens`) and atomic-swaps the in-memory
+    ///   [`graphreact_observer::RotatableRegistry`]. The same
+    ///   SIGHUP also fires the audit-log rotation + the TLS cert
+    ///   reload — operators get one signal, three reload targets,
+    ///   fail-isolated.
+    Admin {
+        #[command(subcommand)]
+        op: AdminOp,
+    },
+}
+
+/// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Sub-subcommand
+/// block under `grx admin <op>`.
+#[derive(Debug, clap::Subcommand)]
+pub enum AdminOp {
+    /// Send SIGHUP to a running daemon PID so it reloads the
+    /// on-disk token registry file (and rotates the audit log +
+    /// reloads TLS certs in the same fan-out). The CLI is a thin
+    /// signal wrapper — exit 0 on successful `kill(2)`, exit 1
+    /// otherwise. Operators wait for a follow-up audit row of
+    /// shape `token_registry_reloaded` / `token_registry_reload_failed`
+    /// to know the in-process outcome.
+    ReloadTokens {
+        /// PID of the daemon to signal. Mutually exclusive with
+        /// `--pid-file`.
+        #[arg(long, conflicts_with = "pid_file")]
+        pid: Option<u32>,
+        /// File containing the daemon PID (one integer, optional
+        /// trailing newline). Mutually exclusive with `--pid`.
+        #[arg(long, conflicts_with = "pid")]
+        pid_file: Option<PathBuf>,
+    },
 }
 
 /// **M-Prod sub-track #1 Phase A.** Sub-subcommand block under
@@ -491,6 +527,23 @@ pub enum ClusterOp {
         /// the process's umask.
         #[arg(long)]
         observer_audit_log: Option<PathBuf>,
+        /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Path
+        /// to an on-disk multi-token RBAC registry (NDJSON one
+        /// record per line; see ADR-0009 for the schema). When set,
+        /// the daemon dispatches every protected request through
+        /// [`graphreact_observer::RotatableRegistry`] + the per-role
+        /// ACL flow shipped in Phase B Part 1, replacing the
+        /// single-bearer `--observer-token-{env,file}` path.
+        ///
+        /// File mode 0o600 is enforced on Unix. SIGHUP
+        /// (`kill -HUP <pid>` or `grx admin reload-tokens --pid
+        /// <pid>`) re-reads the file + atomic-swaps the in-memory
+        /// registry without restarting the daemon. On parse /
+        /// validate failure the prior registry stays serving + an
+        /// audit event of shape `token_registry_reload_failed` is
+        /// emitted.
+        #[arg(long)]
+        observer_tokens: Option<PathBuf>,
         /// **M16-Backend P10.** Export OpenTelemetry traces to the
         /// given OTLP/gRPC endpoint (e.g. `http://localhost:4317`
         /// for a local OTel collector). When set, the daemon
