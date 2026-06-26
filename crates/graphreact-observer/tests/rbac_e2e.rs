@@ -95,6 +95,8 @@ async fn spawn_with_rbac(
         // M-Prod #1 Phase B Part 2 (Group 1c) — JWT bridge unwired
         // for the static-token RBAC e2e.
         jwt_verifier: None,
+        // M-Prod #1 Phase B Part 2 (Group 1d) — forwarder hub unwired.
+        forwarder_hub: None,
     })
     .await
     .expect("spawn");

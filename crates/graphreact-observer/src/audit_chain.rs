@@ -92,6 +92,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::audit_forwarders::ForwarderHub;
 use crate::metrics::MetricsInner;
 
 /// Genesis sentinel for the very first record's `prev_hash` field.
@@ -268,6 +269,15 @@ pub struct AuditChainConfig {
     /// `audit_sink_write_failures_total{kind="open"|"write"|"fsync"|"rotate"}`
     /// alongside the existing `tracing::warn!` emission.
     pub metrics: Option<Arc<MetricsInner>>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Optional
+    /// audit-log forwarder hub. When `Some`, every successful
+    /// append (including the rotation boundary markers) fans the
+    /// fully-stamped [`AuditRecord`] to every registered
+    /// [`crate::AuditForwarder`] via the hub's per-forwarder
+    /// bounded mpsc workers. `None` (the default) keeps the audit
+    /// sink writing only to the in-process file + tracing
+    /// surfaces.
+    pub forwarder_hub: Option<Arc<ForwarderHub>>,
 }
 
 impl std::fmt::Debug for AuditChainConfig {
@@ -317,6 +327,16 @@ impl AuditChainConfig {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<MetricsInner>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Attach
+    /// the [`ForwarderHub`] so the constructed
+    /// [`FileAuditSink`] fans every successful append to every
+    /// registered forwarder.
+    #[must_use]
+    pub fn with_forwarder_hub(mut self, hub: Arc<ForwarderHub>) -> Self {
+        self.forwarder_hub = Some(hub);
         self
     }
 }
@@ -373,6 +393,15 @@ pub struct FileAuditSink {
     /// `OBSERVER_SHUTDOWN_DEADLINE` and is exposed via
     /// [`Self::drain`].
     worker: Option<BatchedFsyncWorker>,
+    /// **M-Prod #1 Phase B Part 2 (Group 1d).** Optional audit-log
+    /// forwarder hub. When `Some`, every successful append (and
+    /// every rotation boundary marker) fans the fully-stamped
+    /// [`AuditRecord`] to every registered
+    /// [`crate::AuditForwarder`] via bounded mpsc worker channels.
+    /// `None` (the default) keeps the sink writing only to the
+    /// in-process file + tracing surfaces — the
+    /// pre-Group-1d behavior is preserved bit-for-bit.
+    forwarder_hub: Option<Arc<ForwarderHub>>,
 }
 
 impl std::fmt::Debug for FileAuditSink {
@@ -380,6 +409,7 @@ impl std::fmt::Debug for FileAuditSink {
         f.debug_struct("FileAuditSink")
             .field("fsync_mode", &self.fsync_mode)
             .field("worker", &self.worker.is_some())
+            .field("forwarder_hub", &self.forwarder_hub.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -456,6 +486,7 @@ impl FileAuditSink {
     ) -> Result<Self, AuditChainError> {
         let path = path.into();
         let metrics = cfg.metrics.clone();
+        let forwarder_hub = cfg.forwarder_hub.clone();
         let fsync_mode = cfg.fsync_mode.unwrap_or(FsyncMode::PerWrite);
         // Recover chain head BEFORE opening the append-mode writer
         // so we don't accidentally hold two file descriptors during
@@ -512,7 +543,21 @@ impl FileAuditSink {
             metrics,
             fsync_mode,
             worker,
+            forwarder_hub,
         })
+    }
+
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Attach
+    /// or replace the [`ForwarderHub`] post-construction. Returns
+    /// the modified sink (builder shape) — mirrors
+    /// [`AuditChainConfig::with_forwarder_hub`] so callers that
+    /// constructed via [`Self::open`] (the legacy short-form
+    /// constructor) can still attach a hub without round-tripping
+    /// through [`AuditChainConfig`].
+    #[must_use]
+    pub fn with_forwarder_hub(mut self, hub: Arc<ForwarderHub>) -> Self {
+        self.forwarder_hub = Some(hub);
+        self
     }
 
     /// Inspect-only accessor for tests + diagnostics. The returned
@@ -567,14 +612,14 @@ impl FileAuditSink {
             "boundary": "prior_tail",
             "prior_last_this_hash": prior_last_this_hash_for_marker,
         });
-        let prior_terminal_hash = append_one_locked(
+        let prior_terminal_record = append_one_locked(
             &mut state,
             "audit_log_rotated",
             &prior_terminal_fields,
             self.metrics.as_ref(),
         );
-        let prior_terminal_hash = match prior_terminal_hash {
-            Some(h) => h,
+        let prior_terminal_record = match prior_terminal_record {
+            Some(r) => r,
             None => {
                 if let Some(m) = self.metrics.as_ref() {
                     m.audit_sink_write_failures_inc("rotate");
@@ -587,6 +632,7 @@ impl FileAuditSink {
                 });
             }
         };
+        let prior_terminal_hash = prior_terminal_record.this_hash.clone();
 
         // **Verify-finding LOW 1 patch.** Force the terminal
         // `audit_log_rotated` marker to disk BEFORE rename so an
@@ -683,19 +729,35 @@ impl FileAuditSink {
             "prior_last_this_hash": prior_terminal_hash,
             "new_first_prev_hash": new_first_prev_hash,
         });
-        let _ = append_one_locked(
+        let new_head_record = append_one_locked(
             &mut state,
             "audit_log_rotated",
             &first_fields,
             self.metrics.as_ref(),
         );
 
-        Ok(RotationOutcome {
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Fan
+        // BOTH rotation boundary markers to the forwarder hub
+        // AFTER releasing the writer lock so a slow forwarder
+        // cannot back-pressure the in-process audit log. The
+        // forwarder fan-out's `try_send` is wait-free; the
+        // boundary markers ride the same chain-continuity contract
+        // as every other record, so downstream verifiers see the
+        // same `audit_log_rotated` markers the on-disk file does.
+        let outcome = RotationOutcome {
             rotated_to: backup_path,
             prior_last_this_hash: prior_terminal_hash,
             new_first_prev_hash,
             records_in_prior_file,
-        })
+        };
+        drop(state);
+        if let Some(hub) = self.forwarder_hub.as_ref() {
+            hub.fan_out(&prior_terminal_record);
+            if let Some(head) = new_head_record {
+                hub.fan_out(&head);
+            }
+        }
+        Ok(outcome)
     }
 
     /// **M-Prod #1 Phase B Part 2 (Group 1ab).** Drain the
@@ -824,7 +886,7 @@ fn append_one_locked(
     kind: &str,
     fields: &serde_json::Value,
     metrics: Option<&Arc<MetricsInner>>,
-) -> Option<String> {
+) -> Option<AuditRecord> {
     let seq = state.next_seq;
     let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -934,7 +996,7 @@ fn append_one_locked(
     if write_failed {
         None
     } else {
-        Some(this_hash)
+        Some(record)
     }
 }
 
@@ -1069,45 +1131,67 @@ impl Drop for FileAuditSink {
 
 impl AuditSink for FileAuditSink {
     fn append(&self, input: AuditRecordInput) {
-        let mut state = match self.state.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let wrote_ok = append_one_locked(
-            &mut state,
-            input.kind,
-            &input.fields,
-            self.metrics.as_ref(),
-        )
-        .is_some();
-        // Fsync policy fork.
-        match self.fsync_mode {
-            FsyncMode::PerWrite => {
-                if wrote_ok {
-                    if let Err(err) = state.writer.get_ref().sync_data() {
-                        if let Some(m) = self.metrics.as_ref() {
-                            m.audit_sink_write_failures_inc("fsync");
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Capture
+        // the fully-stamped `AuditRecord` from `append_one_locked`
+        // so it can be fanned to the forwarder hub AFTER the writer
+        // lock is released. Holding the lock across the fan-out
+        // would needlessly serialize concurrent
+        // `FileAuditSink::path()` / `fsync_mode()` accessors;
+        // forwarder `try_send` is wait-free so releasing first is
+        // strictly better.
+        let written = {
+            let mut state = match self.state.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let r = append_one_locked(
+                &mut state,
+                input.kind,
+                &input.fields,
+                self.metrics.as_ref(),
+            );
+            // Fsync policy fork stays HERE, under the lock, so
+            // PerWrite's inline `sync_data` runs on the same writer
+            // the append landed on. Batched mode signals the
+            // worker; the worker re-acquires the lock for its
+            // out-of-cycle fsync.
+            match self.fsync_mode {
+                FsyncMode::PerWrite => {
+                    if r.is_some() {
+                        if let Err(err) = state.writer.get_ref().sync_data() {
+                            if let Some(m) = self.metrics.as_ref() {
+                                m.audit_sink_write_failures_inc("fsync");
+                            }
+                            tracing::warn!(
+                                target: "graphreact::observer::audit",
+                                event = "audit_sink_write_failed",
+                                error_kind = "fsync",
+                                error = %err,
+                                "audit sink sync_data failed; tracing-side stream continues",
+                            );
                         }
-                        tracing::warn!(
-                            target: "graphreact::observer::audit",
-                            event = "audit_sink_write_failed",
-                            error_kind = "fsync",
-                            error = %err,
-                            "audit sink sync_data failed; tracing-side stream continues",
-                        );
+                    }
+                }
+                FsyncMode::Batched { .. } => {
+                    // Signal the worker that a record is pending.
+                    // The bytes are in the OS page cache after
+                    // `flush`; the worker fsyncs to the disk
+                    // surface on its cadence.
+                    if r.is_some() {
+                        if let Some(w) = self.worker.as_ref() {
+                            let _ = w.msg_tx.send(FsyncWorkerMsg::Signal);
+                        }
                     }
                 }
             }
-            FsyncMode::Batched { .. } => {
-                // Signal the worker that a record is pending. The
-                // bytes are in the OS page cache after `flush`; the
-                // worker fsyncs to the disk surface on its cadence.
-                if wrote_ok {
-                    if let Some(w) = self.worker.as_ref() {
-                        let _ = w.msg_tx.send(FsyncWorkerMsg::Signal);
-                    }
-                }
-            }
+            r
+        };
+        // Fan to forwarders OUT of the writer lock. A `None` here
+        // means the in-process write failed (counter already
+        // bumped); skip the fan so forwarders don't see a record
+        // the in-process file doesn't have.
+        if let (Some(record), Some(hub)) = (written, self.forwarder_hub.as_ref()) {
+            hub.fan_out(&record);
         }
     }
 

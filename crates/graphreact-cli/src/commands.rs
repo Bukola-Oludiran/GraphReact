@@ -1313,6 +1313,29 @@ pub struct DaemonOptions {
     /// needs both halves; half-configured is a no-go state —
     /// `start_daemon` fails fast on the half-config case).
     pub observer_jwt_config_path: Option<std::path::PathBuf>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** When
+    /// `Some(path)`, attach a
+    /// [`graphreact_observer::SpoolFileForwarder`] writing
+    /// every fully-stamped [`graphreact_observer::AuditRecord`]
+    /// to the spool file at `path` (NDJSON one record per line;
+    /// mode `0o600` enforced on Unix). Sidecars (fluentd /
+    /// vector / promtail / opentelemetry-collector / fluent-bit
+    /// / aws-for-fluent-bit / google-cloud-ops-agent) tail the
+    /// spool and ship to S3 / Loki / GCS / OpenSearch / Splunk /
+    /// Datadog. SIGHUP rotates the spool via
+    /// [`DaemonHandle::rotate_audit_forwarder_spool`]; the path
+    /// is retained on the daemon handle for the SIGHUP fan-out.
+    /// `None` (default) leaves the spool forwarder unwired.
+    pub observer_audit_forwarder_spool: Option<std::path::PathBuf>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** When
+    /// `true`, attach a
+    /// [`graphreact_observer::StderrJsonLinesForwarder`] writing
+    /// every fully-stamped audit record as a JSON-line to the
+    /// process's stderr. Kubernetes default — node-level
+    /// log-collector DaemonSets tail container stderr and ship to
+    /// any backend. `false` (default) leaves the stderr forwarder
+    /// unwired.
+    pub observer_audit_forwarder_stderr: bool,
     /// **M-Prod sub-track #4 Phase α.** Outer SIGTERM drain
     /// deadline (seconds). `None` falls through to
     /// `GRX_DRAIN_DEADLINE_SECS` env var, then to
@@ -1495,6 +1518,14 @@ pub struct DaemonHandle {
     /// atomic-swap. `None` keeps SIGHUP JWKS reload a silent no-op
     /// (no operator-visible JWT bridge surface).
     jwks_path: Option<std::path::PathBuf>,
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Audit
+    /// forwarder spool file path captured at boot for SIGHUP-
+    /// triggered `SpoolFileForwarder::rotate`. `Some(path)` iff
+    /// the daemon was booted with
+    /// `--observer-audit-forwarder-spool <PATH>`. When `None`,
+    /// SIGHUP spool rotation is a silent no-op (no operator-
+    /// visible spool surface to rotate).
+    audit_forwarder_spool_path: Option<std::path::PathBuf>,
 }
 
 /// **M-Prod sub-track #4 Phase α.** Outcome of a graceful drain
@@ -1944,6 +1975,70 @@ impl DaemonHandle {
         }
     }
 
+    /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** SIGHUP-
+    /// driven atomic-rename rotation of the audit-log forwarder
+    /// spool file. Mirrors [`Self::rotate_audit_log`]'s shape:
+    /// triple let-else early-return on observer / forwarder hub /
+    /// spool forwarder / spool path; drain-respect via the
+    /// existing audit-log-rotation-skipped helper repurposed with
+    /// a spool-specific event name; match on the
+    /// `AuditForwarder::rotate` result and emit
+    /// `audit_forwarder_spool_rotated` on success or
+    /// `audit_forwarder_spool_rotation_failed` on failure.
+    ///
+    /// No-op when the daemon was booted WITHOUT
+    /// `--observer-audit-forwarder-spool` (no operator-visible
+    /// spool surface to rotate).
+    pub fn rotate_audit_forwarder_spool(&self) {
+        let Some(observer) = self.observer.as_ref() else {
+            return;
+        };
+        let Some(hub) = observer.forwarder_hub.as_ref() else {
+            return;
+        };
+        let Some(spool) = hub.spool_forwarder() else {
+            return;
+        };
+        let Some(path) = self.audit_forwarder_spool_path.as_ref() else {
+            return;
+        };
+        // Drain-respect parity with rotate_audit_log: an
+        // operator-triggered rotation mid-drain is replaced by a
+        // skip-event so the audit stream + spool stream stay
+        // legible to SOC tooling.
+        let sink = observer.audit_sink.as_ref();
+        if let Some(flag) = self.drain.as_ref() {
+            if flag.is_draining() {
+                graphreact_observer::log_audit_forwarder_spool_rotation_skipped(
+                    "draining",
+                    sink,
+                );
+                return;
+            }
+        }
+        match spool.rotate() {
+            Ok(Some(outcome)) => {
+                graphreact_observer::log_audit_forwarder_spool_rotated(
+                    &path.display().to_string(),
+                    &outcome.rotated_to.display().to_string(),
+                    outcome.records_in_prior_file,
+                    sink,
+                );
+            }
+            Ok(None) => {
+                // Forwarder reports "rotation is a no-op for this
+                // backend" — nothing to emit.
+            }
+            Err(err) => {
+                graphreact_observer::log_audit_forwarder_spool_rotation_failed(
+                    rotation_error_kind(&err),
+                    &err.to_string(),
+                    sink,
+                );
+            }
+        }
+    }
+
     /// Drop the cluster and tear down the engine (if any).
     /// **M16-Backend P2:** also signals + joins the observer HTTP
     /// server (if one was spawned). **M16-Backend P10:** flushes
@@ -2027,16 +2122,52 @@ impl DaemonHandle {
         // budget `drain_deadline + OBSERVER_SHUTDOWN_DEADLINE + slack`
         // is unchanged.
         if let Some(observer) = self.observer.as_ref() {
-            if let Some(sink) = observer.audit_sink.as_ref() {
-                let deadline = observer_shutdown_deadline();
-                if !sink.drain(deadline).await {
-                    tracing::warn!(
-                        target: "graphreact::observer::audit",
-                        event = "audit_log_drain_timeout",
-                        deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
-                        "audit sink drain exceeded OBSERVER_SHUTDOWN_DEADLINE — pending records may not be fsynced",
-                    );
+            let deadline = observer_shutdown_deadline();
+            // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).**
+            // Race the in-process audit sink drain alongside the
+            // forwarder hub drain under a SINGLE deadline read so
+            // the locked drain-budget math (drain_deadline +
+            // OBSERVER_SHUTDOWN_DEADLINE + slack ≤ k8s
+            // terminationGracePeriodSeconds) stays bit-for-bit
+            // unchanged when the forwarder substrate is wired.
+            // Both branches return immediately-true when their
+            // respective surface is unwired.
+            let sink_drain = async {
+                if let Some(sink) = observer.audit_sink.as_ref() {
+                    sink.drain(deadline).await
+                } else {
+                    true
                 }
+            };
+            let hub_drain = async {
+                if let Some(hub) = observer.forwarder_hub.as_ref() {
+                    hub.drain(deadline).await
+                } else {
+                    true
+                }
+            };
+            let (sink_ok, hub_ok) = tokio::join!(sink_drain, hub_drain);
+            if !sink_ok {
+                tracing::warn!(
+                    target: "graphreact::observer::audit",
+                    event = "audit_log_drain_timeout",
+                    deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+                    "audit sink drain exceeded OBSERVER_SHUTDOWN_DEADLINE — pending records may not be fsynced",
+                );
+            }
+            if !hub_ok {
+                // Per-forwarder drain-timeout warns + counter
+                // bumps fire inside `ForwarderHub::drain`. The
+                // aggregate "at least one forwarder timed out"
+                // signal goes via the same audit target so
+                // operator dashboards see a single coherent
+                // teardown trail.
+                tracing::warn!(
+                    target: "graphreact::observer::audit",
+                    event = "audit_forwarder_drain_timeout_aggregate",
+                    deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+                    "audit forwarder hub drain exceeded OBSERVER_SHUTDOWN_DEADLINE — pending forwarder records may not be delivered",
+                );
             }
         }
         // Stop the observer server FIRST so any in-flight scrape
@@ -2302,13 +2433,54 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // [`graphreact_observer::AuditChainConfig`] so operators
         // opt into batched-fsync mode via `GRX_AUDIT_FSYNC_MODE=batched`.
         // Default stays PerWrite (bit-for-bit Phase A).
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Build
+        // the forwarder hub BEFORE the audit sink so the
+        // FileAuditSink construction can attach it via
+        // AuditChainConfig::with_forwarder_hub. The hub spawns one
+        // tokio worker per forwarder; both reference impls
+        // (SpoolFileForwarder / StderrJsonLinesForwarder) are
+        // off-by-default — flags opt in. When no forwarder is
+        // wired the hub Arc itself is None (zero overhead — no
+        // worker tasks).
+        let mut forwarders: Vec<
+            std::sync::Arc<dyn graphreact_observer::AuditForwarder>,
+        > = Vec::new();
+        if let Some(spool_path) = opts.observer_audit_forwarder_spool.as_ref() {
+            let spool =
+                graphreact_observer::SpoolFileForwarder::open(spool_path).map_err(|e| {
+                    CommandError::ClusterArg(format!(
+                        "observer-audit-forwarder-spool open {}: {e}",
+                        spool_path.display()
+                    ))
+                })?;
+            forwarders.push(std::sync::Arc::new(spool));
+        }
+        if opts.observer_audit_forwarder_stderr {
+            forwarders.push(std::sync::Arc::new(
+                graphreact_observer::StderrJsonLinesForwarder::new(),
+            ));
+        }
+        let forwarder_hub: Option<
+            std::sync::Arc<graphreact_observer::ForwarderHub>,
+        > = if forwarders.is_empty() {
+            None
+        } else {
+            Some(std::sync::Arc::new(graphreact_observer::ForwarderHub::new(
+                forwarders,
+                Some(metrics.clone()),
+                graphreact_observer::resolve_audit_forwarder_queue_depth(),
+            )))
+        };
         let audit_sink: Option<
             std::sync::Arc<dyn graphreact_observer::AuditSink>,
         > = match opts.observer_audit_log.as_ref() {
             Some(path) => {
-                let cfg = graphreact_observer::AuditChainConfig::new()
+                let mut cfg = graphreact_observer::AuditChainConfig::new()
                     .with_metrics(metrics.clone())
                     .from_env_overlay();
+                if let Some(hub) = forwarder_hub.as_ref() {
+                    cfg = cfg.with_forwarder_hub(hub.clone());
+                }
                 Some(std::sync::Arc::new(
                     graphreact_observer::FileAuditSink::open_with_config(path, cfg)
                         .map_err(|e| {
@@ -2437,6 +2609,13 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 // bearer dispatch through JwtVerifier::verify
                 // inside auth_layer_rbac.
                 jwt_verifier: jwt_verifier_handle.clone(),
+                // **M-Prod sub-track #1 Phase B Part 2 (Group
+                // 1d).** Thread the optional audit forwarder hub
+                // through SpawnOptions. `None` keeps audit fan-
+                // out limited to the in-process file + tracing
+                // surfaces; `Some` enables sidecar fan-out via
+                // SpoolFileForwarder + StderrJsonLinesForwarder.
+                forwarder_hub: forwarder_hub.clone(),
             },
         )
         .await
@@ -2602,6 +2781,12 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // require a daemon restart (live config reload is deferred
         // to gamma.next).
         jwks_path: opts.observer_jwks_path,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).**
+        // Retain the spool forwarder file path so the SIGHUP
+        // fan-out can call rotate_audit_forwarder_spool +
+        // atomic-rename without restarting the daemon. `None`
+        // keeps SIGHUP spool rotation a silent no-op.
+        audit_forwarder_spool_path: opts.observer_audit_forwarder_spool,
     })
 }
 
@@ -2891,6 +3076,10 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         // **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** `connect`
         // has no JWT bridge either; SIGHUP JWKS reload is a no-op.
         jwks_path: None,
+        // **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** `connect`
+        // has no audit forwarder surface either; SIGHUP spool
+        // rotation is a silent no-op on this path.
+        audit_forwarder_spool_path: None,
     };
     let _exit = drive_handle_until(&mut handle, duration).await?;
     handle.shutdown().await;
@@ -2978,6 +3167,7 @@ pub async fn drive_handle_until(
         || handle.tokens_path.is_some()
         || handle.audit_log_path.is_some()
         || handle.jwks_path.is_some()
+        || handle.audit_forwarder_spool_path.is_some()
     {
         use tokio::signal::unix::{signal, SignalKind};
         let stream = signal(SignalKind::hangup())
@@ -3058,6 +3248,16 @@ pub async fn drive_handle_until(
                 // Each reload runs independently — failure in one
                 // does NOT short-circuit the rest.
                 handle.rotate_audit_log();
+                // **M-Prod sub-track #1 Phase B Part 2 (Group
+                // 1d).** Spool rotation is a peer to audit-log
+                // rotation in chain semantics — run them
+                // together so a single SIGHUP rotates both
+                // file-shaped resources. Spool rotation goes
+                // RIGHT AFTER audit-log rotation so the
+                // subsequent token/JWKS/TLS reload audit events
+                // land in the FRESH spool behind the in-process
+                // file's `audit_log_rotated` boundary markers.
+                handle.rotate_audit_forwarder_spool();
                 handle.reload_tokens_from_disk();
                 handle.reload_jwks_from_disk();
                 handle.reload_tls_from_disk();

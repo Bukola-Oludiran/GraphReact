@@ -83,9 +83,11 @@ pub use otel::{
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
 
 pub use audit::{
-    log_audit_log_rotated, log_audit_log_rotation_failed, log_audit_log_rotation_skipped,
-    log_auth_success, log_authz_deny, log_jwks_reload_failed, log_jwks_reload_skipped,
-    log_jwks_reloaded, log_jwt_auth_fail, log_jwt_auth_success, log_tls_reload_skipped,
+    log_audit_forwarder_spool_rotated, log_audit_forwarder_spool_rotation_failed,
+    log_audit_forwarder_spool_rotation_skipped, log_audit_log_rotated,
+    log_audit_log_rotation_failed, log_audit_log_rotation_skipped, log_auth_success,
+    log_authz_deny, log_jwks_reload_failed, log_jwks_reload_skipped, log_jwks_reloaded,
+    log_jwt_auth_fail, log_jwt_auth_success, log_tls_reload_skipped,
     log_token_registry_reload_failed, log_token_registry_reload_skipped,
     log_token_registry_reloaded,
 };

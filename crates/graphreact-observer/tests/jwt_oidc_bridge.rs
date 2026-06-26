@@ -182,6 +182,7 @@ async fn spawn_with_jwt_bridge(
         rbac: Some(rbac),
         trusted_proxies: None,
         jwt_verifier: Some(jwt_verifier),
+        forwarder_hub: None,
     })
     .await
     .expect("spawn");
