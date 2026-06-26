@@ -544,6 +544,42 @@ pub enum ClusterOp {
         /// emitted.
         #[arg(long)]
         observer_tokens: Option<PathBuf>,
+        /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Path
+        /// to a JWKS JSON file (RFC 7517 §5) — the OIDC IdP's
+        /// public signing keys for the JWT-OIDC bridge. Required
+        /// alongside `--observer-jwt-config`. The two flags ship
+        /// together; the daemon fails fast if only one is set.
+        ///
+        /// File mode is NOT enforced (JWKS keys are public by
+        /// convention; ADR-0010 documents the deliberate
+        /// deviation). SIGHUP re-reads the JWKS file + atomic-
+        /// swaps the in-memory store without restarting the
+        /// daemon. On parse / validate failure the prior store
+        /// stays serving + a `jwks_reload_failed` audit row
+        /// emits.
+        #[arg(long)]
+        observer_jwks: Option<PathBuf>,
+        /// **M-Prod sub-track #1 Phase B Part 2 (Group 1c).** Path
+        /// to the JWT-OIDC bridge config JSON (acceptable issuers,
+        /// audiences, algorithm whitelist, leeway, role mapping).
+        /// File mode 0o600 IS enforced on Unix — the role mapping
+        /// determines who becomes admin, so the file gets the
+        /// same filesystem protection as the static-token
+        /// registry.
+        ///
+        /// Config changes require a daemon restart; SIGHUP
+        /// reloads the JWKS file only. When set, requires
+        /// `--observer-jwks` — the JWT bridge needs both halves.
+        ///
+        /// Bridges external OIDC IdP-issued JWTs (Okta / Auth0 /
+        /// Keycloak / AWS Cognito / Google etc.) into the multi-
+        /// token RBAC dispatch by mapping JWT claims onto the
+        /// existing Role::Admin / Role::ReadOnly / Role::Custom
+        /// vocabulary. eyJ-prefixed bearers route through JWT
+        /// verify FIRST; non-eyJ bearers dispatch through the
+        /// existing static-token walk unchanged.
+        #[arg(long, requires = "observer_jwks")]
+        observer_jwt_config: Option<PathBuf>,
         /// **M16-Backend P10.** Export OpenTelemetry traces to the
         /// given OTLP/gRPC endpoint (e.g. `http://localhost:4317`
         /// for a local OTel collector). When set, the daemon
