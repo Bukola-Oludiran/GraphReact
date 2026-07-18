@@ -41,8 +41,10 @@
 #![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use graphreact_engine_zig::EngineError;
+use graphreact_observer::MetricsInner;
 use graphreact_grx_parser::{
     ast::ComponentLang,
     multi_file::{resolve_multi_file, MultiFileResolved},
@@ -179,6 +181,13 @@ fn required_engines(resolved: &MultiFileResolved) -> Vec<EngineSlot> {
 /// run the first body batch (consistent with each per-engine
 /// `mount_with_scheduler` contract).
 pub fn mount_mixed(path: &Path) -> Result<MixedRuntime, RuntimeError> {
+    mount_mixed_with_secrets(path, None)
+}
+
+pub fn mount_mixed_with_secrets(
+    path: &Path,
+    secrets: Option<Arc<crate::runtime_secrets::RuntimeSecretContext>>,
+) -> Result<MixedRuntime, RuntimeError> {
     let resolved = resolve_multi_file(path)?;
     let required = required_engines(&resolved);
 
@@ -226,7 +235,10 @@ pub fn mount_mixed(path: &Path) -> Result<MixedRuntime, RuntimeError> {
                     engine = "jsc",
                     "MixedRuntime: bringing up JSC slot"
                 );
-                let runtime = match crate::jsruntime::mount_with_scheduler(path) {
+                let runtime = match crate::jsruntime::mount_with_scheduler_and_secrets(
+                    path,
+                    secrets.clone(),
+                ) {
                     Ok(r) => r,
                     Err(e) => {
                         // No previously-initialized engines to tear
@@ -247,7 +259,10 @@ pub fn mount_mixed(path: &Path) -> Result<MixedRuntime, RuntimeError> {
                     engine = "cpython",
                     "MixedRuntime: bringing up CPython slot"
                 );
-                let runtime = match crate::pyruntime::mount_with_scheduler(path) {
+                let runtime = match crate::pyruntime::mount_with_scheduler_and_secrets(
+                    path,
+                    secrets.clone(),
+                ) {
                     Ok(r) => r,
                     Err(e) => {
                         unwind_partial(&mut out);
@@ -268,7 +283,11 @@ pub fn mount_mixed(path: &Path) -> Result<MixedRuntime, RuntimeError> {
                     engine = "go",
                     "MixedRuntime: bringing up Go slot"
                 );
-                let runtime = match crate::goruntime::mount_with_scheduler(path, &go_out_dir) {
+                let runtime = match crate::goruntime::mount_with_scheduler_and_secrets(
+                    path,
+                    &go_out_dir,
+                    secrets.clone(),
+                ) {
                     Ok(r) => r,
                     Err(e) => {
                         unwind_partial(&mut out);
@@ -376,14 +395,33 @@ impl MixedRuntime {
     /// delivery is local-to-engine in M22 phase 1-4. Cross-engine
     /// messaging is M22 phase 5+.
     pub fn process_batch(&mut self) -> Result<(), graphreact_core::RuntimeError> {
+        self.process_batch_with_metrics(None)
+    }
+
+    /// Drive each active engine slot and optionally record its individual
+    /// wall-clock duration. Timing here (rather than around the mixed host)
+    /// keeps the bounded `engine` series attributable to the actual runtime.
+    pub fn process_batch_with_metrics(
+        &mut self,
+        metrics: Option<&MetricsInner>,
+    ) -> Result<(), graphreact_core::RuntimeError> {
         if let Some(r) = self.jsc.as_mut() {
-            r.process_batch()?;
+            let started = std::time::Instant::now();
+            let result = r.process_batch();
+            observe_batch_duration(metrics, "jsc", started.elapsed());
+            result?;
         }
         if let Some(r) = self.cpython.as_mut() {
-            r.process_batch()?;
+            let started = std::time::Instant::now();
+            let result = r.process_batch();
+            observe_batch_duration(metrics, "cpython", started.elapsed());
+            result?;
         }
         if let Some(r) = self.go.as_mut() {
-            r.process_batch()?;
+            let started = std::time::Instant::now();
+            let result = r.process_batch();
+            observe_batch_duration(metrics, "go", started.elapsed());
+            result?;
         }
         Ok(())
     }
@@ -578,6 +616,17 @@ impl MixedRuntime {
             lines.push(format!("go {}", r.engine.borrow().engine_version()));
         }
         lines.join("; ")
+    }
+}
+
+fn observe_batch_duration(
+    metrics: Option<&MetricsInner>,
+    engine: &'static str,
+    elapsed: std::time::Duration,
+) {
+    if let Some(metrics) = metrics {
+        let duration_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        metrics.engine_process_batch_duration_observe(engine, duration_ns);
     }
 }
 

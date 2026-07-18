@@ -38,6 +38,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use graphreact_core::runtime::types::Message;
@@ -127,6 +128,90 @@ pub struct ClusterConfig {
 /// while holding outbound channel senders.
 pub(crate) type AbortHandles = Arc<PLMutex<HashMap<String, oneshot::Sender<()>>>>;
 
+#[derive(Default)]
+struct ClusterDrainState {
+    draining: bool,
+    in_flight: usize,
+    restart_dispatches_in_flight: usize,
+}
+
+#[derive(Clone, Default)]
+struct ClusterDrainTracker {
+    state: Arc<PLMutex<ClusterDrainState>>,
+}
+
+impl ClusterDrainTracker {
+    fn try_enter(&self) -> Result<HandshakeGuard, DistError> {
+        let mut state = self.state.lock();
+        if state.draining {
+            return Err(DistError::Draining);
+        }
+        state.in_flight = state.in_flight.saturating_add(1);
+        drop(state);
+        Ok(HandshakeGuard {
+            tracker: self.clone(),
+        })
+    }
+
+    fn try_enter_restart_dispatch(
+        &self,
+    ) -> Result<RestartDispatchGuard, DelegatedRestartError> {
+        let mut state = self.state.lock();
+        if state.draining {
+            return Err(DelegatedRestartError::Draining);
+        }
+        state.restart_dispatches_in_flight =
+            state.restart_dispatches_in_flight.saturating_add(1);
+        drop(state);
+        Ok(RestartDispatchGuard {
+            tracker: self.clone(),
+        })
+    }
+
+    fn begin_drain(&self) -> bool {
+        let mut state = self.state.lock();
+        let first = !state.draining;
+        state.draining = true;
+        first
+    }
+
+    fn is_draining(&self) -> bool {
+        self.state.lock().draining
+    }
+
+    fn in_flight(&self) -> usize {
+        self.state.lock().in_flight
+    }
+
+    fn drain_quiesced(&self) -> bool {
+        let state = self.state.lock();
+        state.in_flight == 0 && state.restart_dispatches_in_flight == 0
+    }
+}
+
+struct HandshakeGuard {
+    tracker: ClusterDrainTracker,
+}
+
+impl Drop for HandshakeGuard {
+    fn drop(&mut self) {
+        let mut state = self.tracker.state.lock();
+        state.in_flight = state.in_flight.saturating_sub(1);
+    }
+}
+
+struct RestartDispatchGuard {
+    tracker: ClusterDrainTracker,
+}
+
+impl Drop for RestartDispatchGuard {
+    fn drop(&mut self) {
+        let mut state = self.tracker.state.lock();
+        state.restart_dispatches_in_flight =
+            state.restart_dispatches_in_flight.saturating_sub(1);
+    }
+}
+
 /// Live cluster instance. Holds the listener task + the registry +
 /// a `SchedulerHandle` for cross-thread inbound delivery.
 pub struct Cluster {
@@ -147,6 +232,10 @@ pub struct Cluster {
     dist_groups: DistGroups,
     listener_addr: SocketAddr,
     listener_task: JoinHandle<()>,
+    /// Admission/count state for graceful cluster quiescence.
+    /// `begin_drain` closes handshake and delegated-restart admission;
+    /// guards already admitted before the flip drain naturally.
+    drain_tracker: ClusterDrainTracker,
     /// **M14.7.** Cluster-wide tick + partition-detection task.
     /// Sends `Tick` packets and checks per-peer
     /// `last_tick_ms`; partitioned peers are removed under
@@ -225,7 +314,17 @@ struct PendingDelegatedRestart {
     peer_name: String,
     /// The child node id that was requested. Audited end-to-end.
     child_node_id: String,
+    /// Originator-side start time used for timeout/drain completion
+    /// duration reporting.
+    started: std::time::Instant,
 }
+
+/// Default originator-side lifetime for an outstanding delegated
+/// restart. After this bound the pending entry is removed and the
+/// result receiver resolves with `TimedOut`.
+pub const DEFAULT_DELEGATED_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
+
+const DELEGATED_RESTART_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// **Phase γ (M14.11).** Caller-facing handle returned by
 /// [`Cluster::send_delegated_restart_request`]. Carries the
@@ -240,10 +339,10 @@ pub struct DelegatedRestartHandle {
     /// Resolves when the responder's `RestartDelegationAck` arrives.
     pub ack: oneshot::Receiver<DelegatedRestartAckOutcome>,
     /// Resolves when the responder's `RestartDelegationResult`
-    /// arrives. Phase γ does NOT implement a local timeout —
-    /// callers wrap the receiver in `tokio::time::timeout` if they
-    /// want a deadline. Late `Result` packets that land after the
-    /// receiver is dropped log + drop on the inbound side.
+    /// arrives, or with a synthesized `TimedOut` result when the
+    /// originator deadline expires or cluster drain starts. Late wire
+    /// results are audited and ignored after the pending entry has
+    /// been removed.
     pub result: oneshot::Receiver<DelegatedRestartResultEvent>,
 }
 
@@ -274,6 +373,12 @@ pub struct DelegatedRestartResultEvent {
 /// failure modes that never produce a wire packet.
 #[derive(Debug, Clone, Error)]
 pub enum DelegatedRestartError {
+    /// Cluster drain admission has closed. This check precedes peer
+    /// and capability validation and no wire packet is produced.
+    /// Audited as `delegated_restart_blocked` with
+    /// `reason = "draining"`.
+    #[error("delegated_restart: cluster is draining")]
+    Draining,
     /// Negotiated capability bitmap does NOT include
     /// [`crate::CAP_DELEGATED_RESTART`] for this peer — either we
     /// didn't advertise it locally, or the peer didn't advertise it,
@@ -294,6 +399,114 @@ pub enum DelegatedRestartError {
     /// `reason = "outbound_channel"`.
     #[error("delegated_restart: outbound channel error to peer `{peer}`: {detail}")]
     OutboundChannel { peer: String, detail: String },
+}
+
+fn spawn_delegated_restart_cleanup(
+    pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
+    correlation_id: u64,
+    peer_name: String,
+    child_node_id: String,
+    timeout: Duration,
+) {
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let deadline = started + timeout;
+        loop {
+            let next_poll = std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + DELEGATED_RESTART_CLEANUP_POLL_INTERVAL,
+            );
+            tokio::time::sleep_until(next_poll).await;
+
+            let timed_out = tokio::time::Instant::now() >= deadline;
+            let mut removed = {
+                let mut entries = pending.lock();
+                let receiver_dropped = entries
+                    .get(&correlation_id)
+                    .and_then(|entry| entry.result_tx.as_ref())
+                    .is_some_and(oneshot::Sender::is_closed);
+                if timed_out || receiver_dropped {
+                    entries.remove(&correlation_id).map(|entry| (entry, receiver_dropped))
+                } else {
+                    None
+                }
+            };
+
+            let Some((mut entry, receiver_dropped)) = removed.take() else {
+                if !pending.lock().contains_key(&correlation_id) {
+                    return;
+                }
+                continue;
+            };
+            if receiver_dropped {
+                tracing::debug!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_cleanup",
+                    peer = %peer_name,
+                    child_node_id = %child_node_id,
+                    correlation_id,
+                    reason = "result_receiver_dropped",
+                    "abandoned delegated restart pending entry removed"
+                );
+                return;
+            }
+
+            let duration_ms =
+                u64::try_from(entry.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Some(result_tx) = entry.result_tx.take() {
+                let _ = result_tx.send(DelegatedRestartResultEvent {
+                    outcome: DelegatedRestartResultOutcome::TimedOut,
+                    duration_ms,
+                });
+            }
+            tracing::warn!(
+                target: "graphreact::observer::audit",
+                event = "delegated_restart_completed",
+                peer = %peer_name,
+                child_node_id = %child_node_id,
+                correlation_id,
+                outcome = "timed_out",
+                error_kind = "",
+                reason = "originator_timeout",
+                duration_ms,
+                "delegated restart timed out at originator"
+            );
+            return;
+        }
+    });
+}
+
+fn cancel_pending_delegated_restarts_for_drain(
+    pending: &Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
+) -> usize {
+    let entries = {
+        let mut pending = pending.lock();
+        std::mem::take(&mut *pending)
+    };
+    let count = entries.len();
+    for (correlation_id, mut entry) in entries {
+        let duration_ms =
+            u64::try_from(entry.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(result_tx) = entry.result_tx.take() {
+            let _ = result_tx.send(DelegatedRestartResultEvent {
+                outcome: DelegatedRestartResultOutcome::TimedOut,
+                duration_ms,
+            });
+        }
+        tracing::warn!(
+            target: "graphreact::observer::audit",
+            event = "delegated_restart_completed",
+            peer = %entry.peer_name,
+            child_node_id = %entry.child_node_id,
+            correlation_id,
+            outcome = "timed_out",
+            error_kind = "",
+            reason = "drain_started",
+            duration_ms,
+            "delegated restart cancelled because cluster drain started"
+        );
+    }
+    count
 }
 
 impl Cluster {
@@ -443,6 +656,7 @@ impl Cluster {
         let delegated_restart_pending: Arc<
             PLMutex<HashMap<u64, PendingDelegatedRestart>>,
         > = Arc::new(PLMutex::new(HashMap::new()));
+        let drain_tracker = ClusterDrainTracker::default();
 
         // Spawn accept loop. Each accepted TCP connection runs
         // through TLS handshake + cookie handshake before being
@@ -456,6 +670,7 @@ impl Cluster {
         let accept_reload_sink = reload_sink_for_accept.clone();
         let accept_telemetry_sink = telemetry_sink.clone();
         let accept_delegated_pending = Arc::clone(&delegated_restart_pending);
+        let accept_drain_tracker = drain_tracker.clone();
         let listener_task = tokio::spawn(async move {
             run_accept_loop(
                 listener,
@@ -468,6 +683,7 @@ impl Cluster {
                 accept_reload_sink,
                 accept_telemetry_sink,
                 accept_delegated_pending,
+                accept_drain_tracker,
             )
             .await;
         });
@@ -618,6 +834,7 @@ impl Cluster {
             dist_groups,
             listener_addr,
             listener_task,
+            drain_tracker,
             tick_loop_task,
             abort_handles,
             peer_states,
@@ -661,17 +878,19 @@ impl Cluster {
     /// **M-Prod sub-track #4 Phase γ (M14.11).** Issue a cross-node
     /// delegated-restart request to the named peer.
     ///
-    /// Validation order (precedence: cap > peer-presence > outbound):
-    /// 1. Look up the peer in the registry. Missing → `UnknownPeer`,
+    /// Validation order (precedence: drain > cap > peer-presence > outbound):
+    /// 1. Enter the cluster drain-admission gate. Closed → `Draining`,
+    ///    audit `delegated_restart_blocked reason=draining`.
+    /// 2. Look up the peer in the registry. Missing → `UnknownPeer`,
     ///    audit `delegated_restart_blocked reason=unknown_peer`.
-    /// 2. Check the negotiated `effective_capabilities & CAP_DELEGATED_RESTART`.
+    /// 3. Check the negotiated `effective_capabilities & CAP_DELEGATED_RESTART`.
     ///    Missing → `CapabilityNotNegotiated`, audit
     ///    `delegated_restart_blocked reason=cap_not_negotiated`.
-    /// 3. Allocate a fresh correlation id + version, build the
+    /// 4. Allocate a fresh correlation id + version, build the
     ///    `RestartDelegationRequest` packet, ship via `peer.send_tx.try_send`.
     ///    On full/closed channel → `OutboundChannel`, audit
     ///    `delegated_restart_blocked reason=outbound_channel`.
-    /// 4. On success, audit `delegated_restart_issued`, register the
+    /// 5. On success, audit `delegated_restart_issued`, register the
     ///    in-flight entry in `delegated_restart_pending`, return
     ///    [`DelegatedRestartHandle`] with the `ack` and `result` one-shots.
     ///
@@ -685,8 +904,42 @@ impl Cluster {
         reason_code: DelegatedRestartReasonCode,
         token_id: impl Into<String>,
     ) -> Result<DelegatedRestartHandle, DelegatedRestartError> {
+        self.send_delegated_restart_request_with_timeout(
+            peer_name,
+            child_node_id,
+            reason_code,
+            token_id,
+            DEFAULT_DELEGATED_RESTART_TIMEOUT,
+        )
+    }
+
+    /// Issue a delegated restart with an explicit originator-side
+    /// completion deadline. The default method delegates here with
+    /// [`DEFAULT_DELEGATED_RESTART_TIMEOUT`].
+    pub fn send_delegated_restart_request_with_timeout(
+        &self,
+        peer_name: &str,
+        child_node_id: impl Into<String>,
+        reason_code: DelegatedRestartReasonCode,
+        token_id: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<DelegatedRestartHandle, DelegatedRestartError> {
         let child_node_id = child_node_id.into();
         let token_id = token_id.into();
+        let _dispatch = match self.drain_tracker.try_enter_restart_dispatch() {
+            Ok(guard) => guard,
+            Err(err) => {
+                tracing::warn!(
+                    target: "graphreact::observer::audit",
+                    event = "delegated_restart_blocked",
+                    peer = peer_name,
+                    child_node_id = %child_node_id,
+                    reason = "draining",
+                    "delegated restart blocked: cluster draining"
+                );
+                return Err(err);
+            }
+        };
         let Some(peer_handle) = self.registry.get_by_name(peer_name) else {
             tracing::warn!(
                 target: "graphreact::observer::audit",
@@ -733,6 +986,7 @@ impl Cluster {
                     result_tx: Some(result_tx),
                     peer_name: peer_name.to_string(),
                     child_node_id: child_node_id.clone(),
+                    started: std::time::Instant::now(),
                 },
             );
         }
@@ -761,6 +1015,22 @@ impl Cluster {
                     version,
                     "delegated restart issued"
                 );
+                spawn_delegated_restart_cleanup(
+                    Arc::clone(&self.delegated_restart_pending),
+                    correlation_id,
+                    peer_name.to_string(),
+                    child_node_id.clone(),
+                    timeout,
+                );
+                // A dispatch admitted just before `begin_drain` can
+                // race the initial pending-map sweep. If drain won
+                // after our admission but before this queue attempt
+                // completed, cancel the newly inserted entry now.
+                if self.drain_tracker.is_draining() {
+                    cancel_pending_delegated_restarts_for_drain(
+                        &self.delegated_restart_pending,
+                    );
+                }
                 Ok(DelegatedRestartHandle {
                     correlation_id,
                     peer_name: peer_name.to_string(),
@@ -800,6 +1070,7 @@ impl Cluster {
         addr: SocketAddr,
         expected_peer: NodeId,
     ) -> Result<(), DistError> {
+        let _handshake = self.drain_tracker.try_enter()?;
         let mut conn = dial(addr, expected_peer.name(), &self.config.tls).await?;
         let result = client_handshake(
             &mut conn,
@@ -849,6 +1120,7 @@ impl Cluster {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let _handshake = self.drain_tracker.try_enter()?;
         let mut conn = dial_over(stream, expected_peer.name(), &self.config.tls).await?;
         let result = client_handshake(
             &mut conn,
@@ -892,6 +1164,7 @@ impl Cluster {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let _handshake = self.drain_tracker.try_enter()?;
         let mut conn = accept_over(stream, &self.config.tls).await?;
         let result = server_handshake(
             &mut conn,
@@ -924,6 +1197,39 @@ impl Cluster {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.listener_addr
+    }
+
+    /// Stop admitting new inbound/outbound handshakes and delegated
+    /// restart dispatches, and resolve outstanding delegated restart
+    /// results as `TimedOut`, while leaving established peer
+    /// connections alive. Returns `true` only for the first transition.
+    pub fn begin_drain(&self) -> bool {
+        let first = self.drain_tracker.begin_drain();
+        self.listener_task.abort();
+        cancel_pending_delegated_restarts_for_drain(&self.delegated_restart_pending);
+        first
+    }
+
+    /// Number of TLS/cookie handshakes admitted before drain that
+    /// have not yet completed or failed.
+    #[must_use]
+    pub fn handshakes_in_flight(&self) -> usize {
+        self.drain_tracker.in_flight()
+    }
+
+    /// Whether no admitted handshake remains. Callers normally invoke
+    /// this after [`Self::begin_drain`].
+    #[must_use]
+    pub fn handshakes_quiesced(&self) -> bool {
+        self.handshakes_in_flight() == 0
+    }
+
+    /// Whether all cluster work admitted before [`Self::begin_drain`]
+    /// has left its admission-critical path. Established peer
+    /// connections are intentionally excluded.
+    #[must_use]
+    pub fn drain_quiesced(&self) -> bool {
+        self.drain_tracker.drain_quiesced() && self.delegated_restart_pending.lock().is_empty()
     }
 
     pub fn registry(&self) -> &NodeRegistry {
@@ -1472,6 +1778,7 @@ async fn run_accept_loop(
     reload_sink: RemoteReloadSink,
     telemetry_sink: TelemetrySinkSlot,
     delegated_restart_pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
+    drain_tracker: ClusterDrainTracker,
 ) {
     loop {
         let conn = match listener.accept().await {
@@ -1480,6 +1787,15 @@ async fn run_accept_loop(
                 tracing::warn!("dist: accept error: {e}");
                 continue;
             }
+        };
+        let handshake_guard = match drain_tracker.try_enter() {
+            Ok(guard) => guard,
+            Err(DistError::Draining) => {
+                let conn = conn;
+                let _ = conn.close().await;
+                break;
+            }
+            Err(_) => unreachable!("handshake admission has only a draining error"),
         };
         let config = Arc::clone(&config);
         let registry = registry.clone();
@@ -1502,6 +1818,7 @@ async fn run_accept_loop(
                 reload_sink,
                 telemetry_sink,
                 delegated_restart_pending,
+                handshake_guard,
             )
             .await;
         });
@@ -1520,6 +1837,7 @@ async fn handle_inbound(
     reload_sink: RemoteReloadSink,
     telemetry_sink: TelemetrySinkSlot,
     delegated_restart_pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>>,
+    _handshake_guard: HandshakeGuard,
 ) {
     let result = match server_handshake(
         &mut conn,
@@ -2112,6 +2430,114 @@ mod tests {
     use graphreact_core::{NodeDefinition, Scheduler};
     use std::sync::Mutex;
     use std::time::Duration;
+
+    #[test]
+    fn cluster_drain_tracker_closes_admission_and_counts_existing_guards() {
+        let tracker = ClusterDrainTracker::default();
+        let guard = tracker.try_enter().expect("pre-drain admission");
+        let dispatch = tracker
+            .try_enter_restart_dispatch()
+            .expect("pre-drain restart dispatch admission");
+        assert_eq!(tracker.in_flight(), 1);
+        assert!(tracker.begin_drain());
+        assert!(!tracker.begin_drain());
+        assert!(matches!(tracker.try_enter(), Err(DistError::Draining)));
+        assert!(matches!(
+            tracker.try_enter_restart_dispatch(),
+            Err(DelegatedRestartError::Draining)
+        ));
+        assert!(!tracker.drain_quiesced());
+        assert_eq!(tracker.in_flight(), 1, "existing handshake remains tracked");
+        drop(guard);
+        assert_eq!(tracker.in_flight(), 0);
+        assert!(!tracker.drain_quiesced(), "restart dispatch remains tracked");
+        drop(dispatch);
+        assert!(tracker.drain_quiesced());
+    }
+
+    #[tokio::test]
+    async fn cluster_drain_rejects_new_handshakes_and_waits_for_admitted_one() {
+        let alice_id: NodeId = "alice@127.0.0.1".parse().unwrap();
+        let bob_id: NodeId = "bob@127.0.0.1".parse().unwrap();
+        let (alice_tls, _bob_tls) = dev_tls::pair("alice", "bob").unwrap();
+        let mut scheduler = Scheduler::new(CommunicationGraph::new());
+        scheduler.start().unwrap();
+        let cluster = Cluster::start(
+            ClusterConfig {
+                node_id: alice_id,
+                creation: Creation(1),
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                cookie: SecretCookie::from_bytes(b"shared".to_vec()).unwrap(),
+                tls: alice_tls.config.clone(),
+                capabilities: vec![],
+                capabilities_bitmap: 0,
+                net_tick: NetTickConfig::default(),
+                net_split_policy: NetSplitPolicy::default(),
+            },
+            &mut scheduler,
+        )
+        .await
+        .expect("alice cluster start");
+
+        // Leave the server half idle so the outbound TLS handshake
+        // is admitted but cannot complete.
+        {
+            let (client, server) = tokio::io::duplex(1_024);
+            let handshake = cluster.connect_with_stream(client, bob_id.clone());
+            tokio::pin!(handshake);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut handshake)
+                    .await
+                    .is_err(),
+                "idle peer should leave the TLS handshake pending"
+            );
+            assert_eq!(cluster.handshakes_in_flight(), 1);
+
+            let (ack_tx, _ack_rx) = oneshot::channel();
+            let (result_tx, result_rx) = oneshot::channel();
+            cluster.delegated_restart_pending.lock().insert(
+                77,
+                PendingDelegatedRestart {
+                    ack_tx: Some(ack_tx),
+                    result_tx: Some(result_tx),
+                    peer_name: "bob".into(),
+                    child_node_id: "worker".into(),
+                    started: std::time::Instant::now(),
+                },
+            );
+
+            assert!(cluster.begin_drain(), "first call closes admission");
+            assert!(!cluster.begin_drain(), "drain transition is idempotent");
+            assert!(!cluster.handshakes_quiesced());
+            let cancelled = result_rx.await.expect("drain cancellation result");
+            assert!(matches!(
+                cancelled.outcome,
+                DelegatedRestartResultOutcome::TimedOut
+            ));
+            assert!(cluster.delegated_restart_pending.lock().is_empty());
+
+            let (fresh_client, _fresh_server) = tokio::io::duplex(1_024);
+            assert!(matches!(
+                cluster
+                    .connect_with_stream(fresh_client, bob_id.clone())
+                    .await,
+                Err(DistError::Draining)
+            ));
+            let (fresh_server, _fresh_client) = tokio::io::duplex(1_024);
+            assert!(matches!(
+                cluster.accept_stream(fresh_server).await,
+                Err(DistError::Draining)
+            ));
+
+            drop(server);
+            assert!(
+                handshake.await.is_err(),
+                "closing the idle peer should fail the admitted handshake"
+            );
+            assert!(cluster.handshakes_quiesced());
+        }
+        cluster.shutdown();
+    }
 
     /// **M14.4 acceptance gate.** Two `Cluster` instances on
     /// in-process loopback. `pinger@alice` emits 100 `ping`s to
@@ -4517,6 +4943,72 @@ mod tests {
         use std::sync::Mutex as StdMutex;
         use std::time::Duration;
 
+        #[tokio::test]
+        async fn originator_timeout_synthesizes_result_and_removes_pending_entry() {
+            let pending = Arc::new(PLMutex::new(HashMap::new()));
+            let (ack_tx, _ack_rx) = oneshot::channel();
+            let (result_tx, result_rx) = oneshot::channel();
+            pending.lock().insert(
+                7,
+                PendingDelegatedRestart {
+                    ack_tx: Some(ack_tx),
+                    result_tx: Some(result_tx),
+                    peer_name: "bob".into(),
+                    child_node_id: "worker".into(),
+                    started: std::time::Instant::now(),
+                },
+            );
+            spawn_delegated_restart_cleanup(
+                Arc::clone(&pending),
+                7,
+                "bob".into(),
+                "worker".into(),
+                Duration::from_millis(20),
+            );
+
+            let event = tokio::time::timeout(Duration::from_secs(1), result_rx)
+                .await
+                .expect("cleanup timeout")
+                .expect("result sender");
+            assert!(matches!(event.outcome, DelegatedRestartResultOutcome::TimedOut));
+            assert!(event.duration_ms >= 20);
+            assert!(!pending.lock().contains_key(&7));
+        }
+
+        #[tokio::test]
+        async fn dropped_result_receiver_is_garbage_collected_before_deadline() {
+            let pending = Arc::new(PLMutex::new(HashMap::new()));
+            let (ack_tx, _ack_rx) = oneshot::channel();
+            let (result_tx, result_rx) = oneshot::channel();
+            pending.lock().insert(
+                8,
+                PendingDelegatedRestart {
+                    ack_tx: Some(ack_tx),
+                    result_tx: Some(result_tx),
+                    peer_name: "bob".into(),
+                    child_node_id: "worker".into(),
+                    started: std::time::Instant::now(),
+                },
+            );
+            drop(result_rx);
+            spawn_delegated_restart_cleanup(
+                Arc::clone(&pending),
+                8,
+                "bob".into(),
+                "worker".into(),
+                Duration::from_secs(5),
+            );
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pending.lock().contains_key(&8) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("abandoned entry cleanup");
+            assert!(!pending.lock().contains_key(&8));
+        }
+
         async fn drive_until<F: FnMut() -> bool>(
             schedulers: &mut [&mut Scheduler],
             mut cond: F,
@@ -4822,6 +5314,17 @@ mod tests {
                 DelegatedRestartError::UnknownPeer { peer } => assert_eq!(peer, "ghost"),
                 other => panic!("expected UnknownPeer, got {other:?}"),
             }
+
+            assert!(alice_cluster.begin_drain());
+            let err = alice_cluster
+                .send_delegated_restart_request(
+                    "ghost",
+                    "worker",
+                    DelegatedRestartReasonCode::OperatorRequest,
+                    "",
+                )
+                .expect_err("drain gate should precede unknown-peer validation");
+            assert!(matches!(err, DelegatedRestartError::Draining));
             alice_cluster.shutdown();
         }
 
@@ -5063,6 +5566,49 @@ mod tests {
                 outbound_rx.try_recv().is_err(),
                 "no Ack should be shipped on forged-origin packet"
             );
+        }
+
+        #[test]
+        fn late_result_after_timeout_is_ignored_without_recreating_pending_state() {
+            let scheduler = Scheduler::new(CommunicationGraph::new());
+            let handle = scheduler.handle();
+            let pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>> =
+                Arc::new(PLMutex::new(HashMap::new()));
+            let (outbound_tx, _outbound_rx) = mpsc::channel::<Packet>(8);
+            let supervision = RemoteSupervision::new(
+                handle.clone(),
+                NodeRegistry::new(),
+                "alice".to_string(),
+                Creation(1),
+            );
+            let dist_groups = DistGroups::new(
+                handle.clone(),
+                NodeRegistry::new(),
+                "alice".to_string(),
+            );
+            let reload_sink = RemoteReloadSink::new();
+            let telemetry_sink = TelemetrySinkSlot::new();
+
+            dispatch_inbound(
+                Packet::RestartDelegationResult(RestartDelegationResult {
+                    origin: "bob".into(),
+                    correlation_id: 99,
+                    outcome: DelegatedRestartResultOutcome::Completed,
+                    duration_ms: 250,
+                }),
+                "bob",
+                "alice",
+                &handle,
+                &supervision,
+                &dist_groups,
+                &reload_sink,
+                &telemetry_sink,
+                CAP_DELEGATED_RESTART,
+                &outbound_tx,
+                &pending,
+            );
+
+            assert!(pending.lock().is_empty());
         }
     }
 }

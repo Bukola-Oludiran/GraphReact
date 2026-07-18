@@ -140,6 +140,45 @@ pub enum SnapshotRequest {
         correlation_id: String,
         oneshot_tx: oneshot::Sender<InjectMessageWithReplyDisposition>,
     },
+    /// **M-Prod sub-track #4 Phase γ.next.** Admin-authorized request
+    /// to issue a delegated restart through the daemon-owned Cluster.
+    /// The observer crate deliberately carries only transport-neutral
+    /// strings/result variants; graphreact-cli maps them to the dist
+    /// crate's typed API on the daemon thread.
+    DelegatedRestart {
+        peer: String,
+        child_node_id: String,
+        token_id: String,
+        oneshot_tx: oneshot::Sender<DelegatedRestartDispatchResult>,
+    },
+}
+
+/// Immediate originator-side disposition for the delegated-restart
+/// management endpoint. A successful response means the wire request
+/// was queued; Ack/Result completion remains observable through the
+/// delegated-restart audit stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegatedRestartDispatchResult {
+    Accepted { correlation_id: u64, peer: String },
+    Draining,
+    UnknownPeer,
+    CapabilityNotNegotiated,
+    OutboundUnavailable,
+}
+
+/// JSON request accepted by `POST /v1/admin/cluster/delegated-restart`.
+/// The endpoint always stamps the wire reason as `operator_request`;
+/// callers cannot impersonate supervisor/reload/health-check causes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DelegatedRestartBody {
+    pub peer: String,
+    pub child_node_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedPrincipal {
+    token_id: String,
+    is_admin: bool,
 }
 
 /// **M-Ingress phase 2.** Initial drain disposition for a call —
@@ -496,6 +535,9 @@ pub struct ApiState {
     /// at least one peer dialed) so the same probe shape works for
     /// both single-node and multi-node deployments.
     pub cluster_readyz: Option<Arc<ClusterReadyzProbe>>,
+    /// Present only for TLS-enabled listeners. Readiness returns
+    /// `tls_rotation_in_progress` while any reload guard is alive.
+    pub tls_readiness: Option<crate::TlsReadiness>,
     /// **M-Prod sub-track #1 Phase A.** Hash-chained tamper-evident
     /// audit sink. `None` for the default test + embedding path:
     /// the existing `target="graphreact::observer::audit"` tracing
@@ -654,13 +696,14 @@ pub const DEFAULT_RATE_LIMIT_PER_TOKEN_BURST: u32 = 40;
 /// route match happens), so `MatchedPath` is NOT in extensions on
 /// the request path. Instead, the middleware uses
 /// [`classify_protected_path`] which performs a small fixed-shape
-/// match against the 11 known patterns + a `unknown` sentinel for
+/// match against the 12 known patterns + an `unknown` sentinel for
 /// anything outside the table (e.g. an operator typoing `/v1/foo`).
 ///
-/// Cardinality bound is exactly `11 + 1 = 12` for the rate-limit
+/// Cardinality bound is exactly `12 + 1 = 13` for the rate-limit
 /// metric family — well under the conventional Prometheus
 /// per-family soft cap of ~10k.
 pub const PROTECTED_ROUTE_LABELS: &[&str] = &[
+    "/v1/admin/cluster/delegated-restart",
     "/v1/identity",
     "/v1/metrics",
     "/v1/nodes",
@@ -689,6 +732,7 @@ pub const PROTECTED_ROUTE_LABELS: &[&str] = &[
 #[must_use]
 pub fn classify_protected_path(path: &str) -> &'static str {
     match path {
+        "/v1/admin/cluster/delegated-restart" => "/v1/admin/cluster/delegated-restart",
         "/v1/identity" => "/v1/identity",
         "/v1/metrics" => "/v1/metrics",
         "/v1/nodes" => "/v1/nodes",
@@ -785,6 +829,9 @@ pub struct ApiServerHandle {
     /// ACME, today's tests) call that method to swap in a new
     /// cert without restarting the daemon.
     pub tls: Option<crate::RotatableServerConfig>,
+    /// Shared TLS reload readiness state. `None` on plaintext
+    /// loopback listeners, which have no certificate prerequisite.
+    pub tls_readiness: Option<crate::TlsReadiness>,
     /// **M-Prod sub-track #1 Phase A.** Audit sink wired through
     /// [`SpawnOptions::audit_sink`]. Surfaced on the handle so
     /// [`Self::reload_tls`] can fan the
@@ -868,6 +915,7 @@ impl ApiServerHandle {
         cert_pem: &[u8],
         key_pem: &[u8],
     ) -> Result<(), crate::TlsRotationError> {
+        let _rotation = self.begin_tls_rotation();
         let sink = self.audit_sink.as_ref();
         crate::audit::log_tls_reload_attempt(cert_pem.len(), key_pem.len(), sink);
         let Some(handle) = self.tls.as_ref() else {
@@ -913,6 +961,15 @@ impl ApiServerHandle {
         let fp = leaf_fingerprint.as_deref().unwrap_or("unavailable");
         crate::audit::log_tls_reload_success(fp, sink);
         Ok(())
+    }
+
+    /// Mark the complete TLS reload window (including caller-side
+    /// cert/key reads) as not-ready. Nested with `reload_tls` safely.
+    #[must_use]
+    pub fn begin_tls_rotation(&self) -> Option<crate::TlsRotationGuard> {
+        self.tls_readiness
+            .as_ref()
+            .map(crate::TlsReadiness::begin_rotation)
     }
 }
 
@@ -1234,6 +1291,10 @@ pub fn build_router_with_rate_limit_and_proxies(
     };
 
     let protected_routes = Router::new()
+        .route(
+            "/v1/admin/cluster/delegated-restart",
+            post(delegated_restart_handler),
+        )
         .route("/v1/identity", get(identity))
         .route("/v1/metrics", get(metrics))
         .route("/v1/nodes", get(nodes_list))
@@ -1843,6 +1904,7 @@ pub async fn spawn_with_options(
     let idempotency_cache = Arc::new(IdempotencyCache::new());
     let pending_calls = PendingCalls::new();
     let ingress_in_flight = IngressInFlight::new();
+    let tls_readiness = bind.tls.as_ref().map(|_| crate::TlsReadiness::new());
     let state = ApiState {
         metrics,
         snapshot_tx,
@@ -1858,6 +1920,7 @@ pub async fn spawn_with_options(
         // threads the real probe through. `None` here keeps single-
         // node + no-cluster tests passing without a synthetic probe.
         cluster_readyz,
+        tls_readiness: tls_readiness.clone(),
         // **M-Prod sub-track #1 Phase A.** Audit sink defaults to
         // `None` unless `spawn_with_options` was called with a
         // pre-constructed sink (typically `FileAuditSink` opened
@@ -1953,6 +2016,7 @@ pub async fn spawn_with_options(
         idempotency_cache,
         pending_calls,
         tls: tls_handle,
+        tls_readiness,
         // **M-Prod sub-track #1 Phase A.** Surfaced on the handle so
         // `reload_tls` can fan TLS-rotation events to the same sink
         // the accept-loop bind event already lands on.
@@ -2187,6 +2251,16 @@ async fn readyz(State(state): State<ApiState>) -> Response {
         )
             .into_response();
     }
+    if !state.metrics.audit_sink_write_failures.is_empty() {
+        return not_ready("audit_sink_failed");
+    }
+    if state
+        .tls_readiness
+        .as_ref()
+        .is_some_and(crate::TlsReadiness::is_rotating)
+    {
+        return not_ready("tls_rotation_in_progress");
+    }
     let batches = state.metrics.process_batch_duration.snapshot().count;
     let bridge_capacity = state.snapshot_tx.capacity();
     // **M-Prod sub-track #5.** Cluster-membership predicate.
@@ -2215,16 +2289,20 @@ async fn readyz(State(state): State<ApiState>) -> Response {
             // scheduler backpressure).
             "cluster_no_peers_connected"
         };
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [
-                (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                (axum::http::header::RETRY_AFTER, "1"),
-            ],
-            reason,
-        )
-            .into_response()
+        not_ready(reason)
     }
+}
+
+fn not_ready(reason: &'static str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (axum::http::header::RETRY_AFTER, "1"),
+        ],
+        reason,
+    )
+        .into_response()
 }
 
 /// **M-Prod sub-track #4 Phase α.** Backpressure-shaped 503 for
@@ -2469,6 +2547,124 @@ async fn inject_message_handler(
     }
 }
 
+/// Issue an operator-driven cross-node delegated restart. The RBAC
+/// middleware must attach an authenticated Admin principal; legacy
+/// single-token auth and Custom roles are intentionally insufficient.
+async fn delegated_restart_handler(
+    State(state): State<ApiState>,
+    principal: Option<axum::extract::Extension<AuthenticatedPrincipal>>,
+    Json(body): Json<DelegatedRestartBody>,
+) -> Response {
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
+        return drain_in_progress_response();
+    }
+    let Some(axum::extract::Extension(principal)) = principal else {
+        crate::audit::log_authz_deny(
+            "<legacy>",
+            "/v1/admin/cluster/delegated-restart",
+            "legacy",
+            "admin_role_required",
+            state.audit_sink.as_ref(),
+        );
+        return forbidden_admin_response();
+    };
+    if !principal.is_admin {
+        crate::audit::log_authz_deny(
+            &principal.token_id,
+            "/v1/admin/cluster/delegated-restart",
+            "custom",
+            "admin_role_required",
+            state.audit_sink.as_ref(),
+        );
+        return forbidden_admin_response();
+    }
+    if body.peer.trim().is_empty() || body.child_node_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "error": "invalid_delegated_restart",
+                "reason": "peer and child_node_id must be non-empty",
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let request = SnapshotRequest::DelegatedRestart {
+        peer: body.peer,
+        child_node_id: body.child_node_id,
+        token_id: principal.token_id,
+        oneshot_tx: tx,
+    };
+    match state.snapshot_tx.try_send(request) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => return bridge_saturated_response(),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return service_unavailable("scheduler bridge closed");
+        }
+    }
+    match rx.await {
+        Ok(DelegatedRestartDispatchResult::Accepted {
+            correlation_id,
+            peer,
+        }) => (
+            StatusCode::ACCEPTED,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "status": "accepted",
+                "correlation_id": correlation_id,
+                "peer": peer,
+            })
+            .to_string(),
+        )
+            .into_response(),
+        Ok(DelegatedRestartDispatchResult::Draining) => drain_in_progress_response(),
+        Ok(DelegatedRestartDispatchResult::UnknownPeer) => delegated_restart_error_response(
+            StatusCode::NOT_FOUND,
+            "unknown_peer",
+        ),
+        Ok(DelegatedRestartDispatchResult::CapabilityNotNegotiated) => {
+            delegated_restart_error_response(StatusCode::CONFLICT, "capability_not_negotiated")
+        }
+        Ok(DelegatedRestartDispatchResult::OutboundUnavailable) => {
+            delegated_restart_outbound_unavailable_response()
+        }
+        Err(_) => service_unavailable("scheduler bridge dropped response"),
+    }
+}
+
+fn forbidden_admin_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "error": "admin_role_required" }).to_string(),
+    )
+        .into_response()
+}
+
+fn delegated_restart_error_response(status: StatusCode, error: &'static str) -> Response {
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "error": error }).to_string(),
+    )
+        .into_response()
+}
+
+fn delegated_restart_outbound_unavailable_response() -> Response {
+    let mut response = delegated_restart_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "outbound_unavailable",
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static("1"),
+    );
+    response
+}
+
 /// **M-Ingress phase 2.** Cap the per-call timeout at 5 minutes
 /// to bound resource consumption (PendingCalls registry slots +
 /// scheduler thread bridge entries). Operators wanting longer
@@ -2480,6 +2676,24 @@ const MAX_CALL_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
 /// client default-read timeouts so callers see a clean 504 rather
 /// than a TCP-level hang on stuck handlers.
 const DEFAULT_CALL_TIMEOUT_MS: u64 = 30_000;
+
+async fn wait_for_drain_deadline(
+    receiver: &mut Option<tokio::sync::watch::Receiver<Option<crate::drain::DrainDeadline>>>,
+) -> u64 {
+    let Some(receiver) = receiver.as_mut() else {
+        return std::future::pending::<u64>().await;
+    };
+    loop {
+        let deadline = { *receiver.borrow_and_update() };
+        if let Some(deadline) = deadline {
+            tokio::time::sleep_until(deadline.at).await;
+            return deadline.budget_ms;
+        }
+        if receiver.changed().await.is_err() {
+            return std::future::pending::<u64>().await;
+        }
+    }
+}
 
 /// **M-Ingress phase 2.** `POST /v1/nodes/:id/call` handler.
 ///
@@ -2494,10 +2708,10 @@ const DEFAULT_CALL_TIMEOUT_MS: u64 = 30_000;
 ///    [`SnapshotRequest::InjectMessageWithReply`]. The drain
 ///    handler validates `accepts_external_call` for a matching
 ///    `(request_type, reply_type)` pair; mismatch → 403.
-/// 4. Wrap the `oneshot::Receiver<Value>` in a `tokio::time::timeout`
-///    capped at [`MAX_CALL_TIMEOUT_MS`]. On reply, return 200 +
-///    payload. On timeout, return 504; the registry guard's Drop
-///    handles eviction.
+/// 4. Race scheduler disposition and reply waiting against the
+///    published drain deadline; also cap reply waiting at
+///    [`MAX_CALL_TIMEOUT_MS`]. On reply, return 200 + payload. On
+///    either timeout, return 504; the registry guard's Drop evicts.
 async fn inject_call_handler(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -2514,6 +2728,13 @@ async fn inject_call_handler(
     if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
         return drain_in_progress_response();
     }
+    // Subscribe immediately after the admission check. If drain
+    // races this point, watch subscription snapshots the published
+    // deadline and the admitted call is still bounded by it.
+    let mut drain_deadline = state
+        .draining
+        .as_ref()
+        .map(DrainFlag::subscribe_deadline);
     let _inflight = state.ingress_in_flight.enter();
     // Server-side correlation_id mint. UUIDv4 keeps the space
     // wide enough that operator-driven `correlation_id` reuse is
@@ -2563,11 +2784,17 @@ async fn inject_call_handler(
             return service_unavailable("scheduler bridge closed");
         }
     }
-    let disposition = match disp_rx.await {
-        Ok(d) => d,
-        Err(_) => {
+    let disposition = tokio::select! {
+        result = disp_rx => match result {
+            Ok(disposition) => disposition,
+            Err(_) => {
+                drop(guard);
+                return service_unavailable("scheduler bridge dropped response");
+            }
+        },
+        drain_timeout_ms = wait_for_drain_deadline(&mut drain_deadline) => {
             drop(guard);
-            return service_unavailable("scheduler bridge dropped response");
+            return drain_call_timeout_response(drain_timeout_ms);
         }
     };
 
@@ -2599,33 +2826,36 @@ async fn inject_call_handler(
             // registry guard's Drop handles HTTP-disconnect
             // (axum cancels this future, the guard drops, the
             // registry entry evicts).
-            let timeout_dur = Duration::from_millis(timeout_ms);
-            match tokio::time::timeout(timeout_dur, reply_rx).await {
-                Ok(Ok(payload)) => {
-                    // Reply received — guard's slot was already
-                    // evicted by the sink on resolution. Disarm
-                    // so Drop doesn't double-evict.
-                    guard.disarm();
-                    let body = serde_json::json!({
-                        "reply_type": body.reply_type,
-                        "payload": payload,
-                    });
-                    (
-                        StatusCode::OK,
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        body.to_string(),
-                    )
-                        .into_response()
-                }
-                Ok(Err(_)) => {
-                    // The oneshot was dropped without sending —
-                    // shouldn't happen on the live path because
-                    // the sink either sends a value or doesn't
-                    // touch the channel. Treat as 504.
-                    drop(guard);
-                    timeout_response(timeout_ms)
-                }
-                Err(_) => {
+            let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
+            tokio::pin!(timeout);
+            tokio::select! {
+                reply = reply_rx => match reply {
+                    Ok(payload) => {
+                        // Reply received — guard's slot was already
+                        // evicted by the sink on resolution. Disarm
+                        // so Drop doesn't double-evict.
+                        guard.disarm();
+                        let body = serde_json::json!({
+                            "reply_type": body.reply_type,
+                            "payload": payload,
+                        });
+                        (
+                            StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            body.to_string(),
+                        )
+                            .into_response()
+                    }
+                    Err(_) => {
+                        // The oneshot was dropped without sending —
+                        // shouldn't happen on the live path because
+                        // the sink either sends a value or doesn't
+                        // touch the channel. Treat as 504.
+                        drop(guard);
+                        timeout_response(timeout_ms)
+                    }
+                },
+                () = &mut timeout => {
                     // tokio::time::timeout elapsed. Drop the
                     // guard so the entry evicts; the sink may
                     // still attempt to resolve (race), but its
@@ -2633,6 +2863,10 @@ async fn inject_call_handler(
                     // which is silently ignored.
                     drop(guard);
                     timeout_response(timeout_ms)
+                }
+                drain_timeout_ms = wait_for_drain_deadline(&mut drain_deadline) => {
+                    drop(guard);
+                    drain_call_timeout_response(drain_timeout_ms)
                 }
             }
         }
@@ -2645,6 +2879,20 @@ fn timeout_response(timeout_ms: u64) -> Response {
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         serde_json::json!({
             "error": "reply_timeout",
+            "timeout_ms": timeout_ms,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+fn drain_call_timeout_response(timeout_ms: u64) -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "error": "reply_timeout",
+            "reason": "drain_started",
             "timeout_ms": timeout_ms,
         })
         .to_string(),
@@ -3433,7 +3681,7 @@ async fn auth_layer(
 async fn auth_layer_rbac(
     state: ApiState,
     rbac: crate::rbac::RotatableRegistry,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
     let route = classify_protected_path(req.uri().path());
@@ -3528,6 +3776,10 @@ async fn auth_layer_rbac(
                                 verified.exp_unix_ms,
                                 state.audit_sink.as_ref(),
                             );
+                            req.extensions_mut().insert(AuthenticatedPrincipal {
+                                token_id: verified.sub.clone(),
+                                is_admin: matches!(role, crate::rbac::Role::Admin),
+                            });
                             return next.run(req).await;
                         }
                         crate::audit::log_jwt_auth_fail(
@@ -3635,6 +3887,10 @@ async fn auth_layer_rbac(
             role_str,
             state.audit_sink.as_ref(),
         );
+        req.extensions_mut().insert(AuthenticatedPrincipal {
+            token_id: entry.id.0.clone(),
+            is_admin: matches!(entry.role, crate::rbac::Role::Admin),
+        });
         next.run(req).await
     } else {
         crate::audit::log_authz_deny(
@@ -3718,6 +3974,226 @@ mod tests {
         assert_eq!(v["process_start_id"], 1234);
         assert_eq!(v["version"], "0.1.0");
         assert_eq!(v["api_version"], 1);
+    }
+
+    fn delegated_restart_test_state(
+        role: crate::rbac::Role,
+    ) -> (ApiState, mpsc::Receiver<SnapshotRequest>) {
+        let entry = crate::rbac::TokenEntry {
+            id: crate::rbac::TokenId("operator-1".into()),
+            token: BearerToken::from_bytes(b"delegated-restart-token".to_vec()).unwrap(),
+            role,
+            expires_at: None,
+        };
+        let registry = crate::rbac::TokenRegistry::new(vec![entry]).unwrap();
+        let (snapshot_tx, snapshot_rx) = mpsc::channel(SNAPSHOT_CHANNEL_CAPACITY);
+        (
+            ApiState {
+                metrics: Arc::new(MetricsInner::new()),
+                snapshot_tx,
+                token: None,
+                identity: Arc::new(Identity {
+                    process_start_id: 1,
+                    version: "test",
+                    api_version: 1,
+                }),
+                ring: Arc::new(RingBufferTelemetry::new()),
+                websocket: None,
+                idempotency_cache: Arc::new(IdempotencyCache::new()),
+                pending_calls: PendingCalls::new(),
+                cluster_readyz: None,
+                tls_readiness: None,
+                audit_sink: None,
+                draining: None,
+                ingress_in_flight: IngressInFlight::new(),
+                rbac: Some(crate::rbac::RotatableRegistry::new(Arc::new(registry))),
+                jwt_verifier: None,
+                forwarder_hub: None,
+            },
+            snapshot_rx,
+        )
+    }
+
+    fn delegated_restart_http_request() -> axum::http::Request<axum::body::Body> {
+        use axum::extract::ConnectInfo;
+        let peer: SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        let mut request = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/admin/cluster/delegated-restart")
+            .header(axum::http::header::AUTHORIZATION, "Bearer delegated-restart-token")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                r#"{"peer":"worker","child_node_id":"child-a"}"#,
+            ))
+            .unwrap();
+        request.extensions_mut().insert(peer);
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    #[tokio::test]
+    async fn delegated_restart_admin_dispatches_token_id_and_returns_correlation() {
+        use tower::ServiceExt;
+        let (state, mut snapshot_rx) = delegated_restart_test_state(crate::rbac::Role::Admin);
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
+        let responder = tokio::spawn(async move {
+            match snapshot_rx.recv().await.expect("delegated restart request") {
+                SnapshotRequest::DelegatedRestart {
+                    peer,
+                    child_node_id,
+                    token_id,
+                    oneshot_tx,
+                } => {
+                    assert_eq!(peer, "worker");
+                    assert_eq!(child_node_id, "child-a");
+                    assert_eq!(token_id, "operator-1");
+                    let _ = oneshot_tx.send(DelegatedRestartDispatchResult::Accepted {
+                        correlation_id: 42,
+                        peer,
+                    });
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        });
+
+        let response = app
+            .oneshot(delegated_restart_http_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["correlation_id"], 42);
+        assert_eq!(json["status"], "accepted");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegated_restart_custom_role_is_denied_even_when_route_allowlisted() {
+        use std::collections::BTreeSet;
+        use tower::ServiceExt;
+        let role = crate::rbac::Role::Custom(BTreeSet::from([
+            "/v1/admin/cluster/delegated-restart".to_string(),
+        ]));
+        let (state, _snapshot_rx) = delegated_restart_test_state(role);
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
+
+        let response = app
+            .oneshot(delegated_restart_http_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            "admin_role_required"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_restart_bridge_saturation_returns_retryable_503() {
+        use tower::ServiceExt;
+        let (mut state, _snapshot_rx) = delegated_restart_test_state(crate::rbac::Role::Admin);
+        let (full_tx, _full_rx) = mpsc::channel(1);
+        let (unused_tx, _unused_rx) = oneshot::channel();
+        full_tx.try_send(SnapshotRequest::Nodes(unused_tx)).unwrap();
+        state.snapshot_tx = full_tx;
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
+
+        let response = app
+            .oneshot(delegated_restart_http_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[axum::http::header::RETRY_AFTER],
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_restart_unknown_peer_maps_to_404() {
+        use tower::ServiceExt;
+        let (state, mut snapshot_rx) = delegated_restart_test_state(crate::rbac::Role::Admin);
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
+        let responder = tokio::spawn(async move {
+            match snapshot_rx.recv().await.expect("delegated restart request") {
+                SnapshotRequest::DelegatedRestart { oneshot_tx, .. } => {
+                    let _ = oneshot_tx.send(DelegatedRestartDispatchResult::UnknownPeer);
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        });
+
+        let response = app
+            .oneshot(delegated_restart_http_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            "unknown_peer"
+        );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegated_restart_dispatch_race_with_drain_maps_to_503() {
+        use tower::ServiceExt;
+        let (state, mut snapshot_rx) = delegated_restart_test_state(crate::rbac::Role::Admin);
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
+        let responder = tokio::spawn(async move {
+            match snapshot_rx.recv().await.expect("delegated restart request") {
+                SnapshotRequest::DelegatedRestart { oneshot_tx, .. } => {
+                    let _ = oneshot_tx.send(DelegatedRestartDispatchResult::Draining);
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        });
+
+        let response = app
+            .oneshot(delegated_restart_http_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            "draining"
+        );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegated_restart_refuses_dispatch_while_draining() {
+        use tower::ServiceExt;
+        let (mut state, _snapshot_rx) = delegated_restart_test_state(crate::rbac::Role::Admin);
+        let drain = DrainFlag::new();
+        assert!(drain.start(20_000));
+        state.draining = Some(drain);
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
+
+        let response = app
+            .oneshot(delegated_restart_http_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            "draining"
+        );
     }
 }
 
@@ -3910,13 +4386,14 @@ mod rate_limit_tests {
 
     #[test]
     fn protected_route_labels_table_matches_registered_routes() {
-        // `PROTECTED_ROUTE_LABELS` must list exactly the 11
+        // `PROTECTED_ROUTE_LABELS` must list exactly the 12
         // protected paths the router registers. If a new
         // protected route lands without updating the table, the
         // classifier collapses it to `"unknown"` and operators
         // lose per-route observability — surface that drift here
         // at unit-test time.
         let expected: std::collections::HashSet<&'static str> = [
+            "/v1/admin/cluster/delegated-restart",
             "/v1/identity",
             "/v1/metrics",
             "/v1/nodes",
@@ -3973,6 +4450,7 @@ mod rate_limit_tests {
             idempotency_cache: Arc::new(IdempotencyCache::new()),
             pending_calls: PendingCalls::new(),
             cluster_readyz: None,
+            tls_readiness: None,
             audit_sink: None,
             draining: None,
             ingress_in_flight: IngressInFlight::new(),

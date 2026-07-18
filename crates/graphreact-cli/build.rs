@@ -36,7 +36,7 @@ fn main() {
     // the release pipeline (sub-track #8) sets `GRX_SIGNATURE_URL` at
     // build time, bake it into the binary so `grx version` advertises
     // where operators can fetch the cosign signature for re-verification
-    // (`cosign verify-blob --signature <URL>.sig <URL>`). When unset /
+    // (`cosign verify-blob --bundle <bundle> <binary>`). When unset /
     // empty (every dev build, every CI build that isn't a tagged release),
     // we emit the env var as an empty string so `option_env!()` returns
     // `Some("")` — the `run_version()` printer then suppresses the line.

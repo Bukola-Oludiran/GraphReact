@@ -69,6 +69,7 @@ use graphreact_grx_parser::{
 };
 
 use crate::runtime::RuntimeError;
+use crate::runtime_secrets::RuntimeSecretContext;
 
 // ---------------------------------------------------------------------
 // Per-thread registries (mirroring pyruntime.rs phase 3b TLS)
@@ -213,6 +214,30 @@ fn current_iso() -> Option<IsolateHandle> {
 
 fn current_node_id() -> Option<String> {
     CURRENT_NODE_ID.with(|n| n.borrow().clone())
+}
+
+fn build_runtime_secret_callback(context: Arc<RuntimeSecretContext>) -> BoxCallback {
+    Box::new(move |args| {
+        let name = match args.first() {
+            Some(HostValue::String(name)) => name,
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(node_id) = current_node_id() else {
+            return Ok(HostValue::Null);
+        };
+        let allowed = current_graph_snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .manifests
+                    .borrow()
+                    .get(&node_id)
+                    .and_then(|manifest| manifest.needs_secret.clone())
+            })
+            .unwrap_or_default();
+        Ok(context
+            .read_utf8(&node_id, name, &allowed)
+            .map_or(HostValue::Null, HostValue::String))
+    })
 }
 
 fn next_go_hook_index() -> usize {
@@ -3284,6 +3309,14 @@ pub fn mount_with_scheduler(
     grx_path: &Path,
     out_dir: &Path,
 ) -> Result<GoRuntime, RuntimeError> {
+    mount_with_scheduler_and_secrets(grx_path, out_dir, None)
+}
+
+pub fn mount_with_scheduler_and_secrets(
+    grx_path: &Path,
+    out_dir: &Path,
+    secrets: Option<Arc<RuntimeSecretContext>>,
+) -> Result<GoRuntime, RuntimeError> {
     let mut ir = parse_grx_to_ir(grx_path)?;
 
     // **M22 phase 1.** Non-Go definitions are silently filtered out
@@ -3375,6 +3408,10 @@ pub fn mount_with_scheduler(
         let iso = e
             .create_isolate(IsolateOptions::default())
             .map_err(RuntimeError::Engine)?;
+        if let Some(context) = secrets {
+            e.register_callback(iso, "host_secret", build_runtime_secret_callback(context))
+                .map_err(RuntimeError::Engine)?;
+        }
         // Register the host_emit / host_message callbacks. The Go side
         // intercepts these names in GrxCallbackRegister and stores
         // the slots so UseEmit / UseMessage helpers can dispatch

@@ -90,7 +90,8 @@ async fn spawn_fixture(process_start_id: u64) -> (ApiServerHandle, JoinHandle<()
                 // observer/tests/{inject,call,bulk}_e2e.rs.
                 SnapshotRequest::InjectMessage { .. }
                 | SnapshotRequest::InjectMessageWithReply { .. }
-                | SnapshotRequest::InjectMessageBulkLine { .. } => {}
+                | SnapshotRequest::InjectMessageBulkLine { .. }
+                | SnapshotRequest::DelegatedRestart { .. } => {}
             }
         }
     });

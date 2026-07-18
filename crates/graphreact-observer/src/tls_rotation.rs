@@ -75,6 +75,7 @@
 //!   Phase A; ticket rotation is Phase B).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
 use rustls::server::ServerConfig;
@@ -94,6 +95,48 @@ use rustls::server::ServerConfig;
 #[derive(Clone)]
 pub struct RotatableServerConfig {
     inner: Arc<ArcSwap<ServerConfig>>,
+}
+
+/// Shared readiness state for TLS reloads. A counter (rather than a
+/// boolean) permits an outer file-read guard and the inner config-swap
+/// guard to nest without briefly reporting ready between them.
+#[derive(Clone, Default)]
+pub struct TlsReadiness {
+    rotations_in_flight: Arc<AtomicUsize>,
+}
+
+impl TlsReadiness {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn begin_rotation(&self) -> TlsRotationGuard {
+        self.rotations_in_flight.fetch_add(1, Ordering::AcqRel);
+        TlsRotationGuard {
+            state: self.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_rotating(&self) -> bool {
+        self.rotations_in_flight.load(Ordering::Acquire) > 0
+    }
+}
+
+#[must_use = "dropping the guard ends the TLS rotation readiness window"]
+pub struct TlsRotationGuard {
+    state: TlsReadiness,
+}
+
+impl Drop for TlsRotationGuard {
+    fn drop(&mut self) {
+        let previous = self
+            .state
+            .rotations_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "unbalanced TLS rotation readiness guard");
+    }
 }
 
 impl RotatableServerConfig {
@@ -192,5 +235,20 @@ mod tests {
         let rot2 = rot1.clone();
         rot1.rotate(cfg_b.clone());
         assert!(Arc::ptr_eq(&rot2.current(), &cfg_b));
+    }
+
+    #[test]
+    fn readiness_tracks_nested_rotation_guards() {
+        let readiness = TlsReadiness::new();
+        assert!(!readiness.is_rotating());
+        let outer = readiness.begin_rotation();
+        assert!(readiness.is_rotating());
+        {
+            let _inner = readiness.begin_rotation();
+            assert!(readiness.is_rotating());
+        }
+        assert!(readiness.is_rotating());
+        drop(outer);
+        assert!(!readiness.is_rotating());
     }
 }

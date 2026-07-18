@@ -59,6 +59,9 @@ async fn spawn_with_drain_responder(
                     let _ = oneshot_tx.send(InjectResult::Accepted);
                 }
                 SnapshotRequest::InjectMessageWithReply { oneshot_tx, .. } => {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let _ = oneshot_tx.send(
                         graphreact_observer::InjectMessageWithReplyDisposition::Dispatched,
                     );
@@ -215,6 +218,88 @@ async fn inflight_inject_completes_through_drain_settles_counter() {
     // quiescence-loop correctness.
     assert_eq!(ingress.load(), 0);
 
+    server.shutdown().await;
+}
+
+/// A call admitted before drain keeps its normal timeout during
+/// steady state, but drain truncates that wait to the drain budget.
+/// The handler returns a structured 504 and evicts both lifecycle
+/// counters before the outer daemon deadline needs to escalate.
+#[tokio::test]
+async fn inflight_call_timeout_is_truncated_by_drain_deadline() {
+    let (server, _drain_task, drain, ingress) =
+        spawn_with_drain_responder(Duration::ZERO).await;
+    let pending_calls = server.pending_calls.clone();
+    let url = format!("http://{}/v1/nodes/alpha/call", server.local_addr);
+    let call = tokio::spawn(async move {
+        http_post(
+            &url,
+            r#"{"type":"ask","reply_type":"answer","payload":{},"timeout_ms":300000}"#,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while pending_calls.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("call should register before drain");
+    assert_eq!(ingress.load(), 1);
+
+    let started = std::time::Instant::now();
+    assert!(drain.start(100));
+    let (status, body) = call.await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(status, 504);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"], "reply_timeout");
+    assert_eq!(body["reason"], "drain_started");
+    assert_eq!(body["timeout_ms"], 100);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "drain should truncate the five-minute call timeout, got {elapsed:?}"
+    );
+    assert!(pending_calls.is_empty());
+    assert_eq!(ingress.load(), 0);
+
+    server.shutdown().await;
+}
+
+/// Drain also bounds a call still waiting for the scheduler bridge's
+/// initial disposition, not only calls already waiting for a reply.
+#[tokio::test]
+async fn call_waiting_for_dispatch_is_truncated_by_drain_deadline() {
+    let (server, drain_task, drain, ingress) =
+        spawn_with_drain_responder(Duration::from_millis(500)).await;
+    let pending_calls = server.pending_calls.clone();
+    let url = format!("http://{}/v1/nodes/alpha/call", server.local_addr);
+    let call = tokio::spawn(async move {
+        http_post(
+            &url,
+            r#"{"type":"ask","reply_type":"answer","payload":{},"timeout_ms":300000}"#,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while pending_calls.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("call should register before drain");
+
+    assert!(drain.start(50));
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 504);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["reason"], "drain_started");
+    assert!(pending_calls.is_empty());
+    assert_eq!(ingress.load(), 0);
+
+    drain_task.abort();
     server.shutdown().await;
 }
 

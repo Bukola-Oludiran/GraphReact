@@ -1,6 +1,6 @@
 # M-Prod — Lifecycle (sub-track #4)
 
-**Status:** SHIPPED Phase α 2026-06-17 — SIGTERM drain primitive landed (drain bit + `/v1/readyz` extension + ingress 503 `draining` + `DaemonHandle::start_drain`); rolling-version negotiation (Phase β) + M14.11 delegated-restart (Phase γ) deferred; Phase β SHIPPED 2026-06-18 — WIRE_VERSION bumped to 5 + MIN_SUPPORTED_VERSION at 4 (one-bump rolling-upgrade compat) + per-engine capability bitmap; **Phase γ SHIPPED 2026-06-18** — WIRE_VERSION bumped to 6 + MIN_SUPPORTED_VERSION at 5 (rolling-upgrade window preserved) + M14.11 cross-node delegated-restart wire protocol (Request/Ack/Result packets gated on `CAP_DELEGATED_RESTART`; responder-side `SchedulerHandle::request_delegated_restart` entry point drives the existing `unmount_with_reason` → supervisor-plan path; four new audit events on `graphreact::observer::audit`).
+**Status:** Phase α SHIPPED 2026-06-17; Phase β + γ SHIPPED 2026-06-18; **Phase γ.next admin REST edge + timeout/GC + cluster drain admission/quiescence + delegated-restart cancellation + ingress-call deadline truncation SHIPPED 2026-07-18.** `POST /v1/admin/cluster/delegated-restart` enforces `Role::Admin` and drain state; originator requests have a 30-second default deadline and abandoned-entry cleanup; `DaemonHandle::start_drain` closes cluster admission, cancels outstanding delegated restarts, and bounds admitted observer calls by the drain deadline.
 
 This document covers sub-track #4 of the M-Prod milestone (production-hardening): orderly daemon lifecycle — graceful drain on SIGTERM, rolling-version handshake compatibility, and delegated restart for the M14.11 hot-reload escalation path. Sibling tracks (#2 TLS / SIGHUP topology, #5 observability `/v1/readyz`, #1 audit-sink for drain events, #9 chaos arms) reference this substrate; see [Cross-track contracts](#cross-track-contracts).
 
@@ -21,12 +21,12 @@ Phase α ships the **SIGTERM drain primitive** — every future drain trigger (k
 | `LoopExit::{Duration,Sigint,Sigterm}` discriminator | SHIPPED | `commands.rs` |
 | SIGTERM signal stream (unix) inside `drive_handle_until` | SHIPPED | `commands.rs` |
 | `--drain-deadline-secs` / `GRX_DRAIN_DEADLINE_SECS` / `DEFAULT_DRAIN_DEADLINE_SECS=20` | SHIPPED | `cli.rs` + `commands.rs` |
-| Integration tests (5 observer + 3 CLI + 4 unit) | SHIPPED | [`crates/graphreact-observer/tests/drain.rs`](../../crates/graphreact-observer/tests/drain.rs), [`crates/graphreact-cli/tests/drain_orchestration.rs`](../../crates/graphreact-cli/tests/drain_orchestration.rs) |
+| Drain integration + cluster admission/quiescence tests | SHIPPED | [`crates/graphreact-observer/tests/drain.rs`](../../crates/graphreact-observer/tests/drain.rs), [`crates/graphreact-cli/tests/drain_orchestration.rs`](../../crates/graphreact-cli/tests/drain_orchestration.rs), [`crates/graphreact-dist/src/cluster.rs`](../../crates/graphreact-dist/src/cluster.rs) |
 | Rolling-version handshake (`WIRE_VERSION` floor relax) | SHIPPED — Phase β 2026-06-18 | [`crates/graphreact-dist/src/handshake.rs`](../../crates/graphreact-dist/src/handshake.rs) + `wire/packet.rs` |
 | M14.11 delegated-restart (reload-driven drain → spawn) | SHIPPED — Phase γ 2026-06-18 | [`crates/graphreact-dist/src/wire/packet.rs`](../../crates/graphreact-dist/src/wire/packet.rs) + [`cluster.rs`](../../crates/graphreact-dist/src/cluster.rs) + [`crates/graphreact-core/src/runtime/scheduler.rs`](../../crates/graphreact-core/src/runtime/scheduler.rs) |
-| Cluster handshake quiescence (`Cluster::begin_drain`) | DEFERRED → Phase β | n/a |
+| Cluster handshake quiescence (`Cluster::begin_drain`) | SHIPPED — Phase γ.next 2026-07-18 | [`crates/graphreact-dist/src/cluster.rs`](../../crates/graphreact-dist/src/cluster.rs) |
 | SIGTERM on Windows (named-event or REST endpoint) | DEFERRED → Phase β | n/a |
-| Per-connection 5-min `MAX_CALL_TIMEOUT_MS` interplay with drain | KNOWN GAP (see [Drain-vs-MAX_CALL_TIMEOUT](#drain-vs-max_call_timeout-interaction)) | n/a |
+| Per-call 5-min `MAX_CALL_TIMEOUT_MS` interplay with drain | SHIPPED — Phase γ.next 2026-07-18 | [`crates/graphreact-observer/src/management_api.rs`](../../crates/graphreact-observer/src/management_api.rs) |
 
 ## DrainFlag shape
 
@@ -133,13 +133,13 @@ pub struct DrainOutcome {
 
 Behavior:
 
-1. Idempotent CAS gate on `DrainFlag::start` — duplicate calls return immediately with the no-op outcome (`in_flight_settled = true, deadline_exceeded = false, drain_duration = ZERO`).
-2. Audit `drain_started` BEFORE the AtomicBool flip becomes observable.
-3. Poll `ingress_in_flight.load() == 0 && pending_calls.is_empty()` on a 25ms cadence until quiescence OR `deadline` elapses.
-4. Audit `drain_completed` (success) or `drain_deadline_exceeded` (timeout) with the remaining counts so operators can correlate against their LB's in-flight metric.
-5. Return `DrainOutcome`. Does NOT call `shutdown()` — the daemon's runtime stays up so the observer can keep replying 503 `draining` to LB probes while the orchestrator decides when to escalate.
+1. Independently transition the optional observer `DrainFlag` and the always-present cluster handshake gate. Duplicate calls return immediately only after both surfaces are already draining.
+2. Audit `drain_started` BEFORE the observer AtomicBool flip becomes observable.
+3. `Cluster::begin_drain` aborts the inbound listener task, rejects fresh outbound/injected handshakes and delegated-restart dispatches with typed draining errors, and leaves established peer connections alive.
+4. Poll `ingress_in_flight.load() == 0 && pending_calls.is_empty() && cluster.drain_quiesced()` on a 25ms cadence until quiescence OR `deadline` elapses.
+5. Audit `drain_completed` (success) or `drain_deadline_exceeded` (timeout), then return the independent ingress and cluster predicates in `DrainOutcome`. Does NOT call `shutdown()`.
 
-When `self.drain` is `None` (observer wasn't wired at boot) this is a no-op — there's no ingress surface to quiesce.
+When `self.drain` is `None` (observer wasn't wired at boot), ingress is trivially settled but cluster admission still closes and admitted handshakes/dispatches still consume the deadline.
 
 ## SIGTERM → drain → shutdown wiring
 
@@ -205,11 +205,9 @@ All four lifecycle events ride the same `graphreact::observer::audit` target as 
 
 ## Drain-vs-`MAX_CALL_TIMEOUT` interaction
 
-`inject_call_handler` caps its per-call timeout at `MAX_CALL_TIMEOUT_MS = 300_000` (5 minutes). A call that hangs the full 5 minutes will outlive any reasonable drain deadline.
+`inject_call_handler` still caps its steady-state per-call timeout at `MAX_CALL_TIMEOUT_MS = 300_000` (5 minutes). Every admitted call now also subscribes to the one-shot deadline published by `DrainFlag::start`. Both scheduler-disposition waiting and reply waiting race that deadline; the earlier of the caller timeout and drain deadline wins.
 
-**Phase α behavior:** when `start_drain` hits its deadline with such a call still in flight, the orchestrator emits `drain_deadline_exceeded` with the remaining counts and the caller (`run_daemon_blocking`) proceeds to `shutdown()`. `ApiServerHandle::shutdown` notifies the accept loop, which kills in-flight axum tasks — the hung call's HTTP client sees connection-reset. `PendingCalls` guards' `Drop` evicts cleanly. k8s SIGKILL is the next escalation if `terminationGracePeriodSeconds` runs out.
-
-This is acceptable for Phase α but not ideal — a future Phase β could bound the per-call remaining-time at drain-start (truncate `MAX_CALL_TIMEOUT_MS` down to `drain_deadline_remaining`).
+On drain expiry the handler drops its `PendingCallGuard`, settles `IngressInFlight`, and returns HTTP 504 with `{"error":"reply_timeout","reason":"drain_started","timeout_ms":<drain budget>}`. Calls replying before that bound still complete normally. Calls arriving after the drain flip retain the existing 503 `draining` admission response.
 
 ## Cross-track contracts
 
@@ -231,10 +229,10 @@ Phase α extends the `/v1/readyz` predicate row + adds a 503 reason row for `dra
 |---|---|---|
 | Rolling-version handshake (`WIRE_VERSION = N`, `MIN_SUPPORTED_VERSION = N-1`) | The wire-protocol crate (`graphreact-dist`) is explicitly out of scope for Phase α per cross-track contract. ~~Phase β picks up the `WIRE_VERSION` floor relax + per-engine capability negotiation.~~ → SHIPPED Phase β 2026-06-18; see [Shipped — Phase β: rolling-version handshake](#shipped--phase-β-rolling-version-handshake). | Phase β |
 | M14.11 delegated-restart (reload-driven drain → spawn new process → handoff connections) | Requires both the drain primitive (this Phase α) AND the hot-reload pipeline (M15) AND the rolling-version handshake (Phase β). Phase γ composes all three. | Phase γ |
-| Cluster handshake quiescence (`Cluster::begin_drain` softer than `Cluster::shutdown`) | Today `Cluster::shutdown` aborts every per-peer task immediately. Phase α accepts this — handshakes that don't complete in the drain window get re-tried by the dialing peer on next reconnect. `cluster_quiesced` in `DrainOutcome` is reported `true` unconditionally for Phase α. | Phase β |
+| ~~Cluster handshake quiescence (`Cluster::begin_drain` softer than `Cluster::shutdown`)~~ | **SHIPPED 2026-07-18.** Drain closes listener/outbound admission, tracks admitted handshakes to completion/failure, and reports the live predicate through `DrainOutcome::cluster_quiesced`; established peers remain connected until shutdown. | Phase γ.next |
 | SIGHUP signal handler | Cross-platform signal handling for cert rotation is sub-track #2 Phase B's domain. Phase α's `drive_handle_until` topology (one `tokio::signal::unix::signal` arm per signal kind) is the contract Phase B extends. | #2 Phase B |
 | SIGTERM on Windows | Phase α is unix-tokio only (`cfg(unix)` gate). Phase β picks up a portable shape (named-event handle, or a small REST `POST /v1/admin/drain`). | Phase β |
-| Per-call drain-aware timeout truncation | `MAX_CALL_TIMEOUT_MS = 300_000` (5 min) can outlive any reasonable drain deadline; Phase α surfaces the count via `drain_deadline_exceeded` + lets SIGKILL handle truncation. | Phase β |
+| ~~Per-call drain-aware timeout truncation~~ | **SHIPPED 2026-07-18.** Admitted calls race dispatch/reply waits against the published drain deadline and return a structured 504 on drain expiry. | Phase γ.next |
 | `grx cluster connect` SIGTERM wiring | `connect` is a one-shot dial without an ingress surface; drain would be a no-op. | Phase β if `connect` ever grows an observer bind. |
 | `drain_budget_misconfig` boot rejection | Phase α emits a WARN audit row rather than rejecting — back-compat with existing operator configs is preferred over hard failure. | Operators escalate to a hard reject via #8 helm chart Pod validation. |
 
@@ -378,15 +376,20 @@ rolling-version + capability-bitmap substrate.
 
 - `Cluster::send_delegated_restart_request(peer_name, child_node_id,
   reason_code, token_id) -> Result<DelegatedRestartHandle,
-  DelegatedRestartError>`. Validates (in this order):
-  1. Peer registered in the cluster registry. Missing →
+  DelegatedRestartError>`. Uses a 30-second originator deadline.
+  `send_delegated_restart_request_with_timeout(..., Duration)` is the
+  additive explicit-deadline variant. Both validate (in this order):
+  1. Cluster drain admission remains open. Closed → `Draining` +
+     audit `delegated_restart_blocked reason=draining`; no peer lookup
+     or wire send occurs.
+  2. Peer registered in the cluster registry. Missing →
      `UnknownPeer` + audit `delegated_restart_blocked reason=unknown_peer`.
-  2. Negotiated `effective_capabilities & CAP_DELEGATED_RESTART != 0`.
+  3. Negotiated `effective_capabilities & CAP_DELEGATED_RESTART != 0`.
      Missing → `CapabilityNotNegotiated` + audit
      `delegated_restart_blocked reason=cap_not_negotiated`.
-  3. Outbound channel has space. Full/closed → `OutboundChannel` +
+  4. Outbound channel has space. Full/closed → `OutboundChannel` +
      audit `delegated_restart_blocked reason=outbound_channel`.
-  4. On success, audit `delegated_restart_issued`, register the
+  5. On success, audit `delegated_restart_issued`, register the
      in-flight entry in `delegated_restart_pending`, return
      `DelegatedRestartHandle` carrying `correlation_id` + `peer_name`
      + `ack` (oneshot::Receiver<DelegatedRestartAckOutcome>) + `result`
@@ -401,6 +404,18 @@ rolling-version + capability-bitmap substrate.
   `PeerHandle::effective_capabilities` already stores the per-peer
   negotiated bitmap (registry.rs:68); the dispatch arm consults it
   via `Cluster::peer_effective_capabilities(name)`.
+- Each successfully queued request owns a lightweight cleanup task.
+  Deadline expiry atomically removes the pending entry, resolves the
+  result receiver with `TimedOut`, and emits
+  `delegated_restart_completed outcome=timed_out
+  reason=originator_timeout`. `Cluster::begin_drain` atomically takes
+  all remaining entries, resolves their result receivers with
+  `TimedOut`, and emits the same event with `reason=drain_started`.
+  A dispatch admitted immediately before drain rechecks the gate after
+  its queue attempt, closing the pending-map insertion race. A dropped result
+  receiver is detected within 100ms and its abandoned pending entry is
+  removed without waiting for the deadline. Late wire results hit the
+  existing `no_pending_entry` audit branch and are ignored.
 
 **Inbound dispatch (graphreact-dist/src/cluster.rs::dispatch_inbound):**
 
@@ -471,7 +486,7 @@ between request and outcome drop with `reason=origin_peer_disconnected`.
   `correlation_id`, `version`.
 - `delegated_restart_blocked` (warn, originator-side) — fields:
   `peer`, `child_node_id`, `reason ∈
-  {cap_not_negotiated, unknown_peer, outbound_channel}`, optional
+  {draining, cap_not_negotiated, unknown_peer, outbound_channel}`, optional
   `detail`.
 - `delegated_restart_received` (info, responder-side) — fields:
   `origin_peer`, `child_node_id`, `reason_code`, `token_id`,
@@ -499,20 +514,20 @@ between request and outcome drop with `reason=origin_peer_disconnected`.
 > with `outcome` variants is catalogued in the Phase γ.next residual
 > below.
 
-**RBAC seam (deferred to Phase γ.next):**
+**RBAC seam (shipped in Phase γ.next 2026-07-18):**
 
 The wire-level `token_id` is **informational + audited end-to-end**.
 The responder cannot independently validate the issuer's token
 (graphreact-dist is below graphreact-observer in the dep graph and
 has no access to `ApiState::rbac`). The load-bearing originator-side
-RBAC gate lives at the management API layer, in a future REST
-endpoint that consults `TokenRegistry` for `Role::Admin` before
-calling `Cluster::send_delegated_restart_request`. Phase γ ships the
-seam (`Cluster::send_delegated_restart_request` accepts a `token_id`
-arg + audits it); the REST handler lands in Phase γ.next alongside
-the management API ingress wiring. Cluster-internal supervisor-driven
-paths pass an empty `token_id` (legacy auth) and rely on the cluster
-handshake (mTLS + shared cookie) for authorization.
+gate now lives at `POST /v1/admin/cluster/delegated-restart`. RBAC
+middleware attaches the verified principal, and the handler requires
+the concrete `Role::Admin`; a legacy single bearer or a `Custom` role
+that explicitly allowlists the route still receives 403. The handler
+passes the principal's operator-assigned `token_id` to
+`Cluster::send_delegated_restart_request`. Cluster-internal
+supervisor-driven paths may still pass an empty `token_id` and rely on
+the cluster handshake (mTLS + shared cookie) for authorization.
 
 **Cross-track contract integrity** (Phase γ):
 
@@ -526,11 +541,9 @@ handshake (mTLS + shared cookie) for authorization.
 - Precedence ladder (`drain > rate_limit::per_token >
   rate_limit::per_ip > auth > bridge_saturated`) — unchanged; Phase γ
   has no REST surface to interact with the ladder. The deferred
-  γ.next REST endpoint will sit at the `auth` level (Admin-role
-  required); drain state already shields the originator-side
-  `Cluster::send_delegated_restart_request` if the daemon is
-  draining (the API itself does not check drain; the caller in the
-  drain-aware management API context does).
+  γ.next REST endpoint sits at the `auth` level (Admin-role required),
+  checks `DrainFlag` before crossing the daemon bridge, and maps bridge
+  or cluster-outbound saturation to retryable 503 responses.
 - Phase β rolling-version invariant preserved
   (`MIN_SUPPORTED_VERSION + 1 == WIRE_VERSION` asserted in
   `wire/frame.rs::tests`).
@@ -549,6 +562,28 @@ sibling-restart logic all run unchanged. Operator-driven restart is
 treated as the same abnormal exit shape any local fault would
 produce.
 
+## Shipped — Phase γ.next admin REST edge (2026-07-18)
+
+`POST /v1/admin/cluster/delegated-restart` accepts:
+
+```json
+{"peer":"worker","child_node_id":"child-a"}
+```
+
+The endpoint fixes `reason_code=operator_request` server-side, so an
+HTTP caller cannot impersonate supervisor, reload, or health-check
+causes. A queued wire request returns `202` with `correlation_id` and
+`peer`; completion remains asynchronous and is reported by the
+existing `delegated_restart_ack` / `delegated_restart_completed` audit
+events. Immediate failures map to `404 unknown_peer`, `409
+capability_not_negotiated`, or retryable `503 outbound_unavailable`.
+Observer-bridge saturation retains the standard `503
+bridge_saturated` envelope. Empty peer/child values return 400.
+
+The route was added to the bounded `PROTECTED_ROUTE_LABELS` catalogue,
+raising its vocabulary from 11 to 12 routes (13 including the
+`unknown` sentinel; 39 maximum `(route,bucket)` rate-limit series).
+
 ## Phase γ.next residual catalogue
 
 Phase γ ships the wire-protocol substrate + responder-side scheduler
@@ -557,44 +592,30 @@ slice is everything that the dist crate cannot reach across the
 dep-graph (graphreact-dist sits below graphreact-observer), plus the
 robustness polish noted by the verify pass:
 
-1. **REST endpoint at `management_api.rs`** — `POST
-   /v1/admin/cluster/delegated-restart` that consults
-   `TokenRegistry::Role::Admin` via the existing `auth_layer_rbac`
-   shape (from B-3) before calling
-   `Cluster::send_delegated_restart_request`. The Cluster seam is
-   shipped (accepts `token_id`, audits it end-to-end); only the REST
-   handler + axum route wiring + Admin-role gate remain.
-2. **Drain-state gate on `Cluster::send_delegated_restart_request`** —
-   the in-dist API currently does NOT consult the `DrainFlag`
-   (`DrainFlag` lives in graphreact-observer, below which dist sits
-   in the dep graph). The cluster-internal supervisor-driven path
-   shipped here has no external HTTP edge that requires drain
-   shielding (drain shields ingress, not internal supervisor
-   decisions). When the γ.next REST endpoint lands, the management
-   API layer will gate by drain BEFORE calling the Cluster API
-   (precedence ladder `drain > rate_limit > auth > bridge_saturated`
-   stays load-bearing at the HTTP edge). If a future cluster-internal
-   caller demands its own drain shielding, thread a `DrainFlag` Arc
-   into `ClusterConfig` rather than punching a layer-violation hole.
-3. **Originator-side `TimedOut` outcome synthesis** — Phase γ ships
-   the responder-side `TimedOut` wire-enum variant but no
-   originator-side local timeout wrapper. Callers wrap
-   `DelegatedRestartHandle::result` in `tokio::time::timeout` if they
-   want a deadline. γ.next: extend
-   `Cluster::send_delegated_restart_request` with an explicit
-   deadline arg + auto-fire `delegated_restart_completed
-   outcome=timed_out` on the originator side when the deadline
-   elapses (discarding any late-arriving wire Result).
-4. **`DelegatedRestartHandle` `Drop` impl** — if the originator drops
-   the handle before awaiting `.result()`, the corresponding entry in
-   `delegated_restart_pending` stays resident until a late-arriving
-   Result clears it (or the peer disconnects and the connection task
-   tears down its pending map — but peer disconnect doesn't
-   automatically clear the originator-side pending map today). γ.next
-   adds a `Drop` impl that removes the correlation_id from the
-   pending map on early-drop, plus a periodic GC pass keyed by
-   deadline. Practical leak is bounded (entries are ~64 bytes), but
-   the explicit GC closes the gap.
+1. ~~**REST endpoint at `management_api.rs`.**~~ **SHIPPED 2026-07-18**, including concrete Admin-role enforcement, drain gate, daemon bridge, bounded rate-limit label, and HTTP error mapping.
+2. ~~**Cluster-internal drain-state gate on `Cluster::send_delegated_restart_request`.**~~
+   **SHIPPED 2026-07-18.** The dist-owned drain admission state now
+   rejects both default and explicit-timeout APIs with typed
+   `DelegatedRestartError::Draining` before peer/capability lookup.
+   Dispatches admitted immediately before the transition are counted
+   until their synchronous queue attempt exits, so
+   `DaemonHandle::start_drain` cannot report `cluster_quiesced` across
+   that race. The observer bridge maps the typed race outcome back to
+   the canonical 503 `draining` response. No observer-layer
+   `DrainFlag` dependency was introduced into graphreact-dist.
+3. ~~**Originator-side `TimedOut` outcome synthesis.**~~ **SHIPPED
+   2026-07-18.** Default deadline is 30 seconds; the additive
+   `send_delegated_restart_request_with_timeout` API accepts an
+   explicit `Duration`. Timeout removes the pending entry, resolves
+   `result` with `TimedOut`, and audits completion. Late results are
+   ignored by the existing `no_pending_entry` branch.
+4. ~~**Abandoned-handle pending-entry cleanup.**~~ **SHIPPED
+   2026-07-18.** A cleanup task detects a closed result receiver on a
+   100ms cadence and removes the entry. This deliberately avoids a
+   `Drop` impl on `DelegatedRestartHandle`: adding `Drop` would make it
+   illegal for existing callers to move the public `ack` and `result`
+   fields out of the handle, breaking the Phase γ API. The receiver-
+   closure probe supplies equivalent cleanup without that break.
 5. **Audit-emit level normalization** —
    `delegated_restart_issued` + `delegated_restart_received` +
    `delegated_restart_ack` + `delegated_restart_completed` (success
@@ -622,17 +643,21 @@ robustness polish noted by the verify pass:
    reachable from dist (or a tracing-layer bridge that captures the
    audit target into the sink), these events can fan to the
    hash-chain ledger.
-8. **Cluster handshake quiescence (`Cluster::begin_drain`)** —
-   softer shutdown path for cluster connections: announce drain to
-   peers BEFORE closing the socket so they can fail outbound
-   delegated-restart calls fast rather than timing out on the
-   wire. Composes with the Phase α SIGTERM drain primitive.
-9. **Per-call drain-aware timeout truncation** — when the daemon
-   enters drain mid-call, in-flight `DelegatedRestartHandle` futures
-   should auto-cancel with `outcome=timed_out reason=drain_started`
-   rather than waiting for the wire Result. Phase α drain budget +
-   Phase γ correlation_id machinery compose; the work is wiring
-   them up.
+8. ~~**Cluster handshake quiescence (`Cluster::begin_drain`).**~~
+   **SHIPPED 2026-07-18.** The drain transition atomically closes
+   handshake admission, aborts the inbound listener task, lets
+   already-admitted handshakes finish or fail, and preserves
+   established peer connections until normal shutdown. This is a
+   local admission/quiescence contract; it does not add a wire-level
+   drain announcement.
+9. ~~**Delegated-restart drain-aware timeout truncation.**~~ **SHIPPED
+   2026-07-18.** When the daemon enters drain, outstanding
+   `DelegatedRestartHandle::result` receivers resolve immediately with
+   `TimedOut`; their pending entries are removed and completion is
+   audited with `reason=drain_started`. Late Ack/Result packets use the
+   existing `no_pending_entry` ignored path. The separate observer-
+   ingress `MAX_CALL_TIMEOUT_MS` truncation gap also shipped in the
+   same γ.next closeout.
 10. **Windows SIGTERM equivalent** — the lifecycle drain primitive
     currently triggers on Unix `SIGTERM`; the Windows equivalent
     (CTRL_SHUTDOWN_EVENT / service stop) is unwired. Cross-cuts

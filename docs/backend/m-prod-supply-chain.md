@@ -69,7 +69,7 @@ The CycloneDX SBOM rides on top of this: the SBOM describes the dep tree, `cargo
 **Operator contract:**
 
 - absent at build time ⇒ `grx version` omits the signature line entirely (every dev build, every CI build that isn't a tagged release).
-- set at build time ⇒ `grx version` appends `signature: <URL>` after the cpython engine line; operators re-verify via `cosign verify-blob --signature <URL>.sig <URL>` (cosign + signing pipeline lands with sub-track #8 — the runbook documents the contract today).
+- set at build time ⇒ `grx version` appends the `grx.cosign.bundle` URL after the cpython engine line; operators download the binary + bundle and run `cosign verify-blob --bundle grx.cosign.bundle grx`.
 
 The legacy version output shape (`grx <ver>`, `parser`, `engine-trait`, `engine-null`, `engine-echo`, the long jsc + cpython lines) is preserved bit-for-bit — the signature line is purely additive. Unit test `commands::tests::version_omits_signature_when_unset` locks the absent contract; `version_shape_preserved` locks the legacy prefixes against regression. The env-var-set path is exercised by the same test via `option_env!()` branching, and end-to-end by the release pipeline (sub-track #8) when it ships.
 
@@ -195,6 +195,6 @@ Each emitted `*.cdx.json` validates against the [CycloneDX 1.4 JSON schema](http
 
 ## Cross-track contracts locked here
 
-- **Sub-track #8 (packaging):** the release pipeline owns the "where does the SBOM go" decision (CI artifact today, GitHub Release attachment + cosign signature tomorrow). #7 provides the SBOM-generating job + the future signature steps; #8 ships the release pipeline that invokes them.
+- **Sub-track #8 (packaging):** the release pipeline attaches the SBOM, keyless cosign bundle, SLSA provenance, binary, and per-arch OCI artifacts to each GitHub Release; the GHCR manifest path remains protected-environment gated.
 - **`deny.toml`:** unchanged by this slice — `cargo-cyclonedx` is not a workspace dependency, so its transitive closure does not flow into the workspace license / advisory enforcement. Any future workspace dep added by #7 (e.g. an in-process SBOM generator) must clear the existing allowlist.
 - **Cleanup-Pass gate:** per the master plan, M-Prod does not open until Cleanup-Pass closes. This slice is small enough to land as a pre-M-Prod scaffolding PR without violating that gate; the full sub-track waits.

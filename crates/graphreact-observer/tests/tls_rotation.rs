@@ -169,6 +169,40 @@ async fn reload_tls_rejects_not_configured() {
     handle.shutdown().await;
 }
 
+#[tokio::test]
+async fn readyz_is_red_only_while_tls_rotation_guard_is_alive() {
+    let cert = mint_test_cert("readyz-rotation.test");
+    let metrics = Arc::new(MetricsInner::new());
+    metrics.process_batch_duration.observe(100_000);
+    let bind = BindConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        token: None,
+        tls: Some(server_tls_config_for(&cert)),
+    };
+    let handle = spawn_management_api(bind, metrics, 0).await.expect("spawn");
+
+    let guard = handle.begin_tls_rotation().expect("TLS readiness state");
+    let (status, body) = tls_http_get_readyz(
+        handle.local_addr,
+        "readyz-rotation.test",
+        &cert.cert_der,
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(body, "tls_rotation_in_progress");
+
+    drop(guard);
+    let (status, body) = tls_http_get_readyz(
+        handle.local_addr,
+        "readyz-rotation.test",
+        &cert.cert_der,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "ready");
+    handle.shutdown().await;
+}
+
 // ---------- ALPN preservation ----------
 
 #[tokio::test]
@@ -475,4 +509,46 @@ async fn dial_and_capture_peer_cert(
         .peer_certificates()
         .expect("peer presented a cert chain");
     chain[0].clone()
+}
+
+async fn tls_http_get_readyz(
+    addr: std::net::SocketAddr,
+    sni: &str,
+    expected: &CertificateDer<'static>,
+) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(expected.clone()).expect("add test root");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(ALL_VERSIONS)
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_cfg));
+    let tcp = TcpStream::connect(addr).await.expect("tcp connect");
+    let server_name = rustls::pki_types::ServerName::try_from(sni.to_string()).expect("SNI");
+    let mut tls = connector.connect(server_name, tcp).await.expect("TLS connect");
+    tls.write_all(
+        format!(
+            "GET /v1/readyz HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("write request");
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.expect("read response");
+    let response = String::from_utf8(response).expect("UTF-8 response");
+    let (head, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .expect("HTTP status");
+    (status, body.to_string())
 }

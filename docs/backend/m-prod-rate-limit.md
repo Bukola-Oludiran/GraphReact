@@ -14,7 +14,7 @@ This document covers sub-track #6 of the M-Prod milestone (production-hardening)
     - `per_token_no_match` — per-token bucket fired for `Authorization: Bearer …` carrying a token that doesn't match any registry entry, OR missing entirely. All such requests collapse to ONE shared bucket so the per-token-keyed limiter's internal state stays bounded.
 - Denial precedence locked at `drain > per_token > per_ip > auth > bridge_saturated`. The outer-runs-first invariant means a per-token cap on a known principal fires BEFORE the per-IP cap, attributing the 429 to the right bucket.
 - `X-Forwarded-For` trusted-proxy OPT-IN via `GRX_TRUSTED_PROXIES=<cidr,cidr,…>`. Default behavior is bit-for-bit Phase A: `X-Forwarded-For` is **IGNORED**, the per-IP bucket keys on the TCP peer IP. When `GRX_TRUSTED_PROXIES` is wired, the leftmost `X-Forwarded-For` IP is honored **ONLY** when the TCP peer is in the trusted set — the silent-spoofing footgun guard.
-- `bucket` field added to the `rate_limit_blocked` audit record + a new 2-label `grx_rate_limit_blocked_total{route,bucket}` Prometheus vocabulary (cardinality bounded `≤ 12 × 3 = 36` series).
+- `bucket` field added to the `rate_limit_blocked` audit record + a new 2-label `grx_rate_limit_blocked_total{route,bucket}` Prometheus vocabulary (cardinality bounded `≤ 13 × 3 = 39` series after the delegated-restart admin route landed).
 - Retry-After clamp pattern preserved on BOTH layers: one helper `rate_limited_response_from_error_with_bucket` services both per-IP and per-token error_handlers; the Phase A verify-finding patch (clamp survives tower_governor header fold) is inherited automatically by the new layer.
 - New `TrustedProxyConfig` parser + matcher (hand-rolled CIDR over IPv4 + IPv6, ~80 LOC, no new crate dep) lives in `crates/graphreact-observer/src/rate_limit_keys.rs`.
 
@@ -131,7 +131,7 @@ grx_rate_limit_blocked_total{bucket="per_token",route="/v1/identity"}           
 grx_rate_limit_blocked_total{bucket="per_token_no_match",route="/v1/nodes/:id/call"}      7
 ```
 
-The `route` label is **bounded** to the 11 registered protected-route patterns plus an `"unknown"` sentinel — 12 routes. The `bucket` label (Phase B Part 1) is bounded to a closed 3-entry vocabulary `{per_ip, per_token, per_token_no_match}`. Total cardinality is `12 × 3 = 36` series. The rate-limit observer middleware feeds the bounded `route` label by passing the raw URI path through `classify_protected_path`, which collapses concrete instantiations like `/v1/nodes/abc123/messages` back to the pattern `/v1/nodes/:id/messages`.
+The `route` label is **bounded** to the 12 registered protected-route patterns plus an `"unknown"` sentinel — 13 values. The `bucket` label (Phase B Part 1) is bounded to a closed 3-entry vocabulary `{per_ip, per_token, per_token_no_match}`. Total cardinality is `13 × 3 = 39` series. The rate-limit observer middleware feeds the bounded `route` label by passing the raw URI path through `classify_protected_path`, which collapses concrete instantiations like `/v1/nodes/abc123/messages` back to the pattern `/v1/nodes/:id/messages`.
 
 The metric is **suppressed entirely** until the first 429 fires (Prometheus best practice — don't emit empty families). A steady-state daemon that never rate-limits never publishes the `grx_rate_limit_blocked_total` family.
 

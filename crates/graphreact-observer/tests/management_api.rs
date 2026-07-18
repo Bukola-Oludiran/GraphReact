@@ -91,7 +91,8 @@ async fn spawn_with_fixture(
                 // `inject_e2e.rs`, `call_e2e.rs`, `bulk_e2e.rs`.
                 SnapshotRequest::InjectMessage { .. }
                 | SnapshotRequest::InjectMessageWithReply { .. }
-                | SnapshotRequest::InjectMessageBulkLine { .. } => {}
+                | SnapshotRequest::InjectMessageBulkLine { .. }
+                | SnapshotRequest::DelegatedRestart { .. } => {}
             }
         }
     });
@@ -177,6 +178,35 @@ async fn readyz_200_after_first_batch_tick() {
     .await;
     assert_eq!(status.code, 200);
     assert!(body.contains("ready"));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn readyz_503_after_audit_sink_write_failure() {
+    let metrics = Arc::new(MetricsInner::new());
+    let bind = BindConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        token: None,
+        tls: None,
+    };
+    let mut server = spawn_management_api(bind, metrics.clone(), 0)
+        .await
+        .expect("spawn");
+    let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
+    let _drain: JoinHandle<()> = tokio::spawn(async move {
+        while snapshot_rx.recv().await.is_some() {}
+    });
+    metrics.process_batch_duration.observe(100_000);
+
+    metrics.audit_sink_write_failures_inc("write");
+    let (status, body) = http_get_with_headers(
+        &format!("http://{}/v1/readyz", server.local_addr),
+        None,
+    )
+    .await;
+    assert_eq!(status.code, 503);
+    assert_eq!(status.retry_after.as_deref(), Some("1"));
+    assert_eq!(body, "audit_sink_failed");
     server.shutdown().await;
 }
 

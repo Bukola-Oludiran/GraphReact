@@ -404,7 +404,13 @@ mod tests {
         // The substrate types + body-dispatch surface must be present:
         // a regression that strips RegisterBody or bodyRegistry would
         // silently break user-authored body dispatch.
-        for sym in ["type Ctx", "type Manifest", "RegisterBody", "bodyRegistry"] {
+        for sym in [
+            "type Ctx",
+            "func (Ctx) Secret(name string) string",
+            "type Manifest",
+            "RegisterBody",
+            "bodyRegistry",
+        ] {
             assert!(
                 prelude_src.contains(sym),
                 "prelude missing required body-dispatch surface: {sym}"

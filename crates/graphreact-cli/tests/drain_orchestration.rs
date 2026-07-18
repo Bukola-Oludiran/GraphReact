@@ -1,4 +1,4 @@
-//! **M-Prod sub-track #4 Phase α verification gate.** Integration
+//! **M-Prod sub-track #4 drain verification gate.** Integration
 //! tests for [`DaemonHandle::start_drain`] + the observer-side drain
 //! contract.
 //!
@@ -12,12 +12,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use graphreact_cli::commands::{start_daemon, DaemonOptions};
-use graphreact_dist::{NetSplitPolicy, NetTickConfig, NodeId, SecretCookie, TlsConfig};
+use graphreact_dist::{DistError, NetSplitPolicy, NetTickConfig, NodeId, SecretCookie, TlsConfig};
 use graphreact_observer::{BindConfig, BindFlags};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// Inline TLS pair generator — same shape as the cluster_cli test
-/// helper. Phase α doesn't exercise mTLS rotation; we just need a
+/// helper. These tests don't exercise mTLS rotation; we just need a
 /// valid cluster cert chain so `start_daemon`'s `Cluster::start`
 /// boots cleanly.
 fn pair_tls(name_a: &str, name_b: &str) -> (TlsConfig, TlsConfig) {
@@ -67,17 +67,19 @@ fn fast_tick() -> NetTickConfig {
 /// ephemeral port (so the drain bit is meaningful). No peers, no
 /// `.grx` mount, Null engine. Single-node clusters pass the
 /// cluster-readiness predicate trivially.
-async fn boot_daemon_with_observer() -> graphreact_cli::commands::DaemonHandle {
+async fn boot_daemon(with_observer: bool) -> graphreact_cli::commands::DaemonHandle {
     let (tls, _bob_tls) = pair_tls("alice", "bob");
     let cookie_bytes = b"shared-cookie".to_vec();
-    let bind = BindConfig::from_flags(BindFlags {
-        addr: Some(ephemeral_loopback()),
-        token_env: None,
-        token_file: None,
-        cert: None,
-        key: None,
-    })
-    .expect("observer bind config");
+    let observer_bind = with_observer.then(|| {
+        BindConfig::from_flags(BindFlags {
+            addr: Some(ephemeral_loopback()),
+            token_env: None,
+            token_file: None,
+            cert: None,
+            key: None,
+        })
+        .expect("observer bind config")
+    });
 
     let opts = DaemonOptions {
         path: None,
@@ -90,7 +92,7 @@ async fn boot_daemon_with_observer() -> graphreact_cli::commands::DaemonHandle {
         net_tick: fast_tick(),
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
-        observer_bind: Some(bind),
+        observer_bind,
         observer_tls_paths: None,
         debug: None,
         debug_wait: false,
@@ -116,19 +118,39 @@ async fn boot_daemon_with_observer() -> graphreact_cli::commands::DaemonHandle {
 /// for CI flake-tolerance.
 #[tokio::test]
 async fn start_drain_completes_immediately_when_inflight_empty() {
-    let handle = boot_daemon_with_observer().await;
+    let handle = boot_daemon(true).await;
     let outcome = handle.start_drain(Duration::from_secs(5)).await;
     assert!(
         outcome.in_flight_settled,
         "no in-flight requests → drain should settle (got {outcome:?})"
     );
     assert!(!outcome.deadline_exceeded, "deadline was 5s; nothing pending");
-    assert!(outcome.cluster_quiesced, "Phase α reports true unconditionally");
+    assert!(
+        outcome.cluster_quiesced,
+        "empty cluster handshake population should quiesce"
+    );
     assert!(
         outcome.drain_duration < Duration::from_millis(200),
         "fast-path drain should be near-instant, got {:?}",
         outcome.drain_duration
     );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn start_drain_without_observer_still_closes_cluster_admission() {
+    let handle = boot_daemon(false).await;
+    let outcome = handle.start_drain(Duration::from_secs(1)).await;
+    assert!(outcome.in_flight_settled);
+    assert!(outcome.cluster_quiesced);
+    assert!(!outcome.deadline_exceeded);
+
+    let (client, _server) = tokio::io::duplex(1_024);
+    let bob_id = parse_id("bob@127.0.0.1");
+    assert!(matches!(
+        handle.cluster().connect_with_stream(client, bob_id).await,
+        Err(DistError::Draining)
+    ));
     handle.shutdown().await;
 }
 
@@ -140,7 +162,7 @@ async fn start_drain_completes_immediately_when_inflight_empty() {
 /// configured 100ms deadline.
 #[tokio::test]
 async fn start_drain_respects_deadline_on_stuck_inflight() {
-    let handle = boot_daemon_with_observer().await;
+    let handle = boot_daemon(true).await;
     // Hold an in-flight guard for the entire drain window — the
     // counter never drops to zero so the orchestrator times out.
     // We grab the counter through the public surface: it's a
@@ -183,7 +205,7 @@ async fn start_drain_respects_deadline_on_stuck_inflight() {
 /// `drain_started` or reset the deadline.
 #[tokio::test]
 async fn start_drain_is_idempotent_across_double_call() {
-    let handle = boot_daemon_with_observer().await;
+    let handle = boot_daemon(true).await;
     let first = handle.start_drain(Duration::from_secs(2)).await;
     assert!(first.in_flight_settled);
     let second = handle.start_drain(Duration::from_secs(2)).await;

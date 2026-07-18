@@ -649,6 +649,7 @@ use graphreact_grx_parser::{
 };
 
 use crate::runtime::RuntimeError;
+use crate::runtime_secrets::RuntimeSecretContext;
 
 // ---------------------------------------------------------------------
 // Per-thread registries (mirroring jsruntime.rs)
@@ -974,6 +975,30 @@ fn current_directory() -> Option<Rc<RefCell<GraphDirectory>>> {
 
 fn current_graph_snapshot() -> Option<Rc<GraphSnapshot>> {
     CURRENT_GRAPH_SNAPSHOT.with(|cell| cell.borrow().clone())
+}
+
+fn build_runtime_secret_callback(context: Arc<RuntimeSecretContext>) -> BoxCallback {
+    Box::new(move |args| {
+        let name = match args.first() {
+            Some(HostValue::String(name)) => name,
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(node_id) = current_node_id() else {
+            return Ok(HostValue::Null);
+        };
+        let allowed = current_graph_snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .manifests
+                    .borrow()
+                    .get(&node_id)
+                    .and_then(|manifest| manifest.needs_secret.clone())
+            })
+            .unwrap_or_default();
+        Ok(context
+            .read_utf8(&node_id, name, &allowed)
+            .map_or(HostValue::Null, HostValue::String))
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1343,6 +1368,7 @@ def __augment_ctx(raw_ctx):
     raw_ctx['compose'] = lambda specs: use_compose()(specs)
     raw_ctx['unmount'] = lambda: use_unmount_self()()
     raw_ctx['accept_edge'] = lambda target_id: use_accept_edge()(target_id)
+    raw_ctx['secret'] = lambda name: getattr(_builtins, 'host_secret')(str(name)) if callable(getattr(_builtins, 'host_secret', None)) else None
     return raw_ctx
 
 def use_graph_query(selector, deps=None):
@@ -4861,6 +4887,7 @@ except NameError:
 fn install_hook_prelude(
     engine: &mut CPythonEngine,
     iso: IsolateHandle,
+    secrets: Option<Arc<RuntimeSecretContext>>,
 ) -> Result<(), RuntimeError> {
     // M13-followon-D analogue: register host_track_token FIRST so
     // every subsequent prelude-driven `__register_callback` call (and
@@ -4870,6 +4897,9 @@ fn install_hook_prelude(
     // prelude eval-phase happens AFTER all register_callback calls
     // below, so the ordering is safe.
     engine.register_callback(iso, "host_track_token", build_host_track_token_callback())?;
+    if let Some(context) = secrets {
+        engine.register_callback(iso, "host_secret", build_runtime_secret_callback(context))?;
+    }
     engine.register_callback(iso, "host_state", build_host_state_callback())?;
     engine.register_callback(iso, "host_state_set", build_host_state_set_callback())?;
     engine.register_callback(iso, "host_effect", build_host_effect_callback())?;
@@ -5315,6 +5345,13 @@ pub fn mount_python_definitions(path: &std::path::Path) -> Result<PyRuntime, Run
 /// `init(ctx)` for phase 3a fixtures) callable, and registers a
 /// [`NodeDefinition`] with a fresh [`Scheduler`].
 pub fn mount_with_scheduler(path: &std::path::Path) -> Result<PyRuntime, RuntimeError> {
+    mount_with_scheduler_and_secrets(path, None)
+}
+
+pub fn mount_with_scheduler_and_secrets(
+    path: &std::path::Path,
+    secrets: Option<Arc<RuntimeSecretContext>>,
+) -> Result<PyRuntime, RuntimeError> {
     let resolved = resolve_multi_file(path)?;
 
     let mut definitions: Vec<(String, String, String, ComponentLang)> = Vec::new();
@@ -5379,7 +5416,7 @@ pub fn mount_with_scheduler(path: &std::path::Path) -> Result<PyRuntime, Runtime
         // Drop the borrow before calling install_hook_prelude since
         // it takes &mut.
         drop(e);
-        install_hook_prelude(&mut engine_rc.borrow_mut(), iso)?;
+        install_hook_prelude(&mut engine_rc.borrow_mut(), iso, secrets)?;
         iso
     };
 
@@ -6185,7 +6222,7 @@ mod tests {
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             drop(e);
-            install_hook_prelude(&mut engine_rc.borrow_mut(), iso).expect("prelude");
+            install_hook_prelude(&mut engine_rc.borrow_mut(), iso, None).expect("prelude");
             engine_rc
                 .borrow_mut()
                 .register_callback(
@@ -6790,7 +6827,7 @@ def body(ctx):
         let mut engine = CPythonEngine::new();
         engine.initialize().expect("init");
         let iso = engine.create_isolate(IsolateOptions::default()).expect("create");
-        install_hook_prelude(&mut engine, iso).expect("prelude");
+        install_hook_prelude(&mut engine, iso, None).expect("prelude");
 
         // A standalone Python module should see use_state on builtins.
         // (Calling it would require an active node — that's tested
@@ -6860,6 +6897,97 @@ def body(ctx):
         }
         engine.dispose_isolate(iso).expect("dispose");
         engine.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn augment_ctx_exposes_safe_secret_accessor_without_production_callback() {
+        let _g = engine_lock();
+        reset_global_state();
+        let mut engine = CPythonEngine::new();
+        engine.initialize().expect("init");
+        let iso = engine.create_isolate(IsolateOptions::default()).expect("create");
+        install_hook_prelude(&mut engine, iso, None).expect("prelude");
+        let module = engine
+            .eval_module(
+                iso,
+                "secret_probe",
+                "def probe():\n    ctx = __augment_ctx({})\n    return callable(ctx.get('secret')) and ctx['secret']('TOKEN') is None\n",
+            )
+            .expect("eval");
+        let probe = engine.resolve_function(iso, module, "probe").expect("resolve");
+        assert_eq!(
+            engine.call_function(iso, probe, &[]).expect("call"),
+            HostValue::Bool(true)
+        );
+        engine.dispose_isolate(iso).expect("dispose");
+        engine.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn production_python_secret_callback_denies_first_render_then_allows_committed_manifest() {
+        #[derive(Debug)]
+        struct OneSecret;
+
+        impl graphreact_secrets::SecretStore for OneSecret {
+            fn set(
+                &self,
+                _name: &str,
+                _value: graphreact_secrets::SecretValue,
+            ) -> Result<(), graphreact_secrets::SecretsError> {
+                unreachable!("read-only test store")
+            }
+
+            fn get(
+                &self,
+                name: &str,
+            ) -> Result<graphreact_secrets::SecretValue, graphreact_secrets::SecretsError> {
+                if name == "TOKEN" {
+                    graphreact_secrets::SecretValue::from_string("allowed-value".into())
+                } else {
+                    Err(graphreact_secrets::SecretsError::NotFound { name: name.into() })
+                }
+            }
+
+            fn list(&self) -> Result<Vec<String>, graphreact_secrets::SecretsError> {
+                Ok(vec!["TOKEN".into()])
+            }
+
+            fn remove(&self, _name: &str) -> Result<(), graphreact_secrets::SecretsError> {
+                unreachable!("read-only test store")
+            }
+        }
+
+        let _g = engine_lock();
+        reset_global_state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = dir.path().join("secret.grx");
+        std::fs::write(
+            &fixture,
+            r#"<Worker lang="python">
+def body(ctx):
+    value = ctx['secret']('TOKEN')
+    return {'needs_secret': ['TOKEN'], 'emits': [value if value is not None else 'DENIED']}
+</Worker>
+<Graph id="secret-test"><Worker id="worker" /></Graph>
+"#,
+        )
+        .expect("write fixture");
+        let secrets = crate::runtime_secrets::RuntimeSecretContext::with_store(Arc::new(OneSecret));
+        let mut runtime = mount_with_scheduler_and_secrets(&fixture, Some(secrets)).expect("mount");
+
+        runtime.process_batch().expect("first batch");
+        assert_eq!(
+            runtime.graph_snapshot.manifests.borrow()["worker"].emits,
+            vec!["DENIED"]
+        );
+        let key = runtime.scheduler.key_for("worker").expect("worker key");
+        runtime.scheduler.mark_dirty(key);
+        runtime.process_batch().expect("second batch");
+        assert_eq!(
+            runtime.graph_snapshot.manifests.borrow()["worker"].emits,
+            vec!["allowed-value"]
+        );
+        runtime.shutdown().expect("shutdown");
     }
 
     // -----------------------------------------------------------------
@@ -10681,7 +10809,7 @@ def body(ctx):
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             drop(e);
-            install_hook_prelude(&mut engine_rc.borrow_mut(), iso).expect("prelude");
+            install_hook_prelude(&mut engine_rc.borrow_mut(), iso, None).expect("prelude");
             // Override the production host_use_source with a capture
             // callback. Replaces the real registration so we can
             // assert the descriptor without instantiating real
@@ -10791,7 +10919,7 @@ def body(ctx):
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             drop(e);
-            install_hook_prelude(&mut engine_rc.borrow_mut(), iso).expect("prelude");
+            install_hook_prelude(&mut engine_rc.borrow_mut(), iso, None).expect("prelude");
             engine_rc
                 .borrow_mut()
                 .register_callback(

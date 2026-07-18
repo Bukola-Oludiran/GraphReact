@@ -102,7 +102,7 @@ pub use wire::{
 };
 pub use cluster::{
     DelegatedRestartError, DelegatedRestartHandle, DelegatedRestartIssued,
-    DelegatedRestartResultEvent,
+    DelegatedRestartResultEvent, DEFAULT_DELEGATED_RESTART_TIMEOUT,
 };
 
 /// Result alias used throughout the dist crate.

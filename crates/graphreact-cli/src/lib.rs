@@ -59,6 +59,8 @@ pub mod goruntime;
 #[cfg(target_os = "macos")]
 pub mod mixedruntime;
 pub mod runtime;
+/// M-Prod #3 Phase B Part 2 shared rotatable secret-store context.
+pub mod runtime_secrets;
 pub mod sources;
 pub mod watch_mode;
 

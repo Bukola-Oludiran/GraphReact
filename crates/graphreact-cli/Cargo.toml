@@ -33,6 +33,7 @@ graphreact-secrets = { path = "../graphreact-secrets" }
 clap.workspace = true
 clap_complete.workspace = true
 parking_lot.workspace = true
+arc-swap.workspace = true
 rustc-hash.workspace = true
 rustls = { workspace = true, default-features = false, features = ["std", "ring"] }
 rustls-native-certs.workspace = true

@@ -1436,15 +1436,50 @@ impl SchedulerHost {
     /// `process_batch` entry point. **M22.** Mixed drives every
     /// active engine slot in init order.
     pub fn process_batch(&mut self) -> Result<(), graphreact_core::RuntimeError> {
+        self.process_batch_with_metrics(None)
+    }
+
+    /// Drive one batch and, when an observer is configured, attribute
+    /// wall-clock time to the bounded active-engine label.
+    pub fn process_batch_with_metrics(
+        &mut self,
+        metrics: Option<&graphreact_observer::MetricsInner>,
+    ) -> Result<(), graphreact_core::RuntimeError> {
         match self {
-            SchedulerHost::Empty(s) => s.process_batch(),
+            SchedulerHost::Empty(s) => {
+                let started = std::time::Instant::now();
+                let result = s.process_batch();
+                observe_engine_batch_duration(metrics, "null", started.elapsed());
+                result
+            }
             #[cfg(target_os = "macos")]
-            SchedulerHost::Jsc(r) => r.process_batch(),
+            SchedulerHost::Jsc(r) => {
+                let started = std::time::Instant::now();
+                let result = r.process_batch();
+                observe_engine_batch_duration(metrics, "jsc", started.elapsed());
+                result
+            }
             #[cfg(target_os = "macos")]
-            SchedulerHost::Cpython(r) => r.process_batch(),
+            SchedulerHost::Cpython(r) => {
+                let started = std::time::Instant::now();
+                let result = r.process_batch();
+                observe_engine_batch_duration(metrics, "cpython", started.elapsed());
+                result
+            }
             #[cfg(target_os = "macos")]
-            SchedulerHost::Mixed(m) => m.process_batch(),
+            SchedulerHost::Mixed(m) => m.process_batch_with_metrics(metrics),
         }
+    }
+}
+
+fn observe_engine_batch_duration(
+    metrics: Option<&graphreact_observer::MetricsInner>,
+    engine: &'static str,
+    elapsed: std::time::Duration,
+) {
+    if let Some(metrics) = metrics {
+        let duration_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        metrics.engine_process_batch_duration_observe(engine, duration_ns);
     }
 }
 
@@ -1480,8 +1515,8 @@ pub struct DaemonHandle {
     otel_provider: Option<graphreact_observer::SdkTracerProvider>,
     /// **M-Prod sub-track #4 Phase α.** Drain bit shared with the
     /// observer's [`graphreact_observer::ApiState`]. `None` when
-    /// no observer was wired (drain becomes a no-op then — there's
-    /// no ingress surface to refuse). `Some(flag)` when `start_daemon`
+    /// no observer was wired; cluster admission still
+    /// closes through [`Cluster::begin_drain`]. `Some(flag)` when `start_daemon`
     /// constructed an observer via
     /// [`graphreact_observer::spawn_management_api_with_drain`].
     drain: Option<graphreact_observer::DrainFlag>,
@@ -1526,6 +1561,9 @@ pub struct DaemonHandle {
     /// SIGHUP spool rotation is a silent no-op (no operator-
     /// visible spool surface to rotate).
     audit_forwarder_spool_path: Option<std::path::PathBuf>,
+    /// Rotatable production secret source shared by every mounted
+    /// guest engine. Present for daemons backed by a `.grx` graph.
+    runtime_secrets: Option<std::sync::Arc<crate::runtime_secrets::RuntimeSecretContext>>,
 }
 
 /// **M-Prod sub-track #4 Phase α.** Outcome of a graceful drain
@@ -1545,11 +1583,8 @@ pub struct DrainOutcome {
     /// before the deadline; `false` if the deadline expired with
     /// either non-zero.
     pub in_flight_settled: bool,
-    /// `true` for Phase α unconditionally (handshake-quiescence
-    /// is deferred; see `m-prod-lifecycle.md` for why). Future
-    /// phases populate this from a `Cluster::handshakes_pending()`
-    /// counter; today the cluster's per-peer tasks are aborted by
-    /// the subsequent `cluster.shutdown()` call.
+    /// `true` when all cluster work admitted before
+    /// [`Cluster::begin_drain`] has left its admission-critical path.
     pub cluster_quiesced: bool,
     /// Wall-clock span between [`graphreact_observer::DrainFlag::start`]
     /// returning `true` and quiescence (or deadline expiry).
@@ -1583,6 +1618,10 @@ impl DaemonHandle {
         self.host.process_batch()
     }
 
+    fn process_batch_observed(&mut self) -> Result<(), graphreact_core::RuntimeError> {
+        self.host.process_batch_with_metrics(self.metrics.as_deref())
+    }
+
     /// **M22 verify fix.** Read the shared `MetricsInner` Arc, if any
     /// was set up during `start_daemon` (i.e. `--observer-bind` was
     /// passed). Used by `drive_handle_until` to record per-tick
@@ -1598,12 +1637,14 @@ impl DaemonHandle {
     ///    `drain_started` audit BEFORE the AtomicBool flip, so
     ///    `/v1/readyz` scrapes racing the flip can't see
     ///    `ready=true` and `no drain_started` in the log).
-    /// 2. Poll the in-flight predicates
+    /// 2. Stop cluster handshake and delegated-restart admission via
+    ///    `Cluster::begin_drain`.
+    /// 3. Poll the in-flight predicates
     ///    (`ingress_in_flight.load() == 0`
     ///    AND, if an observer is wired,
     ///    `observer.pending_calls.is_empty()`) on a 25ms cadence
     ///    until quiescence or `deadline` elapses.
-    /// 3. Emit `drain_completed` (success) or
+    /// 4. Emit `drain_completed` (success) or
     ///    `drain_deadline_exceeded` (timeout) on the
     ///    `graphreact::observer::audit` target.
     ///
@@ -1620,32 +1661,26 @@ impl DaemonHandle {
     /// when to escalate. Typical wiring (SIGTERM path):
     /// `handle.start_drain(deadline).await; handle.shutdown().await`.
     ///
-    /// When `self.drain` is `None` (no observer wired at boot)
-    /// this is a no-op — returns immediately with
-    /// `in_flight_settled: true` because there's no ingress
-    /// surface to quiesce.
+    /// When `self.drain` is `None` (no observer wired at boot),
+    /// ingress is trivially quiescent but cluster handshake drain
+    /// still runs.
     pub async fn start_drain(&self, deadline: Duration) -> DrainOutcome {
-        let Some(flag) = self.drain.as_ref() else {
-            // No observer was wired. Drain has nothing to do —
-            // the daemon's ingress surface doesn't exist. Skip
-            // audit emit too: an operator would never call this
-            // path unless they piped SIGTERM into a no-observer
-            // daemon, and even then there's nothing to surface.
-            return DrainOutcome {
-                in_flight_settled: true,
-                cluster_quiesced: true,
-                drain_duration: Duration::ZERO,
-                deadline_exceeded: false,
-            };
-        };
         let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
-        // Idempotent CAS: only the FIRST call gets `true`.
-        // Duplicate SIGTERMs return immediately without resetting
-        // the deadline or re-emitting `drain_started`.
-        if !flag.start(deadline_ms) {
+        let observer_started = self
+            .drain
+            .as_ref()
+            .is_some_and(|flag| flag.start(deadline_ms));
+        let cluster_started = self.cluster.begin_drain();
+        // Idempotent across both independently optional surfaces.
+        // A daemon without an observer still transitions the cluster.
+        if !observer_started && !cluster_started {
             return DrainOutcome {
-                in_flight_settled: true,
-                cluster_quiesced: true,
+                in_flight_settled: self.ingress_in_flight.load() == 0
+                    && self
+                        .observer
+                        .as_ref()
+                        .is_none_or(|o| o.pending_calls.is_empty()),
+                cluster_quiesced: self.cluster.drain_quiesced(),
                 drain_duration: Duration::ZERO,
                 deadline_exceeded: false,
             };
@@ -1660,35 +1695,29 @@ impl DaemonHandle {
         // bounded by `deadline` for the slow path.
         let mut poll = tokio::time::interval(Duration::from_millis(25));
         poll.tick().await; // skip immediate
-        let quiesced = loop {
+        let (in_flight_settled, cluster_quiesced) = loop {
             let ingress_done = ingress_counter.load() == 0;
             let calls_done = pending_calls
                 .as_ref()
                 .is_none_or(graphreact_observer::PendingCalls::is_empty);
-            if ingress_done && calls_done {
-                break true;
+            let cluster_done = self.cluster.drain_quiesced();
+            if ingress_done && calls_done && cluster_done {
+                break (true, true);
             }
             tokio::select! {
                 _ = poll.tick() => {}
                 () = tokio::time::sleep_until(
                     tokio::time::Instant::from_std(started + deadline)
                 ) => {
-                    break false;
+                    break (ingress_done && calls_done, cluster_done);
                 }
             }
         };
         let elapsed = started.elapsed();
-        if quiesced {
+        if in_flight_settled && cluster_quiesced {
             graphreact_observer::log_drain_completed(elapsed, true, true);
             DrainOutcome {
                 in_flight_settled: true,
-                // Phase α reports `cluster_quiesced: true`
-                // unconditionally — handshake-quiescence is a
-                // Phase β deliverable; today the cluster's
-                // per-peer tasks get aborted by the subsequent
-                // `cluster.shutdown()` call. See
-                // `docs/backend/m-prod-lifecycle.md` for the
-                // deferral rationale.
                 cluster_quiesced: true,
                 drain_duration: elapsed,
                 deadline_exceeded: false,
@@ -1705,8 +1734,8 @@ impl DaemonHandle {
                 ingress_remaining,
             );
             DrainOutcome {
-                in_flight_settled: false,
-                cluster_quiesced: true,
+                in_flight_settled,
+                cluster_quiesced,
                 drain_duration: elapsed,
                 deadline_exceeded: true,
             }
@@ -1740,6 +1769,7 @@ impl DaemonHandle {
         let Some(paths) = self.tls_paths.as_ref() else {
             return;
         };
+        let _rotation = observer.begin_tls_rotation();
         let sink = observer.audit_sink.as_ref();
         // Drain-respect: skip when SIGTERM drain has flipped the
         // bit. Audit, do NOT call reload_tls (would generate a
@@ -1793,6 +1823,20 @@ impl DaemonHandle {
         // Phase A's reload_tls emits tls_reload_attempt / success /
         // failure for us — no double-emission.
         let _ = observer.reload_tls(&cert_bytes, &key_bytes);
+    }
+
+    /// Re-resolve `GRX_RUNTIME_SECRET_BACKEND` and replace the active
+    /// store. Reads already in flight finish against their snapshot;
+    /// the next guest `ctx.secret` / `Ctx.Secret` call sees the new one.
+    pub fn reload_runtime_secrets(&self) {
+        let Some(context) = self.runtime_secrets.as_ref() else {
+            return;
+        };
+        if self.drain.as_ref().is_some_and(graphreact_observer::DrainFlag::is_draining) {
+            context.log_reload_skipped();
+            return;
+        }
+        context.reload_from_env();
     }
 
     /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** SIGHUP
@@ -2264,7 +2308,16 @@ fn validate_tls_paths_absolute(paths: Option<&TlsPaths>) {
 /// [`DaemonHandle`]. Async because `Cluster::start` + `Cluster::connect`
 /// are async.
 pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandError> {
-    let mut host = build_scheduler_host(opts.path.as_deref(), opts.runtime, opts.debug)?;
+    let runtime_secrets = opts
+        .path
+        .as_ref()
+        .map(|_| crate::runtime_secrets::RuntimeSecretContext::from_env());
+    let mut host = build_scheduler_host(
+        opts.path.as_deref(),
+        opts.runtime,
+        opts.debug,
+        runtime_secrets.clone(),
+    )?;
     // **M16-Backend P8.** Install debugpy on the freshly-mounted
     // CPython isolate (if `--debug=cpython:<port>` was passed).
     // build_scheduler_host (above) already mounted via the
@@ -2411,6 +2464,9 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // drain_budget_misconfig precedent below.
         validate_tls_paths_absolute(opts.observer_tls_paths.as_ref());
         let metrics = std::sync::Arc::new(graphreact_observer::MetricsInner::new());
+        if let Some(context) = runtime_secrets.as_ref() {
+            context.set_metrics(Some(metrics.clone()));
+        }
         metrics_for_engine_counts = Some(metrics.clone());
         let prom_sink = std::sync::Arc::new(graphreact_observer::PrometheusSink::from_arc(
             metrics.clone(),
@@ -2493,6 +2549,9 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
             }
             None => None,
         };
+        if let Some(context) = runtime_secrets.as_ref() {
+            context.set_audit_sink(audit_sink.clone());
+        }
         // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Load
         // the optional on-disk token registry (NDJSON per ADR-0009)
         // BEFORE the management API spawn so the very first
@@ -2693,7 +2752,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     //
     // For the engine-free path this is a no-op (no nodes registered
     // → process_batch settles immediately).
-    host.process_batch().map_err(|e| {
+    host.process_batch_with_metrics(metrics_for_engine_counts.as_deref()).map_err(|e| {
         CommandError::Runtime(crate::runtime::RuntimeError::from(e))
     })?;
 
@@ -2787,6 +2846,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // atomic-rename without restarting the daemon. `None`
         // keeps SIGHUP spool rotation a silent no-op.
         audit_forwarder_spool_path: opts.observer_audit_forwarder_spool,
+        runtime_secrets,
     })
 }
 
@@ -2863,6 +2923,7 @@ fn build_scheduler_host(
     path: Option<&Path>,
     runtime: RuntimeArg,
     debug: Option<crate::debug::DebugFlag>,
+    secrets: Option<std::sync::Arc<crate::runtime_secrets::RuntimeSecretContext>>,
 ) -> Result<SchedulerHost, CommandError> {
     match (path, runtime) {
         (None, _) => Ok(SchedulerHost::Empty(Box::default())),
@@ -2884,7 +2945,7 @@ fn build_scheduler_host(
             // returns immediately. If the operator attaches mid-
             // render the breakpoints take effect on the next
             // body invocation.
-            let runtime = crate::jsruntime::mount_with_scheduler(path)?;
+            let runtime = crate::jsruntime::mount_with_scheduler_and_secrets(path, secrets)?;
             if let Some(d) = debug {
                 let mut engine = runtime.engine.borrow_mut();
                 crate::debug::jsc_inspector::install_jsc_inspector(
@@ -2909,11 +2970,7 @@ fn build_scheduler_host(
             // `drive_handle_until` after Cluster::start, by which
             // time debugpy is listening + (if `wait=true`) the
             // operator has attached.
-            let runtime = if debug.is_some() {
-                crate::pyruntime::mount_with_scheduler(path)?
-            } else {
-                crate::pyruntime::mount_python_definitions(path)?
-            };
+            let runtime = crate::pyruntime::mount_with_scheduler_and_secrets(path, secrets)?;
             Ok(SchedulerHost::Cpython(Box::new(runtime)))
         }
         (Some(_), RuntimeArg::Null) => Err(CommandError::ClusterArg(
@@ -2937,7 +2994,7 @@ fn build_scheduler_host(
                         .into(),
                 ));
             }
-            let runtime = crate::mixedruntime::mount_mixed(path)?;
+            let runtime = crate::mixedruntime::mount_mixed_with_secrets(path, secrets)?;
             Ok(SchedulerHost::Mixed(Box::new(runtime)))
         }
         (Some(_), other) => Err(CommandError::ClusterArg(format!(
@@ -3080,6 +3137,7 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         // has no audit forwarder surface either; SIGHUP spool
         // rotation is a silent no-op on this path.
         audit_forwarder_spool_path: None,
+        runtime_secrets: None,
     };
     let _exit = drive_handle_until(&mut handle, duration).await?;
     handle.shutdown().await;
@@ -3168,6 +3226,7 @@ pub async fn drive_handle_until(
         || handle.audit_log_path.is_some()
         || handle.jwks_path.is_some()
         || handle.audit_forwarder_spool_path.is_some()
+        || handle.runtime_secrets.is_some()
     {
         use tokio::signal::unix::{signal, SignalKind};
         let stream = signal(SignalKind::hangup())
@@ -3258,6 +3317,7 @@ pub async fn drive_handle_until(
                 // land in the FRESH spool behind the in-process
                 // file's `audit_log_rotated` boundary markers.
                 handle.rotate_audit_forwarder_spool();
+                handle.reload_runtime_secrets();
                 handle.reload_tokens_from_disk();
                 handle.reload_jwks_from_disk();
                 handle.reload_tls_from_disk();
@@ -3291,7 +3351,7 @@ fn drive_one_tick(handle: &mut DaemonHandle) -> Result<(), CommandError> {
     // identical behavior (same engine TLS guard install, same
     // batch semantics).
     handle
-        .process_batch()
+        .process_batch_observed()
         .map_err(|e| CommandError::Runtime(crate::runtime::RuntimeError::from(e)))?;
     // **M22 verify fix.** Per-tick increment of
     // `grx_engine_eval_count{engine}` so the metric actually
@@ -3317,14 +3377,20 @@ fn drive_one_tick(handle: &mut DaemonHandle) -> Result<(), CommandError> {
 /// completes) so handlers see consistent post-batch state.
 fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
     use graphreact_observer::SnapshotRequest;
-    let Some(observer) = handle.observer.as_mut() else {
+    let DaemonHandle {
+        cluster,
+        host,
+        observer,
+        ..
+    } = handle;
+    let Some(observer) = observer.as_mut() else {
         return;
     };
     // Borrow split: pull the receiver out of the &mut observer,
     // call introspect_* on the scheduler (which lives in
     // host.scheduler_mut()) without conflicting with the receiver
     // borrow.
-    let scheduler = handle.host.scheduler_mut();
+    let scheduler = host.scheduler_mut();
     graphreact_observer::drain_snapshot_requests(&mut observer.snapshot_rx, |req| {
         match req {
             SnapshotRequest::Nodes(tx) => {
@@ -3454,6 +3520,55 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
                             .send(graphreact_observer::BulkInjectResult::RejectedByManifest);
                     }
                 }
+            }
+            SnapshotRequest::DelegatedRestart {
+                peer,
+                child_node_id,
+                token_id,
+                oneshot_tx,
+            } => {
+                use graphreact_dist::{DelegatedRestartError, DelegatedRestartReasonCode};
+                use graphreact_observer::DelegatedRestartDispatchResult;
+
+                let result = match cluster.send_delegated_restart_request(
+                    &peer,
+                    child_node_id,
+                    DelegatedRestartReasonCode::OperatorRequest,
+                    token_id,
+                ) {
+                    Ok(handle) => {
+                        let correlation_id = handle.correlation_id;
+                        let peer = handle.peer_name;
+                        let ack = handle.ack;
+                        let result = handle.result;
+                        // Keep both receivers alive after the HTTP 202
+                        // response. The dist-side deadline resolves or
+                        // closes both, so this task cannot retain them
+                        // indefinitely; dropping them here would make the
+                        // pending-entry GC classify every REST request as
+                        // immediately abandoned.
+                        tokio::spawn(async move {
+                            let _ = tokio::join!(ack, result);
+                        });
+                        DelegatedRestartDispatchResult::Accepted {
+                            correlation_id,
+                            peer,
+                        }
+                    }
+                    Err(DelegatedRestartError::UnknownPeer { .. }) => {
+                        DelegatedRestartDispatchResult::UnknownPeer
+                    }
+                    Err(DelegatedRestartError::CapabilityNotNegotiated { .. }) => {
+                        DelegatedRestartDispatchResult::CapabilityNotNegotiated
+                    }
+                    Err(DelegatedRestartError::OutboundChannel { .. }) => {
+                        DelegatedRestartDispatchResult::OutboundUnavailable
+                    }
+                    Err(DelegatedRestartError::Draining) => {
+                        DelegatedRestartDispatchResult::Draining
+                    }
+                };
+                let _ = oneshot_tx.send(result);
             }
         }
     });
@@ -3751,5 +3866,24 @@ mod tests {
                 "version output must contain `{needle}`: {out}",
             );
         }
+    }
+
+    #[test]
+    fn engine_free_batch_records_bounded_latency_series() {
+        let mut host = SchedulerHost::Empty(Box::new(Scheduler::new(
+            graphreact_core::CommunicationGraph::new(),
+        )));
+        let metrics = graphreact_observer::MetricsInner::new();
+
+        host.process_batch_with_metrics(Some(&metrics))
+            .expect("empty scheduler batch");
+
+        let series = metrics
+            .engine_process_batch_duration
+            .iter()
+            .next()
+            .expect("null-engine series");
+        assert_eq!(series.labels, vec![("engine", "null".to_string())]);
+        assert_eq!(series.histogram.snapshot().count, 1);
     }
 }

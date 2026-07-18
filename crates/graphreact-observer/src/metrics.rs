@@ -287,6 +287,24 @@ pub struct LabeledGauge {
     pub gauge: Gauge,
 }
 
+/// Histogram with attached label values. The label vocabulary is
+/// bounded by the caller; the histogram itself retains the same
+/// sharded, lock-free write path as [`Histogram`].
+pub struct LabeledHistogram {
+    pub labels: Vec<(&'static str, String)>,
+    pub histogram: Histogram,
+}
+
+impl LabeledHistogram {
+    #[must_use]
+    pub fn new(labels: Vec<(&'static str, String)>) -> Self {
+        Self {
+            labels,
+            histogram: Histogram::new(),
+        }
+    }
+}
+
 impl LabeledGauge {
     #[must_use]
     pub fn new(labels: Vec<(&'static str, String)>) -> Self {
@@ -349,6 +367,12 @@ pub struct MetricsInner {
     /// `engine_mount_count`.
     pub engine_eval_count: DashMap<u64, Arc<LabeledCounter>>,
 
+    /// `grx_engine_process_batch_duration_seconds{engine}` — wall-clock
+    /// duration of each active engine slot's `process_batch` call. The
+    /// `engine` label uses the same closed vocabulary as the engine
+    /// mount/evaluation counters.
+    pub engine_process_batch_duration: DashMap<u64, Arc<LabeledHistogram>>,
+
     /// Queue-depth gauges — set by the `on_queue_depths` event.
     pub queue_depth_messages: Gauge,
     pub queue_depth_dirty: Gauge,
@@ -363,13 +387,13 @@ pub struct MetricsInner {
     /// **M-Prod sub-track #6 Phase A → Phase B Part 1.**
     /// `grx_rate_limit_blocked_total{route,bucket}` — per-(route,bucket)
     /// count of HTTP requests rejected by `tower_governor` with
-    /// `429 Too Many Requests`. `route` is bounded to the 11 protected
+    /// `429 Too Many Requests`. `route` is bounded to the 12 protected
     /// route patterns the management API registers (no `:id`
     /// substitution — the rate-limit observer middleware classifies the
     /// raw URI path back to its pattern), and `bucket` is bounded to a
     /// 3-entry vocabulary `{"per_ip", "per_token", "per_token_no_match"}`
     /// stamped by the per-layer error_handler closures. Total cardinality
-    /// is bounded by `(protected_routes + 1) × 3 = 12 × 3 = 36` series.
+    /// is bounded by `(protected_routes + 1) × 3 = 13 × 3 = 39` series.
     /// See [`crate::management_api::build_router`] for the observer
     /// middleware that increments this counter.
     pub rate_limit_blocked: DashMap<u64, Arc<LabeledCounter>>,
@@ -384,6 +408,10 @@ pub struct MetricsInner {
     /// operator dashboards alongside the existing
     /// `audit_sink_write_failed` tracing line.
     pub audit_sink_write_failures: DashMap<u64, Arc<LabeledCounter>>,
+
+    /// `grx_secret_read_failures_total{reason}`. Reasons are the
+    /// closed vocabulary `{undeclared,missing,backend_error,non_utf8}`.
+    pub secret_read_failures: DashMap<u64, Arc<LabeledCounter>>,
 
     /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).**
     /// `grx_audit_sink_pending_records` — current size of the
@@ -444,6 +472,7 @@ impl MetricsInner {
             hot_reload: DashMap::new(),
             engine_mount_count: DashMap::new(),
             engine_eval_count: DashMap::new(),
+            engine_process_batch_duration: DashMap::new(),
             queue_depth_messages: Gauge::new(),
             queue_depth_dirty: Gauge::new(),
             queue_depth_pending_topology: Gauge::new(),
@@ -452,6 +481,7 @@ impl MetricsInner {
             process_batch_duration: Histogram::new(),
             rate_limit_blocked: DashMap::new(),
             audit_sink_write_failures: DashMap::new(),
+            secret_read_failures: DashMap::new(),
             audit_sink_pending_records: Gauge::new(),
             audit_forwarder_records: DashMap::new(),
             audit_forwarder_queue_depth: DashMap::new(),
@@ -577,6 +607,24 @@ impl MetricsInner {
             .inc();
     }
 
+    /// Increment the bounded per-reason runtime secret-read failure
+    /// counter. Callers pass only the four policy/backend outcomes.
+    #[inline]
+    pub fn secret_read_failures_inc(&self, reason: &'static str) {
+        let key = hash1(reason);
+        if let Some(counter) = self.secret_read_failures.get(&key) {
+            counter.counter.inc();
+            return;
+        }
+        self.secret_read_failures
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledCounter::new(vec![("reason", reason.to_string())]))
+            })
+            .counter
+            .inc();
+    }
+
     /// **M22 phase 4.** Increment the per-engine mount counter. The
     /// `engine` label is a `&'static str` to keep the cardinality
     /// bounded (one of `"jsc"|"cpython"|"go"|"null"|"echo"`) — the
@@ -616,6 +664,32 @@ impl MetricsInner {
             })
             .counter
             .inc();
+    }
+
+    /// Observe one engine slot's `process_batch` wall-clock duration.
+    /// The first observation creates the labeled histogram; subsequent
+    /// observations take the DashMap read path and a sharded atomic write.
+    #[inline]
+    pub fn engine_process_batch_duration_observe(
+        &self,
+        engine: &'static str,
+        duration_ns: u64,
+    ) {
+        let key = hash1(engine);
+        if let Some(h) = self.engine_process_batch_duration.get(&key) {
+            h.histogram.observe(duration_ns);
+            return;
+        }
+        self.engine_process_batch_duration
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(LabeledHistogram::new(vec![(
+                    "engine",
+                    engine.to_string(),
+                )]))
+            })
+            .histogram
+            .observe(duration_ns);
     }
 
     /// Hot-path counter increment for `messages_delivered`.

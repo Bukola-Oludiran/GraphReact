@@ -1,6 +1,6 @@
 # GraphReact published SLOs
 
-**Status:** SHIPPED 2026-06-17 (M-Prod sub-track #5 residual). Living document — engine-attributed numbers land once M17/M22 per-engine cardinality lock settles (see [Blocked rows](#blocked-rows)).
+**Status:** SHIPPED 2026-06-17; observability close-out updated 2026-07-18. M17/M22's bounded `engine` vocabulary is now reflected in per-engine latency telemetry.
 
 This document captures the production-readiness SLOs that GraphReact operators can rely on TODAY. Each row carries:
 
@@ -17,7 +17,7 @@ A target marked `BLOCKED ON …` is a known gap; the row is preserved so operato
 | Surface | SLO target | Source of truth | Verification | Notes |
 |---|---|---|---|---|
 | `GET /v1/healthz` | p99 < 10 ms (loopback, idle daemon) | constant-time handler in [`management_api.rs::healthz`](../crates/graphreact-observer/src/management_api.rs); no scheduler thread touch | `hey -n 10000 -c 16 http://127.0.0.1:9090/v1/healthz` | Always returns 200 + body `ok`. Designed for k8s liveness probes. |
-| `GET /v1/readyz` | p99 < 50 ms (loopback, idle daemon) | predicate over `(process_batch_count > 0, snapshot_tx.capacity() > 0, cluster_readyz())` — three Arc-shared atomic reads | `hey -n 10000 -c 16 http://127.0.0.1:9090/v1/readyz` after boot | Returns 503 + `Retry-After: 1` with one of `scheduler_first_batch_pending` / `bridge_saturated` / `cluster_no_peers_connected` during partial init. See [`m-prod-observability.md`](backend/m-prod-observability.md). |
+| `GET /v1/readyz` | p99 < 50 ms (loopback, idle daemon) | lock-free predicates over drain, audit-sink health, TLS rotation, first batch, bridge capacity, and cluster membership | `hey -n 10000 -c 16 http://127.0.0.1:9090/v1/readyz` after boot | 503 reason precedence: `draining` > `audit_sink_failed` > `tls_rotation_in_progress` > `scheduler_first_batch_pending` > `bridge_saturated` > `cluster_no_peers_connected`. See [`m-prod-observability.md`](backend/m-prod-observability.md). |
 | `GET /v1/metrics` | p99 < 500 ms (idle daemon, ~1k metric series) | `PrometheusSink::encode_text` walks `MetricsInner` in single pass | `hey -n 1000 -c 8 http://127.0.0.1:9090/v1/metrics` | Cardinality cap policy: `MetricsInner` rejects new labels past `MAX_LABEL_CARDINALITY` (currently un-pinned — see [`Blocked rows`](#blocked-rows)). |
 | `POST /v1/nodes/:id/messages` round-trip | p99 < 100 ms (single-node, scheduler 50 ms tick) | inject_message_handler → `snapshot_tx.try_send` → scheduler drain → oneshot reply | `wrk -t4 -c64 -d30s -s scripts/inject_one.lua http://127.0.0.1:9090/v1/nodes/X/messages` | Saturated bridge surfaces as 503 + `Retry-After: 1` via [`bridge_saturated_response`](../crates/graphreact-observer/src/management_api.rs). Operators retry on 503; idempotency-key dedup keeps retries safe. |
 | `POST /v1/nodes/:id/call` round-trip | p99 < 200 ms (single-node) | inject_call_handler → bridge → reducer → reply over `PendingCalls` oneshot | `wrk -t4 -c32 -d30s -s scripts/call_one.lua` | Same try_send→503 policy as the messages endpoint; correlation-id timeout configurable via `timeout_ms` body field. |
@@ -43,19 +43,17 @@ A target marked `BLOCKED ON …` is a known gap; the row is preserved so operato
 |---|---|---|---|---|
 | Scheduler `process_batch` tick cadence | 50 ms tick, p99 < 75 ms (idle daemon) | `drive_handle_until` in `commands.rs` | `grx_engine_eval_count` increment cadence on `/v1/metrics` | Per-tick eval count emission cadence fixed via M22 verify patch (`commands.rs:1828`). Heavy bodies extend the tick — operators monitor `process_batch_duration` histogram. |
 | Per-engine `grx_engine_eval_count` emission | per-tick (50 ms cadence) | `record_engine_eval_metrics` called inside `drive_handle_until` tick body | scrape `/v1/metrics` 10 times in 1 s; expect ≥ 20 counter increments per active engine | Pre-M22-patch this was a one-shot snapshot. M22 verify finding `grx_engine_eval_count one-shot` (commit `7fe1d3a`) restored per-tick emission. |
-| Body-eval latency under mixed runtime (per engine) | BLOCKED ON M17/M22 per-engine cardinality lock | n/a | n/a | Per-engine numbers (JSC vs CPython vs Go body eval p99) require the label cardinality contract to settle. Tracked under [`m22-mixed-runtime.md`](backend/m22-mixed-runtime.md). |
+| Per-engine `process_batch` latency | p99 < 75 ms per active engine slot (idle daemon) | `grx_engine_process_batch_duration_seconds{engine}` histogram | `histogram_quantile(0.99, sum by (le, engine) (rate(grx_engine_process_batch_duration_seconds_bucket[5m])))` | M17/M22 closed the label vocabulary to `jsc`, `cpython`, `go`, `null`, and `echo`. Mixed-runtime batches time each slot independently; this is batch latency, not individual body latency. |
 
 ## Blocked rows
 
 The following SLOs are deferred because they depend on a substrate that hasn't shipped yet:
 
 1. **Cluster reconvergence after partition heal** — blocked on the Jepsen-style harness CI infrastructure (see the M-Prod remainder plan; CI-infra track).
-2. **TLS rotation latency** — blocked on M-Prod sub-track #2 SIGHUP atomic-swap primitive.
-3. **Drain window** — blocked on M-Prod sub-track #4 SIGTERM drain semantics. Once shipped, `/v1/readyz` flips to 503 at drain start so the LB de-routes before the daemon stops accepting calls.
-4. **OTel exporter reachability** — blocked on CI-infra OTel-collector fixture; the `BatchSpanProcessor` doesn't expose a connect-failure handle that `/v1/readyz` could read today.
-5. **Per-engine label cardinality lock** — blocked on M17 + M22 closure. Without the lock, per-engine SLOs (eval p99, GC pause, RSS per engine) would commit to a cardinality contract that may need to widen.
-6. **24h fuzz cumulative corpus growth** — blocked on the M-Prod #9 24h CI fuzz cell + 7-day soak fixture (both CI-infra-bound).
-7. **`POST /v1/nodes/:id/call` 1k-concurrent-call p99** — needs the M-Prod #6 rate-limit shape to settle (governor wraps the management API).
+2. **TLS rotation latency distribution** — atomic rotation and its readiness gate have shipped; a dedicated rotation-duration histogram still needs a repeatable certificate fixture.
+3. **OTel exporter reachability** — blocked on CI-infra OTel-collector fixture; the `BatchSpanProcessor` doesn't expose a connect-failure handle that `/v1/readyz` could read today.
+4. **24h fuzz cumulative corpus growth** — blocked on the M-Prod #9 24h CI fuzz cell + 7-day soak fixture (both CI-infra-bound).
+5. **`POST /v1/nodes/:id/call` 1k-concurrent-call p99** — needs the M-Prod #6 rate-limit shape to settle (governor wraps the management API).
 
 ## Verification recipe (operator runbook)
 

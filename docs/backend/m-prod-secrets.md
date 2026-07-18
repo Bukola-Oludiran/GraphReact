@@ -1,8 +1,8 @@
-# M-Prod sub-track #3 — Secrets handling (Phase A + Phase B Part 1)
+# M-Prod sub-track #3 — Secrets handling
 
-**Status:** SHIPPED 2026-06-17 (Phase A: operator CLI + library substrate) + SHIPPED 2026-06-18 (Phase B Part 1: `ctx.secret(name)` JSC slice + Engine trait surface + ADR-0007). Tracks M-Prod sub-track #3 as defined in the [master plan](../../../../.claude/plans/graphreact-rust-later-milestones.md).
+**Status:** SHIPPED 2026-06-17 (Phase A) + SHIPPED 2026-06-18 (Phase B Part 1) + SHIPPED 2026-07-18 (Phase B Part 2: production JSC/CPython/Go access, manifest enforcement, atomic SIGHUP rotation, hash-chain audit fan, and failure metrics).
 
-Lives alongside [m-prod-observability.md](m-prod-observability.md) and [m-prod-supply-chain.md](m-prod-supply-chain.md). Phase B Part 2 — the CPython + Go runtime accessors + production-side host-callback factory + SIGHUP re-read + audit-of-secret-reads — is **deferred** — see [Phase B Part 2 (deferred)](#phase-b-part-2-deferred).
+Lives alongside [m-prod-observability.md](m-prod-observability.md) and [m-prod-supply-chain.md](m-prod-supply-chain.md).
 
 ## Sub-track #3 scope recap
 
@@ -81,7 +81,7 @@ graphreact::secrets::audit  backend=keyring  action=set     name=DATABASE_URL
 graphreact::secrets::audit  backend=env      action=remove  name=DATABASE_URL
 ```
 
-`get` and `list` deliberately do NOT emit audit events at this layer — they're read-paths that a sub-track #1 audit-chain sink will own once it ships (so the audit log captures the calling principal, not just the action). Tracking under [Phase B Part 2 (deferred)](#phase-b-part-2-deferred).
+`get` and `list` deliberately do NOT emit runtime-read events at this operator layer. Guest reads now audit at the production callback boundary, where the active node and committed manifest are known.
 
 ## Phase B Part 1 — `ctx.secret(name)` substrate (SHIPPED 2026-06-18)
 
@@ -95,22 +95,26 @@ What shipped on 2026-06-18:
 4. **Permission manifest field** — `PermissionManifest::needs_secret: Option<Vec<String>>`. `None` matches Phase A pre-existing semantics bit-for-bit (no declared secrets → default-deny → every `ctx.secret(name)` resolves to null). `PermissionManifest::new` initialises to `None`; the `Debug` impl includes the field; `Default` derive carries it. Existing call-sites that use `..Default::default()` keep compiling.
 5. **Integration test** — `crates/graphreact-engine-jsc/tests/ctx_secret.rs`. Three cases prove the contract over a real JSC isolate: declared+present returns the value, declared+missing returns `null`, undeclared returns `null` even when the store has the value.
 
-Audit-of-secret-reads is **still deferred** to Phase B Part 2 — it waits on the audit-chain sink (sub-track #1 Phase B) so events ride the same hash-chained log instead of just `tracing::info!`.
+Part 2 now fans `secret_read_allow` / `secret_read_deny` to both tracing and the hash-chained `AuditSink`; values are never included.
 
-## Phase B Part 2 (deferred)
+## Phase B Part 2 — runtime access and rotation (SHIPPED 2026-07-18)
 
-The remaining Phase B work that depends on either the cross-engine wiring or other M-Prod sub-tracks landing first:
+The cross-track audit-chain and atomic-swap prerequisites are now landed. Part 2 ships:
 
-1. **CPython runtime accessor.** Wire `ctx.secret(name)` through `__augment_ctx` (Python source-wrap pattern; see `m13-phases.md:526`) and add a CPython-side integration test mirroring `tests/ctx_secret.rs`.
-2. **Go runtime accessor.** Add a `Ctx.Secret(name string) string` method on the codegen `Ctx` struct + a Go-side integration test.
-3. **Production-side `host_secret` BoxCallback factory.** Lives in `graphreact-cli/src/jsruntime.rs` (and the CPython / Go equivalents in Part 2): closes over the registered `Arc<dyn SecretStore>`, reads `Scheduler::manifests` keyed by `current_node_id()`, checks `manifest.needs_secret` for the requested name, and dispatches to `SecretStore::get` on allow. The Phase B Part 1 integration test stands in with an inline `TestSecretSource::read` so the surface is verified without the full production wiring.
-4. **SIGHUP-triggered re-read.** Atomic-swap the registered `Arc<dyn SecretStore>` on SIGHUP. Depends on sub-track #2's `Arc<ArcSwap<Arc<T>>>` pattern shipping for a non-TLS resource so secrets can reuse the idiom. Widens the JscEngine's `OnceLock` shadow to an `Arc<arc_swap::ArcSwap<Arc<dyn HostSecretCallback>>>`.
+1. **CPython runtime accessor.** `ctx['secret'](name)` is injected through `__augment_ctx`; a CPython isolate test locks the safe absent-callback behavior.
+2. **Go runtime accessor.** Generated `Ctx.Secret(name string) string` dispatches through `Invoke`; the codegen emission test locks the method into the prelude.
+3. **Production-side `host_secret` factories.** JSC, CPython, and Go callbacks close over the shared runtime context, read `Scheduler::manifests` by `current_node_id()`, enforce `needs_secret`, then dispatch to the store.
+4. **SIGHUP-triggered re-read.** `ArcSwap<Arc<dyn SecretStore>>` reuses the established non-TLS atomic-swap idiom. Existing callbacks retain the outer context and observe the next snapshot without re-registration.
 5. **Audit-of-secret-reads.** `secret_read_allow` / `secret_read_deny` events ride the same `graphreact::observer::audit` target + `AuditSink::append` fan as Phase B Part 2's auth events. Logs the name, NEVER the value.
-6. **Cached-vs-uncached perf knob.** No measured load yet to justify a cache; revisit when `auth_success`-class fan-out moves the read rate above current projections.
+6. **Failure metric.** `grx_secret_read_failures_total{reason}` uses the closed vocabulary `undeclared`, `missing`, `backend_error`, and `non_utf8`.
+
+Runtime selection uses `GRX_RUNTIME_SECRET_BACKEND=env|keyring` and defaults to `env`. The callback stays per-call and uncached. The rotatable handle is `ArcSwap<Arc<dyn SecretStore>>`; SIGHUP order is audit log → audit-forwarder spool → runtime secrets → tokens → JWKS → TLS.
+
+The first render remains default-deny: authorization consults the last committed `PermissionManifest`. A body returns `needs_secret`, then reads on a later render. JSC/Python return null/`None` on deny; Go returns `""`.
 
 ## Open work in #3
 
-- **Phase B Part 2** (above).
+- **Cached-vs-uncached performance knob** — evidence-gated; ADR-0007 retains per-call dispatch until measurements justify cache invalidation complexity.
 - **`KeyringStore::list` enumeration** — depends on `keyring` upstream landing a portable `search` API (`hwchen/keyring-rs#193`).
 - **Keychain access-groups** for cross-process sharing — requires code-signing `grx` with `keychain-access-groups` entitlements; lands in M-Prod #8 packaging.
 

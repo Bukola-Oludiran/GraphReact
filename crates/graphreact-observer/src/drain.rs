@@ -11,7 +11,8 @@
 //!
 //! ## Shape
 //!
-//! - [`DrainFlag`] is a thin newtype around `Arc<AtomicBool>` so
+//! - [`DrainFlag`] is a thin shared state object around an atomic bit
+//!   plus a watch channel carrying the one-shot drain deadline, so
 //!   the same drain bit is observable from EVERY place that needs
 //!   to know about it: the management-API `/v1/readyz` handler,
 //!   the ingress POST middlewares, the cluster-handshake quiesce
@@ -60,16 +61,32 @@ use std::time::Duration;
 /// [`crate::ApiState`] and held on the CLI's `DaemonHandle` so the
 /// management-API hot path and the lifecycle orchestrator agree on
 /// "are we draining yet".
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DrainDeadline {
+    pub(crate) at: tokio::time::Instant,
+    pub(crate) budget_ms: u64,
+}
+
+#[derive(Debug)]
+struct DrainState {
+    draining: AtomicBool,
+    deadline_tx: tokio::sync::watch::Sender<Option<DrainDeadline>>,
+}
+
+#[derive(Clone, Debug)]
 pub struct DrainFlag {
-    inner: Arc<AtomicBool>,
+    inner: Arc<DrainState>,
 }
 
 impl DrainFlag {
     /// Fresh flag, value `false`.
     pub fn new() -> Self {
+        let (deadline_tx, _deadline_rx) = tokio::sync::watch::channel(None);
         Self {
-            inner: Arc::new(AtomicBool::new(false)),
+            inner: Arc::new(DrainState {
+                draining: AtomicBool::new(false),
+                deadline_tx,
+            }),
         }
     }
 
@@ -88,7 +105,7 @@ impl DrainFlag {
         // Emit BEFORE the flip so any reader that races us can't
         // observe `is_draining()==true` without `drain_started`
         // already being in the audit stream.
-        match self.inner.compare_exchange(
+        match self.inner.draining.compare_exchange(
             false,
             true,
             Ordering::AcqRel,
@@ -102,6 +119,10 @@ impl DrainFlag {
                 // so this emit happens-before the compare_exchange
                 // succeeds from any other thread's perspective.
                 crate::audit::log_drain_started(deadline_ms);
+                self.inner.deadline_tx.send_replace(Some(DrainDeadline {
+                    at: tokio::time::Instant::now() + Duration::from_millis(deadline_ms),
+                    budget_ms: deadline_ms,
+                }));
                 true
             }
             Err(_) => false,
@@ -112,7 +133,19 @@ impl DrainFlag {
     /// (readyz handler, ingress POST middlewares) should use this.
     #[inline]
     pub fn is_draining(&self) -> bool {
-        self.inner.load(Ordering::Relaxed)
+        self.inner.draining.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn subscribe_deadline(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<DrainDeadline>> {
+        self.inner.deadline_tx.subscribe()
+    }
+}
+
+impl Default for DrainFlag {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

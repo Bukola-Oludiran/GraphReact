@@ -131,8 +131,9 @@ pub use management_api::{
     spawn_with_drain as spawn_management_api_with_drain,
     spawn_with_options as spawn_management_api_with_options, ApiServerHandle, ApiState,
     BulkInjectResult, BulkLineBody, CallMessageBody, CallResult, ClusterReadyzProbe,
-    IdempotencyCache, Identity, InjectMessageBody, InjectMessageWithReplyDisposition, InjectResult,
-    PendingCallGuard, PendingCalls, RateLimitConfig, SnapshotRequest, SpawnOptions,
+    DelegatedRestartBody, DelegatedRestartDispatchResult, IdempotencyCache, Identity,
+    InjectMessageBody, InjectMessageWithReplyDisposition, InjectResult, PendingCallGuard,
+    PendingCalls, RateLimitConfig, SnapshotRequest, SpawnOptions,
     BULK_MAX_BODY_BYTES, BULK_MAX_LINE_BYTES, DEFAULT_BULK_LINE_CAP,
     DEFAULT_RATE_LIMIT_PER_IP_BURST, DEFAULT_RATE_LIMIT_PER_IP_PER_SEC,
     DEFAULT_RATE_LIMIT_PER_TOKEN_BURST, DEFAULT_RATE_LIMIT_PER_TOKEN_PER_SEC,
@@ -144,14 +145,15 @@ pub use rate_limit_keys::{
     TrustedProxyConfig, TrustedProxyParseError,
 };
 pub use metrics::{
-    Counter, Gauge, Histogram, HistogramSnapshot, LabeledCounter, LabeledGauge, MetricsInner,
+    Counter, Gauge, Histogram, HistogramSnapshot, LabeledCounter, LabeledGauge, LabeledHistogram,
+    MetricsInner,
 };
 pub use multiplex::MultiplexSink;
 pub use prometheus::encode_text;
 pub use prometheus_sink::PrometheusSink;
 pub use ring_buffer::{MessageSnapshot, RingBufferTelemetry, DEFAULT_RING_CAPACITY};
 pub use tls::{ServerTlsConfig, TlsError, TlsRotationError};
-pub use tls_rotation::RotatableServerConfig;
+pub use tls_rotation::{RotatableServerConfig, TlsReadiness, TlsRotationGuard};
 pub use tracing_layer::{stderr_writer, TracingJsonLayer, WriterHandle};
 pub use websocket::{EventFilter, WebSocketSink, BROADCAST_CAPACITY};
 

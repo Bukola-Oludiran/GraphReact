@@ -36,7 +36,8 @@
 use std::fmt::Write;
 
 use crate::metrics::{
-    HistogramSnapshot, LabeledCounter, LabeledGauge, MetricsInner, HISTOGRAM_BUCKETS_NS,
+    HistogramSnapshot, LabeledCounter, LabeledGauge, LabeledHistogram, MetricsInner,
+    HISTOGRAM_BUCKETS_NS,
 };
 
 /// Encode the entire [`MetricsInner`] into the Prometheus text
@@ -134,6 +135,13 @@ pub fn encode_text(inner: &MetricsInner) -> String {
         &inner.engine_eval_count,
     );
 
+    encode_labeled_histogram(
+        &mut s,
+        "grx_engine_process_batch_duration_seconds",
+        "Wall-clock duration of one process_batch call per active engine slot, in seconds. engine is one of (jsc, cpython, go, null, echo).",
+        &inner.engine_process_batch_duration,
+    );
+
     encode_gauge(
         &mut s,
         "grx_queue_depth_messages",
@@ -175,7 +183,7 @@ pub fn encode_text(inner: &MetricsInner) -> String {
 
     // **M-Prod sub-track #6 Phase A.** Per-route rate-limit-blocked
     // counter. `route` label is bounded to the protected-route
-    // pattern table (≤ 11 entries + `"unknown"` sentinel); family
+    // pattern table (≤ 12 entries + `"unknown"` sentinel); family
     // is suppressed entirely until the first 429 fires so steady-
     // state daemons don't pay even a HELP+TYPE line.
     encode_labeled_counter(
@@ -204,6 +212,13 @@ pub fn encode_text(inner: &MetricsInner) -> String {
          inspect the audit ledger for gaps. Family is suppressed \
          until the first failure fires.",
         &inner.audit_sink_write_failures,
+    );
+
+    encode_labeled_counter(
+        &mut s,
+        "grx_secret_read_failures_total",
+        "Runtime secret reads denied by policy, missing data, backend failure, or non-UTF-8 data. reason is one of {undeclared, missing, backend_error, non_utf8}.",
+        &inner.secret_read_failures,
     );
 
     // **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Gauge of
@@ -319,6 +334,57 @@ fn encode_labeled_gauge(
     }
 }
 
+fn encode_labeled_histogram(
+    s: &mut String,
+    name: &str,
+    help: &str,
+    map: &dashmap::DashMap<u64, std::sync::Arc<LabeledHistogram>>,
+) {
+    if map.is_empty() {
+        return;
+    }
+    write_help(s, name, help);
+    write_type(s, name, "histogram");
+    for entry in map {
+        let labeled = entry.value();
+        let snap = labeled.histogram.snapshot();
+        for (i, upper_ns) in HISTOGRAM_BUCKETS_NS.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let upper_seconds = (*upper_ns as f64) / 1_000_000_000.0;
+            write_metric_with_extra_label(
+                s,
+                &format!("{name}_bucket"),
+                &labeled.labels,
+                "le",
+                &upper_seconds.to_string(),
+                snap.cumulative_buckets[i],
+            );
+        }
+        write_metric_with_extra_label(
+            s,
+            &format!("{name}_bucket"),
+            &labeled.labels,
+            "le",
+            "+Inf",
+            snap.count,
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let sum_seconds = (snap.sum_ns as f64) / 1_000_000_000.0;
+        write_float_metric_with_labels(
+            s,
+            &format!("{name}_sum"),
+            &labeled.labels,
+            sum_seconds,
+        );
+        write_metric_with_labels(
+            s,
+            &format!("{name}_count"),
+            &labeled.labels,
+            snap.count,
+        );
+    }
+}
+
 fn encode_unlabeled_counter(s: &mut String, name: &str, help: &str, value: u64) {
     write_help(s, name, help);
     write_type(s, name, "counter");
@@ -403,6 +469,55 @@ fn write_metric_with_labels(
         s.push('"');
     }
     let _ = writeln!(s, "}} {value}");
+}
+
+fn write_float_metric_with_labels(
+    s: &mut String,
+    name: &str,
+    labels: &[(&'static str, String)],
+    value: f64,
+) {
+    write_labels(s, name, labels);
+    let _ = writeln!(s, " {value}");
+}
+
+fn write_metric_with_extra_label(
+    s: &mut String,
+    name: &str,
+    labels: &[(&'static str, String)],
+    extra_key: &'static str,
+    extra_value: &str,
+    value: u64,
+) {
+    s.push_str(name);
+    s.push('{');
+    for (key, val) in labels {
+        s.push_str(key);
+        s.push_str("=\"");
+        escape_label_value(s, val);
+        s.push_str("\",");
+    }
+    s.push_str(extra_key);
+    s.push_str("=\"");
+    escape_label_value(s, extra_value);
+    let _ = writeln!(s, "\"}} {value}");
+}
+
+fn write_labels(s: &mut String, name: &str, labels: &[(&'static str, String)]) {
+    s.push_str(name);
+    s.push('{');
+    let mut first = true;
+    for (key, val) in labels {
+        if !first {
+            s.push(',');
+        }
+        first = false;
+        s.push_str(key);
+        s.push_str("=\"");
+        escape_label_value(s, val);
+        s.push('"');
+    }
+    s.push('}');
 }
 
 /// Escape a label value per the Prometheus text-format spec:
@@ -490,6 +605,24 @@ mod tests {
             out.contains(&format!("grx_process_batch_duration_seconds_sum {expected_sum}")),
             "missing sum line in:\n{out}"
         );
+    }
+
+    #[test]
+    fn labeled_engine_histogram_emits_bounded_engine_series() {
+        let inner = MetricsInner::new();
+        inner.engine_process_batch_duration_observe("jsc", 2_000);
+        inner.engine_process_batch_duration_observe("jsc", 50_000);
+        inner.engine_process_batch_duration_observe("cpython", 8_000);
+        let out = encode_text(&inner);
+        assert!(out.contains(
+            "# TYPE grx_engine_process_batch_duration_seconds histogram"
+        ));
+        assert!(out.contains(
+            "grx_engine_process_batch_duration_seconds_bucket{engine=\"jsc\",le=\"+Inf\"} 2"
+        ));
+        assert!(out.contains(
+            "grx_engine_process_batch_duration_seconds_count{engine=\"cpython\"} 1"
+        ));
     }
 
     #[test]

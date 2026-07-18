@@ -108,6 +108,7 @@ jobs:
       - name: First build (capture sha256)
         env:
           RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=${{ env.HOME }}/.cargo=/cargo"
+          GRX_SIGNATURE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/grx.cosign.bundle
         run: |
           set -euo pipefail
           cargo build --release --bin grx
@@ -119,6 +120,7 @@ jobs:
       - name: Second build (capture sha256)
         env:
           RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=${{ env.HOME }}/.cargo=/cargo"
+          GRX_SIGNATURE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/grx.cosign.bundle
         run: |
           set -euo pipefail
           cargo build --release --bin grx
@@ -359,7 +361,7 @@ jobs:
           build-args: |
             GRX_PYTHON_MINOR=3.13
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
-            GRX_SIGNATURE_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/grx.sig
+            GRX_SIGNATURE_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/grx.cosign.bundle
       # ---- Phase B Part 1 (joint #7+#8): Sigstore-keyless sign + SLSA attest the per-arch tar ----
       - name: Install cosign (Sigstore-keyless signer)
         uses: sigstore/cosign-installer@v3.5.0
@@ -465,7 +467,7 @@ jobs:
           build-args: |
             GRX_PYTHON_MINOR=3.13
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
-            GRX_SIGNATURE_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/grx.sig
+            GRX_SIGNATURE_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/grx.cosign.bundle
       - uses: sigstore/cosign-installer@v3.5.0
       - name: Cosign sign pushed manifest digest (keyless)
         # Sign the registry-side image by digest (the immutable identity
@@ -496,9 +498,8 @@ jobs:
   #   - release-sbom-<tag>/{*.cdx.json + SHA256SUMS.txt}
   #   - oci-image-{amd64,arm64}-<tag>.tar (Phase A scaffolds; Phase B
   #     replaces these with ghcr.io image references)
-  # Sets a `GRX_SIGNATURE_URL` placeholder in the release notes pointing
-  # at the canonical `grx.sig` URL that the Phase B signing pipeline will
-  # populate.
+  # The binary and OCI images advertise the canonical
+  # `grx.cosign.bundle` URL attached by this workflow.
 
   publish-release:
     name: publish-release

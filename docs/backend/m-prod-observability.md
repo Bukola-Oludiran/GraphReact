@@ -1,6 +1,6 @@
 # M-Prod — Observability completeness (sub-track #5)
 
-**Status:** STARTED 2026-06-17 with the safest slice. Tracks M-Prod sub-track #5 as defined in the master plan; closes the M16-Backend "deferred to M-Prod" observability rows.
+**Status:** OBSERVABILITY CLOSE-OUT SHIPPED 2026-07-18. The original safe slice landed 2026-06-17; readiness now covers TLS rotation and audit-sink failure, and engine latency uses M17/M22's bounded labels.
 
 This document lives alongside [`m16-backend-observer.md`](m16-backend-observer.md) (which covers the M16-Backend baseline) and extends it with the M-Prod hardening passes.
 
@@ -25,6 +25,8 @@ The **safest slice** lands #1 + #2 (this commit pair); items #3–#5 are address
 | Term | Source | Why |
 |---|---|---|
 | Drain in progress (sub-track #4 Phase α, shipped 2026-06-17) | `state.draining.as_ref().is_some_and(|f| f.is_draining())` — relaxed `AtomicBool` load | First-branch predicate evaluated BEFORE the trio below. When set, return 503 + body `draining` ahead of any other not-ready reason. See [`m-prod-lifecycle.md`](m-prod-lifecycle.md) for the SIGTERM wiring + budget math. |
+| Audit sink has recorded an I/O failure (shipped 2026-07-18) | `!MetricsInner::audit_sink_write_failures.is_empty()` | An audit-ledger gap is a production-integrity failure. Readiness latches red as `audit_sink_failed` after the first `open`, `write`, `fsync`, or `rotate` failure; after repairing the sink, restart the daemon and verify the ledger before routing traffic back. |
+| TLS reload in progress (shipped 2026-07-18) | `TlsReadiness::is_rotating()` | A nested-safe RAII guard covers the entire SIGHUP file-read and atomic-swap window. Readiness returns `tls_rotation_in_progress`, preventing new traffic from racing certificate replacement. |
 | Scheduler has completed ≥1 `process_batch` round | `MetricsInner::process_batch_duration.snapshot().count > 0` | The histogram is updated by `PrometheusSink::on_tick_end` exactly once per scheduler tick. Count > 0 means the first mount cascade drained, so the daemon's view of the `.grx` system is consistent. |
 | Snapshot bridge has capacity | `state.snapshot_tx.capacity() > 0` | Capacity at zero means the scheduler thread is wedged behind a long `process_batch` round AND every `SnapshotRequest` slot is full. Inbound HTTP would 503 anyway; pre-emptively de-route via readiness rather than serve a stale snapshot. |
 | Cluster membership reached (M-Prod residual, shipped 2026-06-17) | `cluster_readyz()` probe — returns `true` if `configured_peers == 0` OR `dialed_count >= 1` | Single-node deploys (no peers configured) pass trivially. Multi-node deploys flip to ready only once at least one peer dial completed, so load balancers don't route to a daemon whose `Cluster::start` hasn't yet handshook with anyone. Lock-free `AtomicUsize` read on the hot path. |
@@ -35,6 +37,8 @@ The **safest slice** lands #1 + #2 (this commit pair); items #3–#5 are address
 |---|---|---|---|
 | Ready | 200 OK | `ready` | `Content-Type: text/plain; charset=utf-8` |
 | **Draining (sub-track #4 Phase α)** | **503 Service Unavailable** | **`draining`** | **`Content-Type: text/plain; charset=utf-8`, `Retry-After: 1`** |
+| Audit sink failed | 503 Service Unavailable | `audit_sink_failed` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
+| TLS reload in progress | 503 Service Unavailable | `tls_rotation_in_progress` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
 | Pre-tick | 503 Service Unavailable | `scheduler_first_batch_pending` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
 | Bridge saturated | 503 Service Unavailable | `bridge_saturated` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
 | Cluster peers configured but none dialed (M-Prod residual) | 503 Service Unavailable | `cluster_no_peers_connected` | `Content-Type: text/plain; charset=utf-8`, `Retry-After: 1` |
@@ -64,6 +68,10 @@ readinessProbe:
 - `readyz_503_before_first_batch_tick` — pre-tick path emits 503 + `Retry-After`, body names the reason.
 - `readyz_200_after_first_batch_tick` — direct `process_batch_duration.observe(...)` flips the predicate to green.
 - `readyz_bypasses_auth_when_token_required` — 503 (not 401) when the protected branch has a bearer token configured.
+- `readyz_503_after_audit_sink_write_failure` — the integrity failure latches readiness red.
+- `readyz_is_red_only_while_tls_rotation_guard_is_alive` — HTTPS readiness is red only for the guarded rotation window.
+
+Predicate precedence is locked as `draining > audit_sink_failed > tls_rotation_in_progress > scheduler_first_batch_pending > bridge_saturated > cluster_no_peers_connected`.
 
 ## Shipped — `OBSERVER_SHUTDOWN_DEADLINE`
 
@@ -132,13 +140,14 @@ cargo bench -p graphreact-observer --features otel-test --bench scheduler_overhe
 
 ## Open work in #5
 
-- ~~**`docs/SLO.md`**: not yet authored~~ — **SHIPPED 2026-06-17.** See [`docs/SLO.md`](../../docs/SLO.md). Engine-attributed rows are explicitly marked `BLOCKED ON M17/M22 per-engine cardinality lock`.
+- ~~**`docs/SLO.md`**: not yet authored~~ — **SHIPPED 2026-06-17; engine close-out 2026-07-18.** `grx_engine_process_batch_duration_seconds{engine}` now provides a bounded histogram for JSC, CPython, Go, and engine-free slots.
 - ~~**mpsc::Sender uniform backpressure audit**~~ — **SHIPPED 2026-06-17 (residual slice).** Ingress endpoints (`POST /v1/nodes/:id/{messages,call,messages/bulk}`) now use `try_send`→503 + `Retry-After: 1` via [`bridge_saturated_response`](../../crates/graphreact-observer/src/management_api.rs). Read-snapshot bridges (`nodes_list` / `node_detail` / `supervisor_tree`) keep `send().await` — those are internal observer→scheduler reads with bounded depth; blocking briefly is preferable to a 503 cascade on the snapshot surface. The bulk-response body `out_tx` (`mpsc::channel(64)`) also keeps `send().await` — that's slow-HTTP-client flow control, NOT scheduler backpressure; converting it to `try_send` would silently drop NDJSON result lines.
 - ~~**Cluster-membership readyz extension**~~ — **SHIPPED 2026-06-17 (residual slice).** See predicate row above. Probe is a lock-free `Arc<dyn Fn() -> bool>` capturing `configured_peers + Arc<AtomicUsize>` so `/v1/readyz` doesn't pay any allocation per request.
 - ~~**OTel `case_g_batch` bench variant**: the current `case_g_otel_sink` uses SimpleSpanProcessor and overstates per-emit cost. The production path uses BatchSpanProcessor; needs a parallel bench cell to measure it honestly.~~ — **SHIPPED 2026-06-18 (Phase B).** See [Shipped — `case_g_batch` bench](#shipped--case_g_batch-bench) above. Measured ratio drops from +33% (`case_g_otel_sink`) to +12% (`case_g_batch`) over the trait-not-attached baseline.
 - ~~**Per-route 503-vs-429 ordering audit** (joint contract with sub-track #6 rate-limiter): when both fire under saturation, which precedence does the operator see? Need a single policy locked between #5 and #6.~~ — **SHIPPED 2026-06-18 (#6 Phase A).** Precedence ladder `drain > rate_limit > auth > bridge_saturated` is documented in [`m-prod-rate-limit.md`](m-prod-rate-limit.md). 429 fires before 503 when both could apply: "going too fast" is actionable client-side, "scheduler slow" is operator-side; surfacing 429 first means the client backs off without waking the operator. Canonical response envelope (same JSON shape across `rate_limited` / `bridge_saturated` / `draining` / `scheduler_first_batch_pending` / `cluster_no_peers_connected`) is unit-test-pinned via `rate_limited_response_shape_matches_bridge_saturated_envelope`.
 - **Readiness predicate extensions** (deferred inside #5 until sub-track dependencies land):
-  - TLS cert loaded / not-in-rotation — needs sub-track #2 SIGHUP reload primitive.
+  - ~~TLS cert loaded / not-in-rotation~~ — **SHIPPED 2026-07-18.** `TlsReadiness` guards the whole reload window and returns `tls_rotation_in_progress`.
+  - ~~Audit-sink healthy~~ — **SHIPPED 2026-07-18.** Any recorded sink I/O failure latches readiness red as `audit_sink_failed`.
   - OTel exporter reachable — needs BatchSpanProcessor connect handle (currently the SDK absorbs the failure mode).
   - ~~Drain-in-progress flag~~ — **SHIPPED 2026-06-17 (sub-track #4 Phase α).** See [`m-prod-lifecycle.md`](m-prod-lifecycle.md). `/v1/readyz` now flips to 503 `draining` on SIGTERM-driven drain start, ahead of all other not-ready predicates.
 

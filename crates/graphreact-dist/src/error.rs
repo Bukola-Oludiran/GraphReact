@@ -91,6 +91,12 @@ pub enum DistError {
     #[error("dist: discovery error: {0}")]
     Discovery(String),
 
+    /// A new inbound/outbound handshake was attempted after the
+    /// cluster entered graceful drain. Existing peer connections
+    /// remain alive until normal shutdown.
+    #[error("dist: cluster is draining; new handshakes are not admitted")]
+    Draining,
+
     /// JSON payload encode/decode error. Dist messages carry their
     /// app-level payload as a serde_json blob inside the postcard
     /// envelope; if the receiving end can't decode it, the wire

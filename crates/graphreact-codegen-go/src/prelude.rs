@@ -230,6 +230,21 @@ type Ctx struct {{
     Neighbors []string               `json:"neighbors"`
 }}
 
+// Secret returns a declared runtime secret, or the empty string when
+// the active node did not declare it, it is missing, or no production
+// secret callback is installed. Secret values are never cached here.
+func (Ctx) Secret(name string) string {{
+    raw, status := Invoke("host_secret", name)
+    if status != GR_OK {{
+        return ""
+    }}
+    var value string
+    if err := json.Unmarshal(raw, &value); err != nil {{
+        return ""
+    }}
+    return value
+}}
+
 // M6.6 method-style sibling API on Ctx. Thin delegations to the
 // UseX hook accessors — mechanically identical (same HOOK_CTX TLS,
 // same host callbacks), exposed as methods for ergonomic parity

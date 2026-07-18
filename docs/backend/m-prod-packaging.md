@@ -35,7 +35,7 @@ The `Dockerfile` at the repo root is a four-stage build:
 
 **Reproducibility plumbing:** the `rust-builder` stage mirrors the `reproducible-build` CI cell at `.github/workflows/ci.yml` lines 367 + 383 — `SOURCE_DATE_EPOCH` passed as a build-arg + `RUSTFLAGS=--remap-path-prefix=/work=. --remap-path-prefix=/usr/local/cargo=/cargo`. Phase A scope: same-builder reproducibility only. Cross-host reproducibility is Phase B (see flip-to-hard-gate trigger in [`m-prod-supply-chain.md`](m-prod-supply-chain.md)).
 
-**`GRX_SIGNATURE_URL` threading:** Phase A passes this as a build-arg into the `rust-builder` stage; release.yml's `docker-build` matrix sets it to `https://github.com/${REPO}/releases/download/${TAG}/grx.sig`. When Phase B ships the signing pipeline, that URL becomes operator-resolvable.
+**`GRX_SIGNATURE_URL` threading:** release.yml injects `https://github.com/${REPO}/releases/download/${TAG}/grx.cosign.bundle` into both reproducibility builds and OCI builds. The same workflow creates and attaches that exact keyless bundle, so `grx version` points at an operator-resolvable artifact.
 
 **Multi-arch:** Phase A relies on QEMU emulation via `docker buildx build --platform=linux/amd64,linux/arm64`. Native arm64 cross-compile needs an xtask `-Dtarget` knob (Phase B) — the slow `linux/arm64` emulation lane is acceptable for Phase A's once-per-tag cadence.
 
@@ -50,7 +50,7 @@ The `.dockerignore` trims the build context to the Rust source tree + zig source
 | `reproducibility-recheck` | Twice-builds `target/release/grx` on a single runner, captures SHAs, hard-fails on divergence | **HARD GATE** (unlike ci.yml's `continue-on-error: true` repro cell) |
 | `sbom-pin` | Polls the ci.yml run for the matching SHA's `sbom-cyclonedx-<tag>` artifact (15min budget), downloads it, generates a `SHA256SUMS.txt` manifest, re-uploads under `release-sbom-<tag>` | HARD (`exit 1` if ci.yml doesn't publish) |
 | `docker-build` (`{amd64, arm64}` matrix) | `docker buildx build` per arch via QEMU, OUTPUT to local tar (NO push) | Soft (Phase A scaffold) |
-| `publish-release` | `gh release create` attaches binary + SBOM bundle + OCI tars + the canonical `GRX_SIGNATURE_URL` placeholder | HARD |
+| `publish-release` | `gh release create` attaches binary, cosign/SLSA bundles, SBOM bundle, and signed OCI tars | HARD |
 
 **Defense against fork-tag-push:** every push job is gated by `if: github.repository == 'graphreact/graphreact'` so a fork pushing a `v*` tag does NOT run the release pipeline. Phase B widens this to also require `environment: production-release` (forces a maintainer-approval gate before any push runs); the environment must be configured in repo settings before Phase B's signing pipeline lands.
 
@@ -108,7 +108,7 @@ Phase B submits to a `graphreact/homebrew-tap` repo (with the `bottle` block pop
 
 ## Cross-track contracts locked here
 
-- **Sub-track #7 (supply chain):** the release pipeline owns the "where does the SBOM go" decision — Phase A pins the ci.yml SBOM artifact to the GitHub Release; Phase B adds the cosign `.sig` upload alongside (the `GRX_SIGNATURE_URL` baked into the binary by `crates/graphreact-cli/build.rs` already points at the Phase B URL). Cross-link: [`m-prod-supply-chain.md`](m-prod-supply-chain.md).
+- **Sub-track #7 (supply chain):** the release pipeline attaches the pinned SBOM plus `grx.cosign.bundle` and SLSA provenance to the GitHub Release. The URL baked into `grx version` points at that exact bundle. Cross-link: [`m-prod-supply-chain.md`](m-prod-supply-chain.md).
 - **Sub-track #4 (lifecycle):** the helm chart's `terminationGracePeriodSeconds` IS the operator-facing k8s contract for the drain budget. Bumping either the CLI's `DEFAULT_DRAIN_DEADLINE_SECS` or the `OBSERVER_SHUTDOWN_DEADLINE` requires a coupled bump in `charts/grx/values.yaml` AND a coupled update to the `m-prod-lifecycle.md` budget math table. Cross-link: [`m-prod-lifecycle.md`](m-prod-lifecycle.md).
 - **Sub-track #5 (observability):** the probes block in `charts/grx/values.yaml` was pasted verbatim from m-prod-observability.md's "k8s configuration" anchor — that doc explicitly says "paste into the helm chart when sub-track #8 lands". When the predicate set for `/v1/readyz` evolves (e.g. sub-track #2 TLS rotation adds a `tls_reload_pending` reason), the probe documentation in BOTH docs MUST stay in sync. Cross-link: [`m-prod-observability.md`](m-prod-observability.md).
 - **Sub-track #1 (auth / audit):** `observer.audit.logPath` in `values.yaml` is the operator surface for the hash-chained audit log sink. When sub-track #1 graduates from Phase A (multi-token RBAC + batched-fsync + SIGHUP atomic-swap rotation) the helm chart MUST expose the new knobs. Cross-link: [`m-prod-auth.md`](m-prod-auth.md).

@@ -1,19 +1,19 @@
-# 0007 — ctx.secret(name) is a per-call host-callback over an Engine-trait surface; manifest-declared needs_secret allowlist gates reads at the host-callback boundary; default-deny on undeclared names; SecretStore impls are Sync so the engine worker thread can dispatch; CPython + Go wiring + audit-of-secret-reads + SIGHUP re-read defer to Phase B Part 2
+# 0007 — ctx.secret(name) is a per-call host callback gated by the manifest-declared needs_secret allowlist
 
-**Status:** DECIDED 2026-06-18. M-Prod sub-track #3 Phase B Part 1 SHIPPED 2026-06-18 (JSC slice).
-**Related:** ADR-0006 (audit chain substrate, [0006-audit-chain-substrate.md](0006-audit-chain-substrate.md)) — the `graphreact::observer::audit` target convention secret-read auditing will eventually ride; ADR-0004 (substrate-not-MVP discipline, [0004-ingress-as-substrate-primitive.md](0004-ingress-as-substrate-primitive.md)). Cross-references: [m-prod-secrets.md](../backend/m-prod-secrets.md) and [m-prod.md](../backend/m-prod.md).
+**Status:** DECIDED 2026-06-18. Phase B Part 1 SHIPPED 2026-06-18; Phase B Part 2 SHIPPED 2026-07-18.
+**Related:** ADR-0006 (audit chain substrate, [0006-audit-chain-substrate.md](0006-audit-chain-substrate.md)) — secret-read auditing rides its `graphreact::observer::audit` target and `AuditSink` fan; ADR-0004 (substrate-not-MVP discipline, [0004-ingress-as-substrate-primitive.md](0004-ingress-as-substrate-primitive.md)). Cross-references: [m-prod-secrets.md](../backend/m-prod-secrets.md) and [m-prod.md](../backend/m-prod.md).
 
 ## The decisions (five)
 
 1. **Per-call host-callback dispatch.** Every `ctx.secret("FOO")` call crosses into Rust and re-dispatches against the registered `SecretStore`. NO caching at the engine layer. SIGHUP-driven rotation (Phase B Part 2) then just swaps the registered `Arc<dyn SecretStore>` — bodies see the new value on the next call, no per-isolate cache invalidation needed.
 2. **Manifest-declared `needs_secret = ["NAME1", "NAME2"]` allowlist, default-deny.** Bodies must declare the secrets they read in the permission manifest they return per render. The host-callback consults the **last-committed manifest for the active node** (`Scheduler::manifests`) — the first render therefore has an empty allowlist → default-deny. Non-declared names resolve to `null` (JS) / `None` (Py) / zero-value (Go); calls never throw. Mirrors `accepts_external` default-deny shape.
 3. **`SecretStore: Send + Sync` is the thread-safety contract.** The host-callback executes on whichever worker the engine schedules; the existing `graphreact_secrets::SecretStore` trait already pins `Send + Sync` at the trait level. No new lock at the host-callback boundary.
-4. **Engine trait surface gains `fn host_secret_callback(&self) -> Option<&dyn HostSecretCallback>` with a `None` default.** Engines that don't yet wire secrets (cpython, go, echo, null, zig) compile unchanged; JSC overrides to return `Some(&...)`. This is the contract surface — the actual wiring on the JS side goes through the existing `register_callback("host_secret", …)` plumbing in `graphreact-cli/src/jsruntime.rs` for the production daemon path; the trait method is the gating predicate the orchestrator queries to decide whether to install the JS-side `ctx.secret` shim.
-5. **`SecretValue` traverses the host-callback boundary as a UTF-8 string in `HostValue::String`** for the JSC slice. Non-UTF-8 secrets resolve to `null` and emit a `tracing::warn!(target: "graphreact::secrets::audit")` warning. Phase B Part 2 will widen to a typed sealed-wrapper once CPython + Go cross the same boundary.
+4. **Engine trait surface includes `fn host_secret_callback(&self) -> Option<&dyn HostSecretCallback>` with a `None` default.** JSC retains this compatibility surface. Production JSC, CPython, and Go mounting uses each engine's existing named `register_callback("host_secret", …)` plumbing; echo/null engines remain unchanged.
+5. **`SecretValue` traverses the host-callback boundary as a UTF-8 string in `HostValue::String`.** Non-UTF-8 secrets deny safely and increment the bounded failure metric. A typed binary-secret ABI remains future work.
 
 ## Why per-call (not cached)
 
-Rotation correctness > microbench. Phase B Part 2's SIGHUP path swaps the `Arc<dyn SecretStore>` atomically; a cache would need a separate invalidation channel. The host-callback fast path is one `RwLock::read()` on the store handle + one `SecretStore::get()` (env-var read = O(1); keyring read is the expensive case but rare).
+Rotation correctness > microbench. SIGHUP swaps the `Arc<dyn SecretStore>` atomically; a cache would need a separate invalidation channel. The host-callback fast path is one lock-free `ArcSwap::load()` snapshot + one `SecretStore::get()` (env-var read = O(1); keyring read is the expensive case but rare).
 
 The trio of expected per-event costs:
 
@@ -21,7 +21,7 @@ The trio of expected per-event costs:
 - **KeyringStore::get** — single platform syscall (Keychain query / Secret Service dbus round-trip / wincred lookup). Tens-of-µs to single-ms range; rare in steady state (bodies read once per render).
 - **Caller-side overhead** — JSON serialisation of the `HostValue::String` reply across the JSC bridge dominates the cost at sub-microsecond per call; the lookup itself isn't the bottleneck.
 
-Phase B Part 2 may revisit if `auth_success`-class fan-out moves the read rate above current projections, but the substrate doesn't preclude a cache — it just doesn't ship one in Phase B Part 1.
+Later work may revisit if measurements move the read rate above current projections, but the shipped substrate deliberately stays uncached.
 
 ## Why manifest-declared allowlist (not implicit-allow-all)
 
@@ -41,9 +41,9 @@ The Zig prelude's `__augmentCtx` (zig/bridge/jsc.zig:433) is the canonical insta
 
 ## Why `SecretValue` rides the host-callback boundary as UTF-8 string
 
-The `HostValue` ABI in `graphreact-engine-zig` already routes JSON-serialisable shapes (string, number, bool, null, object, array) across the FFI. The simplest JSC slice (Phase B Part 1) marshals secrets as `HostValue::String` so the JS side sees them as a plain JS `string`. The non-UTF-8 path (binary-only secrets like raw signing keys) resolves to `null` for now + emits a `tracing::warn!(target: "graphreact::secrets::audit")` warning so operators see the gap; Phase B Part 2 widens the boundary to a typed sealed-wrapper after CPython + Go cross the same surface and the right typed-bytes representation is clear (likely `HostValue::Bytes(Vec<u8>)` once the engine ABI carries it).
+The `HostValue` ABI in `graphreact-engine-zig` already routes JSON-serialisable shapes (string, number, bool, null, object, array) across the FFI. All three production callbacks marshal secrets as `HostValue::String`. Non-UTF-8 data denies safely, emits the canonical audit event, and increments the failure metric. A future typed-bytes ABI can close the binary-secret gap.
 
-The `SecretValue` does NOT travel as-is across the FFI — the `Zeroize` + `ZeroizeOnDrop` derive only protects the original `Vec<u8>`; once the bytes are copied into a JS `string`, the JS engine's heap holds an independent copy outside the Rust zeroize regime. This is a known gap; Phase B Part 2 will revisit when widening to typed-bytes (engines that hold the bytes can hand the heap back to Rust on body completion).
+The `SecretValue` does NOT travel as-is across the FFI — the `Zeroize` + `ZeroizeOnDrop` derive only protects the original `Vec<u8>`; once copied into a guest string, the engine heap holds an independent copy outside the Rust zeroize regime. This remains the reason a typed binary-secret ABI is catalogued as future work.
 
 ## Reversibility
 
@@ -64,13 +64,13 @@ Five Phase B Part 1 scope decisions were load-bearing:
 - **`PermissionManifest::needs_secret` field.** Without it, the allowlist contract isn't enforceable at the boundary; Phase B Part 2's production-side host-callback factory (reading `Scheduler::manifests` by `current_node_id()`) has nowhere to look.
 - **JSC integration test.** Without an executable proof of allowlist-allow + default-deny over a real JSC isolate, the contract shape is undisturbed but unverified.
 
-Explicitly deferred to Phase B Part 2:
+Phase B Part 2 subsequently shipped:
 
 - **CPython `__augment_ctx` wiring.** Same shape as JSC but with the Python-side source-wrap pattern; each engine needs its own test.
 - **Go codegen prelude `Ctx.Secret(name)` method.** Same shape via the generated Go struct.
 - **Audit-of-secret-reads** (`secret_read_allow` / `secret_read_deny` events). Waits on #1's audit-chain sink Phase B landing so the events ride the same hash-chained log instead of just `tracing::info!`.
 - **SIGHUP-driven re-read** (atomic swap of the `Arc<dyn SecretStore>` on signal). Waits on #2's atomic-swap pattern shipping for a non-TLS resource.
-- **Cached-vs-uncached perf knob.** No measured load yet to justify a cache; revisit when `auth_success`-class fan-out moves the read rate above current projections.
+- **Failure metrics.** The bounded `grx_secret_read_failures_total{reason}` family ships alongside the audit fan. A cache knob remains evidence-gated and was not added.
 - **Production `host_secret` factory.** The JSC integration test stands in with an inline `TestSecretSource::read` that enforces the allowlist. The production-side wiring (in `graphreact-cli/src/jsruntime.rs`, reading `Scheduler::manifests` by `current_node_id()` + checking `manifest.needs_secret`) ships Phase B Part 2.
 
 ## Cross-track contracts (locked here, executed elsewhere)
@@ -83,6 +83,6 @@ Explicitly deferred to Phase B Part 2:
 
 ## Open questions tracked (not blockers)
 
-- **`&self` return type may need widening for CPython + Go.** ADR-0007's `host_secret_callback(&self) -> Option<&dyn HostSecretCallback>` returns a borrow tied to `self`. The JSC slice satisfies this via a process-global `OnceLock<Arc<dyn HostSecretCallback>>` shadow (production model: one `SecretStore` per process, consistent with Phase A's `EnvStore` / `KeyringStore` semantics). CPython / Go may need a different lifetime shape — Phase B Part 2 will revisit; if a widening is needed it's a strict-additive trait change (the JSC default keeps returning the same shape).
-- **Binary-only secrets.** Phase B Part 1 resolves non-UTF-8 to `null`. Phase B Part 2 will widen the boundary once the right typed-bytes representation on the engine ABI is clear.
+- **Engine-trait shadow.** The production callback factories use each engine's existing named `BoxCallback` registration, so CPython and Go did not require widening the JSC-specific borrowed trait shadow.
+- **Binary-only secrets.** Non-UTF-8 values deny safely today; a portable typed-bytes representation remains open.
 - **Per-isolate vs process-global allowlist scope.** The Phase B Part 1 production factory will read `Scheduler::manifests` by `current_node_id()`. This implicitly scopes the allowlist per-node; future composite-component patterns may need the allowlist to extend down the tree. Track when the use case shows up.

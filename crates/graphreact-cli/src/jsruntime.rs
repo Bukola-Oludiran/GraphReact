@@ -87,6 +87,7 @@ use graphreact_engine_zig::{
 use graphreact_grx_parser::{multi_file::resolve_multi_file, ir::IrNode, GrxFile, GrxIr, SourceLoc};
 
 use crate::runtime::RuntimeError;
+use crate::runtime_secrets::RuntimeSecretContext;
 
 // ---------------------------------------------------------------------
 // Per-thread registries
@@ -385,6 +386,30 @@ fn current_directory() -> Option<Rc<RefCell<GraphDirectory>>> {
 
 fn current_graph_snapshot() -> Option<Rc<GraphSnapshot>> {
     CURRENT_GRAPH_SNAPSHOT.with(|cell| cell.borrow().clone())
+}
+
+fn build_runtime_secret_callback(context: Arc<RuntimeSecretContext>) -> BoxCallback {
+    Box::new(move |args| {
+        let name = match args.first() {
+            Some(HostValue::String(name)) => name,
+            _ => return Ok(HostValue::Null),
+        };
+        let Some(node_id) = current_node_id() else {
+            return Ok(HostValue::Null);
+        };
+        let allowed = current_graph_snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .manifests
+                    .borrow()
+                    .get(&node_id)
+                    .and_then(|manifest| manifest.needs_secret.clone())
+            })
+            .unwrap_or_default();
+        Ok(context
+            .read_utf8(&node_id, name, &allowed)
+            .map_or(HostValue::Null, HostValue::String))
+    })
 }
 
 fn current_engine() -> Option<Rc<RefCell<JscEngine>>> {
@@ -4591,6 +4616,13 @@ impl JsRuntime {
 /// (tests want fine-grained control; the CLI typically runs once
 /// then stops).
 pub fn mount_with_scheduler(path: &std::path::Path) -> Result<JsRuntime, RuntimeError> {
+    mount_with_scheduler_and_secrets(path, None)
+}
+
+pub fn mount_with_scheduler_and_secrets(
+    path: &std::path::Path,
+    secrets: Option<Arc<RuntimeSecretContext>>,
+) -> Result<JsRuntime, RuntimeError> {
     let resolved = resolve_multi_file(path)?;
 
     // Concatenate definitions from root + imports (same shape as
@@ -4680,6 +4712,9 @@ pub fn mount_with_scheduler(path: &std::path::Path) -> Result<JsRuntime, Runtime
     // reference them via the prelude stubs.
     {
         let mut e = engine_rc.borrow_mut();
+        if let Some(context) = secrets {
+            e.register_callback(iso, "host_secret", build_runtime_secret_callback(context))?;
+        }
         e.register_callback(iso, "host_state", build_host_state_callback())?;
         e.register_callback(iso, "host_state_set", build_host_state_set_callback())?;
         e.register_callback(iso, "host_effect", build_host_effect_callback())?;
