@@ -370,18 +370,8 @@ fn encode_labeled_histogram(
         );
         #[allow(clippy::cast_precision_loss)]
         let sum_seconds = (snap.sum_ns as f64) / 1_000_000_000.0;
-        write_float_metric_with_labels(
-            s,
-            &format!("{name}_sum"),
-            &labeled.labels,
-            sum_seconds,
-        );
-        write_metric_with_labels(
-            s,
-            &format!("{name}_count"),
-            &labeled.labels,
-            snap.count,
-        );
+        write_float_metric_with_labels(s, &format!("{name}_sum"), &labeled.labels, sum_seconds);
+        write_metric_with_labels(s, &format!("{name}_count"), &labeled.labels, snap.count);
     }
 }
 
@@ -602,7 +592,9 @@ mod tests {
         // _sum uses seconds units (sum_ns / 1e9).
         let expected_sum = (2_000.0 + 50_000.0 + 2_000_000.0) / 1_000_000_000.0;
         assert!(
-            out.contains(&format!("grx_process_batch_duration_seconds_sum {expected_sum}")),
+            out.contains(&format!(
+                "grx_process_batch_duration_seconds_sum {expected_sum}"
+            )),
             "missing sum line in:\n{out}"
         );
     }
@@ -614,15 +606,13 @@ mod tests {
         inner.engine_process_batch_duration_observe("jsc", 50_000);
         inner.engine_process_batch_duration_observe("cpython", 8_000);
         let out = encode_text(&inner);
-        assert!(out.contains(
-            "# TYPE grx_engine_process_batch_duration_seconds histogram"
-        ));
+        assert!(out.contains("# TYPE grx_engine_process_batch_duration_seconds histogram"));
         assert!(out.contains(
             "grx_engine_process_batch_duration_seconds_bucket{engine=\"jsc\",le=\"+Inf\"} 2"
         ));
-        assert!(out.contains(
-            "grx_engine_process_batch_duration_seconds_count{engine=\"cpython\"} 1"
-        ));
+        assert!(
+            out.contains("grx_engine_process_batch_duration_seconds_count{engine=\"cpython\"} 1")
+        );
     }
 
     #[test]

@@ -28,13 +28,15 @@ pub async fn resolve_with_store(
     let snapshot = snapshot_open_buffers(store).await;
 
     let loader = move |path: &Path| -> Result<String, std::io::Error> {
-        let canonical = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf());
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let key = path_to_uri_string(&canonical)
             .or_else(|| canonical.to_str().map(|s| format!("file://{s}")));
         if let Some(uri) = key {
-            if let Some(text) = snapshot.iter().find(|(u, _)| u == &uri).map(|(_, t)| t.clone()) {
+            if let Some(text) = snapshot
+                .iter()
+                .find(|(u, _)| u == &uri)
+                .map(|(_, t)| t.clone())
+            {
                 return Ok(text);
             }
         }
@@ -110,7 +112,10 @@ pub fn resolve_subsystem_target(
     let mut visited: Vec<PathBuf> = Vec::new();
     for import in &resolved.root.imports {
         if import.alias.as_deref() == Some(&alias) {
-            let root_dir = resolved.root_path.parent().unwrap_or_else(|| Path::new("."));
+            let root_dir = resolved
+                .root_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
             let candidate = root_dir.join(&import.src);
             let canonical = candidate.canonicalize().ok().unwrap_or(candidate);
             visited.push(canonical.clone());
@@ -127,11 +132,7 @@ pub fn resolve_subsystem_target(
     locate_subgraph(imported_file, &import_path, &bare_name)
 }
 
-fn locate_subgraph(
-    file: &GrxFile,
-    file_path: &Path,
-    name: &str,
-) -> Option<SubsystemTarget> {
+fn locate_subgraph(file: &GrxFile, file_path: &Path, name: &str) -> Option<SubsystemTarget> {
     for sg in &file.subgraphs {
         if sg.name == name {
             return Some(SubsystemTarget {
@@ -156,11 +157,11 @@ pub struct ImportTarget {
 /// (so the LSP can also "go to the import line" from a tag-name
 /// click).
 #[must_use]
-pub fn resolve_import_alias(
-    resolved: &MultiFileResolved,
-    alias: &str,
-) -> Option<ImportTarget> {
-    let root_dir = resolved.root_path.parent().unwrap_or_else(|| Path::new("."));
+pub fn resolve_import_alias(resolved: &MultiFileResolved, alias: &str) -> Option<ImportTarget> {
+    let root_dir = resolved
+        .root_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
     for import in &resolved.root.imports {
         if import.alias.as_deref() == Some(alias) {
             let candidate = root_dir.join(&import.src);

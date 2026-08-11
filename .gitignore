@@ -30,6 +30,8 @@ crates/graphreact-graspologic/fixtures/generated/
 # M22 mixed-runtime fixture: Go codegen build directory (regenerated
 # by `mount_with_scheduler` on every test invocation).
 crates/graphreact-cli/tests/fixtures/.grx-go-build-*/
+.grx-go-build-*/
+**/.grx-go-build-*/
 
 # Temp / scratch
 .scratch/

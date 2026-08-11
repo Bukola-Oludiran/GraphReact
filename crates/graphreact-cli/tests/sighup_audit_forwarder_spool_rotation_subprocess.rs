@@ -32,8 +32,7 @@ fn write_cluster_pem(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
     let ca_path = dir.join("ca.pem");
     std::fs::write(&ca_path, ca_pem).expect("write ca pem");
 
-    let mut params =
-        rcgen::CertificateParams::new(vec!["alice".into()]).expect("leaf params");
+    let mut params = rcgen::CertificateParams::new(vec!["alice".into()]).expect("leaf params");
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         "alice".to_string().try_into().expect("san"),
     ));

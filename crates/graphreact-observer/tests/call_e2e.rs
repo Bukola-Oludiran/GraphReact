@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use graphreact_observer::{
-    spawn_management_api, ApiServerHandle, BearerToken, BindConfig, InjectMessageWithReplyDisposition,
-    MetricsInner, PendingCalls, SnapshotRequest,
+    spawn_management_api, ApiServerHandle, BearerToken, BindConfig,
+    InjectMessageWithReplyDisposition, MetricsInner, PendingCalls, SnapshotRequest,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -55,7 +55,9 @@ async fn spawn_with_call_responder(
         token: token.map(|t| BearerToken::from_bytes(t.to_vec()).unwrap()),
         tls: None,
     };
-    let mut server = spawn_management_api(bind, metrics, 1234).await.expect("spawn");
+    let mut server = spawn_management_api(bind, metrics, 1234)
+        .await
+        .expect("spawn");
     let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
     let pending_calls = server.pending_calls.clone();
     let drain_task = tokio::spawn(async move {
@@ -69,8 +71,7 @@ async fn spawn_with_call_responder(
                 } => {
                     match behaviour.clone() {
                         CallBehaviour::ReplyImmediately(payload) => {
-                            let _ = oneshot_tx
-                                .send(InjectMessageWithReplyDisposition::Dispatched);
+                            let _ = oneshot_tx.send(InjectMessageWithReplyDisposition::Dispatched);
                             // Fire on_call_reply via the
                             // PendingCalls TelemetrySink impl —
                             // mirrors the scheduler's auto-tag
@@ -87,19 +88,17 @@ async fn spawn_with_call_responder(
                             );
                         }
                         CallBehaviour::DropAfterDispatch => {
-                            let _ = oneshot_tx
-                                .send(InjectMessageWithReplyDisposition::Dispatched);
+                            let _ = oneshot_tx.send(InjectMessageWithReplyDisposition::Dispatched);
                             // Don't fire on_call_reply — caller
                             // times out.
                         }
                         CallBehaviour::RejectByManifest => {
-                            let _ = oneshot_tx.send(
-                                InjectMessageWithReplyDisposition::RejectedByManifest,
-                            );
+                            let _ = oneshot_tx
+                                .send(InjectMessageWithReplyDisposition::RejectedByManifest);
                         }
                         CallBehaviour::NodeNotFound => {
-                            let _ = oneshot_tx
-                                .send(InjectMessageWithReplyDisposition::NodeNotFound);
+                            let _ =
+                                oneshot_tx.send(InjectMessageWithReplyDisposition::NodeNotFound);
                         }
                     }
                 }
@@ -113,11 +112,9 @@ async fn spawn_with_call_responder(
 #[tokio::test]
 async fn call_returns_200_with_payload_on_reply() {
     let reply_payload = serde_json::json!({"answer": 42});
-    let (server, _drain) = spawn_with_call_responder(
-        None,
-        CallBehaviour::ReplyImmediately(reply_payload.clone()),
-    )
-    .await;
+    let (server, _drain) =
+        spawn_with_call_responder(None, CallBehaviour::ReplyImmediately(reply_payload.clone()))
+            .await;
     let (status, body) = http_post(
         &format!("http://{}/v1/nodes/aggregator/call", server.local_addr),
         None,
@@ -133,8 +130,7 @@ async fn call_returns_200_with_payload_on_reply() {
 
 #[tokio::test]
 async fn call_returns_504_on_timeout() {
-    let (server, _drain) =
-        spawn_with_call_responder(None, CallBehaviour::DropAfterDispatch).await;
+    let (server, _drain) = spawn_with_call_responder(None, CallBehaviour::DropAfterDispatch).await;
     let (status, body) = http_post(
         &format!("http://{}/v1/nodes/slow/call", server.local_addr),
         None,
@@ -151,8 +147,7 @@ async fn call_returns_504_on_timeout() {
 
 #[tokio::test]
 async fn call_returns_403_on_manifest_rejection() {
-    let (server, _drain) =
-        spawn_with_call_responder(None, CallBehaviour::RejectByManifest).await;
+    let (server, _drain) = spawn_with_call_responder(None, CallBehaviour::RejectByManifest).await;
     let (status, body) = http_post(
         &format!("http://{}/v1/nodes/aggregator/call", server.local_addr),
         None,
@@ -167,8 +162,7 @@ async fn call_returns_403_on_manifest_rejection() {
 
 #[tokio::test]
 async fn call_returns_404_for_unknown_node() {
-    let (server, _drain) =
-        spawn_with_call_responder(None, CallBehaviour::NodeNotFound).await;
+    let (server, _drain) = spawn_with_call_responder(None, CallBehaviour::NodeNotFound).await;
     let (status, body) = http_post(
         &format!("http://{}/v1/nodes/ghost/call", server.local_addr),
         None,
@@ -194,7 +188,9 @@ async fn concurrent_calls_isolate_correlation_ids() {
         token: None,
         tls: None,
     };
-    let mut server = spawn_management_api(bind, metrics, 1234).await.expect("spawn");
+    let mut server = spawn_management_api(bind, metrics, 1234)
+        .await
+        .expect("spawn");
     let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
     let pending_calls = server.pending_calls.clone();
     let _drain = tokio::spawn(async move {
@@ -225,9 +221,8 @@ async fn concurrent_calls_isolate_correlation_ids() {
     for i in 0..3u32 {
         let url = url.clone();
         tasks.push(tokio::spawn(async move {
-            let body = format!(
-                r#"{{"type":"query","reply_type":"query_result","payload":{{"i":{i}}}}}"#
-            );
+            let body =
+                format!(r#"{{"type":"query","reply_type":"query_result","payload":{{"i":{i}}}}}"#);
             http_post(&url, None, &body).await
         }));
     }

@@ -341,13 +341,9 @@ mod tests {
         let cfg = TrustedProxyConfig::parse("::1/128,fc00::/7").expect("parse");
         assert_eq!(cfg.len(), 2);
         assert!(cfg.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(cfg.contains(IpAddr::V6(Ipv6Addr::new(
-            0xfc00, 0, 0, 0, 0, 0, 0, 1,
-        ))));
+        assert!(cfg.contains(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1,))));
         // Outside fc00::/7 → not matched.
-        assert!(!cfg.contains(IpAddr::V6(Ipv6Addr::new(
-            0xfe80, 0, 0, 0, 0, 0, 0, 1,
-        ))));
+        assert!(!cfg.contains(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1,))));
     }
 
     #[test]

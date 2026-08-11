@@ -44,32 +44,38 @@ use graphreact_codegen_go::{BuildArtifact, Codegen};
 use graphreact_core::{
     delay_source as core_delay_source, timer_source as core_timer_source,
     use_accept_edge as core_use_accept_edge, use_compose as core_use_compose,
-    use_demonitor as core_use_demonitor,
-    use_edge_accept_handler as core_use_edge_accept_handler, use_effect as core_use_effect,
-    use_emit as core_use_emit, use_group_join as core_use_group_join,
-    use_group_leave as core_use_group_leave, use_link as core_use_link,
-    use_memo as core_use_memo, use_message as core_use_message,
+    use_demonitor as core_use_demonitor, use_edge_accept_handler as core_use_edge_accept_handler,
+    use_effect as core_use_effect, use_emit as core_use_emit,
+    use_group_join as core_use_group_join, use_group_leave as core_use_group_leave,
+    use_link as core_use_link, use_memo as core_use_memo, use_message as core_use_message,
     use_monitor as core_use_monitor, use_neighbors as core_use_neighbors,
     use_source as core_use_source, use_spawn_child as core_use_spawn_child,
-    use_state as core_use_state, use_topology as core_use_topology,
-    use_unlink as core_use_unlink, use_unmount_self as core_use_unmount_self, Attrs,
-    CommunicationGraph, ComposeChildSpec, EdgeAcceptPredicate, EffectCleanup, EmitOptions,
-    EventSource, GraphDirectory, IncomingMessage, MonitorRef as CoreMonitorRef, NodeContext,
-    NodeDefinition, PermissionManifest, Scheduler, Signal, TopologyEvent, TopologyEventKind,
-    TopologyFilterOptions,
+    use_state as core_use_state, use_topology as core_use_topology, use_unlink as core_use_unlink,
+    use_unmount_self as core_use_unmount_self, Attrs, CommunicationGraph, ComposeChildSpec,
+    EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource, GraphDirectory, IncomingMessage,
+    MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest, Scheduler,
+    Signal, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
 };
 use std::sync::Arc;
 
-use graphreact_engine_go::{invoke_child_body_static, invoke_predicate_static, GoEngine, LoadedRuntime};
+use graphreact_engine_go::{
+    invoke_child_body_static, invoke_predicate_static, GoEngine, LoadedRuntime,
+};
 use graphreact_engine_zig::{
     BoxCallback, Engine, EngineError, FunctionHandle, HostValue, IsolateHandle, IsolateOptions,
 };
-use graphreact_grx_parser::{
-    ast::ComponentLang, ir::IrNode, multi_file::resolve_multi_file,
-};
+use graphreact_grx_parser::{ast::ComponentLang, ir::IrNode, multi_file::resolve_multi_file};
 
 use crate::runtime::RuntimeError;
 use crate::runtime_secrets::RuntimeSecretContext;
+
+/// Operator-controlled Go dependency build knobs shared by direct
+/// Go and mixed-runtime mounts.
+#[derive(Debug, Clone, Default)]
+pub struct GoRuntimeBuildOptions {
+    pub offline: bool,
+    pub module_cache: Option<PathBuf>,
+}
 
 // ---------------------------------------------------------------------
 // Per-thread registries (mirroring pyruntime.rs phase 3b TLS)
@@ -628,14 +634,10 @@ fn build_host_effect_callback() -> BoxCallback {
                 let cleanup: EffectCleanup = Box::new(move || {
                     let e = engine_for_cleanup.borrow();
                     if let Err(err) = e.invoke_callback(ct) {
-                        eprintln!(
-                            "[graphreact-cli] use_effect cleanup invocation failed: {err}"
-                        );
+                        eprintln!("[graphreact-cli] use_effect cleanup invocation failed: {err}");
                     }
                     if let Err(err) = e.release_callback(ct) {
-                        eprintln!(
-                            "[graphreact-cli] use_effect cleanup release failed: {err}"
-                        );
+                        eprintln!("[graphreact-cli] use_effect cleanup release failed: {err}");
                     }
                 });
                 Some(cleanup)
@@ -862,10 +864,7 @@ fn topology_event_to_host_value(event: &TopologyEvent) -> HostValue {
             ("nodeId".to_string(), HostValue::String(node_id.clone())),
         ]),
         TopologyEvent::NodeRemoved { node_id } => HostValue::Object(vec![
-            (
-                "kind".to_string(),
-                HostValue::String("node-removed".into()),
-            ),
+            ("kind".to_string(), HostValue::String("node-removed".into())),
             ("nodeId".to_string(), HostValue::String(node_id.clone())),
         ]),
         TopologyEvent::EdgeAdded { u, v, key } => HostValue::Object(vec![
@@ -875,19 +874,13 @@ fn topology_event_to_host_value(event: &TopologyEvent) -> HostValue {
             ("key".to_string(), HostValue::String(key.clone())),
         ]),
         TopologyEvent::EdgeRemoved { u, v, key } => HostValue::Object(vec![
-            (
-                "kind".to_string(),
-                HostValue::String("edge-removed".into()),
-            ),
+            ("kind".to_string(), HostValue::String("edge-removed".into())),
             ("u".to_string(), HostValue::String(u.clone())),
             ("v".to_string(), HostValue::String(v.clone())),
             ("key".to_string(), HostValue::String(key.clone())),
         ]),
         TopologyEvent::EdgeUpdated { u, v, key } => HostValue::Object(vec![
-            (
-                "kind".to_string(),
-                HostValue::String("edge-updated".into()),
-            ),
+            ("kind".to_string(), HostValue::String("edge-updated".into())),
             ("u".to_string(), HostValue::String(u.clone())),
             ("v".to_string(), HostValue::String(v.clone())),
             ("key".to_string(), HostValue::String(key.clone())),
@@ -913,7 +906,10 @@ fn build_host_directory_find_by_id_callback() -> BoxCallback {
             Some(entry) => Ok(HostValue::Object(vec![
                 ("id".to_string(), HostValue::String(entry.id.clone())),
                 ("role".to_string(), HostValue::String(entry.role.clone())),
-                ("depth".to_string(), HostValue::Number(f64::from(entry.depth))),
+                (
+                    "depth".to_string(),
+                    HostValue::Number(f64::from(entry.depth)),
+                ),
                 (
                     "path".to_string(),
                     HostValue::Array(
@@ -1254,7 +1250,9 @@ fn build_host_graph_cycle_detection_callback() -> BoxCallback {
             Some(edges) => HostValue::Array(
                 edges
                     .into_iter()
-                    .map(|(u, v)| HostValue::Array(vec![HostValue::String(u), HostValue::String(v)]))
+                    .map(|(u, v)| {
+                        HostValue::Array(vec![HostValue::String(u), HostValue::String(v)])
+                    })
                     .collect(),
             ),
             None => HostValue::Null,
@@ -1312,7 +1310,9 @@ impl DirectedAdj for Tier2Adj {
         self.out.contains_key(id)
     }
     fn has_edge(&self, u: &str, v: &str) -> bool {
-        self.out.get(u).is_some_and(|outs| outs.iter().any(|t| t == v))
+        self.out
+            .get(u)
+            .is_some_and(|outs| outs.iter().any(|t| t == v))
     }
 }
 
@@ -2285,7 +2285,9 @@ impl DirectedAdj for Tier3Adj {
         self.out.contains_key(id)
     }
     fn has_edge(&self, u: &str, v: &str) -> bool {
-        self.out.get(u).is_some_and(|outs| outs.iter().any(|t| t == v))
+        self.out
+            .get(u)
+            .is_some_and(|outs| outs.iter().any(|t| t == v))
     }
 }
 
@@ -2807,9 +2809,7 @@ fn build_host_compose_callback() -> BoxCallback {
 /// handle is valid for the lifetime of the spawned node.
 ///
 /// Verbatim Go port of `pyruntime::build_compose_spec_from_host_value`.
-fn build_compose_spec_from_host_value(
-    value: HostValue,
-) -> Result<ComposeChildSpec, EngineError> {
+fn build_compose_spec_from_host_value(value: HostValue) -> Result<ComposeChildSpec, EngineError> {
     let HostValue::Object(pairs) = value else {
         return Err(EngineError::Internal(format!(
             "expected ComposeChildSpec object, got {value:?}"
@@ -2845,8 +2845,9 @@ fn build_compose_spec_from_host_value(
     }
 
     let id = id.ok_or_else(|| EngineError::Internal("ComposeChildSpec: missing `id`".into()))?;
-    let component_token = component_token
-        .ok_or_else(|| EngineError::Internal("ComposeChildSpec: missing `componentToken`".into()))?;
+    let component_token = component_token.ok_or_else(|| {
+        EngineError::Internal("ComposeChildSpec: missing `componentToken`".into())
+    })?;
 
     let runtime = current_loaded_runtime().ok_or_else(|| {
         EngineError::Internal(
@@ -3026,9 +3027,7 @@ fn build_host_use_source_callback() -> BoxCallback {
             }
         };
         let deps: Vec<Value> = match args.get(1) {
-            Some(HostValue::Array(arr)) => {
-                arr.iter().cloned().map(HostValue::into_json).collect()
-            }
+            Some(HostValue::Array(arr)) => arr.iter().cloned().map(HostValue::into_json).collect(),
             None | Some(HostValue::Null) => Vec::new(),
             other => {
                 return Err(EngineError::Internal(format!(
@@ -3052,10 +3051,7 @@ fn build_host_use_source_callback() -> BoxCallback {
                 ("opts", HostValue::Object(opts_pairs)) => {
                     for (ok, ov) in opts_pairs {
                         match (ok.as_str(), ov) {
-                            #[allow(
-                                clippy::cast_possible_truncation,
-                                clippy::cast_sign_loss
-                            )]
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             ("port", HostValue::Number(n)) => {
                                 http_port = (n as u64).min(u64::from(u16::MAX)) as u16;
                             }
@@ -3249,12 +3245,11 @@ impl GoRuntime {
 /// smoke). New code should prefer [`mount_with_scheduler`].
 pub fn build_and_load(grx_path: &Path, out_dir: &Path) -> Result<GoRuntime, RuntimeError> {
     let ir = parse_grx_to_ir(grx_path)?;
-    let artifact = codegen_and_build(&ir, out_dir)?;
+    let build = prepare_go_build_options(grx_path, None, &GoRuntimeBuildOptions::default())?;
+    let artifact = codegen_and_build(&ir, out_dir, &build)?;
 
     let mut engine = GoEngine::with_artifact(artifact.library_path.clone());
-    engine
-        .initialize()
-        .map_err(RuntimeError::Engine)?;
+    engine.initialize().map_err(RuntimeError::Engine)?;
     let iso = engine
         .create_isolate(IsolateOptions::default())
         .map_err(RuntimeError::Engine)?;
@@ -3305,10 +3300,7 @@ pub fn build_and_load(grx_path: &Path, out_dir: &Path) -> Result<GoRuntime, Runt
 /// Single-engine-per-system enforcement: a `lang="js"` /
 /// `lang="python"` definition fed here surfaces as
 /// [`RuntimeError::EngineMisroute`] with a clear diagnostic.
-pub fn mount_with_scheduler(
-    grx_path: &Path,
-    out_dir: &Path,
-) -> Result<GoRuntime, RuntimeError> {
+pub fn mount_with_scheduler(grx_path: &Path, out_dir: &Path) -> Result<GoRuntime, RuntimeError> {
     mount_with_scheduler_and_secrets(grx_path, out_dir, None)
 }
 
@@ -3316,6 +3308,20 @@ pub fn mount_with_scheduler_and_secrets(
     grx_path: &Path,
     out_dir: &Path,
     secrets: Option<Arc<RuntimeSecretContext>>,
+) -> Result<GoRuntime, RuntimeError> {
+    mount_with_scheduler_and_options(
+        grx_path,
+        out_dir,
+        secrets,
+        &GoRuntimeBuildOptions::default(),
+    )
+}
+
+pub fn mount_with_scheduler_and_options(
+    grx_path: &Path,
+    out_dir: &Path,
+    secrets: Option<Arc<RuntimeSecretContext>>,
+    runtime_options: &GoRuntimeBuildOptions,
 ) -> Result<GoRuntime, RuntimeError> {
     let mut ir = parse_grx_to_ir(grx_path)?;
 
@@ -3397,7 +3403,8 @@ pub fn mount_with_scheduler_and_secrets(
         });
     }
 
-    let artifact = codegen_and_build(&ir, out_dir)?;
+    let build_options = prepare_go_build_options(grx_path, secrets.as_ref(), runtime_options)?;
+    let artifact = codegen_and_build(&ir, out_dir, &build_options)?;
 
     let engine_rc: Rc<RefCell<GoEngine>> = Rc::new(RefCell::new(GoEngine::with_artifact(
         artifact.library_path.clone(),
@@ -3440,12 +3447,8 @@ pub fn mount_with_scheduler_and_secrets(
             .map_err(RuntimeError::Engine)?;
         e.register_callback(iso, "host_topology", build_host_topology_callback())
             .map_err(RuntimeError::Engine)?;
-        e.register_callback(
-            iso,
-            "host_accept_edge",
-            build_host_accept_edge_callback(),
-        )
-        .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_accept_edge", build_host_accept_edge_callback())
+            .map_err(RuntimeError::Engine)?;
         // M17 phase 3d-γ: directory finders + graph_query Tier 1.
         e.register_callback(
             iso,
@@ -3675,12 +3678,8 @@ pub fn mount_with_scheduler_and_secrets(
         // M17 phase 3e-α: dynamic node lifecycle.
         e.register_callback(iso, "host_spawn_child", build_host_spawn_child_callback())
             .map_err(RuntimeError::Engine)?;
-        e.register_callback(
-            iso,
-            "host_unmount_self",
-            build_host_unmount_self_callback(),
-        )
-        .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_unmount_self", build_host_unmount_self_callback())
+            .map_err(RuntimeError::Engine)?;
         e.register_callback(iso, "host_compose", build_host_compose_callback())
             .map_err(RuntimeError::Engine)?;
         // M17 phase 3e-β: 6 supervision hooks (Tier A: pure HOOK_CTX
@@ -3695,12 +3694,8 @@ pub fn mount_with_scheduler_and_secrets(
             .map_err(RuntimeError::Engine)?;
         e.register_callback(iso, "host_group_join", build_host_group_join_callback())
             .map_err(RuntimeError::Engine)?;
-        e.register_callback(
-            iso,
-            "host_group_leave",
-            build_host_group_leave_callback(),
-        )
-        .map_err(RuntimeError::Engine)?;
+        e.register_callback(iso, "host_group_leave", build_host_group_leave_callback())
+            .map_err(RuntimeError::Engine)?;
         // M17 phase 3e-γ: external-event source substrate.
         e.register_callback(iso, "host_use_source", build_host_use_source_callback())
             .map_err(RuntimeError::Engine)?;
@@ -3980,9 +3975,7 @@ mod manifest_extraction_tests {
             ("emits".to_string(), HostValue::Array(vec![])),
             (
                 "needs_secret".to_string(),
-                HostValue::Array(vec![
-                    HostValue::String("API_KEY".to_string()),
-                ]),
+                HostValue::Array(vec![HostValue::String("API_KEY".to_string())]),
             ),
         ]);
         let m = host_value_to_manifest(hv);
@@ -4015,18 +4008,138 @@ fn component_name_for_node(node: &IrNode) -> String {
 fn codegen_and_build(
     ir: &graphreact_grx_parser::ir::GrxIr,
     out_dir: &Path,
+    build_options: &graphreact_codegen_go::module::GoBuildOptions,
 ) -> Result<BuildArtifact, RuntimeError> {
     let codegen = Codegen::new();
-    codegen.emit_prelude(ir, out_dir).map_err(|e| {
+    codegen
+        .emit_prelude_with_module(ir, out_dir, build_options.module.as_ref())
+        .map_err(|e| {
+            RuntimeError::Engine(EngineError::Internal(format!(
+                "graphreact-codegen-go::emit_prelude: {e}"
+            )))
+        })?;
+    codegen
+        .build_artifact_with_options(out_dir, out_dir, build_options)
+        .map_err(|e| {
+            RuntimeError::Engine(EngineError::Internal(format!(
+                "graphreact-codegen-go::build_artifact: {e}"
+            )))
+        })
+}
+
+fn prepare_go_build_options(
+    grx_path: &Path,
+    secrets: Option<&Arc<RuntimeSecretContext>>,
+    runtime_options: &GoRuntimeBuildOptions,
+) -> Result<graphreact_codegen_go::module::GoBuildOptions, RuntimeError> {
+    use graphreact_codegen_go::module::{
+        discover_module, required_secret_names, GoBuildOptions, ResolvedGoAuth,
+    };
+
+    let resolved = resolve_multi_file(grx_path).map_err(|error| {
         RuntimeError::Engine(EngineError::Internal(format!(
-            "graphreact-codegen-go::emit_prelude: {e}"
+            "graphreact-cli::goruntime module discovery: {error}"
         )))
     })?;
-    codegen.build_artifact(out_dir, out_dir).map_err(|e| {
-        RuntimeError::Engine(EngineError::Internal(format!(
-            "graphreact-codegen-go::build_artifact: {e}"
-        )))
+    let mut go_sources = Vec::new();
+    collect_go_source_paths(
+        &resolved.root_path,
+        &resolved.root.definitions,
+        &mut go_sources,
+    );
+    for import in &resolved.imports {
+        collect_go_source_paths(&import.path, &import.file.definitions, &mut go_sources);
+    }
+    let module = discover_module(&resolved.root_path, &go_sources)
+        .map_err(|error| RuntimeError::Engine(EngineError::Internal(error.to_string())))?;
+    let auth = if let Some(module) = &module {
+        if let Some(policy) = &module.auth {
+            let allowed = required_secret_names(module);
+            let context = secrets.ok_or_else(|| {
+                RuntimeError::Engine(EngineError::Internal(
+                    "go.auth.json requires the GraphReact runtime secret store".into(),
+                ))
+            })?;
+            let mut auth = ResolvedGoAuth::default();
+            for entry in &policy.https {
+                let value = context.read_build_utf8(&entry.password_secret, &allowed);
+                context.audit_go_credential_resolution(
+                    &entry.host,
+                    &entry.password_secret,
+                    value.is_some(),
+                );
+                let value = value.ok_or_else(|| {
+                    RuntimeError::Engine(EngineError::Internal(format!(
+                        "missing Go build secret `{}` for HTTPS host {}",
+                        entry.password_secret, entry.host
+                    )))
+                })?;
+                auth.https_passwords.insert(entry.host.clone(), value);
+            }
+            if let Some(proxy) = &policy.proxy {
+                let proxy_host = proxy
+                    .url
+                    .strip_prefix("https://")
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or(&proxy.url);
+                let username = context.read_build_utf8(&proxy.username_secret, &allowed);
+                context.audit_go_credential_resolution(
+                    proxy_host,
+                    &proxy.username_secret,
+                    username.is_some(),
+                );
+                auth.proxy_username = Some(username.ok_or_else(|| {
+                    RuntimeError::Engine(EngineError::Internal(format!(
+                        "missing Go build secret `{}` for module proxy",
+                        proxy.username_secret
+                    )))
+                })?);
+                let password = context.read_build_utf8(&proxy.password_secret, &allowed);
+                context.audit_go_credential_resolution(
+                    proxy_host,
+                    &proxy.password_secret,
+                    password.is_some(),
+                );
+                auth.proxy_password = Some(password.ok_or_else(|| {
+                    RuntimeError::Engine(EngineError::Internal(format!(
+                        "missing Go build secret `{}` for module proxy",
+                        proxy.password_secret
+                    )))
+                })?);
+            }
+            Some(auth)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(GoBuildOptions {
+        module,
+        offline: runtime_options.offline,
+        module_cache: runtime_options.module_cache.clone(),
+        auth,
     })
+}
+
+fn collect_go_source_paths(
+    owner: &Path,
+    definitions: &[graphreact_grx_parser::ast::NodeDefinitionBlock],
+    out: &mut Vec<PathBuf>,
+) {
+    if definitions
+        .iter()
+        .any(|definition| definition.lang == ComponentLang::Go)
+    {
+        out.push(owner.to_path_buf());
+    }
+    let base = owner.parent().unwrap_or_else(|| Path::new("."));
+    out.extend(definitions.iter().filter_map(|definition| {
+        (definition.lang == ComponentLang::Go)
+            .then_some(definition.src.as_ref())
+            .flatten()
+            .map(|source| base.join(source))
+    }));
 }
 
 fn parse_grx_to_ir(path: &Path) -> Result<graphreact_grx_parser::ir::GrxIr, RuntimeError> {
@@ -4090,10 +4203,8 @@ mod tests {
     }
 
     fn fresh_out_dir(tag: &str) -> PathBuf {
-        let out_dir = std::env::temp_dir().join(format!(
-            "grx-goruntime-{tag}-{}",
-            std::process::id()
-        ));
+        let out_dir =
+            std::env::temp_dir().join(format!("grx-goruntime-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out_dir);
         out_dir
     }
@@ -4222,8 +4333,7 @@ mod tests {
     /// batches; second batch's render observes the new value.
     /// Mirrors pyruntime::phase3b_use_state_preserves_value_across_renders.
     fn scenario_use_state_preserves_value_across_renders() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-counter.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-counter.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("counter-survive");
@@ -4285,8 +4395,7 @@ mod tests {
     /// setter; the next batch observes the bumped value. Mirrors
     /// pyruntime::phase3c_python_use_message_handler_re_renders_on_message.
     fn scenario_use_state_survives_a_message() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-counter.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-counter.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("counter-message");
@@ -4393,8 +4502,7 @@ mod tests {
     /// (initial render, then on signal-set bumping count → recompute,
     /// then unchanged deps → cache hit).
     fn scenario_use_memo_caches_and_recomputes() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-memo.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-memo.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("memo");
@@ -4472,7 +4580,8 @@ mod tests {
             "third factory fire reads count=9; got {runs:?}"
         );
         assert!(
-            obs.len() >= 3 && (obs[0] - 0.0).abs() < f64::EPSILON
+            obs.len() >= 3
+                && (obs[0] - 0.0).abs() < f64::EPSILON
                 && (obs[1] - 14.0).abs() < f64::EPSILON
                 && (obs[2] - 18.0).abs() < f64::EPSILON,
             "doubled observations should follow factory output; got {obs:?}"
@@ -4482,8 +4591,7 @@ mod tests {
     /// Phase 3d-α: UseMemo cache hit on unchanged deps — factory
     /// fires once across multiple renders when deps stay equal.
     fn scenario_use_memo_caches_when_deps_unchanged() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-memo.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-memo.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("memo-unchanged");
@@ -4534,7 +4642,10 @@ mod tests {
         // exactly once; that's the cache contract on the initial
         // mount + when no re-render fires.
         let runs = *factory_runs.lock();
-        assert_eq!(runs, 1, "single render fires factory exactly once; got {runs}");
+        assert_eq!(
+            runs, 1,
+            "single render fires factory exactly once; got {runs}"
+        );
     }
 
     /// Phase 3d-α: UseReducer dispatches actions through the
@@ -4542,8 +4653,7 @@ mod tests {
     /// external "inc" message delivery, the next render observes
     /// the bumped state.
     fn scenario_use_reducer_dispatch_updates_state() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-reducer.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-reducer.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("reducer");
@@ -4596,8 +4706,7 @@ mod tests {
     /// neighbours. The fixture wires a → b and a → c so the body of
     /// node "a" observes both ids on its render.
     fn scenario_use_neighbors_returns_structural_ids() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-neighbors.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-neighbors.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("neighbors");
@@ -4649,9 +4758,7 @@ mod tests {
         // mean only a has outgoing neighbours in the structural
         // sense the hook reads).
         let has_two_id_row = obs.iter().any(|row| {
-            row.len() == 2
-                && row.iter().any(|x| x == "b")
-                && row.iter().any(|x| x == "c")
+            row.len() == 2 && row.iter().any(|x| x == "b") && row.iter().any(|x| x == "c")
         });
         assert!(
             has_two_id_row,
@@ -4712,9 +4819,9 @@ mod tests {
         let obs = observations.lock();
         // The handler should have observed an "edge-added" event
         // with u=acceptor, v=listener.
-        let saw = obs.iter().any(|(kind, u, v)| {
-            kind == "edge-added" && u == "acceptor" && v == "listener"
-        });
+        let saw = obs
+            .iter()
+            .any(|(kind, u, v)| kind == "edge-added" && u == "acceptor" && v == "listener");
         assert!(
             saw,
             "expected edge-added(acceptor -> listener) in topology stream; got obs={obs:?}"
@@ -4847,7 +4954,9 @@ mod tests {
         assert!(zzz_absent, "expected HasNode(zzz)=false; got {nodes:?}");
 
         let edges = has_edge_obs.lock();
-        let alpha_beta = edges.iter().any(|(u, v, p)| u == "alpha" && v == "beta" && *p);
+        let alpha_beta = edges
+            .iter()
+            .any(|(u, v, p)| u == "alpha" && v == "beta" && *p);
         let alpha_gamma = edges
             .iter()
             .any(|(u, v, p)| u == "alpha" && v == "gamma" && !*p);
@@ -4874,8 +4983,7 @@ mod tests {
     /// GraphDirectory. Probe body looks up an existing id + a
     /// missing one; the test asserts the entry presence pattern.
     fn scenario_use_directory_find_by_id() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-directory.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-directory.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("directory");
@@ -4913,7 +5021,9 @@ mod tests {
         let saw_a = obs
             .iter()
             .any(|(asked, found, id)| asked == "a" && *found && id == "a");
-        let missed_zzz = obs.iter().any(|(asked, found, _)| asked == "zzz" && !*found);
+        let missed_zzz = obs
+            .iter()
+            .any(|(asked, found, _)| asked == "zzz" && !*found);
         assert!(
             saw_a,
             "expected FindByID(a) to return entry with id=a; got obs={obs:?}"
@@ -5116,13 +5226,17 @@ mod tests {
 
         let sp = shortest.lock();
         // a -> c is direct; shortest path is [a, c].
-        let sp_ac = sp.iter().any(|row| row == &vec!["a".to_string(), "c".to_string()]);
+        let sp_ac = sp
+            .iter()
+            .any(|row| row == &vec!["a".to_string(), "c".to_string()]);
         assert!(sp_ac, "expected ShortestPath(a, c) = [a, c]; got {sp:?}");
 
         let ap = all_paths.lock();
         // Two simple paths from a to c: [a, c] and [a, b, c].
         let two_paths = ap.iter().any(|rows| {
-            let has_direct = rows.iter().any(|p| p == &vec!["a".to_string(), "c".to_string()]);
+            let has_direct = rows
+                .iter()
+                .any(|p| p == &vec!["a".to_string(), "c".to_string()]);
             let has_indirect = rows
                 .iter()
                 .any(|p| p == &vec!["a".to_string(), "b".to_string(), "c".to_string()]);
@@ -5136,8 +5250,13 @@ mod tests {
         let as_ = astar.lock();
         // Tier 1 AStarPath is heuristic-free → degenerates to
         // shortest path of length 2.
-        let astar_len_2 = as_.iter().any(|row| row.len() == 2 && row[0] == "a" && row[1] == "c");
-        assert!(astar_len_2, "expected AStarPath(a, c) = [a, c]; got {as_:?}");
+        let astar_len_2 = as_
+            .iter()
+            .any(|row| row.len() == 2 && row[0] == "a" && row[1] == "c");
+        assert!(
+            astar_len_2,
+            "expected AStarPath(a, c) = [a, c]; got {as_:?}"
+        );
 
         let bfs_ = bfs.lock();
         // BFS(a) reaches a, b, c, d. Order may vary by neighbour
@@ -5149,7 +5268,10 @@ mod tests {
                 && row.iter().any(|x| x == "c")
                 && row.iter().any(|x| x == "d")
         });
-        assert!(bfs_full, "expected BFS(a) to reach all 4 nodes; got {bfs_:?}");
+        assert!(
+            bfs_full,
+            "expected BFS(a) to reach all 4 nodes; got {bfs_:?}"
+        );
 
         let dfs_s = dfs_sizes.lock();
         // DFS(a) reaches all 4 nodes.
@@ -5191,8 +5313,7 @@ mod tests {
     /// - CycleDetection on the Tier 2 directed adjacency reports
     ///   HasCycle = false (terminals + DAG-shaped policy graph).
     fn scenario_use_graph_query_tier_2_accessors() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-tier2.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-tier2.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("tier2");
@@ -5369,8 +5490,7 @@ mod tests {
     /// producer for "metric". Tier 2 baseline still includes relay
     /// in producer's neighbours; Tier 3 strictly excludes it.
     fn scenario_use_graph_query_tier_3_accessors() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-tier3.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-tier3.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("tier3");
@@ -5496,9 +5616,9 @@ mod tests {
         );
 
         let filtered_ns = filtered.lock();
-        let saw_filtered = filtered_ns.iter().any(|row| {
-            row.len() == 1 && row[0] == "observer"
-        });
+        let saw_filtered = filtered_ns
+            .iter()
+            .any(|row| row.len() == 1 && row[0] == "observer");
         assert!(
             saw_filtered,
             "expected Tier 3 (predicate-filtered) Neighbors(producer) for 'metric' = [observer]; got {filtered_ns:?}"
@@ -5533,8 +5653,8 @@ mod tests {
     /// `compB` (order-independent). Mirrors
     /// `pyruntime::phase3e_alpha_*` family.
     fn scenario_use_spawn_child_use_compose_use_unmount_self() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/go-dynamic-lifecycle.grx");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-dynamic-lifecycle.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("dynlife");
@@ -5599,8 +5719,8 @@ mod tests {
     /// `down:target:normal`, `linked:true`, `joined-workers`,
     /// `left-workers`. Mirrors `pyruntime::phase3e_beta_*`.
     fn scenario_supervision_hooks_round_trip() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/go-supervision.grx");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-supervision.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("supervision");
@@ -5674,8 +5794,7 @@ mod tests {
     /// the production firing path. Verbatim port of
     /// `pyruntime::phase3e_gamma_use_source_*`.
     fn scenario_use_source_dispatches_descriptors() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/go-source.grx");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-source.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("source");
@@ -5695,8 +5814,7 @@ mod tests {
                 runtime.iso,
                 "host_use_source",
                 Box::new(move |args| {
-                    let HostValue::Object(pairs) =
-                        args.first().cloned().unwrap_or(HostValue::Null)
+                    let HostValue::Object(pairs) = args.first().cloned().unwrap_or(HostValue::Null)
                     else {
                         return Ok(HostValue::Null);
                     };
@@ -5704,10 +5822,7 @@ mod tests {
                     let mut value: u64 = 0;
                     let mut path = String::new();
                     for (k, v) in pairs {
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss
-                        )]
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         match (k.as_str(), v) {
                             ("kind", HostValue::String(s)) => kind = s,
                             ("intervalMs" | "delayMs", HostValue::Number(n)) => {
@@ -5798,8 +5913,8 @@ mod tests {
     /// without the asyncio.run blocking footgun — Go's goroutine +
     /// context.Context substrate is non-blocking by construction.
     fn scenario_use_effect_async_cancellation_runs_user_cleanup() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/go-effect-async.grx");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-effect-async.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("effect-async");
@@ -5860,8 +5975,7 @@ mod tests {
         // observes 'inner-exit' → user cleanup observes 'cleanup'.
         // Then effect re-fires → second 'mount' observed.
         let id = signal_id_for("async-1", 0).expect("signal id for async-1");
-        signal_set_external(id, Value::Number(serde_json::Number::from(1)))
-            .expect("bump dep");
+        signal_set_external(id, Value::Number(serde_json::Number::from(1))).expect("bump dep");
         runtime.process_batch().expect("batch 2");
         // Wait for the cleanup AND the re-fire — both come from the
         // goroutine path so a single fixed sleep can't guarantee both.
@@ -5919,8 +6033,8 @@ mod tests {
     /// dyn1, compA, compB all observed; compB unmounts on the next
     /// cascade. This is the M6.6 parity gate for the Go arm.
     fn scenario_method_style_ctx_parity() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/go-method-style-ctx.grx");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go-method-style-ctx.grx");
         assert!(fixture.exists(), "fixture missing at {}", fixture.display());
 
         let out_dir = fresh_out_dir("method-style-ctx");
@@ -6069,11 +6183,15 @@ mod tests {
         reset_global_state();
         scenario_use_spawn_child_use_compose_use_unmount_self();
 
-        eprintln!("[goruntime smoke 18/21] supervision hooks (monitor/demonitor/link/unlink/group)");
+        eprintln!(
+            "[goruntime smoke 18/21] supervision hooks (monitor/demonitor/link/unlink/group)"
+        );
         reset_global_state();
         scenario_supervision_hooks_round_trip();
 
-        eprintln!("[goruntime smoke 19/21] use_source dispatches timer/delay/http/watch descriptors");
+        eprintln!(
+            "[goruntime smoke 19/21] use_source dispatches timer/delay/http/watch descriptors"
+        );
         reset_global_state();
         scenario_use_source_dispatches_descriptors();
 
@@ -6081,7 +6199,9 @@ mod tests {
         reset_global_state();
         scenario_use_effect_async_cancellation_runs_user_cleanup();
 
-        eprintln!("[goruntime smoke 21/21] method-style ctx parity (ctx.SpawnChild/Compose/Unmount)");
+        eprintln!(
+            "[goruntime smoke 21/21] method-style ctx parity (ctx.SpawnChild/Compose/Unmount)"
+        );
         reset_global_state();
         scenario_method_style_ctx_parity();
 

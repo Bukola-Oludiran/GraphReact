@@ -19,9 +19,7 @@ use faer::Mat;
 
 use super::ase::{adjacency_spectral_embed_matrix, Embedding};
 use super::error::{EmbedError, EmbedResult};
-use super::matrix::{
-    augment_diagonal_in_place, is_almost_symmetric, to_laplacian, LaplacianForm,
-};
+use super::matrix::{augment_diagonal_in_place, is_almost_symmetric, to_laplacian, LaplacianForm};
 
 #[derive(Debug, Clone)]
 pub struct OmniOptions {
@@ -57,14 +55,9 @@ pub struct OmniEmbedding {
 }
 
 /// OMNI on a slice of pre-built adjacency matrices.
-pub fn omnibus_embed(
-    matrices: &[Mat<f64>],
-    opts: &OmniOptions,
-) -> EmbedResult<OmniEmbedding> {
+pub fn omnibus_embed(matrices: &[Mat<f64>], opts: &OmniOptions) -> EmbedResult<OmniEmbedding> {
     if matrices.len() < 2 {
-        return Err(EmbedError::TooFewGraphs {
-            n: matrices.len(),
-        });
+        return Err(EmbedError::TooFewGraphs { n: matrices.len() });
     }
     let n = matrices[0].nrows();
     if matrices[0].ncols() != n {
@@ -156,10 +149,7 @@ fn split_per_graph(latent: &Mat<f64>, m: usize, n: usize, k: usize) -> Vec<Mat<f
 /// Lower-level helper: the fitted [`Embedding`] over the raw `(mn × mn)`
 /// omnibus matrix. Useful when callers want full access to the joint
 /// embedding rather than the per-graph slices.
-pub fn omnibus_embed_full(
-    matrices: &[Mat<f64>],
-    opts: &OmniOptions,
-) -> EmbedResult<Embedding> {
+pub fn omnibus_embed_full(matrices: &[Mat<f64>], opts: &OmniOptions) -> EmbedResult<Embedding> {
     let omni_emb = omnibus_embed(matrices, opts)?;
     let m = omni_emb.per_graph_left.len();
     let n = omni_emb.per_graph_left[0].nrows();

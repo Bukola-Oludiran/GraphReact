@@ -291,10 +291,7 @@ pub fn log_tls_reload_attempt(
 /// -noout -fingerprint -sha256 -in cert.pem` to confirm the
 /// rotation took. Cert / key bytes are NEVER logged.
 #[inline]
-pub fn log_tls_reload_success(
-    leaf_fingerprint_sha256: &str,
-    sink: Option<&Arc<dyn AuditSink>>,
-) {
+pub fn log_tls_reload_success(leaf_fingerprint_sha256: &str, sink: Option<&Arc<dyn AuditSink>>) {
     tracing::info!(
         target: "graphreact::observer::audit",
         event = "tls_reloaded",
@@ -545,10 +542,7 @@ pub fn log_audit_log_rotation_failed(
 /// [`log_tls_reload_skipped`] — today `"draining"` is the only
 /// emit value.
 #[inline]
-pub fn log_token_registry_reload_skipped(
-    reason: &'static str,
-    sink: Option<&Arc<dyn AuditSink>>,
-) {
+pub fn log_token_registry_reload_skipped(reason: &'static str, sink: Option<&Arc<dyn AuditSink>>) {
     tracing::warn!(
         target: "graphreact::observer::audit",
         event = "token_registry_reload_skipped",
@@ -569,10 +563,7 @@ pub fn log_token_registry_reload_skipped(
 /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Audit-log
 /// rotation was triggered but skipped (today: drain in progress).
 #[inline]
-pub fn log_audit_log_rotation_skipped(
-    reason: &'static str,
-    sink: Option<&Arc<dyn AuditSink>>,
-) {
+pub fn log_audit_log_rotation_skipped(reason: &'static str, sink: Option<&Arc<dyn AuditSink>>) {
     tracing::warn!(
         target: "graphreact::observer::audit",
         event = "audit_log_rotation_skipped",
@@ -906,11 +897,7 @@ pub fn log_drain_started(deadline_ms: u64) {
 /// `duration_ms` is the wall-clock span between
 /// [`crate::DrainFlag::start`] returning `true` and this emit.
 #[inline]
-pub fn log_drain_completed(
-    duration_ms: u64,
-    in_flight_settled: bool,
-    cluster_quiesced: bool,
-) {
+pub fn log_drain_completed(duration_ms: u64, in_flight_settled: bool, cluster_quiesced: bool) {
     tracing::info!(
         target: "graphreact::observer::audit",
         event = "drain_completed",

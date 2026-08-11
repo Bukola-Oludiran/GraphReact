@@ -56,7 +56,10 @@ fn spawn_child_during_evaluation_lands_in_next_pass() {
         .unwrap();
     scheduler.start().unwrap();
 
-    assert!(scheduler.has_node("child"), "spawned child must be registered");
+    assert!(
+        scheduler.has_node("child"),
+        "spawned child must be registered"
+    );
     assert!(scheduler.graph.borrow().has_edge("parent", "child", None));
 }
 
@@ -94,7 +97,10 @@ fn unmount_self_removes_node_in_next_pass() {
         .unwrap();
     scheduler.start().unwrap();
 
-    assert!(!scheduler.has_node("self"), "self-unmount must remove the node");
+    assert!(
+        !scheduler.has_node("self"),
+        "self-unmount must remove the node"
+    );
 }
 
 #[test]
@@ -184,5 +190,8 @@ fn replace_definition_swaps_behavior_preserves_state() {
         .replace_definition("n", NodeDefinition::new("N", second_def))
         .unwrap();
     scheduler.process_batch().unwrap();
-    assert!(observed_second_def.get(), "second def must have run after replace");
+    assert!(
+        observed_second_def.get(),
+        "second def must have run after replace"
+    );
 }

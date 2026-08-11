@@ -76,9 +76,7 @@ impl EventSource for HttpSource {
             let listener = match TcpListener::bind(("127.0.0.1", port)).await {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!(
-                        "[graphreact-cli] http source bind failed on 127.0.0.1:{port}: {e}"
-                    );
+                    eprintln!("[graphreact-cli] http source bind failed on 127.0.0.1:{port}: {e}");
                     return;
                 }
             };
@@ -126,7 +124,9 @@ async fn handle_connection(
         }
         if buf.len() > 64 * 1024 {
             let _ = socket
-                .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\n\r\n",
+                )
                 .await;
             return;
         }
@@ -242,8 +242,8 @@ impl EventSource for WatchSource {
 
     fn start(&self, push: Arc<dyn Fn(&str, Value) + Send + Sync>) {
         let push_for_handler = Arc::clone(&push);
-        let mut watcher = match notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| {
+        let mut watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let Ok(event) = res else {
                     return;
                 };
@@ -259,17 +259,14 @@ impl EventSource for WatchSource {
                         "paths": paths,
                     }),
                 );
-            },
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("[graphreact-cli] watch source init failed: {e}");
-                return;
-            }
-        };
-        if let Err(e) =
-            watcher.watch(std::path::Path::new(&self.path), RecursiveMode::Recursive)
-        {
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("[graphreact-cli] watch source init failed: {e}");
+                    return;
+                }
+            };
+        if let Err(e) = watcher.watch(std::path::Path::new(&self.path), RecursiveMode::Recursive) {
             eprintln!(
                 "[graphreact-cli] watch source watch({}) failed: {e}",
                 self.path

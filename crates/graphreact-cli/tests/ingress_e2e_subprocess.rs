@@ -72,8 +72,7 @@ fn write_pem_artifacts(name: &str) -> PemArtifacts {
     let ca_path = dir.path().join("ca.pem");
     std::fs::write(&ca_path, ca_pem).expect("write ca pem");
 
-    let mut params =
-        rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
+    let mut params = rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         name.to_string().try_into().expect("san name"),
     ));
@@ -166,9 +165,7 @@ fn spawn_ingress_daemon(
                 let mut r = BufReader::new(stderr);
                 let _ = std::io::Read::read_to_string(&mut r, &mut stderr_buf);
             }
-            panic!(
-                "daemon did not emit `grx-observer-ready` within 20s; stderr:\n{stderr_buf}"
-            );
+            panic!("daemon did not emit `grx-observer-ready` within 20s; stderr:\n{stderr_buf}");
         }
         let mut line = String::new();
         if reader.read_line(&mut line).expect("read daemon stdout") == 0 {
@@ -216,12 +213,7 @@ fn http_get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> (u16, String)
 }
 
 /// Plain HTTP/1.1 POST via std blocking sockets.
-fn http_post(
-    addr: SocketAddr,
-    path: &str,
-    bearer: Option<&str>,
-    body: &str,
-) -> (u16, String) {
+fn http_post(addr: SocketAddr, path: &str, bearer: Option<&str>, body: &str) -> (u16, String) {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     let mut stream = TcpStream::connect(addr).expect("connect observer");
@@ -297,14 +289,8 @@ fn ingress_subprocess_routes_message_to_node_inbox() {
     let observer_port = listen_port + 1;
     let pem = write_pem_artifacts("ingress-e2e");
     let grx_file = pem.grx_file.clone();
-    let (mut child, observer_addr) = spawn_ingress_daemon(
-        cookie,
-        listen_port,
-        observer_port,
-        bearer,
-        &pem,
-        &grx_file,
-    );
+    let (mut child, observer_addr) =
+        spawn_ingress_daemon(cookie, listen_port, observer_port, bearer, &pem, &grx_file);
 
     // Drain stdout in the background.
     let stdout = child.stdout.take().expect("stdout");
@@ -331,13 +317,8 @@ fn ingress_subprocess_routes_message_to_node_inbox() {
     assert_eq!(resp["status"], "accepted");
 
     // ---- 2. Poll the ring buffer until the message surfaces. ----
-    let recent = poll_until_recent_count(
-        observer_addr,
-        bearer,
-        "receiver",
-        1,
-        Duration::from_secs(5),
-    );
+    let recent =
+        poll_until_recent_count(observer_addr, bearer, "receiver", 1, Duration::from_secs(5));
     let entry = recent
         .iter()
         .find(|e| e["type"] == "ping")
@@ -370,13 +351,8 @@ fn ingress_subprocess_routes_message_to_node_inbox() {
         status_rej, 202,
         "Phase 1 single-shot returns 202 even for manifest-rejected types"
     );
-    let recent_after = poll_until_recent_count(
-        observer_addr,
-        bearer,
-        "receiver",
-        2,
-        Duration::from_secs(5),
-    );
+    let recent_after =
+        poll_until_recent_count(observer_addr, bearer, "receiver", 2, Duration::from_secs(5));
     let rejected = recent_after
         .iter()
         .find(|e| e["type"] == "forbidden")

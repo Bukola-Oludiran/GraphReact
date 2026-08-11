@@ -16,11 +16,11 @@ pub mod types;
 pub use constants::{flags, DEFAULT_TTL, MAX_PROCESS_DEPTH};
 pub use directory::{build_directory, DirectoryEntry, GraphDirectory};
 pub use hooks::{
-    ctx_accept_edge, ctx_compose, ctx_spawn_child, ctx_unmount_self, use_accept_edge,
-    use_callback, use_compose, use_demonitor, use_edge_accept_handler, use_effect,
-    use_effect_async, use_emit, use_group_join, use_group_leave, use_link, use_memo, use_message,
-    use_monitor, use_neighbors, use_reducer, use_source, use_spawn_child, use_state, use_topology,
-    use_unlink, use_unmount_self, Signal,
+    ctx_accept_edge, ctx_compose, ctx_spawn_child, ctx_unmount_self, use_accept_edge, use_callback,
+    use_compose, use_demonitor, use_edge_accept_handler, use_effect, use_effect_async, use_emit,
+    use_group_join, use_group_leave, use_link, use_memo, use_message, use_monitor, use_neighbors,
+    use_reducer, use_source, use_spawn_child, use_state, use_topology, use_unlink,
+    use_unmount_self, Signal,
 };
 pub use lifecycle::{evaluate_node, evaluate_node_async, unmount_node, unmount_node_async};
 pub use message::{create_message, decrement_ttl, reset_message_counter};

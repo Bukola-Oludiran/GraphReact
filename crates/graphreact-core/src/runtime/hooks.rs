@@ -75,14 +75,12 @@ pub struct HookCtx {
     /// Leave a process group.
     pub(crate) group_leave: std::rc::Rc<dyn Fn(&str)>,
     /// Spawn a child node — deferred to the next `process_batch` round.
-    pub(crate) spawn_child:
-        std::rc::Rc<dyn Fn(crate::runtime::types::ComposeChildSpec)>,
+    pub(crate) spawn_child: std::rc::Rc<dyn Fn(crate::runtime::types::ComposeChildSpec)>,
     /// Unmount the active node — deferred to the next `process_batch` round.
     pub(crate) unmount_self: std::rc::Rc<dyn Fn()>,
     /// Declarative composition — set the parent's `composed_children`
     /// and spawn any missing children. Deferred.
-    pub(crate) compose:
-        std::rc::Rc<dyn Fn(Vec<crate::runtime::types::ComposeChildSpec>)>,
+    pub(crate) compose: std::rc::Rc<dyn Fn(Vec<crate::runtime::types::ComposeChildSpec>)>,
     /// Phase-9 edge negotiation — accept an incoming edge request from
     /// `target_id`, materialising a real bidirectional edge between the
     /// active node and the target. The TS reference implementation calls
@@ -91,9 +89,8 @@ pub struct HookCtx {
     /// Install the active node's edge-accept predicate. Called by
     /// [`use_edge_accept_handler`]; the closure writes the predicate onto
     /// the active `NodeInstance.edge_accept_predicate` slot. M12.3a-followon-F.
-    pub(crate) set_edge_accept_handler: std::rc::Rc<
-        dyn Fn(crate::runtime::node_instance::EdgeAcceptPredicate),
-    >,
+    pub(crate) set_edge_accept_handler:
+        std::rc::Rc<dyn Fn(crate::runtime::node_instance::EdgeAcceptPredicate)>,
 }
 
 /// Set the currently-evaluating node. Called by the lifecycle exclusively.
@@ -583,8 +580,7 @@ pub fn ctx_compose(specs: Vec<crate::runtime::types::ComposeChildSpec>) {
 
 /// Hook accessor: returns a closure that sets the active node's
 /// composed-children list and spawns any missing entries.
-pub fn use_compose(
-) -> std::rc::Rc<dyn Fn(Vec<crate::runtime::types::ComposeChildSpec>)> {
+pub fn use_compose() -> std::rc::Rc<dyn Fn(Vec<crate::runtime::types::ComposeChildSpec>)> {
     with_ctx(|c| std::rc::Rc::clone(&c.compose))
 }
 
@@ -622,8 +618,7 @@ where
     F: Fn(&str, &str) -> bool + 'static,
 {
     let _ = next_hook_index();
-    let predicate: crate::runtime::node_instance::EdgeAcceptPredicate =
-        std::rc::Rc::new(predicate);
+    let predicate: crate::runtime::node_instance::EdgeAcceptPredicate = std::rc::Rc::new(predicate);
     with_ctx(|c| (c.set_edge_accept_handler)(predicate));
 }
 

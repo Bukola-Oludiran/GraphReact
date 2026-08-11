@@ -126,7 +126,10 @@ mod tests {
     #[test]
     fn q_quits() {
         let mut s = seeded_state();
-        assert_eq!(handle_key(&mut s, key(KeyCode::Char('q'))), InputAction::Quit);
+        assert_eq!(
+            handle_key(&mut s, key(KeyCode::Char('q'))),
+            InputAction::Quit
+        );
     }
 
     #[test]

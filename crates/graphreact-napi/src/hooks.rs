@@ -16,13 +16,12 @@ use std::rc::Rc;
 use graphreact_core::{
     delay_source as core_delay_source, timer_source as core_timer_source,
     use_accept_edge as core_use_accept_edge, use_compose as core_use_compose,
-    use_demonitor as core_use_demonitor, use_effect as core_use_effect,
-    use_emit as core_use_emit, use_group_join as core_use_group_join,
-    use_group_leave as core_use_group_leave, use_link as core_use_link,
-    use_memo as core_use_memo, use_message as core_use_message, use_monitor as core_use_monitor,
-    use_neighbors as core_use_neighbors, use_source as core_use_source,
-    use_spawn_child as core_use_spawn_child, use_state as core_use_state,
-    use_topology as core_use_topology, use_unlink as core_use_unlink,
+    use_demonitor as core_use_demonitor, use_effect as core_use_effect, use_emit as core_use_emit,
+    use_group_join as core_use_group_join, use_group_leave as core_use_group_leave,
+    use_link as core_use_link, use_memo as core_use_memo, use_message as core_use_message,
+    use_monitor as core_use_monitor, use_neighbors as core_use_neighbors,
+    use_source as core_use_source, use_spawn_child as core_use_spawn_child,
+    use_state as core_use_state, use_topology as core_use_topology, use_unlink as core_use_unlink,
     use_unmount_self as core_use_unmount_self, ComposeChildSpec, EffectCleanup,
     EmitOptions as CoreEmitOptions, IncomingMessage, MonitorRef as CoreMonitorRef,
     Signal as CoreSignal, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
@@ -722,11 +721,7 @@ pub struct ComposeHandle {
 #[napi]
 impl ComposeHandle {
     #[napi]
-    pub fn call(
-        &self,
-        env: Env,
-        specs: Vec<crate::scheduler::JsComposeChildSpec>,
-    ) -> Result<()> {
+    pub fn call(&self, env: Env, specs: Vec<crate::scheduler::JsComposeChildSpec>) -> Result<()> {
         let rust_specs: Vec<ComposeChildSpec> = specs
             .into_iter()
             .map(|s| crate::scheduler::build_compose_spec(env, s))

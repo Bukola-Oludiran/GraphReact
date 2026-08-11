@@ -404,8 +404,7 @@ impl<T: PartialEq + Clone + 'static> Memo<T> {
                 // change, OR if a source's update flipped our state to
                 // Dirty (because a recompute upstream marked us
                 // Dirty), recompute ourselves.
-                let sources_snapshot: Vec<AnyReactive> =
-                    self.inner.sources.borrow().clone();
+                let sources_snapshot: Vec<AnyReactive> = self.inner.sources.borrow().clone();
                 let mut needs_recompute = false;
                 for source in sources_snapshot {
                     if source.update_if_necessary() {
@@ -535,8 +534,7 @@ impl<T: PartialEq + Clone + 'static> MemoInner<T> {
             Some(self_rc) => {
                 let registrar: SourceRegistrar = {
                     let inner = Rc::clone(&self_rc);
-                    let weak_self: WeakReactive =
-                        Rc::downgrade(&(inner.clone() as AnyReactive));
+                    let weak_self: WeakReactive = Rc::downgrade(&(inner.clone() as AnyReactive));
                     Box::new(move |source: AnyReactive| {
                         // Add to my source list (dedup by id).
                         let mut sources = inner.sources.borrow_mut();
@@ -728,7 +726,11 @@ mod tests {
         // should NOT re-run.
         count.set(2);
         assert_eq!(label.get(), "even");
-        assert_eq!(parity_runs.get(), 2, "parity recomputes (its value didn't change but it was Dirty)");
+        assert_eq!(
+            parity_runs.get(),
+            2,
+            "parity recomputes (its value didn't change but it was Dirty)"
+        );
         assert_eq!(label_runs.get(), 1, "label SKIPS recompute via Check state");
     }
 
@@ -797,7 +799,11 @@ mod tests {
         assert_eq!(only_a.get(), 14);
         assert_eq!(only_b.get(), 30);
         assert_eq!(runs_a.get(), 2);
-        assert_eq!(runs_b.get(), 1, "only_b should not recompute when only `a` changed");
+        assert_eq!(
+            runs_b.get(),
+            1,
+            "only_b should not recompute when only `a` changed"
+        );
     }
 
     // ---- Diamond dependency ----
@@ -949,7 +955,11 @@ mod tests {
         let sf1 = s.clone();
         let m = Memo::new(move || sf1.get() + sf1.get());
         let _ = m.get();
-        assert_eq!(s.subscriber_count(), 1, "single subscriber even though read twice");
+        assert_eq!(
+            s.subscriber_count(),
+            1,
+            "single subscriber even though read twice"
+        );
     }
 
     #[test]
@@ -987,13 +997,7 @@ mod tests {
         let sel = selector.clone();
         let af = a.clone();
         let bf = b.clone();
-        let m = Memo::new(move || {
-            if sel.get() {
-                af.get()
-            } else {
-                bf.get()
-            }
-        });
+        let m = Memo::new(move || if sel.get() { af.get() } else { bf.get() });
         assert_eq!(m.get(), 1);
         // Currently subscribes to: selector + a (b not read)
         assert_eq!(a.subscriber_count(), 1);
@@ -1130,5 +1134,3 @@ mod tests {
         assert_eq!(runs3.get(), 1);
     }
 }
-
-

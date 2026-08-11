@@ -65,8 +65,7 @@ fn write_pem_artifacts(name: &str) -> PemArtifacts {
     let ca_path = dir.path().join("ca.pem");
     std::fs::write(&ca_path, ca_cert.pem()).expect("write ca");
 
-    let mut params =
-        rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
+    let mut params = rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         name.to_string().try_into().expect("san name"),
     ));
@@ -77,7 +76,12 @@ fn write_pem_artifacts(name: &str) -> PemArtifacts {
     std::fs::write(&cert_path, cert.pem()).expect("write cert");
     std::fs::write(&key_path, kp.serialize_pem()).expect("write key");
 
-    PemArtifacts { _tempdir: dir, cert: cert_path, key: key_path, ca: ca_path }
+    PemArtifacts {
+        _tempdir: dir,
+        cert: cert_path,
+        key: key_path,
+        ca: ca_path,
+    }
 }
 
 fn pid_derived_port() -> u16 {
@@ -151,9 +155,7 @@ fn spawn_observer_daemon(
                 let mut r = BufReader::new(stderr);
                 let _ = std::io::Read::read_to_string(&mut r, &mut stderr_buf);
             }
-            panic!(
-                "daemon did not emit `grx-observer-ready` within 15s; stderr:\n{stderr_buf}"
-            );
+            panic!("daemon did not emit `grx-observer-ready` within 15s; stderr:\n{stderr_buf}");
         }
         let mut line = String::new();
         if reader.read_line(&mut line).expect("read daemon stdout") == 0 {
@@ -296,14 +298,8 @@ async fn observer_survives_daemon_kill_restart_with_id_rotation() {
     // linger; SO_REUSEADDR on tokio's listener should handle this
     // but a sleep is belt-and-suspenders for slow CI runners).
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let (mut daemon2, observer_addr2) = spawn_observer_daemon(
-        cookie,
-        listen_port,
-        observer_port,
-        bearer,
-        &pem,
-        8,
-    );
+    let (mut daemon2, observer_addr2) =
+        spawn_observer_daemon(cookie, listen_port, observer_port, bearer, &pem, 8);
     assert_eq!(
         observer_addr1, observer_addr2,
         "both daemons must bind the same observer port (port reuse works)"
@@ -332,5 +328,8 @@ async fn observer_survives_daemon_kill_restart_with_id_rotation() {
     // ---- Cleanup: let daemon #2 self-terminate. ----
     let exit2 = daemon2.wait().expect("wait daemon #2");
     drain2.join().expect("daemon #2 stdout drain");
-    assert!(exit2.success(), "daemon #2 must exit cleanly via --duration-secs");
+    assert!(
+        exit2.success(),
+        "daemon #2 must exit cleanly via --duration-secs"
+    );
 }

@@ -29,12 +29,30 @@ pub(super) enum ClipPath {
     /// `inset(0 0 0 0)` — needs w, h from siblings.
     Rect,
     /// `inset(0 0 0 0 round Rmm)` — needs w, h from siblings.
-    RoundRect { r: f64 },
-    Circle { r: f64, cx: f64, cy: f64 },
-    Ellipse { rx: f64, ry: f64, cx: f64, cy: f64 },
-    Polygon { points: Vec<(f64, f64)> },
-    Path { svg_d: String },
-    Kicad { name: String, data: JsonValue },
+    RoundRect {
+        r: f64,
+    },
+    Circle {
+        r: f64,
+        cx: f64,
+        cy: f64,
+    },
+    Ellipse {
+        rx: f64,
+        ry: f64,
+        cx: f64,
+        cy: f64,
+    },
+    Polygon {
+        points: Vec<(f64, f64)>,
+    },
+    Path {
+        svg_d: String,
+    },
+    Kicad {
+        name: String,
+        data: JsonValue,
+    },
 }
 
 impl ClipPath {
@@ -146,7 +164,8 @@ pub(super) fn parse_clip_path(value: &str) -> Result<ClipPath, StyleError> {
 }
 
 fn strip_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    s.strip_prefix(prefix).and_then(|rest| rest.strip_suffix(')'))
+    s.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(')'))
 }
 
 /// `inset(0 0 0 0)` or `inset(0 0 0 0 round Rmm)` — we ignore the 4
@@ -249,11 +268,10 @@ fn parse_kicad(body: &str) -> Result<ClipPath, StyleError> {
             snippet: format!("kicad-shape({body}) — name must be quoted"),
         })?
         .to_string();
-    let data: JsonValue = serde_json::from_str(data_part).map_err(|_| {
-        StyleError::MalformedClipPath {
+    let data: JsonValue =
+        serde_json::from_str(data_part).map_err(|_| StyleError::MalformedClipPath {
             snippet: format!("kicad-shape data block is not valid JSON: {data_part}"),
-        }
-    })?;
+        })?;
     Ok(ClipPath::Kicad { name, data })
 }
 
@@ -271,16 +289,12 @@ fn parse_mm(s: &str, context: &'static str) -> Result<f64, StyleError> {
 fn parse_xy(s: &str, context: &'static str) -> Result<(f64, f64), StyleError> {
     let s = s.trim();
     let mut parts = s.split_whitespace();
-    let x = parts
-        .next()
-        .ok_or_else(|| StyleError::MalformedClipPath {
-            snippet: format!("{context} expected `X Y`, got `{s}`"),
-        })?;
-    let y = parts
-        .next()
-        .ok_or_else(|| StyleError::MalformedClipPath {
-            snippet: format!("{context} expected `X Y`, got `{s}`"),
-        })?;
+    let x = parts.next().ok_or_else(|| StyleError::MalformedClipPath {
+        snippet: format!("{context} expected `X Y`, got `{s}`"),
+    })?;
+    let y = parts.next().ok_or_else(|| StyleError::MalformedClipPath {
+        snippet: format!("{context} expected `X Y`, got `{s}`"),
+    })?;
     if parts.next().is_some() {
         return Err(StyleError::MalformedClipPath {
             snippet: format!("{context} too many parts: `{s}`"),
@@ -308,19 +322,33 @@ mod tests {
     #[test]
     fn parses_circle() {
         let cp = parse_clip_path("circle(0.3mm at 0mm 0mm)").expect("ok");
-        assert_eq!(cp, ClipPath::Circle { r: 0.3, cx: 0.0, cy: 0.0 });
+        assert_eq!(
+            cp,
+            ClipPath::Circle {
+                r: 0.3,
+                cx: 0.0,
+                cy: 0.0
+            }
+        );
     }
 
     #[test]
     fn parses_ellipse() {
         let cp = parse_clip_path("ellipse(1mm 2mm at 5mm 6mm)").expect("ok");
-        assert_eq!(cp, ClipPath::Ellipse { rx: 1.0, ry: 2.0, cx: 5.0, cy: 6.0 });
+        assert_eq!(
+            cp,
+            ClipPath::Ellipse {
+                rx: 1.0,
+                ry: 2.0,
+                cx: 5.0,
+                cy: 6.0
+            }
+        );
     }
 
     #[test]
     fn parses_polygon() {
-        let cp =
-            parse_clip_path("polygon(0mm 0mm, 14mm 0mm, 14mm 5mm, 0mm 5mm)").expect("ok");
+        let cp = parse_clip_path("polygon(0mm 0mm, 14mm 0mm, 14mm 5mm, 0mm 5mm)").expect("ok");
         match cp {
             ClipPath::Polygon { points } => {
                 assert_eq!(points.len(), 4);
@@ -344,8 +372,7 @@ mod tests {
 
     #[test]
     fn parses_kicad_shape() {
-        let cp = parse_clip_path(r#"kicad-shape("chamfered", {"chamfer":0.1})"#)
-            .expect("ok");
+        let cp = parse_clip_path(r#"kicad-shape("chamfered", {"chamfer":0.1})"#).expect("ok");
         match cp {
             ClipPath::Kicad { name, data } => {
                 assert_eq!(name, "chamfered");

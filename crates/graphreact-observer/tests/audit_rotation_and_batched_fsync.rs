@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use graphreact_observer::{
-    replay_audit_chain, AuditChainConfig, AuditRecordInput, AuditSink, FileAuditSink,
-    FsyncMode, MetricsInner,
+    replay_audit_chain, AuditChainConfig, AuditRecordInput, AuditSink, FileAuditSink, FsyncMode,
+    MetricsInner,
 };
 
 /// In-tree minimal tempdir shim — no new dev-dep.
@@ -87,11 +87,15 @@ fn rotate_preserves_chain_across_files() {
     // Cross-file linkage carried by the boundary records' `fields`:
     let head_fields = &new_chain[0].fields;
     assert_eq!(
-        head_fields.get("prior_last_this_hash").and_then(|v| v.as_str()),
+        head_fields
+            .get("prior_last_this_hash")
+            .and_then(|v| v.as_str()),
         Some(terminal_this_hash.as_str())
     );
     assert_eq!(
-        head_fields.get("new_first_prev_hash").and_then(|v| v.as_str()),
+        head_fields
+            .get("new_first_prev_hash")
+            .and_then(|v| v.as_str()),
         Some(outcome.new_first_prev_hash.as_str())
     );
 }
@@ -154,8 +158,7 @@ async fn batched_fsync_flushes_on_timer() {
     let tmp = TempDir::new("grx-audit-batched-timer");
     let path = tmp.path().join("audit.ndjson");
     let metrics = Arc::new(MetricsInner::new());
-    let cfg = AuditChainConfig::new()
-        .with_metrics(metrics.clone());
+    let cfg = AuditChainConfig::new().with_metrics(metrics.clone());
     let cfg = AuditChainConfig {
         fsync_mode: Some(FsyncMode::Batched {
             interval_ms: 20,

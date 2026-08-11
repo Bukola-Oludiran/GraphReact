@@ -297,7 +297,11 @@ fn unix_secs_to_utc_components(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let hour = (hours_total % 24) as u32;
     let mut days = (hours_total / 24) as i64;
     days += 719_468;
-    let era = if days >= 0 { days / 146_097 } else { (days - 146_096) / 146_097 };
+    let era = if days >= 0 {
+        days / 146_097
+    } else {
+        (days - 146_096) / 146_097
+    };
     let doe = (days - era * 146_097) as u64;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = (yoe as i64) + era * 400;

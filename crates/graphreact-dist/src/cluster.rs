@@ -56,10 +56,9 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 use crate::groups::DistGroups;
 use crate::handshake::{client_handshake, server_handshake};
 use crate::net_tick;
-use crate::net_tick::{
-    spawn_tick_loop, NetSplitPolicy, NetTickConfig, PeerStates, PeerStatus,
-};
+use crate::net_tick::{spawn_tick_loop, NetSplitPolicy, NetTickConfig, PeerStates, PeerStatus};
 use crate::node_id::{Creation, NodeId};
+use crate::observability::{WireTracingHook, WireTracingHookSlot, INGRESS_CALL_V1_CAPABILITY};
 use crate::registry::{NodeRegistry, PeerHandle};
 use crate::reload::{
     ClusterReloadOutcome, PeerReloadOutcome, RemoteReloadCallback, RemoteReloadSink,
@@ -67,9 +66,6 @@ use crate::reload::{
 };
 use crate::secret::SecretCookie;
 use crate::supervision::RemoteSupervision;
-use crate::observability::{
-    WireTracingHook, WireTracingHookSlot, INGRESS_CALL_V1_CAPABILITY,
-};
 use crate::telemetry::TelemetrySinkSlot;
 use crate::tls_config::TlsConfig;
 use crate::transport::{accept_over, dial, dial_over, Connection, Listener};
@@ -153,15 +149,12 @@ impl ClusterDrainTracker {
         })
     }
 
-    fn try_enter_restart_dispatch(
-        &self,
-    ) -> Result<RestartDispatchGuard, DelegatedRestartError> {
+    fn try_enter_restart_dispatch(&self) -> Result<RestartDispatchGuard, DelegatedRestartError> {
         let mut state = self.state.lock();
         if state.draining {
             return Err(DelegatedRestartError::Draining);
         }
-        state.restart_dispatches_in_flight =
-            state.restart_dispatches_in_flight.saturating_add(1);
+        state.restart_dispatches_in_flight = state.restart_dispatches_in_flight.saturating_add(1);
         drop(state);
         Ok(RestartDispatchGuard {
             tracker: self.clone(),
@@ -207,8 +200,7 @@ struct RestartDispatchGuard {
 impl Drop for RestartDispatchGuard {
     fn drop(&mut self) {
         let mut state = self.tracker.state.lock();
-        state.restart_dispatches_in_flight =
-            state.restart_dispatches_in_flight.saturating_sub(1);
+        state.restart_dispatches_in_flight = state.restart_dispatches_in_flight.saturating_sub(1);
     }
 }
 
@@ -385,10 +377,11 @@ pub enum DelegatedRestartError {
     /// or both. Outbound is refused with no wire packet shipped.
     /// Audited as `delegated_restart_blocked` with
     /// `reason = "cap_not_negotiated"`.
-    #[error(
-        "delegated_restart: capability `{missing_bit}` not negotiated with peer `{peer}`"
-    )]
-    CapabilityNotNegotiated { peer: String, missing_bit: &'static str },
+    #[error("delegated_restart: capability `{missing_bit}` not negotiated with peer `{peer}`")]
+    CapabilityNotNegotiated {
+        peer: String,
+        missing_bit: &'static str,
+    },
     /// The named peer is not currently in the cluster registry.
     /// Audited as `delegated_restart_blocked` with
     /// `reason = "unknown_peer"`.
@@ -426,7 +419,9 @@ fn spawn_delegated_restart_cleanup(
                     .and_then(|entry| entry.result_tx.as_ref())
                     .is_some_and(oneshot::Sender::is_closed);
                 if timed_out || receiver_dropped {
-                    entries.remove(&correlation_id).map(|entry| (entry, receiver_dropped))
+                    entries
+                        .remove(&correlation_id)
+                        .map(|entry| (entry, receiver_dropped))
                 } else {
                     None
                 }
@@ -485,8 +480,7 @@ fn cancel_pending_delegated_restarts_for_drain(
     };
     let count = entries.len();
     for (correlation_id, mut entry) in entries {
-        let duration_ms =
-            u64::try_from(entry.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let duration_ms = u64::try_from(entry.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(result_tx) = entry.result_tx.take() {
             let _ = result_tx.send(DelegatedRestartResultEvent {
                 outcome: DelegatedRestartResultOutcome::TimedOut,
@@ -615,11 +609,9 @@ impl Cluster {
         );
         {
             let dg = dist_groups.clone();
-            scheduler.install_remote_group_sink(Arc::new(
-                move |op, group, member_id| {
-                    dg.record_local_group_op(op, group, member_id);
-                },
-            ));
+            scheduler.install_remote_group_sink(Arc::new(move |op, group, member_id| {
+                dg.record_local_group_op(op, group, member_id);
+            }));
         }
         {
             let dg = dist_groups.clone();
@@ -653,9 +645,8 @@ impl Cluster {
         // per-connection tasks so inbound `Ack`/`Result` arms can
         // resolve the matching originating entry.
         let delegated_restart_counter = Arc::new(AtomicU64::new(0));
-        let delegated_restart_pending: Arc<
-            PLMutex<HashMap<u64, PendingDelegatedRestart>>,
-        > = Arc::new(PLMutex::new(HashMap::new()));
+        let delegated_restart_pending: Arc<PLMutex<HashMap<u64, PendingDelegatedRestart>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
         let drain_tracker = ClusterDrainTracker::default();
 
         // Spawn accept loop. Each accepted TCP connection runs
@@ -703,9 +694,7 @@ impl Cluster {
         let poller_our_name = config.node_id.name().to_string();
         let _delegated_outcome_poller: JoinHandle<()> = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
-            interval.set_missed_tick_behavior(
-                tokio::time::MissedTickBehavior::Skip,
-            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let outcomes = poller_scheduler.poll_delegated_restart_outcomes();
@@ -720,10 +709,7 @@ impl Cluster {
                             reason: outcome
                                 .reason
                                 .unwrap_or_else(|| "restart attempt failed".to_string()),
-                            error_kind: outcome
-                                .error_kind
-                                .unwrap_or("unspecified")
-                                .to_string(),
+                            error_kind: outcome.error_kind.unwrap_or("unspecified").to_string(),
                         }
                     };
                     let result_packet = RestartDelegationResult {
@@ -1027,9 +1013,7 @@ impl Cluster {
                 // after our admission but before this queue attempt
                 // completed, cancel the newly inserted entry now.
                 if self.drain_tracker.is_draining() {
-                    cancel_pending_delegated_restarts_for_drain(
-                        &self.delegated_restart_pending,
-                    );
+                    cancel_pending_delegated_restarts_for_drain(&self.delegated_restart_pending);
                 }
                 Ok(DelegatedRestartHandle {
                     correlation_id,
@@ -1041,7 +1025,9 @@ impl Cluster {
             Err(err) => {
                 // Roll back the pending entry — neither Ack nor
                 // Result can land for a packet we couldn't ship.
-                self.delegated_restart_pending.lock().remove(&correlation_id);
+                self.delegated_restart_pending
+                    .lock()
+                    .remove(&correlation_id);
                 let detail = match &err {
                     mpsc::error::TrySendError::Full(_) => "channel_full".to_string(),
                     mpsc::error::TrySendError::Closed(_) => "channel_closed".to_string(),
@@ -1065,11 +1051,7 @@ impl Cluster {
 
     /// Outbound dial. Performs TLS handshake + OTP-style handshake;
     /// on success registers the peer + spawns its connection task.
-    pub async fn connect(
-        &self,
-        addr: SocketAddr,
-        expected_peer: NodeId,
-    ) -> Result<(), DistError> {
+    pub async fn connect(&self, addr: SocketAddr, expected_peer: NodeId) -> Result<(), DistError> {
         let _handshake = self.drain_tracker.try_enter()?;
         let mut conn = dial(addr, expected_peer.name(), &self.config.tls).await?;
         let result = client_handshake(
@@ -1291,10 +1273,7 @@ impl Cluster {
     /// "register one consumer" experience. A `MultiplexSink` from
     /// `graphreact-observer` lets the same handle fan out to
     /// Prometheus + JSON logs + WebSocket subscribers + OTel.
-    pub fn install_telemetry_sink(
-        &self,
-        sink: std::sync::Arc<dyn graphreact_core::TelemetrySink>,
-    ) {
+    pub fn install_telemetry_sink(&self, sink: std::sync::Arc<dyn graphreact_core::TelemetrySink>) {
         self.telemetry_sink.install(sink);
     }
 
@@ -1523,8 +1502,12 @@ impl Cluster {
         // Without this, a task holding an outbound `Sender<Packet>`
         // clone (for TickAck echo) would prevent send_rx from
         // closing, trapping the task forever.
-        let aborts: Vec<oneshot::Sender<()>> =
-            self.abort_handles.lock().drain().map(|(_, tx)| tx).collect();
+        let aborts: Vec<oneshot::Sender<()>> = self
+            .abort_handles
+            .lock()
+            .drain()
+            .map(|(_, tx)| tx)
+            .collect();
         for abort_tx in aborts {
             let _ = abort_tx.send(());
         }
@@ -1734,9 +1717,8 @@ fn wire_to_local(
     let payload: serde_json::Value = if wire.payload.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::from_slice(&wire.payload).map_err(|e| {
-            DistError::Payload(format!("decode wire payload: {e}"))
-        })?
+        serde_json::from_slice(&wire.payload)
+            .map_err(|e| DistError::Payload(format!("decode wire payload: {e}")))?
     };
     Ok(Message {
         id: wire.id,
@@ -2165,10 +2147,7 @@ fn dispatch_inbound(
                         // payload — wire framing overhead is
                         // accounted for separately by the framed
                         // codec metrics in M-Prod.
-                        byte_size: msg
-                            .payload
-                            .to_string()
-                            .len(),
+                        byte_size: msg.payload.to_string().len(),
                     });
                 });
                 scheduler_handle.send_raw(msg);
@@ -2335,7 +2314,9 @@ fn dispatch_inbound(
             // Resolve the originator's pending Ack one-shot.
             let entry_ack = {
                 let mut pending = delegated_restart_pending.lock();
-                pending.get_mut(&ack.correlation_id).and_then(|p| p.ack_tx.take())
+                pending
+                    .get_mut(&ack.correlation_id)
+                    .and_then(|p| p.ack_tx.take())
             };
             if let Some(sender) = entry_ack {
                 let _ = sender.send(ack.outcome);
@@ -2374,7 +2355,9 @@ fn dispatch_inbound(
                 DelegatedRestartResultOutcome::TimedOut => "timed_out",
             };
             let error_kind: Option<&str> = match &res.outcome {
-                DelegatedRestartResultOutcome::Failed { error_kind, .. } => Some(error_kind.as_str()),
+                DelegatedRestartResultOutcome::Failed { error_kind, .. } => {
+                    Some(error_kind.as_str())
+                }
                 _ => None,
             };
             if let Some(sender) = entry_result {
@@ -2450,7 +2433,10 @@ mod tests {
         assert_eq!(tracker.in_flight(), 1, "existing handshake remains tracked");
         drop(guard);
         assert_eq!(tracker.in_flight(), 0);
-        assert!(!tracker.drain_quiesced(), "restart dispatch remains tracked");
+        assert!(
+            !tracker.drain_quiesced(),
+            "restart dispatch remains tracked"
+        );
         drop(dispatch);
         assert!(tracker.drain_quiesced());
     }
@@ -2554,8 +2540,7 @@ mod tests {
         // Bob: build a Scheduler with one component "responder" that
         // records every received `ping`. Start the cluster + bind to
         // an ephemeral port.
-        let received: Arc<Mutex<Vec<(String, u64, u32)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let received: Arc<Mutex<Vec<(String, u64, u32)>>> = Arc::new(Mutex::new(Vec::new()));
         let received_for_bob = Arc::clone(&received);
 
         let mut bob_graph = CommunicationGraph::new();
@@ -2569,7 +2554,10 @@ mod tests {
                     .get("n")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
-                received.lock().unwrap().push((msg.from.clone(), n, msg.ttl));
+                received
+                    .lock()
+                    .unwrap()
+                    .push((msg.from.clone(), n, msg.ttl));
             });
             graphreact_core::runtime::types::PermissionManifest::new(
                 vec!["ping".to_string()],
@@ -2786,16 +2774,12 @@ mod tests {
                         .to_string();
                     downs.lock().unwrap().push((target, reason));
                 });
-                PermissionManifest::new(
-                    vec![SYSTEM_DOWN.to_string()],
-                    Vec::<String>::new(),
-                )
+                PermissionManifest::new(vec![SYSTEM_DOWN.to_string()], Vec::<String>::new())
             })
         };
 
         // ----- Alice
-        let alice_downs: Arc<StdMutex<Vec<(String, String)>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let alice_downs: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
         let mut alice_graph = CommunicationGraph::new();
         alice_graph.add_node("watcher".to_string(), Attrs::new());
         let mut alice_scheduler = Scheduler::new(alice_graph);
@@ -2823,8 +2807,7 @@ mod tests {
             .expect("alice cluster start");
 
         // ----- Carol
-        let carol_downs: Arc<StdMutex<Vec<(String, String)>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let carol_downs: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
         let mut carol_graph = CommunicationGraph::new();
         carol_graph.add_node("watcher".to_string(), Attrs::new());
         let mut carol_scheduler = Scheduler::new(carol_graph);
@@ -2998,10 +2981,7 @@ mod tests {
                         .unwrap_or(0);
                     received.lock().unwrap().push(n);
                 });
-                PermissionManifest::new(
-                    vec!["do_work".to_string()],
-                    Vec::<String>::new(),
-                )
+                PermissionManifest::new(vec!["do_work".to_string()], Vec::<String>::new())
             })
         };
 
@@ -3912,10 +3892,7 @@ mod tests {
             ) -> Poll<std::io::Result<usize>> {
                 Pin::new(&mut self.get_mut().inner).poll_write(cx, data)
             }
-            fn poll_flush(
-                self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
                 Pin::new(&mut self.get_mut().inner).poll_flush(cx)
             }
             fn poll_shutdown(
@@ -4227,17 +4204,17 @@ mod tests {
         // in for `postcard::to_stdvec(&grx_ir)` — substrate test
         // asserts on byte-identity, not on `GrxIr` semantics.
         let ir_payload = b"phase10-test-ir-payload-bytes-go-here".to_vec();
-        let outcome = alice_cluster.reload_module(
-            ir_payload.clone(),
-            "/srv/grx/system.grx".into(),
-            42,
-        );
+        let outcome =
+            alice_cluster.reload_module(ir_payload.clone(), "/srv/grx/system.grx".into(), 42);
 
         assert_eq!(outcome.shipped.len(), 2, "should ship to both peers");
         assert!(outcome.skipped_no_capability.is_empty());
         assert!(outcome.skipped_non_healthy.is_empty());
         assert!(outcome.send_failed.is_empty());
-        assert!(outcome.all_shipped(), "all peers should have received the packet");
+        assert!(
+            outcome.all_shipped(),
+            "all peers should have received the packet"
+        );
 
         // Wait for bob and carol to dispatch the inbound packet
         // through their recording sinks.
@@ -4252,8 +4229,16 @@ mod tests {
 
         let bob_records = bob_recorded.lock().unwrap();
         let carol_records = carol_recorded.lock().unwrap();
-        assert_eq!(bob_records.len(), 1, "bob should receive exactly one reload");
-        assert_eq!(carol_records.len(), 1, "carol should receive exactly one reload");
+        assert_eq!(
+            bob_records.len(),
+            1,
+            "bob should receive exactly one reload"
+        );
+        assert_eq!(
+            carol_records.len(),
+            1,
+            "carol should receive exactly one reload"
+        );
 
         // Verify the bytes round-tripped intact.
         let (bob_origin, bob_path, bob_payload, _bob_hash, bob_version) = &bob_records[0];
@@ -4611,10 +4596,8 @@ mod tests {
         // Per-peer apply timestamps. We'll measure the wall-clock
         // elapsed from origin's `reload_module` return → each peer
         // sink firing.
-        let bob_apply_ts: Arc<Mutex<Option<std::time::Instant>>> =
-            Arc::new(Mutex::new(None));
-        let carol_apply_ts: Arc<Mutex<Option<std::time::Instant>>> =
-            Arc::new(Mutex::new(None));
+        let bob_apply_ts: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+        let carol_apply_ts: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
         {
             let ts = Arc::clone(&bob_apply_ts);
             bob_cluster.install_remote_reload_sink(Arc::new(
@@ -4681,7 +4664,9 @@ mod tests {
             // ≥10k msg/sec on M-series loopback.
             let mut counter = 0u64;
             while stop_load_for_task.load(Ordering::Relaxed) == 0 {
-                if let Some(peer) = alice_registry.get_by_name(if counter % 2 == 0 { "bob" } else { "carol" }) {
+                if let Some(peer) =
+                    alice_registry.get_by_name(if counter % 2 == 0 { "bob" } else { "carol" })
+                {
                     let pkt = Packet::Tick(crate::wire::Tick {
                         seq: counter,
                         sent_at_ms: counter,
@@ -4970,7 +4955,10 @@ mod tests {
                 .await
                 .expect("cleanup timeout")
                 .expect("result sender");
-            assert!(matches!(event.outcome, DelegatedRestartResultOutcome::TimedOut));
+            assert!(matches!(
+                event.outcome,
+                DelegatedRestartResultOutcome::TimedOut
+            ));
             assert!(event.duration_ms >= 20);
             assert!(!pending.lock().contains_key(&7));
         }
@@ -5407,8 +5395,7 @@ mod tests {
             // Drive both schedulers, polling for the result. Since
             // bob's scheduler is `!Send`, we can't spawn the driver
             // onto the runtime — we interleave it inline.
-            let mut schedulers: [&mut Scheduler; 2] =
-                [&mut bob_scheduler, &mut alice_scheduler];
+            let mut schedulers: [&mut Scheduler; 2] = [&mut bob_scheduler, &mut alice_scheduler];
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut result_handle = result_handle;
             let mut maybe_result: Option<DelegatedRestartResultEvent> = None;
@@ -5475,11 +5462,8 @@ mod tests {
                 "bob".to_string(),
                 Creation(1),
             );
-            let dist_groups = DistGroups::new(
-                handle.clone(),
-                NodeRegistry::new(),
-                "bob".to_string(),
-            );
+            let dist_groups =
+                DistGroups::new(handle.clone(), NodeRegistry::new(), "bob".to_string());
             let reload_sink = RemoteReloadSink::new();
             let telemetry_sink = TelemetrySinkSlot::new();
 
@@ -5530,11 +5514,8 @@ mod tests {
                 "bob".to_string(),
                 Creation(1),
             );
-            let dist_groups = DistGroups::new(
-                handle.clone(),
-                NodeRegistry::new(),
-                "bob".to_string(),
-            );
+            let dist_groups =
+                DistGroups::new(handle.clone(), NodeRegistry::new(), "bob".to_string());
             let reload_sink = RemoteReloadSink::new();
             let telemetry_sink = TelemetrySinkSlot::new();
 
@@ -5581,11 +5562,8 @@ mod tests {
                 "alice".to_string(),
                 Creation(1),
             );
-            let dist_groups = DistGroups::new(
-                handle.clone(),
-                NodeRegistry::new(),
-                "alice".to_string(),
-            );
+            let dist_groups =
+                DistGroups::new(handle.clone(), NodeRegistry::new(), "alice".to_string());
             let reload_sink = RemoteReloadSink::new();
             let telemetry_sink = TelemetrySinkSlot::new();
 

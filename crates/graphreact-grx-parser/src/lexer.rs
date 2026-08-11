@@ -123,9 +123,9 @@ impl<'a> Lexer<'a> {
                             if !reserved.contains(tag_name.as_str())
                                 && last_token.kind == TokenType::TagEnd
                             {
-                                let has_id_attr = self.tokens[saved_token_len..].iter().any(|t| {
-                                    t.kind == TokenType::AttrName && t.value == "id"
-                                });
+                                let has_id_attr = self.tokens[saved_token_len..]
+                                    .iter()
+                                    .any(|t| t.kind == TokenType::AttrName && t.value == "id");
                                 if !has_id_attr {
                                     self.read_raw_content(&tag_name)?;
                                 }
@@ -456,14 +456,20 @@ mod tests {
     #[test]
     fn lexer_handles_expr_attribute() {
         let tokens = lex("<X v={42} />");
-        let expr = tokens.iter().find(|t| t.kind == TokenType::ExprLiteral).unwrap();
+        let expr = tokens
+            .iter()
+            .find(|t| t.kind == TokenType::ExprLiteral)
+            .unwrap();
         assert_eq!(expr.value, "42");
     }
 
     #[test]
     fn lexer_handles_balanced_expr_braces() {
         let tokens = lex("<X v={ {a:1, b:[2,3]} } />");
-        let expr = tokens.iter().find(|t| t.kind == TokenType::ExprLiteral).unwrap();
+        let expr = tokens
+            .iter()
+            .find(|t| t.kind == TokenType::ExprLiteral)
+            .unwrap();
         assert_eq!(expr.value, "{a:1, b:[2,3]}");
     }
 
@@ -477,7 +483,10 @@ mod tests {
     #[test]
     fn lexer_string_with_escape() {
         let tokens = lex("<X label=\"a\\\"b\" />");
-        let s = tokens.iter().find(|t| t.kind == TokenType::StringLiteral).unwrap();
+        let s = tokens
+            .iter()
+            .find(|t| t.kind == TokenType::StringLiteral)
+            .unwrap();
         assert_eq!(s.value, "a\"b");
     }
 
@@ -507,14 +516,20 @@ return { accepts: ['a'] };
         let src = r#"<import src="./foo.grx" />
 <Graph id="g"></Graph>"#;
         let tokens = lex_file(src);
-        let raws: Vec<_> = tokens.iter().filter(|t| t.kind == TokenType::RawContent).collect();
+        let raws: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.kind == TokenType::RawContent)
+            .collect();
         assert!(raws.is_empty());
     }
 
     #[test]
     fn lexer_tracks_line_column() {
         let tokens = lex("\n  <Graph id=\"x\"></Graph>");
-        let open = tokens.iter().find(|t| t.kind == TokenType::OpenTag).unwrap();
+        let open = tokens
+            .iter()
+            .find(|t| t.kind == TokenType::OpenTag)
+            .unwrap();
         assert_eq!(open.loc.line, 2);
         assert_eq!(open.loc.column, 3);
     }

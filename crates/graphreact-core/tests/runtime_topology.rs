@@ -239,7 +239,10 @@ fn use_topology_unmounted_node_does_not_receive_events() {
     scheduler.remove_node_at_runtime("watcher").unwrap();
     events.borrow_mut().clear();
 
-    scheduler.graph.borrow_mut().add_node("new-node", Attrs::new());
+    scheduler
+        .graph
+        .borrow_mut()
+        .add_node("new-node", Attrs::new());
     scheduler.process_batch().unwrap();
     assert!(events.borrow().is_empty());
 }

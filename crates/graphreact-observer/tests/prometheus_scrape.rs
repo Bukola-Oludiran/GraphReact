@@ -11,9 +11,7 @@ use graphreact_core::{
     runtime::types::{NodeContext, PermissionManifest},
     Attrs, CommunicationGraph, NodeDefinition, Scheduler, TelemetrySink,
 };
-use graphreact_observer::{
-    spawn_http_server, BindConfig, MetricsInner, PrometheusSink,
-};
+use graphreact_observer::{spawn_http_server, BindConfig, MetricsInner, PrometheusSink};
 use prometheus_parse::Scrape;
 
 const RING_NODE_COUNT: usize = 4;
@@ -156,9 +154,7 @@ async fn http_get_status(url: &str) -> (u16, String) {
         .unwrap_or((after_scheme, "/".into()));
 
     let mut stream = TcpStream::connect(host_port).await.expect("tcp connect");
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.expect("send req");
 
     let mut response = Vec::new();

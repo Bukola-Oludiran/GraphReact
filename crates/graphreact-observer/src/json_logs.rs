@@ -211,9 +211,7 @@ impl TelemetrySink for JsonLogTelemetry {
 
     fn on_scheduler_tick_end(&self, ev: &SchedulerTickEnd) {
         self.emit_with(|buf| {
-            buf.extend_from_slice(
-                br#"{"event":"scheduler_tick_end","payload":{"iterations":"#,
-            );
+            buf.extend_from_slice(br#"{"event":"scheduler_tick_end","payload":{"iterations":"#);
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(ev.iterations).as_bytes());
             buf.extend_from_slice(br#","terminated_by_depth_cap":"#);
@@ -414,8 +412,7 @@ mod tests {
                 serde_json::from_str(line).expect("parse hand-rolled");
             // Synthesize the equivalent serde_json output for shape
             // comparison.
-            let serde_payload =
-                serde_json::to_value(ev).expect("serde_json encodes ev");
+            let serde_payload = serde_json::to_value(ev).expect("serde_json encodes ev");
             let expected = serde_json::json!({
                 "event": "scheduler_tick_end",
                 "payload": serde_payload,

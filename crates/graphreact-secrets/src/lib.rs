@@ -196,7 +196,10 @@ pub enum SecretsError {
     ///   `launchctl asuser`), or the user denied the TouchID prompt.
     /// - Windows: Credential Manager service stopped.
     #[error("secret store backend unavailable ({backend}): {detail}")]
-    BackendUnavailable { backend: &'static str, detail: String },
+    BackendUnavailable {
+        backend: &'static str,
+        detail: String,
+    },
 
     /// Secret was empty. Both [`SecretValue::from_bytes`] and the
     /// `grx secrets set` reader reject empty input — silent acceptance
@@ -280,9 +283,7 @@ pub fn validate_secret_name(name: &str) -> Result<(), SecretsError> {
         if !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
             return Err(SecretsError::InvalidName {
                 name: name.to_string(),
-                reason: format!(
-                    "character `{c}` not allowed; names match [A-Z][A-Z0-9_]*"
-                ),
+                reason: format!("character `{c}` not allowed; names match [A-Z][A-Z0-9_]*"),
             });
         }
     }
@@ -333,14 +334,13 @@ impl SecretStore for EnvStore {
         // single-threaded at the dispatch site (`fn dispatch` in
         // bin/grx.rs runs serially); test isolation is documented in
         // the module-level docstring.
-        let bytes_string = std::str::from_utf8(value.expose_bytes()).map_err(|_| {
-            SecretsError::InvalidName {
+        let bytes_string =
+            std::str::from_utf8(value.expose_bytes()).map_err(|_| SecretsError::InvalidName {
                 name: name.to_string(),
                 reason: "EnvStore::set requires UTF-8 bytes (env vars are byte-string \
                          shaped on POSIX but the Rust API requires &OsStr / &str)"
                     .into(),
-            }
-        })?;
+            })?;
         std::env::set_var(&key, bytes_string);
         tracing::info!(
             target: "graphreact::secrets::audit",
@@ -440,12 +440,11 @@ impl SecretStore for KeyringStore {
         let entry = Self::entry(name)?;
         // keyring::Entry::set_password takes &str; reject non-UTF-8
         // secrets at this boundary so the OS-side error is consistent.
-        let s = std::str::from_utf8(value.expose_bytes()).map_err(|_| {
-            SecretsError::InvalidName {
+        let s =
+            std::str::from_utf8(value.expose_bytes()).map_err(|_| SecretsError::InvalidName {
                 name: name.to_string(),
                 reason: "KeyringStore::set requires UTF-8 secret bytes".into(),
-            }
-        })?;
+            })?;
         entry.set_password(s).map_err(map_keyring_err)?;
         tracing::info!(
             target: "graphreact::secrets::audit",
@@ -680,7 +679,10 @@ mod tests {
         let bad_key = format!("{}lower_case_bad", ENV_PREFIX);
         std::env::set_var(&bad_key, "irrelevant");
         let names = store.list().unwrap();
-        assert!(names.contains(&good), "list missing expected name: {names:?}");
+        assert!(
+            names.contains(&good),
+            "list missing expected name: {names:?}"
+        );
         assert!(
             !names.contains(&"lower_case_bad".to_string()),
             "list leaked invalid name: {names:?}"
@@ -743,7 +745,10 @@ mod tests {
         let store = KeyringStore;
         let name = unique_name("KRT");
         store
-            .set(&name, SecretValue::from_bytes(b"opt-in-value".to_vec()).unwrap())
+            .set(
+                &name,
+                SecretValue::from_bytes(b"opt-in-value".to_vec()).unwrap(),
+            )
             .expect("set");
         let v = store.get(&name).expect("get");
         assert_eq!(v.expose_bytes(), b"opt-in-value");

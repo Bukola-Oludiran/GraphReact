@@ -55,8 +55,7 @@ struct TestCert {
 }
 
 fn mint_test_cert(common_name: &str) -> TestCert {
-    let mut params =
-        rcgen::CertificateParams::new(vec![common_name.to_string()]).unwrap();
+    let mut params = rcgen::CertificateParams::new(vec![common_name.to_string()]).unwrap();
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         common_name.to_string().try_into().unwrap(),
     ));
@@ -99,18 +98,14 @@ fn pair_cluster_tls(name_a: &str, name_b: &str) -> (TlsConfig, TlsConfig) {
     let ca_cert = ca_params.self_signed(&ca_kp).expect("ca self-sign");
     let ca_der: CertificateDer<'static> = ca_cert.der().clone();
     let make_leaf = |name: &str| -> TlsConfig {
-        let mut params =
-            rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
+        let mut params = rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
         params.subject_alt_names.push(rcgen::SanType::DnsName(
             name.to_string().try_into().expect("san name"),
         ));
         let kp = rcgen::KeyPair::generate().expect("leaf keygen");
-        let cert = params
-            .signed_by(&kp, &ca_cert, &ca_kp)
-            .expect("leaf sign");
+        let cert = params.signed_by(&kp, &ca_cert, &ca_kp).expect("leaf sign");
         let cert_der: CertificateDer<'static> = cert.der().clone();
-        let key_der: PrivateKeyDer<'static> =
-            PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
+        let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
         TlsConfig::from_pem_bytes(vec![cert_der], key_der, vec![ca_der.clone()], true)
             .expect("tls from pem bytes")
     };
@@ -174,6 +169,7 @@ async fn boot_tls_daemon(initial: &TestCert) -> TlsBooted {
         tls: cluster_tls,
         peers: Vec::new(),
         runtime: graphreact_cli::cli::RuntimeArg::Null,
+        go_build: Default::default(),
         net_tick: fast_tick(),
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
@@ -228,8 +224,7 @@ async fn dial_observer_capture_cert(
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(client_cfg));
     let tcp = TcpStream::connect(addr).await.expect("tcp connect");
-    let dns_name = rustls::pki_types::ServerName::try_from(sni.to_string())
-        .expect("sni parses");
+    let dns_name = rustls::pki_types::ServerName::try_from(sni.to_string()).expect("sni parses");
     let tls = connector
         .connect(dns_name, tcp)
         .await
@@ -318,8 +313,7 @@ fn install_capture() -> CaptureLayer {
     let capture = CAPTURE
         .get_or_init(|| {
             let capture = CaptureLayer::default();
-            let subscriber =
-                tracing_subscriber::Registry::default().with(capture.clone());
+            let subscriber = tracing_subscriber::Registry::default().with(capture.clone());
             let _ = tracing::subscriber::set_global_default(subscriber);
             capture
         })
@@ -439,9 +433,7 @@ async fn reload_tls_from_disk_is_noop_during_drain() {
     let window: Vec<&String> = all.iter().skip(baseline_events).collect();
     let skipped = window
         .iter()
-        .filter(|e| {
-            e.contains("event=tls_reload_skipped") && e.contains("reason=draining")
-        })
+        .filter(|e| e.contains("event=tls_reload_skipped") && e.contains("reason=draining"))
         .count();
     assert!(
         skipped >= 1,
@@ -512,9 +504,7 @@ async fn reload_tls_from_disk_with_missing_cert_file_surfaces_audit() {
     );
     let failures: Vec<&&String> = window
         .iter()
-        .filter(|e| {
-            e.contains("event=tls_reload_failure") && e.contains("error_kind=cert_read")
-        })
+        .filter(|e| e.contains("event=tls_reload_failure") && e.contains("error_kind=cert_read"))
         .collect();
     assert!(
         !failures.is_empty(),

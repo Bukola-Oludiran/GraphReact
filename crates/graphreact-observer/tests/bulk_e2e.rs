@@ -51,16 +51,16 @@ fn decide_bulk_response(node_id: &str, message_type: &str) -> BulkInjectResult {
     }
 }
 
-async fn spawn_with_bulk_responder(
-    token: Option<&[u8]>,
-) -> (ApiServerHandle, JoinHandle<()>) {
+async fn spawn_with_bulk_responder(token: Option<&[u8]>) -> (ApiServerHandle, JoinHandle<()>) {
     let metrics = Arc::new(MetricsInner::new());
     let bind = BindConfig {
         addr: "127.0.0.1:0".parse().unwrap(),
         token: token.map(|t| BearerToken::from_bytes(t.to_vec()).unwrap()),
         tls: None,
     };
-    let mut server = spawn_management_api(bind, metrics, 1234).await.expect("spawn");
+    let mut server = spawn_management_api(bind, metrics, 1234)
+        .await
+        .expect("spawn");
     let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
     let drain_task = tokio::spawn(async move {
         while let Some(req) = snapshot_rx.recv().await {
@@ -153,10 +153,7 @@ async fn bulk_surfaces_node_not_found_per_line() {
     let _guard = BULK_TEST_LOCK.lock().await;
     let (server, _drain) = spawn_with_bulk_responder(None).await;
     let (status, _, response) = http_post_bulk(
-        &format!(
-            "http://{}/v1/nodes/ghost/messages/bulk",
-            server.local_addr
-        ),
+        &format!("http://{}/v1/nodes/ghost/messages/bulk", server.local_addr),
         None,
         "{\"type\":\"audit\",\"payload\":{}}\n",
     )
@@ -233,12 +230,8 @@ async fn bulk_returns_413_for_oversized_content_length() {
     // (would be ~10 GB) — fortunately the pre-flight check fires
     // on the declared header, so a small body suffices.
     let url = format!("http://{}/v1/nodes/logger/messages/bulk", server.local_addr);
-    let (status, body) = http_post_with_fake_content_length(
-        &url,
-        BULK_MAX_BODY_BYTES + 1,
-        "{}",
-    )
-    .await;
+    let (status, body) =
+        http_post_with_fake_content_length(&url, BULK_MAX_BODY_BYTES + 1, "{}").await;
     assert_eq!(status, 413);
     let v: Value = serde_json::from_str(&body).expect("json body");
     assert_eq!(v["error"], "body_too_large");
@@ -292,10 +285,7 @@ async fn bulk_processes_final_line_without_trailing_newline() {
     .await;
     assert_eq!(status, 200);
     let lines = parse_bulk_body(&response);
-    assert_eq!(
-        lines,
-        vec![(0, "accepted".into()), (1, "accepted".into())]
-    );
+    assert_eq!(lines, vec![(0, "accepted".into()), (1, "accepted".into())]);
     server.shutdown().await;
 }
 
@@ -319,10 +309,7 @@ async fn bulk_skips_empty_lines_silently() {
     .await;
     assert_eq!(status, 200);
     let lines = parse_bulk_body(&response);
-    assert_eq!(
-        lines,
-        vec![(0, "accepted".into()), (1, "accepted".into())]
-    );
+    assert_eq!(lines, vec![(0, "accepted".into()), (1, "accepted".into())]);
     server.shutdown().await;
 }
 
@@ -414,7 +401,10 @@ async fn http_post_bulk(
     // bodies are small so we walk hex-prefixed chunks. For
     // non-chunked responses (Content-Length-bounded) the body
     // is raw.
-    let body_str = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    let body_str = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         decode_chunked(body)
     } else {
         body.to_string()

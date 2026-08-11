@@ -257,13 +257,9 @@ mod tests {
             return { accepts: ['v1'], emits: [] };\n\
         ";
 
-        let initial = super::build_jsc_node_definition_from_source(
-            &engine_rc,
-            iso,
-            "Counter",
-            body_v1,
-        )
-        .expect("eval v1");
+        let initial =
+            super::build_jsc_node_definition_from_source(&engine_rc, iso, "Counter", body_v1)
+                .expect("eval v1");
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -310,8 +306,8 @@ mod tests {
             "second render observed 7 — useState persisted across the adapter swap"
         );
 
-        let new_signal_id = crate::jsruntime::signal_id_for("counter-1", 0)
-            .expect("signal id still registered");
+        let new_signal_id =
+            crate::jsruntime::signal_id_for("counter-1", 0).expect("signal id still registered");
         assert_eq!(
             new_signal_id, signal_id,
             "signal id is keyed on (node_id, hook_pos); the slot is the same after swap"
@@ -385,10 +381,8 @@ mod tests {
             host_observe('ok');\n\
             return { accepts: [], emits: [] };\n\
         ";
-        let initial = super::build_jsc_node_definition_from_source(
-            &engine_rc, iso, "Rb", body_ok,
-        )
-        .expect("eval ok");
+        let initial = super::build_jsc_node_definition_from_source(&engine_rc, iso, "Rb", body_ok)
+            .expect("eval ok");
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -516,10 +510,9 @@ mod tests {
             useEffect(function() { host_observe('v1:effect:' + count); }, [count]);\n\
             return { accepts: ['v1'], emits: [] };\n\
         ";
-        let initial = super::build_jsc_node_definition_from_source(
-            &engine_rc, iso, "EffSwap", body_v1,
-        )
-        .expect("eval v1");
+        let initial =
+            super::build_jsc_node_definition_from_source(&engine_rc, iso, "EffSwap", body_v1)
+                .expect("eval v1");
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -529,8 +522,7 @@ mod tests {
         // First batch under the EngineGuard so flush_effects can
         // re-enter JSC via __invokeCallback to fire the effect closure.
         {
-            let _engine_guard =
-                crate::jsruntime::EngineGuard::new(Rc::clone(&engine_rc), iso);
+            let _engine_guard = crate::jsruntime::EngineGuard::new(Rc::clone(&engine_rc), iso);
             scheduler.process_batch().expect("first batch");
         }
         assert_eq!(
@@ -570,8 +562,7 @@ mod tests {
         // runs, useEffect's deps `[5]` differ from the committed
         // pre-swap deps `[0]`, so flush_effects fires v2's closure.
         {
-            let _engine_guard =
-                crate::jsruntime::EngineGuard::new(Rc::clone(&engine_rc), iso);
+            let _engine_guard = crate::jsruntime::EngineGuard::new(Rc::clone(&engine_rc), iso);
             scheduler.process_batch().expect("second batch under v2");
         }
         let observed = observations.lock().clone();
@@ -581,7 +572,9 @@ mod tests {
              observed: {observed:?}",
         );
         assert!(
-            !observed.iter().any(|s| s.starts_with("v1:effect:") && s != "v1:effect:0"),
+            !observed
+                .iter()
+                .any(|s| s.starts_with("v1:effect:") && s != "v1:effect:0"),
             "v1's effect closure must NOT fire after the swap installs v2; \
              observed: {observed:?}",
         );
@@ -652,10 +645,9 @@ mod tests {
         };
 
         let body_v1 = "const [count, setCount] = useState(0); host_observe('v1'); return { accepts: ['v1'], emits: [] };";
-        let initial = super::build_jsc_node_definition_from_source(
-            &engine_rc, iso, "Counter", body_v1,
-        )
-        .expect("eval v1");
+        let initial =
+            super::build_jsc_node_definition_from_source(&engine_rc, iso, "Counter", body_v1)
+                .expect("eval v1");
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -666,8 +658,8 @@ mod tests {
 
         // Drive the signal externally so we can assert state
         // survival through the Compatible swap path.
-        let signal_id = crate::jsruntime::signal_id_for("c1", 0)
-            .expect("signal id minted on first render");
+        let signal_id =
+            crate::jsruntime::signal_id_for("c1", 0).expect("signal id minted on first render");
         crate::jsruntime::set_signal(
             signal_id,
             serde_json::Value::Number(serde_json::Number::from(42)),
@@ -783,8 +775,7 @@ def body(ctx):
         .expect("write fixture");
 
         // Mount via the real path so all host callbacks are bound.
-        let mut runtime =
-            crate::pyruntime::mount_with_scheduler(&fixture).expect("py mount");
+        let mut runtime = crate::pyruntime::mount_with_scheduler(&fixture).expect("py mount");
         runtime.process_batch().expect("first batch");
 
         // Snapshot the signal id minted by the first render. Python
@@ -799,8 +790,7 @@ def body(ctx):
 
         // Build the swapped body via the adapter. Same hook
         // signature, different manifest accepts list.
-        let adapter =
-            PyReloadAdapter::new(Rc::clone(&runtime.engine), runtime.iso);
+        let adapter = PyReloadAdapter::new(Rc::clone(&runtime.engine), runtime.iso);
         let body_v2 = r"def body(ctx):
     count, set_count = use_state(0)
     return {'accepts': ['v2'], 'emits': []}
@@ -836,17 +826,13 @@ def body(ctx):
     #[test]
     fn jsc_adapter_rejects_python_lang() {
         // No engine init — the guard fires before any FFI call.
-        let engine_rc: Rc<RefCell<JscEngine>> =
-            Rc::new(RefCell::new(JscEngine::new()));
+        let engine_rc: Rc<RefCell<JscEngine>> = Rc::new(RefCell::new(JscEngine::new()));
         // Synthesize an isolate handle without binding it; the guard
         // path doesn't dereference it.
         let iso = graphreact_engine_zig::IsolateHandle(0);
         let adapter = JscReloadAdapter::new(engine_rc, iso);
-        let result = adapter.build_definition(
-            "Counter",
-            "def body(ctx): return {}",
-            ComponentLang::Python,
-        );
+        let result =
+            adapter.build_definition("Counter", "def body(ctx): return {}", ComponentLang::Python);
         match result {
             Err(ApplyError::EngineFailure { component, message }) => {
                 assert_eq!(component, "Counter");
@@ -861,8 +847,7 @@ def body(ctx):
 
     #[test]
     fn cpython_adapter_rejects_js_lang() {
-        let engine_rc: Rc<RefCell<CPythonEngine>> =
-            Rc::new(RefCell::new(CPythonEngine::new()));
+        let engine_rc: Rc<RefCell<CPythonEngine>> = Rc::new(RefCell::new(CPythonEngine::new()));
         let iso = graphreact_engine_zig::IsolateHandle(0);
         let adapter = PyReloadAdapter::new(engine_rc, iso);
         let result = adapter.build_definition(

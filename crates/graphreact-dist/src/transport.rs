@@ -215,10 +215,15 @@ mod tests {
         });
 
         let client = tokio::spawn(async move {
-            let mut conn = dial_over(bob_stream, "alice", &bob_cfg).await.expect("dial");
-            conn.send(Packet::Tick(Tick { seq: 42, sent_at_ms: 0 }))
+            let mut conn = dial_over(bob_stream, "alice", &bob_cfg)
                 .await
-                .expect("send");
+                .expect("dial");
+            conn.send(Packet::Tick(Tick {
+                seq: 42,
+                sent_at_ms: 0,
+            }))
+            .await
+            .expect("send");
             let echo = conn.recv().await.expect("recv ok").expect("not eof");
             assert!(matches!(echo, Packet::Tick(Tick { seq: 42, .. })));
             // Wait for the server's Disconnect; the recv will yield
@@ -268,9 +273,8 @@ mod tests {
         let bob_cfg = bob.config.clone();
 
         let server = tokio::spawn(async move { accept_over(alice_stream, &alice_cfg).await });
-        let client = tokio::spawn(
-            async move { dial_over(bob_stream, "carol-impostor", &bob_cfg).await },
-        );
+        let client =
+            tokio::spawn(async move { dial_over(bob_stream, "carol-impostor", &bob_cfg).await });
 
         let server_res = server.await.expect("server task");
         let client_res = client.await.expect("client task");
@@ -296,12 +300,10 @@ mod tests {
         // Run both handshakes concurrently — neither side completes
         // until the other does, so we can't drop the client until
         // BOTH are post-handshake.
-        let server_handle = tokio::spawn(async move {
-            accept_over(alice_stream, &alice_cfg).await
-        });
-        let client_handle = tokio::spawn(async move {
-            dial_over(bob_stream, "alice", &bob_cfg).await
-        });
+        let server_handle =
+            tokio::spawn(async move { accept_over(alice_stream, &alice_cfg).await });
+        let client_handle =
+            tokio::spawn(async move { dial_over(bob_stream, "alice", &bob_cfg).await });
 
         let server_conn = server_handle.await.expect("server join").expect("accept");
         let client_conn = client_handle.await.expect("client join").expect("dial");

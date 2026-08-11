@@ -97,14 +97,10 @@ pub fn leiden(
     opts: &LeidenOptions,
 ) -> Result<PartitionMap, LeidenError> {
     if !(0.0..=10.0).contains(&opts.resolution) {
-        return Err(LeidenError::InvalidOptions(
-            "resolution must be in [0, 10]",
-        ));
+        return Err(LeidenError::InvalidOptions("resolution must be in [0, 10]"));
     }
     if opts.max_iterations == 0 {
-        return Err(LeidenError::InvalidOptions(
-            "max_iterations must be >= 1",
-        ));
+        return Err(LeidenError::InvalidOptions("max_iterations must be >= 1"));
     }
 
     let original_nodes: Vec<String> = graph.nodes().map(String::from).collect();
@@ -153,8 +149,7 @@ pub fn leiden(
         // PRE-refinement community of each refined sub-community
         // (since refined sub-communities live inside phase-1
         // communities by construction).
-        let (aggregated, member_map, refined_to_phase1) =
-            aggregate(&current, &refined);
+        let (aggregated, member_map, refined_to_phase1) = aggregate(&current, &refined);
         current = aggregated;
         // The phase-1 community of each new node = the phase-1
         // community of any of its (refined) members.
@@ -260,16 +255,12 @@ impl SnapshotState {
         // Initial partition: each node its own community.
         let mut node_community = vec![0u64; n];
         let mut community_degree: FxHashMap<u64, f64> = FxHashMap::default();
-        let mut community_members: FxHashMap<u64, FxHashSet<usize>> =
-            FxHashMap::default();
+        let mut community_members: FxHashMap<u64, FxHashSet<usize>> = FxHashMap::default();
         for i in 0..n {
             let c = i as u64;
             node_community[i] = c;
             community_degree.insert(c, node_degree[i]);
-            community_members
-                .entry(c)
-                .or_default()
-                .insert(i);
+            community_members.entry(c).or_default().insert(i);
         }
 
         Self {
@@ -327,11 +318,7 @@ impl SnapshotState {
 // Phase 1 — move_nodes_fast
 // ===========================================================================
 
-fn move_nodes_fast(
-    state: &mut SnapshotState,
-    resolution: f64,
-    rng: &mut ChaCha8Rng,
-) -> bool {
+fn move_nodes_fast(state: &mut SnapshotState, resolution: f64, rng: &mut ChaCha8Rng) -> bool {
     let mut queue: Vec<usize> = (0..state.n).collect();
     fisher_yates_shuffle(&mut queue, rng);
     let mut in_queue: Vec<bool> = vec![true; state.n];
@@ -361,11 +348,8 @@ fn move_nodes_fast(
             continue;
         }
 
-        let weight_to_current = state.weight_to_community(
-            v,
-            current_comm,
-            &state.community_members,
-        );
+        let weight_to_current =
+            state.weight_to_community(v, current_comm, &state.community_members);
         let k_current_minus_v = state
             .community_degree
             .get(&current_comm)
@@ -527,8 +511,7 @@ fn refine_partition(
 
             let k_v = state.node_degree[v];
             let weight_v_to_s_minus_v = sum_weights(state, v, &s_members) - 0.0;
-            let well_connected_threshold =
-                resolution * k_v * (s_degree - k_v) / two_m;
+            let well_connected_threshold = resolution * k_v * (s_degree - k_v) / two_m;
             if weight_v_to_s_minus_v < well_connected_threshold {
                 continue;
             }
@@ -554,11 +537,8 @@ fn refine_partition(
                 let k_c = sub_degree.get(&candidate).copied().unwrap_or(0.0);
                 // Well-connectedness of candidate sub-community
                 // against rest of S.
-                let weight_c_to_s_minus_c = members_weight_to_set_excluding(
-                    state,
-                    candidate_members,
-                    &s_members,
-                );
+                let weight_c_to_s_minus_c =
+                    members_weight_to_set_excluding(state, candidate_members, &s_members);
                 if weight_c_to_s_minus_c < resolution * k_c * (s_degree - k_c) / two_m {
                     continue;
                 }
@@ -914,11 +894,7 @@ mod tests {
             }
             for i in 1..=4 {
                 for j in (i + 1)..=4 {
-                    unweighted_edge(
-                        &mut g,
-                        &format!("{prefix}{i}"),
-                        &format!("{prefix}{j}"),
-                    );
+                    unweighted_edge(&mut g, &format!("{prefix}{i}"), &format!("{prefix}{j}"));
                 }
             }
         }

@@ -237,11 +237,7 @@ pub fn fit_with_model_selection(
     best.map(|(_, m)| m).ok_or(GmmError::Empty)
 }
 
-fn run_em(
-    x: MatRef<'_, f64>,
-    opts: &GmmOptions,
-    rng: &mut impl Rng,
-) -> GmmResult<GmmModel> {
+fn run_em(x: MatRef<'_, f64>, opts: &GmmOptions, rng: &mut impl Rng) -> GmmResult<GmmModel> {
     let n = x.nrows();
     let d = x.ncols();
     let k = opts.n_components;
@@ -469,8 +465,7 @@ fn log_multivariate_normal(
     match cov {
         CovarianceType::Full => {
             let sigma = &covariances[component];
-            let (inv, log_det) =
-                invert_symmetric_positive(sigma.as_ref(), component)?;
+            let (inv, log_det) = invert_symmetric_positive(sigma.as_ref(), component)?;
             let mut out = vec![0.0; n];
             for r in 0..n {
                 let diff: Vec<f64> = (0..d).map(|c| x[(r, c)] - mu[c]).collect();
@@ -542,10 +537,7 @@ fn log_multivariate_normal(
     }
 }
 
-fn invert_symmetric_positive(
-    s: MatRef<'_, f64>,
-    component: usize,
-) -> GmmResult<(Mat<f64>, f64)> {
+fn invert_symmetric_positive(s: MatRef<'_, f64>, component: usize) -> GmmResult<(Mat<f64>, f64)> {
     // s = Q Λ Q^T → s^{-1} = Q Λ^{-1} Q^T, log|s| = Σ ln λ_i
     let d = s.nrows();
     let decomp = linalg_eigh(s, d).map_err(|_| GmmError::SingularCovariance { component })?;

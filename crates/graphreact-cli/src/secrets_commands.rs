@@ -13,9 +13,7 @@
 
 use std::io::{self, BufRead, IsTerminal, Write};
 
-use graphreact_secrets::{
-    EnvStore, KeyringStore, SecretStore, SecretValue, SecretsError,
-};
+use graphreact_secrets::{EnvStore, KeyringStore, SecretStore, SecretValue, SecretsError};
 
 use crate::cli::{SecretsBackend, SecretsOp};
 use crate::commands::{CommandError, CommandResult};

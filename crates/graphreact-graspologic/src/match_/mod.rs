@@ -9,10 +9,7 @@
 pub mod faq;
 pub mod lap;
 
-pub use faq::{
-    faq_graph_match, faq_graph_match_seeded, FaqError, FaqMatch, FaqOptions,
-};
+pub use faq::{faq_graph_match, faq_graph_match_seeded, FaqError, FaqMatch, FaqOptions};
 pub use lap::{
-    assignment_cost, linear_sum_assignment, linear_sum_assignment_max, LapError,
-    LapResult,
+    assignment_cost, linear_sum_assignment, linear_sum_assignment_max, LapError, LapResult,
 };

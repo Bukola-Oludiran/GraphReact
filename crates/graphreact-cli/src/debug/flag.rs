@@ -72,9 +72,7 @@ pub enum DebugFlagError {
     UnknownEngine(String),
     #[error("port `{0}`: {1}")]
     BadPort(String, String),
-    #[error(
-        "debug engine `jsc` not yet wired (P8 ships cpython only; JSC CDP lands in P9)"
-    )]
+    #[error("debug engine `jsc` not yet wired (P8 ships cpython only; JSC CDP lands in P9)")]
     JscNotYetSupported,
     #[error(
         "debug engine `go` is parser-accepted but not yet wired (Delve DAP attach lands with M17 phase 1)"
@@ -95,11 +93,9 @@ impl FromStr for DebugFlag {
             "go" => DebugEngine::Go,
             other => return Err(DebugFlagError::UnknownEngine(other.to_string())),
         };
-        let port: u16 = port_str
-            .parse()
-            .map_err(|e: std::num::ParseIntError| {
-                DebugFlagError::BadPort(port_str.to_string(), e.to_string())
-            })?;
+        let port: u16 = port_str.parse().map_err(|e: std::num::ParseIntError| {
+            DebugFlagError::BadPort(port_str.to_string(), e.to_string())
+        })?;
         Ok(DebugFlag { engine, port })
     }
 }

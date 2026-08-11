@@ -74,8 +74,8 @@
 //!   handshake against the new config (correct + expected for
 //!   Phase A; ticket rotation is Phase B).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use rustls::server::ServerConfig;
@@ -181,16 +181,14 @@ mod tests {
     use rustls::ALL_VERSIONS;
 
     fn build_config() -> Arc<ServerConfig> {
-        let mut params =
-            rcgen::CertificateParams::new(vec!["rotate.test".into()]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["rotate.test".into()]).unwrap();
         params.subject_alt_names.push(rcgen::SanType::DnsName(
             "rotate.test".to_string().try_into().unwrap(),
         ));
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
         let cert_der: CertificateDer<'static> = cert.der().clone();
-        let key_der: PrivateKeyDer<'static> =
-            PrivatePkcs8KeyDer::from(key.serialize_der()).into();
+        let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key.serialize_der()).into();
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cfg = ServerConfig::builder_with_provider(provider)

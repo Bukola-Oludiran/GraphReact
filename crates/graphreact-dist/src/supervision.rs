@@ -140,8 +140,7 @@ struct Inner {
     outbound_monitors_by_node: Mutex<FxHashMap<String, Vec<Arc<OutboundMonitor>>>>,
     outbound_monitors_by_local_ref: Mutex<FxHashMap<MonitorRef, Arc<OutboundMonitor>>>,
     outbound_links_by_node: Mutex<FxHashMap<String, Vec<OutboundLink>>>,
-    outbound_link_counts_per_observer:
-        Mutex<FxHashMap<NodeKey, FxHashMap<String, usize>>>,
+    outbound_link_counts_per_observer: Mutex<FxHashMap<NodeKey, FxHashMap<String, usize>>>,
 
     inbound_monitors_by_local_target: Mutex<FxHashMap<String, Vec<InboundMonitor>>>,
     inbound_links_by_local_id: Mutex<FxHashMap<String, Vec<InboundLink>>>,
@@ -323,12 +322,7 @@ impl RemoteSupervision {
     /// [`SchedulerHandle::unlink_remote`] so the local
     /// `(observer, sentinel)` edge in `LinkRegistry` is torn
     /// down at the next `process_batch`.
-    pub fn record_outbound_unlink(
-        &self,
-        observer_key: NodeKey,
-        observer_id: &str,
-        target: &str,
-    ) {
+    pub fn record_outbound_unlink(&self, observer_key: NodeKey, observer_id: &str, target: &str) {
         let Some(peer_name) = peer_name_of(target) else {
             return;
         };
@@ -469,9 +463,7 @@ impl RemoteSupervision {
                     total == 0
                 };
                 if observer_zero {
-                    self.inner
-                        .scheduler_handle
-                        .unlink_remote(link.observer_key);
+                    self.inner.scheduler_handle.unlink_remote(link.observer_key);
                 }
             }
         }
@@ -600,8 +592,8 @@ impl RemoteSupervision {
     /// the unmount hook can ship a wire `Exit` when the local
     /// target id unmounts.
     pub fn handle_link_request(&self, peer_name: &str, req: LinkRequest) {
-        let local_target = strip_our_suffix(&req.b, &self.inner.our_name)
-            .unwrap_or_else(|| req.b.clone());
+        let local_target =
+            strip_our_suffix(&req.b, &self.inner.our_name).unwrap_or_else(|| req.b.clone());
         self.inner
             .inbound_links_by_local_id
             .lock()
@@ -615,8 +607,8 @@ impl RemoteSupervision {
 
     /// Inbound `Unlink`.
     pub fn handle_unlink(&self, peer_name: &str, unl: Unlink) {
-        let local_target = strip_our_suffix(&unl.b, &self.inner.our_name)
-            .unwrap_or_else(|| unl.b.clone());
+        let local_target =
+            strip_our_suffix(&unl.b, &self.inner.our_name).unwrap_or_else(|| unl.b.clone());
         let mut by_id = self.inner.inbound_links_by_local_id.lock();
         if let Some(list) = by_id.get_mut(&local_target) {
             list.retain(|l| l.peer_name != peer_name);
@@ -634,8 +626,11 @@ impl RemoteSupervision {
         let observers: Vec<OutboundLink> = {
             let mut by_node = self.inner.outbound_links_by_node.lock();
             if let Some(list) = by_node.get_mut(peer_name) {
-                let matched: Vec<OutboundLink> =
-                    list.iter().filter(|l| l.target == target).cloned().collect();
+                let matched: Vec<OutboundLink> = list
+                    .iter()
+                    .filter(|l| l.target == target)
+                    .cloned()
+                    .collect();
                 list.retain(|l| l.target != target);
                 if list.is_empty() {
                     by_node.remove(peer_name);
@@ -680,9 +675,7 @@ impl RemoteSupervision {
                 total == 0
             };
             if observer_zero {
-                self.inner
-                    .scheduler_handle
-                    .unlink_remote(link.observer_key);
+                self.inner.scheduler_handle.unlink_remote(link.observer_key);
             }
         }
     }
@@ -848,9 +841,7 @@ fn best_effort_send(
             false
         }
         Err(TrySendError::Closed(_)) => {
-            tracing::debug!(
-                "dist supervision: peer `{peer_name}` channel closed; dropping {ty:?}"
-            );
+            tracing::debug!("dist supervision: peer `{peer_name}` channel closed; dropping {ty:?}");
             false
         }
     }
@@ -876,12 +867,8 @@ mod tests {
         let scheduler = Scheduler::default();
         let handle = scheduler.handle();
         let registry = NodeRegistry::new();
-        let sup = RemoteSupervision::new(
-            handle,
-            registry.clone(),
-            "alice".to_string(),
-            Creation(7),
-        );
+        let sup =
+            RemoteSupervision::new(handle, registry.clone(), "alice".to_string(), Creation(7));
         (sup, registry)
     }
 
@@ -923,14 +910,32 @@ mod tests {
         sup.record_outbound_monitor(observer_key(), "watcher", "tgt1@bob", MonitorRef(1));
         sup.record_outbound_monitor(observer_key(), "watcher", "tgt2@bob", MonitorRef(2));
         // Ensure the registry index is populated.
-        assert_eq!(sup.inner.outbound_monitors_by_node.lock().get("bob").unwrap().len(), 2);
+        assert_eq!(
+            sup.inner
+                .outbound_monitors_by_node
+                .lock()
+                .get("bob")
+                .unwrap()
+                .len(),
+            2
+        );
         sup.synthesize_disconnect("bob");
         // Both entries drained.
-        assert!(sup.inner.outbound_monitors_by_node.lock().get("bob").is_none());
+        assert!(sup
+            .inner
+            .outbound_monitors_by_node
+            .lock()
+            .get("bob")
+            .is_none());
         assert_eq!(sup.inner.outbound_monitors_by_local_ref.lock().len(), 0);
         // Re-running is a no-op (idempotent).
         sup.synthesize_disconnect("bob");
-        assert!(sup.inner.outbound_monitors_by_node.lock().get("bob").is_none());
+        assert!(sup
+            .inner
+            .outbound_monitors_by_node
+            .lock()
+            .get("bob")
+            .is_none());
     }
 
     #[tokio::test]

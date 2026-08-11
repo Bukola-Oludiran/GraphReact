@@ -315,9 +315,7 @@ pub fn load_registry_from_file(path: &Path) -> Result<TokenRegistry, RegistryLoa
                     error = %err,
                     "token registry parse error at line; skipping"
                 );
-                first_parse_err.get_or_insert_with(|| {
-                    format!("line {idx}: {err}")
-                });
+                first_parse_err.get_or_insert_with(|| format!("line {idx}: {err}"));
                 continue;
             }
         };
@@ -331,9 +329,8 @@ pub fn load_registry_from_file(path: &Path) -> Result<TokenRegistry, RegistryLoa
                     error = %err,
                     "token registry entry has an invalid bearer token; skipping"
                 );
-                first_parse_err.get_or_insert_with(|| {
-                    format!("line {idx}: invalid bearer token: {err}")
-                });
+                first_parse_err
+                    .get_or_insert_with(|| format!("line {idx}: invalid bearer token: {err}"));
                 continue;
             }
         };
@@ -589,10 +586,7 @@ mod tests {
 
     #[test]
     fn match_token_returns_none_on_miss() {
-        let reg = TokenRegistry::new(vec![
-            mk_entry("admin1", b"AAAAAA", Role::Admin),
-        ])
-        .unwrap();
+        let reg = TokenRegistry::new(vec![mk_entry("admin1", b"AAAAAA", Role::Admin)]).unwrap();
         assert!(reg.match_token(b"NOPE").is_none());
         // Length mismatch (subtle::ConstantTimeEq requires equal
         // lengths; short-circuit is documented in BearerToken).
@@ -624,10 +618,7 @@ mod tests {
 
     #[test]
     fn check_route_admin_grants_all_protected() {
-        let reg = TokenRegistry::new(vec![
-            mk_entry("admin1", b"AAAAAA", Role::Admin),
-        ])
-        .unwrap();
+        let reg = TokenRegistry::new(vec![mk_entry("admin1", b"AAAAAA", Role::Admin)]).unwrap();
         let entry = reg.match_token(b"AAAAAA").unwrap();
         // Admin grants the read-only subset AND the POST endpoints.
         assert!(reg.check_route(entry, "/v1/identity"));
@@ -643,10 +634,7 @@ mod tests {
 
     #[test]
     fn check_route_read_only_grants_subset_denies_post() {
-        let reg = TokenRegistry::new(vec![
-            mk_entry("reader1", b"BBBBBB", Role::ReadOnly),
-        ])
-        .unwrap();
+        let reg = TokenRegistry::new(vec![mk_entry("reader1", b"BBBBBB", Role::ReadOnly)]).unwrap();
         let entry = reg.match_token(b"BBBBBB").unwrap();
         // Every READ_ONLY_ROUTES entry → permitted.
         for route in READ_ONLY_ROUTES {
@@ -668,10 +656,8 @@ mod tests {
         let mut allow = BTreeSet::new();
         allow.insert("/v1/metrics".to_string());
         allow.insert("/v1/nodes/:id/call".to_string());
-        let reg = TokenRegistry::new(vec![
-            mk_entry("ci1", b"CCCCCC", Role::Custom(allow)),
-        ])
-        .unwrap();
+        let reg =
+            TokenRegistry::new(vec![mk_entry("ci1", b"CCCCCC", Role::Custom(allow))]).unwrap();
         let entry = reg.match_token(b"CCCCCC").unwrap();
         assert!(reg.check_route(entry, "/v1/metrics"));
         assert!(reg.check_route(entry, "/v1/nodes/:id/call"));
@@ -684,10 +670,7 @@ mod tests {
 
     #[test]
     fn is_expired_now_or_past_is_true_future_is_false() {
-        let reg = TokenRegistry::new(vec![
-            mk_entry("admin1", b"AAAAAA", Role::Admin),
-        ])
-        .unwrap();
+        let reg = TokenRegistry::new(vec![mk_entry("admin1", b"AAAAAA", Role::Admin)]).unwrap();
         let entry = &reg.entries[0];
         let now = SystemTime::now();
         // None expires_at → never expired.
@@ -770,9 +753,8 @@ mod tests {
 
     #[test]
     fn rotatable_registry_current_returns_initial_then_rotate_replaces() {
-        let reg_a = Arc::new(
-            TokenRegistry::new(vec![mk_entry("admin1", b"AAAAAA", Role::Admin)]).unwrap(),
-        );
+        let reg_a =
+            Arc::new(TokenRegistry::new(vec![mk_entry("admin1", b"AAAAAA", Role::Admin)]).unwrap());
         let reg_b = Arc::new(
             TokenRegistry::new(vec![
                 mk_entry("admin1", b"AAAAAA", Role::Admin),
@@ -796,12 +778,10 @@ mod tests {
 
     #[test]
     fn rotatable_registry_clone_observes_rotation() {
-        let reg_a = Arc::new(
-            TokenRegistry::new(vec![mk_entry("admin1", b"AAAAAA", Role::Admin)]).unwrap(),
-        );
-        let reg_b = Arc::new(
-            TokenRegistry::new(vec![mk_entry("admin2", b"BBBBBB", Role::Admin)]).unwrap(),
-        );
+        let reg_a =
+            Arc::new(TokenRegistry::new(vec![mk_entry("admin1", b"AAAAAA", Role::Admin)]).unwrap());
+        let reg_b =
+            Arc::new(TokenRegistry::new(vec![mk_entry("admin2", b"BBBBBB", Role::Admin)]).unwrap());
         let rot1 = RotatableRegistry::new(reg_a);
         let rot2 = rot1.clone();
         rot1.rotate(reg_b.clone());

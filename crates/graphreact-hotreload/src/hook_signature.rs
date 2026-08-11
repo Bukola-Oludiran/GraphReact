@@ -172,10 +172,7 @@ impl HookKind {
     fn deps_arg_index(self) -> Option<usize> {
         match self {
             // (fn, deps)
-            Self::UseEffect
-            | Self::UseEffectAsync
-            | Self::UseMemo
-            | Self::UseCallback => Some(1),
+            Self::UseEffect | Self::UseEffectAsync | Self::UseMemo | Self::UseCallback => Some(1),
             // No deps argument — these hooks either take none or
             // their argument shape is something other than a deps
             // array (e.g., `useState(initial)`, `useMessage(type, fn)`).
@@ -263,10 +260,7 @@ pub fn extract_js(source: &str) -> Result<HookSignature, HookSignatureError> {
     let wrapped = format!("(function(__rawCtx) {{ {source} }})");
 
     let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
-    let fm = cm.new_source_file(
-        Lrc::new(FileName::Custom("body.js".into())),
-        wrapped,
-    );
+    let fm = cm.new_source_file(Lrc::new(FileName::Custom("body.js".into())), wrapped);
     let lexer = Lexer::new(
         Syntax::Es(Default::default()),
         Default::default(),
@@ -325,8 +319,7 @@ impl swc_ecma_visit::Visit for JsHookVisitor {
             // looks hook-shaped, flag dynamic dispatch defensively.
             if expr_looks_hook_shaped(callee_expr) {
                 self.dynamic_reason = Some(
-                    "non-identifier callee with hook-shaped name; can't statically verify"
-                        .into(),
+                    "non-identifier callee with hook-shaped name; can't statically verify".into(),
                 );
             }
             swc_ecma_visit::VisitWith::visit_children_with(call, self);
@@ -400,9 +393,7 @@ pub fn extract_python(source: &str) -> Result<HookSignature, HookSignatureError>
 
     // Find the `body` (preferred) or `init` (legacy) function def.
     let target = module.iter().find_map(|stmt| match stmt {
-        rustpython_parser::ast::Stmt::FunctionDef(f) if f.name.as_str() == "body" => {
-            Some(&f.body)
-        }
+        rustpython_parser::ast::Stmt::FunctionDef(f) if f.name.as_str() == "body" => Some(&f.body),
         rustpython_parser::ast::Stmt::AsyncFunctionDef(f) if f.name.as_str() == "body" => {
             Some(&f.body)
         }
@@ -706,7 +697,7 @@ mod tests {
 
     #[test]
     fn js_parse_failure_returns_parse_failed() {
-        let src = "const [count, setCount] = useState(0";  // unbalanced paren
+        let src = "const [count, setCount] = useState(0"; // unbalanced paren
         let err = extract_js(src).expect_err("must error");
         assert!(matches!(err, HookSignatureError::ParseFailed(_)));
     }
@@ -787,7 +778,8 @@ mod tests {
         // promotes lang change to LangChanged → Incompatible
         // unconditionally). Within a single language, identical
         // hook orderings produce identical signatures.
-        let js = extract_js("useState(0); useEffect(function() {}, [x]); return null;").expect("js");
+        let js =
+            extract_js("useState(0); useEffect(function() {}, [x]); return null;").expect("js");
         let py = extract_python(
             "def body(ctx):\n    use_state(0)\n    use_effect(lambda: None, [x])\n    return None\n",
         )

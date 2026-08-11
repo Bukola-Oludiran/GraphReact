@@ -19,11 +19,7 @@ use crate::position::token_range_at;
 /// with a `(0, 0)`-anchored range since the parser doesn't currently
 /// surface the originating `<import>` tag location.
 #[must_use]
-pub fn from_parse_error(
-    err: &GrxParseError,
-    source: &str,
-    source_uri: &Uri,
-) -> Diagnostic {
+pub fn from_parse_error(err: &GrxParseError, source: &str, source_uri: &Uri) -> Diagnostic {
     let (range, related) = build_range_and_related(err, source, source_uri);
     Diagnostic {
         range,
@@ -64,9 +60,7 @@ pub fn error_code(err: &GrxParseError) -> &'static str {
         GrxParseError::SubsystemMalformedRef { .. } => "subsystem-malformed-ref",
         GrxParseError::SubsystemUnknownRef { .. } => "subsystem-unknown-ref",
         GrxParseError::SpliceCycle { .. } => "splice-cycle",
-        GrxParseError::DuplicateSubgraphAcrossImports { .. } => {
-            "duplicate-subgraph-across-imports"
-        }
+        GrxParseError::DuplicateSubgraphAcrossImports { .. } => "duplicate-subgraph-across-imports",
         GrxParseError::DefinitionBodyIo { .. } => "definition-body-io",
         GrxParseError::CircularImport { .. } => "circular-import",
         GrxParseError::ImportNotFound { .. } => "import-not-found",
@@ -131,10 +125,7 @@ fn build_range_and_related(
         // exposes the originating `<import>` loc we can widen here.
         GrxParseError::CircularImport { .. }
         | GrxParseError::ImportNotFound { .. }
-        | GrxParseError::Io { .. } => (
-            Range::new(Position::new(0, 0), Position::new(0, 0)),
-            None,
-        ),
+        | GrxParseError::Io { .. } => (Range::new(Position::new(0, 0), Position::new(0, 0)), None),
         other => {
             let loc = other.source_loc().unwrap_or(SourceLoc::new(1, 1));
             (token_range_at(loc, source), None)

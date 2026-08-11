@@ -908,10 +908,7 @@ mod tests {
     fn check_route_for_role_admin_grants_unknown() {
         assert!(check_route_for_role(&Role::Admin, "unknown"));
         assert!(check_route_for_role(&Role::Admin, "/v1/identity"));
-        assert!(check_route_for_role(
-            &Role::Admin,
-            "/v1/nodes/:id/messages"
-        ));
+        assert!(check_route_for_role(&Role::Admin, "/v1/nodes/:id/messages"));
     }
 
     #[test]
@@ -953,10 +950,7 @@ mod tests {
         );
         assert_eq!(JwtVerifyError::ExpiredSignature.reason_str(), "expired");
         assert_eq!(JwtVerifyError::NotYetValid.reason_str(), "not_yet_valid");
-        assert_eq!(
-            JwtVerifyError::InvalidIssuer.reason_str(),
-            "invalid_issuer"
-        );
+        assert_eq!(JwtVerifyError::InvalidIssuer.reason_str(), "invalid_issuer");
         assert_eq!(
             JwtVerifyError::InvalidAudience.reason_str(),
             "invalid_audience"

@@ -145,15 +145,13 @@ mod tests {
     /// origin-authoritative IR shape without drift.
     #[test]
     fn roundtrip_reload_module() {
-        roundtrip(Packet::ReloadModule(
-            crate::wire::ReloadModulePacket {
-                origin: "alice@127.0.0.1".into(),
-                file_path: "/srv/grx/system.grx".into(),
-                ir_hash: [0xABu8; 32],
-                ir_payload: vec![1, 2, 3, 4, 5, 6, 7, 8],
-                version: 17,
-            },
-        ));
+        roundtrip(Packet::ReloadModule(crate::wire::ReloadModulePacket {
+            origin: "alice@127.0.0.1".into(),
+            file_path: "/srv/grx/system.grx".into(),
+            ir_hash: [0xABu8; 32],
+            ir_payload: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            version: 17,
+        }));
     }
 
     #[test]
@@ -334,8 +332,7 @@ mod tests {
                 origin: "alice".into(),
                 target_node: "bob".into(),
                 child_node_id: "worker".into(),
-                reason_code:
-                    crate::wire::DelegatedRestartReasonCode::SupervisorEscalation,
+                reason_code: crate::wire::DelegatedRestartReasonCode::SupervisorEscalation,
                 correlation_id: 7,
                 token_id: "token-id-123".into(),
                 version: 7,

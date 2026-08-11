@@ -126,11 +126,8 @@ pub type gr_go_microtasks_drain_fn = unsafe extern "C" fn(isolate: u64) -> c_int
 /// `UseMessage` handler stored under `token` in the prelude's
 /// `handlerRegistry`. `args_json` is a single-element JSON array
 /// `[envelope]` matching the M13 phase 3c shape.
-pub type gr_go_invoke_handler_fn = unsafe extern "C" fn(
-    token: u64,
-    args_json: *const c_char,
-    args_len: usize,
-) -> c_int;
+pub type gr_go_invoke_handler_fn =
+    unsafe extern "C" fn(token: u64, args_json: *const c_char, args_len: usize) -> c_int;
 
 /// **M17 phase 3d-ζ.** Rust → Go edge-accept-predicate invocation
 /// symbol. The scheduler asks "would this node accept an edge from

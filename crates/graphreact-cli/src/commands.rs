@@ -100,11 +100,7 @@ pub fn run_check(path: &Path) -> CommandResult<String> {
     // resolve_multi_file does parser + import walk in one shot.
     let resolved = resolve_multi_file(path)?;
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "✓ {} parsed cleanly",
-        resolved.root_path.display()
-    );
+    let _ = writeln!(out, "✓ {} parsed cleanly", resolved.root_path.display());
     if !resolved.imports.is_empty() {
         let _ = writeln!(out, "  resolved {} imports:", resolved.imports.len());
         for imp in &resolved.imports {
@@ -164,7 +160,10 @@ pub fn run_init(path: &Path, template: InitTemplate) -> CommandResult<String> {
     if path.exists() {
         return Err(CommandError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            format!("path `{}` already exists; refusing to overwrite", path.display()),
+            format!(
+                "path `{}` already exists; refusing to overwrite",
+                path.display()
+            ),
         )));
     }
     std::fs::create_dir_all(path)?;
@@ -172,15 +171,27 @@ pub fn run_init(path: &Path, template: InitTemplate) -> CommandResult<String> {
     std::fs::write(path.join(filename), contents)?;
     std::fs::write(path.join("README.md"), render_readme(template, path))?;
     let mut out = String::new();
-    let _ = writeln!(out, "scaffolded `{}` from `{template:?}` template", path.display());
+    let _ = writeln!(
+        out,
+        "scaffolded `{}` from `{template:?}` template",
+        path.display()
+    );
     let _ = writeln!(out, "  • {}", filename);
     let _ = writeln!(out, "  • README.md");
     let _ = writeln!(out);
     let _ = writeln!(out, "next steps:");
     let _ = writeln!(out, "  cd {}", path.display());
     let _ = writeln!(out, "  grx check {}", filename);
-    let _ = writeln!(out, "  grx run {}                   # null engine (topology dry-run)", filename);
-    let _ = writeln!(out, "  grx run {} --runtime jsc     # once M12.3 lands", filename);
+    let _ = writeln!(
+        out,
+        "  grx run {}                   # null engine (topology dry-run)",
+        filename
+    );
+    let _ = writeln!(
+        out,
+        "  grx run {} --runtime jsc     # once M12.3 lands",
+        filename
+    );
     Ok(out)
 }
 
@@ -358,7 +369,8 @@ fn cpython_version_line() -> String {
 fn cpython_version_line() -> String {
     "engine-cpython not-linked (M13-phase3f's build.rs supports Linux + Windows \
      via pkg-config python-3.X-embed; per-OS artifact production is a parallel \
-     CI track, not blocked on M13-phase3h).".to_string()
+     CI track, not blocked on M13-phase3h)."
+        .to_string()
 }
 
 #[cfg(target_os = "macos")]
@@ -467,6 +479,26 @@ mod debug_validation_tests {
             "expected runtime-required error, got: {msg}"
         );
     }
+
+    #[test]
+    fn go_dependency_flags_accept_go_and_mixed_runtimes() {
+        let options = crate::goruntime::GoRuntimeBuildOptions {
+            offline: true,
+            module_cache: Some(std::path::PathBuf::from("/tmp/grx-go-mod-cache")),
+        };
+        assert!(validate_go_build_options(RuntimeArg::Go, &options).is_ok());
+        assert!(validate_go_build_options(RuntimeArg::Mixed, &options).is_ok());
+    }
+
+    #[test]
+    fn go_dependency_flags_reject_unrelated_runtimes() {
+        let options = crate::goruntime::GoRuntimeBuildOptions {
+            offline: true,
+            module_cache: None,
+        };
+        let error = validate_go_build_options(RuntimeArg::Null, &options).unwrap_err();
+        assert!(error.to_string().contains("--runtime go"));
+    }
 }
 
 /// **M16-Backend P8.** Reject `--debug=<engine>` that doesn't match
@@ -528,6 +560,20 @@ pub fn validate_debug_against_runtime(
     Ok(Some(d))
 }
 
+pub fn validate_go_build_options(
+    runtime: RuntimeArg,
+    options: &crate::goruntime::GoRuntimeBuildOptions,
+) -> Result<(), CommandError> {
+    if (options.offline || options.module_cache.is_some())
+        && !matches!(runtime, RuntimeArg::Go | RuntimeArg::Mixed)
+    {
+        return Err(CommandError::ClusterArg(format!(
+            "Go dependency flags require `--runtime go` or `--runtime mixed`; got `{runtime}`"
+        )));
+    }
+    Ok(())
+}
+
 /// `grx run --watch` — drives the M15 hot-reload pipeline. Returns
 /// only on SIGINT or fatal error; this is the long-running variant of
 /// `grx run`. Engine-restricted to JSC plus CPython (the null plus
@@ -574,6 +620,22 @@ pub fn run_run(
     debug: Option<crate::debug::DebugFlag>,
     debug_wait: bool,
 ) -> CommandResult<String> {
+    run_run_with_go_options(
+        path,
+        runtime,
+        debug,
+        debug_wait,
+        crate::goruntime::GoRuntimeBuildOptions::default(),
+    )
+}
+
+pub fn run_run_with_go_options(
+    path: &Path,
+    runtime: RuntimeArg,
+    debug: Option<crate::debug::DebugFlag>,
+    debug_wait: bool,
+    go_options: crate::goruntime::GoRuntimeBuildOptions,
+) -> CommandResult<String> {
     let kind = EngineKind::from(runtime);
     let report = match kind {
         // Phase 3b: JSC uses `mount_with_scheduler` — each component
@@ -604,8 +666,8 @@ pub fn run_run(
             let path_buf = path.to_path_buf();
             let debug_install = debug;
             let _ = debug_wait; // no wait-for-client on JSC lockdownd
-            let report =
-                std::thread::spawn(move || -> Result<crate::runtime::DryMountReport, CommandError> {
+            let report = std::thread::spawn(
+                move || -> Result<crate::runtime::DryMountReport, CommandError> {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -625,9 +687,7 @@ pub fn run_run(
                                 d.port,
                             )
                             .map_err(|e| {
-                                CommandError::ClusterArg(format!(
-                                    "debug install failed: {e}"
-                                ))
+                                CommandError::ClusterArg(format!("debug install failed: {e}"))
                             })?;
                         }
                         runtime
@@ -646,13 +706,12 @@ pub fn run_run(
                         let _ = runtime.shutdown();
                         Ok::<_, CommandError>(report)
                     })
-                })
-                .join()
-                .map_err(|_| {
-                    CommandError::Io(std::io::Error::other(
-                        "jsc localset thread panicked",
-                    ))
-                })??;
+                },
+            )
+            .join()
+            .map_err(|_| {
+                CommandError::Io(std::io::Error::other("jsc localset thread panicked"))
+            })??;
             report
         }
         // CPython arm. Files with `lang="python"` definitions route
@@ -678,7 +737,12 @@ pub fn run_run(
                 .root
                 .definitions
                 .iter()
-                .chain(resolved.imports.iter().flat_map(|i| i.file.definitions.iter()))
+                .chain(
+                    resolved
+                        .imports
+                        .iter()
+                        .flat_map(|i| i.file.definitions.iter()),
+                )
                 .any(|d| d.lang == graphreact_grx_parser::ast::ComponentLang::Python);
 
             if has_python_def {
@@ -721,8 +785,7 @@ pub fn run_run(
                             // path (perf wash for any body without
                             // observable side effects on second
                             // render).
-                            let mut runtime =
-                                crate::pyruntime::mount_with_scheduler(&path_buf)?;
+                            let mut runtime = crate::pyruntime::mount_with_scheduler(&path_buf)?;
                             if let Some(d) = debug_install {
                                 {
                                     let mut engine = runtime.engine.borrow_mut();
@@ -759,9 +822,7 @@ pub fn run_run(
                 )
                 .join()
                 .map_err(|_| {
-                    CommandError::Io(std::io::Error::other(
-                        "cpython localset thread panicked",
-                    ))
+                    CommandError::Io(std::io::Error::other("cpython localset thread panicked"))
                 })??
             } else {
                 // Pre-phase-3a smoke fallback. Lets `grx run --runtime=cpython
@@ -776,12 +837,13 @@ pub fn run_run(
                     .map(|g| g.id.clone())
                     .unwrap_or_else(|| "<no graph>".to_string());
                 let (n_nodes, n_edges) = if let Some(g) = graph_block_opt {
-                    let ir = graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
-                        imports: resolved.root.imports.clone(),
-                        graph: Some(g),
-                        subgraphs: resolved.root.subgraphs.clone(),
-                        definitions: resolved.root.definitions.clone(),
-                    })?;
+                    let ir =
+                        graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
+                            imports: resolved.root.imports.clone(),
+                            graph: Some(g),
+                            subgraphs: resolved.root.subgraphs.clone(),
+                            definitions: resolved.root.definitions.clone(),
+                        })?;
                     (ir.nodes.len(), ir.edges.len())
                 } else {
                     (0, 0)
@@ -793,7 +855,9 @@ pub fn run_run(
                         .map(|i| i.file.definitions.len())
                         .sum::<usize>();
 
-                engine.initialize().map_err(crate::runtime::RuntimeError::from)?;
+                engine
+                    .initialize()
+                    .map_err(crate::runtime::RuntimeError::from)?;
                 let iso = engine
                     .create_isolate(graphreact_engine_zig::IsolateOptions::default())
                     .map_err(crate::runtime::RuntimeError::from)?;
@@ -839,8 +903,9 @@ pub fn run_run(
             let _ = debug;
             let _ = debug_wait;
             let path_buf = path.to_path_buf();
-            let result =
-                std::thread::spawn(move || -> Result<crate::runtime::DryMountReport, CommandError> {
+            let go_options = go_options.clone();
+            let result = std::thread::spawn(
+                move || -> Result<crate::runtime::DryMountReport, CommandError> {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -851,7 +916,12 @@ pub fn run_run(
                         })?;
                     let local = tokio::task::LocalSet::new();
                     local.block_on(&rt, async move {
-                        let mut runtime = crate::mixedruntime::mount_mixed(&path_buf)?;
+                        let secrets = crate::runtime_secrets::RuntimeSecretContext::from_env();
+                        let mut runtime = crate::mixedruntime::mount_mixed_with_options(
+                            &path_buf,
+                            Some(secrets),
+                            &go_options,
+                        )?;
                         runtime
                             .process_batch_async()
                             .await
@@ -869,14 +939,48 @@ pub fn run_run(
                         let _ = runtime.shutdown();
                         Ok::<_, CommandError>(report)
                     })
-                })
-                .join()
-                .map_err(|_| {
-                    CommandError::Io(std::io::Error::other(
-                        "mixed-runtime localset thread panicked",
-                    ))
-                })??;
+                },
+            )
+            .join()
+            .map_err(|_| {
+                CommandError::Io(std::io::Error::other(
+                    "mixed-runtime localset thread panicked",
+                ))
+            })??;
             result
+        }
+        EngineKind::Go => {
+            let path_buf = path.to_path_buf();
+            let out_dir = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!(
+                    ".grx-go-build-{}",
+                    path.file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("run"),
+                ));
+            let secrets = crate::runtime_secrets::RuntimeSecretContext::from_env();
+            let mut runtime = crate::goruntime::mount_with_scheduler_and_options(
+                &path_buf,
+                &out_dir,
+                Some(secrets),
+                &go_options,
+            )?;
+            runtime
+                .process_batch()
+                .map_err(crate::runtime::RuntimeError::from)?;
+            let report = crate::runtime::DryMountReport {
+                engine_name: "go".to_string(),
+                engine_version: runtime.engine.borrow().engine_version(),
+                graph_id: runtime.graph_id.clone(),
+                n_nodes: runtime.n_nodes,
+                n_edges: runtime.n_edges,
+                n_definitions: runtime.n_definitions,
+                mounted_components: runtime.mounted.clone(),
+            };
+            let _ = runtime.shutdown();
+            report
         }
         // Null + echo continue using the legacy IIFE-based
         // `eval_module` path. They do no real evaluation anyway —
@@ -1049,9 +1153,7 @@ fn summarise_ast(file: &graphreact_grx_parser::GrxFile) -> String {
 
 /// Build an [`IR`] from any path. Public so integration tests can
 /// reuse the conversion without going through the CLI.
-pub fn build_ir_for_path(
-    path: &Path,
-) -> Result<graphreact_grx_parser::GrxIr, CommandError> {
+pub fn build_ir_for_path(path: &Path) -> Result<graphreact_grx_parser::GrxIr, CommandError> {
     let source = std::fs::read_to_string(path)?;
     let file = Parser::parse_file(&source)?;
     Ok(build_ir(&file)?)
@@ -1093,9 +1195,7 @@ use graphreact_dist::{
     Cluster, ClusterConfig, Creation, NetSplitPolicy, NetTickConfig, NodeId, SecretCookie,
     TlsConfig, RELOAD_V1_CAPABILITY,
 };
-use rustls::pki_types::{
-    pem::PemObject, CertificateDer, PrivateKeyDer,
-};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 /// **M-Prod sub-track #5 safest slice.** Default upper bound on
 /// the OTel `SdkTracerProvider::shutdown()` call during daemon
@@ -1197,6 +1297,54 @@ pub struct TlsPaths {
     pub key_path: std::path::PathBuf,
 }
 
+/// Generate the cluster identity used by `grx cluster daemon
+/// --dev-loopback`. All sensitive material stays in memory and is dropped with
+/// the process; production credential loading remains a separate path.
+pub fn dev_loopback_cluster_material(
+) -> Result<(NodeId, SocketAddr, SecretCookie, TlsConfig), CommandError> {
+    use rand::RngCore;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let node_id: NodeId = "greenhouse@127.0.0.1"
+        .parse()
+        .map_err(|err| CommandError::ClusterArg(format!("dev loopback node id: {err}")))?;
+    let listen = "127.0.0.1:0"
+        .parse()
+        .map_err(|err| CommandError::ClusterArg(format!("dev loopback listen: {err}")))?;
+
+    let mut cookie_bytes = vec![0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut cookie_bytes);
+    let cookie = SecretCookie::from_bytes(cookie_bytes)?;
+
+    let ca_key = rcgen::KeyPair::generate()
+        .map_err(|err| CommandError::ClusterArg(format!("dev loopback CA key: {err}")))?;
+    let mut ca_params = rcgen::CertificateParams::new(vec!["GraphReact development CA".into()])
+        .map_err(|err| CommandError::ClusterArg(format!("dev loopback CA: {err}")))?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .map_err(|err| CommandError::ClusterArg(format!("dev loopback CA signing: {err}")))?;
+    let ca_der: CertificateDer<'static> = ca_cert.der().clone();
+
+    let leaf_key = rcgen::KeyPair::generate()
+        .map_err(|err| CommandError::ClusterArg(format!("dev loopback leaf key: {err}")))?;
+    let mut leaf_params = rcgen::CertificateParams::new(vec!["greenhouse".into()])
+        .map_err(|err| CommandError::ClusterArg(format!("dev loopback leaf: {err}")))?;
+    leaf_params
+        .subject_alt_names
+        .push(rcgen::SanType::DnsName("greenhouse".try_into().map_err(
+            |err: rcgen::Error| CommandError::ClusterArg(format!("dev loopback SAN: {err}")),
+        )?));
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &ca_cert, &ca_key)
+        .map_err(|err| CommandError::ClusterArg(format!("dev loopback leaf signing: {err}")))?;
+    let leaf_der: CertificateDer<'static> = leaf_cert.der().clone();
+    let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into();
+    let tls = TlsConfig::from_pem_bytes(vec![leaf_der], key_der, vec![ca_der], true)?;
+
+    Ok((node_id, listen, cookie, tls))
+}
+
 /// Daemon CLI knobs translated into structured form. Constructed
 /// from the [`crate::cli::ClusterOp::Daemon`] variant; consumed by
 /// [`start_daemon`].
@@ -1208,6 +1356,7 @@ pub struct DaemonOptions {
     pub tls: TlsConfig,
     pub peers: Vec<(NodeId, SocketAddr)>,
     pub runtime: RuntimeArg,
+    pub go_build: crate::goruntime::GoRuntimeBuildOptions,
     pub net_tick: NetTickConfig,
     pub net_split_policy: NetSplitPolicy,
     pub duration_secs: Option<u64>,
@@ -1392,6 +1541,8 @@ pub enum SchedulerHost {
     /// duration of body evaluation. M14.8.x.
     #[cfg(target_os = "macos")]
     Cpython(Box<crate::pyruntime::PyRuntime>),
+    /// Precompiled Go engine-hosted runtime.
+    Go(Box<crate::goruntime::GoRuntime>),
     /// **M22.** Mixed-runtime host — co-owns JSC + CPython + Go
     /// runtimes against the same `.grx` IR. `process_batch` drives
     /// every active engine slot in init order; `scheduler_mut`
@@ -1426,6 +1577,7 @@ impl SchedulerHost {
             SchedulerHost::Jsc(r) => &mut r.scheduler,
             #[cfg(target_os = "macos")]
             SchedulerHost::Cpython(r) => &mut r.scheduler,
+            SchedulerHost::Go(r) => &mut r.scheduler,
             #[cfg(target_os = "macos")]
             SchedulerHost::Mixed(m) => m.scheduler_mut(),
         }
@@ -1464,6 +1616,12 @@ impl SchedulerHost {
                 let started = std::time::Instant::now();
                 let result = r.process_batch();
                 observe_engine_batch_duration(metrics, "cpython", started.elapsed());
+                result
+            }
+            SchedulerHost::Go(r) => {
+                let started = std::time::Instant::now();
+                let result = r.process_batch();
+                observe_engine_batch_duration(metrics, "go", started.elapsed());
                 result
             }
             #[cfg(target_os = "macos")]
@@ -1619,7 +1777,8 @@ impl DaemonHandle {
     }
 
     fn process_batch_observed(&mut self) -> Result<(), graphreact_core::RuntimeError> {
-        self.host.process_batch_with_metrics(self.metrics.as_deref())
+        self.host
+            .process_batch_with_metrics(self.metrics.as_deref())
     }
 
     /// **M22 verify fix.** Read the shared `MetricsInner` Arc, if any
@@ -1807,11 +1966,7 @@ impl DaemonHandle {
         let key_bytes = match std::fs::read(&paths.key_path) {
             Ok(b) => b,
             Err(e) => {
-                graphreact_observer::audit::log_tls_reload_attempt(
-                    cert_bytes.len(),
-                    0,
-                    sink,
-                );
+                graphreact_observer::audit::log_tls_reload_attempt(cert_bytes.len(), 0, sink);
                 graphreact_observer::audit::log_tls_reload_failure(
                     "key_read",
                     &format!("read {}: {}", paths.key_path.display(), e),
@@ -1832,7 +1987,11 @@ impl DaemonHandle {
         let Some(context) = self.runtime_secrets.as_ref() else {
             return;
         };
-        if self.drain.as_ref().is_some_and(graphreact_observer::DrainFlag::is_draining) {
+        if self
+            .drain
+            .as_ref()
+            .is_some_and(graphreact_observer::DrainFlag::is_draining)
+        {
             context.log_reload_skipped();
             return;
         }
@@ -1878,8 +2037,7 @@ impl DaemonHandle {
             Ok(registry) => {
                 let counts = registry.role_counts();
                 rbac.rotate(std::sync::Arc::new(registry));
-                let duration_ms =
-                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                 graphreact_observer::log_token_registry_reloaded(
                     counts.total,
                     counts.admin,
@@ -1938,21 +2096,11 @@ impl DaemonHandle {
                 let key_count = store.key_count();
                 let kid_count = store.kid_count();
                 verifier.jwks().rotate(std::sync::Arc::new(store));
-                let duration_ms =
-                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                graphreact_observer::log_jwks_reloaded(
-                    key_count,
-                    kid_count,
-                    duration_ms,
-                    sink,
-                );
+                let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                graphreact_observer::log_jwks_reloaded(key_count, kid_count, duration_ms, sink);
             }
             Err(err) => {
-                graphreact_observer::log_jwks_reload_failed(
-                    err.kind_str(),
-                    &err.to_string(),
-                    sink,
-                );
+                graphreact_observer::log_jwks_reload_failed(err.kind_str(), &err.to_string(), sink);
             }
         }
     }
@@ -1986,10 +2134,7 @@ impl DaemonHandle {
         };
         if let Some(flag) = self.drain.as_ref() {
             if flag.is_draining() {
-                graphreact_observer::log_audit_log_rotation_skipped(
-                    "draining",
-                    Some(sink),
-                );
+                graphreact_observer::log_audit_log_rotation_skipped("draining", Some(sink));
                 return;
             }
         }
@@ -2053,10 +2198,7 @@ impl DaemonHandle {
         let sink = observer.audit_sink.as_ref();
         if let Some(flag) = self.drain.as_ref() {
             if flag.is_draining() {
-                graphreact_observer::log_audit_forwarder_spool_rotation_skipped(
-                    "draining",
-                    sink,
-                );
+                graphreact_observer::log_audit_forwarder_spool_rotation_skipped("draining", sink);
                 return;
             }
         }
@@ -2234,6 +2376,9 @@ impl DaemonHandle {
             SchedulerHost::Cpython(mut runtime) => {
                 let _ = runtime.shutdown();
             }
+            SchedulerHost::Go(mut runtime) => {
+                let _ = runtime.shutdown();
+            }
             // **M22.** Mixed shutdown reverses init order across
             // every active engine slot; errors are logged inside
             // MixedRuntime::shutdown but never propagated past the
@@ -2261,7 +2406,9 @@ impl DaemonHandle {
     /// inert — there's no ingress surface bumping it).
     #[must_use]
     pub fn observer_ingress_counter(&self) -> Option<graphreact_observer::IngressInFlight> {
-        self.observer.as_ref().map(|_| self.ingress_in_flight.clone())
+        self.observer
+            .as_ref()
+            .map(|_| self.ingress_in_flight.clone())
     }
 }
 
@@ -2317,6 +2464,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         opts.runtime,
         opts.debug,
         runtime_secrets.clone(),
+        &opts.go_build,
     )?;
     // **M16-Backend P8.** Install debugpy on the freshly-mounted
     // CPython isolate (if `--debug=cpython:<port>` was passed).
@@ -2406,7 +2554,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // Install as the wire-tracing hook so route_outbound
         // populates wire::Message::trace_context.
         cluster.install_wire_tracing_hook(
-            sink.clone() as std::sync::Arc<dyn graphreact_dist::WireTracingHook>,
+            sink.clone() as std::sync::Arc<dyn graphreact_dist::WireTracingHook>
         );
         let sink_dyn = sink as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
         (Some(sink_dyn), Some(provider))
@@ -2431,8 +2579,9 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     // observer is wired. `None` when no observer is configured
     // (zero-overhead default).
     #[allow(unused_assignments)]
-    let mut metrics_for_engine_counts: Option<std::sync::Arc<graphreact_observer::MetricsInner>> =
-        None;
+    let mut metrics_for_engine_counts: Option<
+        std::sync::Arc<graphreact_observer::MetricsInner>,
+    > = None;
     // **M-Prod sub-track #5.** Cluster-readiness counter shared
     // between the `/v1/readyz` handler and the per-peer dial loop
     // below. The handler returns 200 once `configured_peers == 0`
@@ -2498,17 +2647,15 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // off-by-default — flags opt in. When no forwarder is
         // wired the hub Arc itself is None (zero overhead — no
         // worker tasks).
-        let mut forwarders: Vec<
-            std::sync::Arc<dyn graphreact_observer::AuditForwarder>,
-        > = Vec::new();
+        let mut forwarders: Vec<std::sync::Arc<dyn graphreact_observer::AuditForwarder>> =
+            Vec::new();
         if let Some(spool_path) = opts.observer_audit_forwarder_spool.as_ref() {
-            let spool =
-                graphreact_observer::SpoolFileForwarder::open(spool_path).map_err(|e| {
-                    CommandError::ClusterArg(format!(
-                        "observer-audit-forwarder-spool open {}: {e}",
-                        spool_path.display()
-                    ))
-                })?;
+            let spool = graphreact_observer::SpoolFileForwarder::open(spool_path).map_err(|e| {
+                CommandError::ClusterArg(format!(
+                    "observer-audit-forwarder-spool open {}: {e}",
+                    spool_path.display()
+                ))
+            })?;
             forwarders.push(std::sync::Arc::new(spool));
         }
         if opts.observer_audit_forwarder_stderr {
@@ -2516,39 +2663,38 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
                 graphreact_observer::StderrJsonLinesForwarder::new(),
             ));
         }
-        let forwarder_hub: Option<
-            std::sync::Arc<graphreact_observer::ForwarderHub>,
-        > = if forwarders.is_empty() {
-            None
-        } else {
-            Some(std::sync::Arc::new(graphreact_observer::ForwarderHub::new(
-                forwarders,
-                Some(metrics.clone()),
-                graphreact_observer::resolve_audit_forwarder_queue_depth(),
-            )))
-        };
-        let audit_sink: Option<
-            std::sync::Arc<dyn graphreact_observer::AuditSink>,
-        > = match opts.observer_audit_log.as_ref() {
-            Some(path) => {
-                let mut cfg = graphreact_observer::AuditChainConfig::new()
-                    .with_metrics(metrics.clone())
-                    .from_env_overlay();
-                if let Some(hub) = forwarder_hub.as_ref() {
-                    cfg = cfg.with_forwarder_hub(hub.clone());
+        let forwarder_hub: Option<std::sync::Arc<graphreact_observer::ForwarderHub>> =
+            if forwarders.is_empty() {
+                None
+            } else {
+                Some(std::sync::Arc::new(graphreact_observer::ForwarderHub::new(
+                    forwarders,
+                    Some(metrics.clone()),
+                    graphreact_observer::resolve_audit_forwarder_queue_depth(),
+                )))
+            };
+        let audit_sink: Option<std::sync::Arc<dyn graphreact_observer::AuditSink>> =
+            match opts.observer_audit_log.as_ref() {
+                Some(path) => {
+                    let mut cfg = graphreact_observer::AuditChainConfig::new()
+                        .with_metrics(metrics.clone())
+                        .from_env_overlay();
+                    if let Some(hub) = forwarder_hub.as_ref() {
+                        cfg = cfg.with_forwarder_hub(hub.clone());
+                    }
+                    Some(std::sync::Arc::new(
+                        graphreact_observer::FileAuditSink::open_with_config(path, cfg).map_err(
+                            |e| {
+                                CommandError::ClusterArg(format!(
+                                    "observer-audit-log open {}: {e}",
+                                    path.display()
+                                ))
+                            },
+                        )?,
+                    ))
                 }
-                Some(std::sync::Arc::new(
-                    graphreact_observer::FileAuditSink::open_with_config(path, cfg)
-                        .map_err(|e| {
-                            CommandError::ClusterArg(format!(
-                                "observer-audit-log open {}: {e}",
-                                path.display()
-                            ))
-                        })?,
-                ))
-            }
-            None => None,
-        };
+                None => None,
+            };
         if let Some(context) = runtime_secrets.as_ref() {
             context.set_audit_sink(audit_sink.clone());
         }
@@ -2563,8 +2709,8 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         let rbac_handle: Option<graphreact_observer::RotatableRegistry> =
             match opts.observer_tokens_path.as_ref() {
                 Some(path) => {
-                    let registry = graphreact_observer::load_registry_from_file(path)
-                        .map_err(|e| {
+                    let registry =
+                        graphreact_observer::load_registry_from_file(path).map_err(|e| {
                             CommandError::ClusterArg(format!(
                                 "observer-tokens load {}: {e}",
                                 path.display()
@@ -2583,50 +2729,47 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // together — half-configured is a no-go state. fail-fast on
         // either-but-not-both rather than silently degrade. Parse
         // / mode / empty failures surface as daemon boot failure.
-        let jwt_verifier_handle: Option<std::sync::Arc<graphreact_observer::JwtVerifier>> =
-            match (
-                opts.observer_jwt_config_path.as_ref(),
-                opts.observer_jwks_path.as_ref(),
-            ) {
-                (Some(cfg_path), Some(jwks_path)) => {
-                    let cfg = graphreact_observer::load_jwt_oidc_config_from_file(cfg_path)
-                        .map_err(|e| {
-                            CommandError::ClusterArg(format!(
-                                "observer-jwt-config load {}: {e}",
-                                cfg_path.display()
-                            ))
-                        })?;
-                    let jwks = graphreact_observer::load_jwks_from_file(jwks_path)
-                        .map_err(|e| {
-                            CommandError::ClusterArg(format!(
-                                "observer-jwks load {}: {e}",
-                                jwks_path.display()
-                            ))
-                        })?;
-                    let rotatable =
-                        graphreact_observer::RotatableJwks::new(std::sync::Arc::new(jwks));
-                    Some(std::sync::Arc::new(graphreact_observer::JwtVerifier::new(
-                        cfg, rotatable,
-                    )))
-                }
-                (Some(cfg_path), None) => {
-                    return Err(CommandError::ClusterArg(format!(
-                        "observer-jwt-config {} requires --observer-jwks; \
+        let jwt_verifier_handle: Option<std::sync::Arc<graphreact_observer::JwtVerifier>> = match (
+            opts.observer_jwt_config_path.as_ref(),
+            opts.observer_jwks_path.as_ref(),
+        ) {
+            (Some(cfg_path), Some(jwks_path)) => {
+                let cfg =
+                    graphreact_observer::load_jwt_oidc_config_from_file(cfg_path).map_err(|e| {
+                        CommandError::ClusterArg(format!(
+                            "observer-jwt-config load {}: {e}",
+                            cfg_path.display()
+                        ))
+                    })?;
+                let jwks = graphreact_observer::load_jwks_from_file(jwks_path).map_err(|e| {
+                    CommandError::ClusterArg(format!(
+                        "observer-jwks load {}: {e}",
+                        jwks_path.display()
+                    ))
+                })?;
+                let rotatable = graphreact_observer::RotatableJwks::new(std::sync::Arc::new(jwks));
+                Some(std::sync::Arc::new(graphreact_observer::JwtVerifier::new(
+                    cfg, rotatable,
+                )))
+            }
+            (Some(cfg_path), None) => {
+                return Err(CommandError::ClusterArg(format!(
+                    "observer-jwt-config {} requires --observer-jwks; \
                          the JWT bridge needs both the bridge config (issuers \
                          + role mapping) AND the IdP signing keys",
-                        cfg_path.display()
-                    )))
-                }
-                (None, Some(jwks_path)) => {
-                    return Err(CommandError::ClusterArg(format!(
-                        "observer-jwks {} requires --observer-jwt-config; \
+                    cfg_path.display()
+                )))
+            }
+            (None, Some(jwks_path)) => {
+                return Err(CommandError::ClusterArg(format!(
+                    "observer-jwks {} requires --observer-jwt-config; \
                          the JWT bridge needs both the IdP signing keys AND \
                          the bridge config (issuers + role mapping)",
-                        jwks_path.display()
-                    )))
-                }
-                (None, None) => None,
-            };
+                    jwks_path.display()
+                )))
+            }
+            (None, None) => None,
+        };
         let server = graphreact_observer::spawn_management_api_with_options(
             graphreact_observer::SpawnOptions {
                 bind: bind_cfg,
@@ -2702,9 +2845,8 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // a multiplex consumer so the scheduler's `on_call_reply`
         // event resolves the awaiting `oneshot::Sender` for any
         // in-flight `POST /v1/nodes/:id/call`.
-        let pending_calls_dyn =
-            std::sync::Arc::new(server.pending_calls.clone())
-                as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
+        let pending_calls_dyn = std::sync::Arc::new(server.pending_calls.clone())
+            as std::sync::Arc<dyn graphreact_core::TelemetrySink>;
         mux_builder = mux_builder.push(pending_calls_dyn);
         // **M16-Backend P10.** Add OtelSink as a fourth multiplex
         // consumer (after Prom + Ring + WS). Only installed when
@@ -2723,7 +2865,8 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // `--observer-bind` — install directly on scheduler +
         // cluster via single-sink path. Supports the "OTel-only"
         // deployment shape (no Prometheus, no management API).
-        host.scheduler_mut().install_telemetry_sink(otel_sink.clone());
+        host.scheduler_mut()
+            .install_telemetry_sink(otel_sink.clone());
         cluster.install_telemetry_sink(otel_sink);
         None
     } else {
@@ -2752,9 +2895,8 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     //
     // For the engine-free path this is a no-op (no nodes registered
     // → process_batch settles immediately).
-    host.process_batch_with_metrics(metrics_for_engine_counts.as_deref()).map_err(|e| {
-        CommandError::Runtime(crate::runtime::RuntimeError::from(e))
-    })?;
+    host.process_batch_with_metrics(metrics_for_engine_counts.as_deref())
+        .map_err(|e| CommandError::Runtime(crate::runtime::RuntimeError::from(e)))?;
 
     // **M22 phase 4.** Record the first batch's body-evaluation
     // counts. Subsequent `process_batch` rounds (driven by
@@ -2856,10 +2998,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
 /// `/v1/metrics` scrape sees the mount counts. Pure-lang
 /// daemons emit one series; mixed daemons emit one per active
 /// engine slot.
-fn record_engine_mount_metrics(
-    host: &SchedulerHost,
-    metrics: &graphreact_observer::MetricsInner,
-) {
+fn record_engine_mount_metrics(host: &SchedulerHost, metrics: &graphreact_observer::MetricsInner) {
     match host {
         SchedulerHost::Empty(_) => {}
         #[cfg(target_os = "macos")]
@@ -2874,6 +3013,11 @@ fn record_engine_mount_metrics(
                 metrics.engine_mount_count_inc("cpython");
             }
         }
+        SchedulerHost::Go(r) => {
+            for _ in &r.mounted {
+                metrics.engine_mount_count_inc("go");
+            }
+        }
         #[cfg(target_os = "macos")]
         SchedulerHost::Mixed(m) => {
             m.record_mount_metrics(metrics);
@@ -2886,10 +3030,7 @@ fn record_engine_mount_metrics(
 /// each `process_batch` round (initial boot batch + every
 /// `drive_handle_until` tick). The per-batch upper bound is one
 /// eval per mounted node per active engine.
-fn record_engine_eval_metrics(
-    host: &SchedulerHost,
-    metrics: &graphreact_observer::MetricsInner,
-) {
+fn record_engine_eval_metrics(host: &SchedulerHost, metrics: &graphreact_observer::MetricsInner) {
     match host {
         SchedulerHost::Empty(_) => {}
         #[cfg(target_os = "macos")]
@@ -2902,6 +3043,11 @@ fn record_engine_eval_metrics(
         SchedulerHost::Cpython(r) => {
             for _ in &r.mounted {
                 metrics.engine_eval_count_inc("cpython");
+            }
+        }
+        SchedulerHost::Go(r) => {
+            for _ in &r.mounted {
+                metrics.engine_eval_count_inc("go");
             }
         }
         #[cfg(target_os = "macos")]
@@ -2924,6 +3070,7 @@ fn build_scheduler_host(
     runtime: RuntimeArg,
     debug: Option<crate::debug::DebugFlag>,
     secrets: Option<std::sync::Arc<crate::runtime_secrets::RuntimeSecretContext>>,
+    go_options: &crate::goruntime::GoRuntimeBuildOptions,
 ) -> Result<SchedulerHost, CommandError> {
     match (path, runtime) {
         (None, _) => Ok(SchedulerHost::Empty(Box::default())),
@@ -2953,9 +3100,7 @@ fn build_scheduler_host(
                     runtime.iso,
                     d.port,
                 )
-                .map_err(|e| {
-                    CommandError::ClusterArg(format!("debug install failed: {e}"))
-                })?;
+                .map_err(|e| CommandError::ClusterArg(format!("debug install failed: {e}")))?;
             }
             Ok(SchedulerHost::Jsc(Box::new(runtime)))
         }
@@ -2973,9 +3118,23 @@ fn build_scheduler_host(
             let runtime = crate::pyruntime::mount_with_scheduler_and_secrets(path, secrets)?;
             Ok(SchedulerHost::Cpython(Box::new(runtime)))
         }
+        (Some(path), RuntimeArg::Go) => {
+            let out_dir = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!(
+                    ".grx-go-build-{}",
+                    path.file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("daemon"),
+                ));
+            let runtime = crate::goruntime::mount_with_scheduler_and_options(
+                path, &out_dir, secrets, go_options,
+            )?;
+            Ok(SchedulerHost::Go(Box::new(runtime)))
+        }
         (Some(_), RuntimeArg::Null) => Err(CommandError::ClusterArg(
-            "`--runtime null` requires no `--path`; remove the path or pick a real runtime"
-                .into(),
+            "`--runtime null` requires no `--path`; remove the path or pick a real runtime".into(),
         )),
         // **M22.** Mixed-runtime daemon arm. Brings up every
         // engine present in the IR via `mount_mixed`. Debug attach
@@ -2990,11 +3149,10 @@ fn build_scheduler_host(
                 // bypasses validation doesn't silently drop the
                 // flag.
                 return Err(CommandError::ClusterArg(
-                    "--debug under `--runtime=mixed` is rejected; pin to a single engine."
-                        .into(),
+                    "--debug under `--runtime=mixed` is rejected; pin to a single engine.".into(),
                 ));
             }
-            let runtime = crate::mixedruntime::mount_mixed_with_secrets(path, secrets)?;
+            let runtime = crate::mixedruntime::mount_mixed_with_options(path, secrets, go_options)?;
             Ok(SchedulerHost::Mixed(Box::new(runtime)))
         }
         (Some(_), other) => Err(CommandError::ClusterArg(format!(
@@ -3166,8 +3324,7 @@ pub async fn drive_handle_until(
     handle: &mut DaemonHandle,
     duration: Option<u64>,
 ) -> Result<LoopExit, CommandError> {
-    let deadline =
-        duration.map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs));
+    let deadline = duration.map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs));
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     tick.tick().await; // skip immediate
 
@@ -3414,8 +3571,7 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
                 oneshot_tx,
             } => {
                 if scheduler.introspect_node(&node_id).is_none() {
-                    let _ = oneshot_tx
-                        .send(graphreact_observer::InjectResult::NodeNotFound);
+                    let _ = oneshot_tx.send(graphreact_observer::InjectResult::NodeNotFound);
                 } else {
                     // `send_ingress` prepends `from = "__ingress__"`, which
                     // makes `Scheduler::deliver` enforce the target's
@@ -3425,8 +3581,7 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
                     scheduler
                         .handle()
                         .send_ingress(node_id, message_type, payload);
-                    let _ = oneshot_tx
-                        .send(graphreact_observer::InjectResult::Accepted);
+                    let _ = oneshot_tx.send(graphreact_observer::InjectResult::Accepted);
                 }
             }
             // **M-Ingress phase 2.** Validate node existence + the
@@ -3446,9 +3601,8 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
                 oneshot_tx,
             } => {
                 if scheduler.introspect_node(&node_id).is_none() {
-                    let _ = oneshot_tx.send(
-                        graphreact_observer::InjectMessageWithReplyDisposition::NodeNotFound,
-                    );
+                    let _ = oneshot_tx
+                        .send(graphreact_observer::InjectMessageWithReplyDisposition::NodeNotFound);
                 } else {
                     // Look up the manifest from the scheduler's
                     // live index for the matching
@@ -3459,8 +3613,7 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
                         .get(&node_id)
                         .map(|m| {
                             m.accepts_external_call.iter().any(|c| {
-                                c.request_type == message_type
-                                    && c.reply_type == reply_type
+                                c.request_type == message_type && c.reply_type == reply_type
                             })
                         })
                         .unwrap_or(false);
@@ -3498,23 +3651,19 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
                 oneshot_tx,
             } => {
                 if scheduler.introspect_node(&node_id).is_none() {
-                    let _ = oneshot_tx
-                        .send(graphreact_observer::BulkInjectResult::NodeNotFound);
+                    let _ = oneshot_tx.send(graphreact_observer::BulkInjectResult::NodeNotFound);
                 } else {
                     let manifest_match = scheduler
                         .manifests
                         .borrow()
                         .get(&node_id)
-                        .map(|m| {
-                            m.accepts_external.iter().any(|t| t == &message_type)
-                        })
+                        .map(|m| m.accepts_external.iter().any(|t| t == &message_type))
                         .unwrap_or(false);
                     if manifest_match {
                         scheduler
                             .handle()
                             .send_ingress(node_id, message_type, payload);
-                        let _ = oneshot_tx
-                            .send(graphreact_observer::BulkInjectResult::Accepted);
+                        let _ = oneshot_tx.send(graphreact_observer::BulkInjectResult::Accepted);
                     } else {
                         let _ = oneshot_tx
                             .send(graphreact_observer::BulkInjectResult::RejectedByManifest);
@@ -3594,9 +3743,9 @@ fn default_creation() -> u32 {
 /// dial address; `NodeId::host` is `host:port` literally and is
 /// handed to `tokio::net::TcpStream::connect` (via `dial`).
 pub fn parse_peer_entry(spec: &str) -> Result<(NodeId, SocketAddr), CommandError> {
-    let id: NodeId = spec.parse().map_err(|e| {
-        CommandError::ClusterArg(format!("peer `{spec}`: {e}"))
-    })?;
+    let id: NodeId = spec
+        .parse()
+        .map_err(|e| CommandError::ClusterArg(format!("peer `{spec}`: {e}")))?;
     let addr: SocketAddr = id.host().parse().map_err(|e| {
         CommandError::ClusterArg(format!(
             "peer `{spec}` host `{}` is not a valid socket address: {e}",
@@ -3634,19 +3783,22 @@ pub fn load_tls_from_paths(
     let cert_path_str = cert_path.display();
     let key_path_str = key_path.display();
     let ca_path_str = ca_path.display();
-    let cert_chain: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_file_iter(cert_path)
-            .map_err(|e| CommandError::ClusterArg(format!("cert {cert_path_str}: {e}")))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| CommandError::ClusterArg(format!("cert {cert_path_str}: {e}")))?;
-    let private_key: PrivateKeyDer<'static> =
-        PrivateKeyDer::from_pem_file(key_path)
-            .map_err(|e| CommandError::ClusterArg(format!("key {key_path_str}: {e}")))?;
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| CommandError::ClusterArg(format!("cert {cert_path_str}: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CommandError::ClusterArg(format!("cert {cert_path_str}: {e}")))?;
+    let private_key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| CommandError::ClusterArg(format!("key {key_path_str}: {e}")))?;
     let ca: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_path)
         .map_err(|e| CommandError::ClusterArg(format!("ca {ca_path_str}: {e}")))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| CommandError::ClusterArg(format!("ca {ca_path_str}: {e}")))?;
-    Ok(TlsConfig::from_pem_bytes(cert_chain, private_key, ca, true)?)
+    Ok(TlsConfig::from_pem_bytes(
+        cert_chain,
+        private_key,
+        ca,
+        true,
+    )?)
 }
 
 // `Arc` import is used by `load_tls_from_paths`'s arena symbol
@@ -3860,7 +4012,13 @@ mod tests {
         let out = run_version().expect("version ok");
         // Locked prefixes: anything an operator script might depend on
         // when parsing `grx version`.
-        for needle in ["grx ", "parser ", "engine-trait", "engine-null", "engine-echo"] {
+        for needle in [
+            "grx ",
+            "parser ",
+            "engine-trait",
+            "engine-null",
+            "engine-echo",
+        ] {
             assert!(
                 out.contains(needle),
                 "version output must contain `{needle}`: {out}",

@@ -78,11 +78,7 @@ async fn spawn_fixture(process_start_id: u64) -> (ApiServerHandle, JoinHandle<()
                         max_restarts: 3,
                         period_secs: 5,
                         restart_count: 0,
-                        children: vec![
-                            "logger".into(),
-                            "sensor-1".into(),
-                            "sensor-2".into(),
-                        ],
+                        children: vec!["logger".into(), "sensor-1".into(), "sensor-2".into()],
                     }]);
                 }
                 // **M-Ingress.** TUI smoke test does not exercise inject /
@@ -238,7 +234,10 @@ async fn reconnect_keeps_last_known_state_visible() {
     let dump = dump_buffer(&term);
     assert!(dump.contains("disconnected"), "buffer: {dump}");
     assert!(dump.contains("connect refused"), "buffer: {dump}");
-    assert!(dump.contains("nodes:        3"), "last-known still shown: {dump}");
+    assert!(
+        dump.contains("nodes:        3"),
+        "last-known still shown: {dump}"
+    );
 }
 
 fn unix_ms() -> u64 {

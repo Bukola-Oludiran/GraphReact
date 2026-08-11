@@ -85,8 +85,7 @@ fn build_test_jwks_store() -> Arc<JwksStore> {
     let jwks_json = format!(
         r#"{{"keys": [{{"kty":"RSA","kid":"{TEST_KID}","use":"sig","alg":"RS256","n":"{TEST_RSA_N}","e":"{TEST_RSA_E}"}}]}}"#
     );
-    let set: jsonwebtoken::jwk::JwkSet =
-        serde_json::from_str(&jwks_json).expect("parse JWKS json");
+    let set: jsonwebtoken::jwk::JwkSet = serde_json::from_str(&jwks_json).expect("parse JWKS json");
     Arc::new(
         JwksStore::from_jwk_set(set, std::path::Path::new("test-jwks.json"))
             .expect("build JwksStore"),
@@ -150,8 +149,8 @@ fn mint_test_jwt(
     claims.insert("nbf".to_string(), json!(now - 30));
     claims.insert("iat".to_string(), json!(now));
     claims.insert("role".to_string(), role_claim_value);
-    let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes())
-        .expect("load test RSA key");
+    let key =
+        EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes()).expect("load test RSA key");
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
     jsonwebtoken::encode(&header, &claims, &key).expect("encode jwt")

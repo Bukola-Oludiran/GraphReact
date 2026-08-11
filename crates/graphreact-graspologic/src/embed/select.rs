@@ -144,7 +144,11 @@ pub fn select_svd(
         Some(k) => k,
         None => {
             let elbows = select_dimension(&full.s, n_elbows.max(1));
-            elbows.last().map(|(idx, _)| *idx).unwrap_or(min_shape).max(1)
+            elbows
+                .last()
+                .map(|(idx, _)| *idx)
+                .unwrap_or(min_shape)
+                .max(1)
         }
     };
 
@@ -192,10 +196,7 @@ fn select_svd_symmetric(
             .partial_cmp(&decomp.eigenvalues[i].abs())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let s_full: Vec<f64> = order
-        .iter()
-        .map(|&i| decomp.eigenvalues[i].abs())
-        .collect();
+    let s_full: Vec<f64> = order.iter().map(|&i| decomp.eigenvalues[i].abs()).collect();
 
     let k = match n_components {
         Some(k) => k,

@@ -139,7 +139,11 @@ fn ping_pong_ttl_inheritance_terminates_naturally() {
                         observed
                             .borrow_mut()
                             .push(format!("{label}-emit:{count_for_emit}"));
-                        emit_fn(emit_type, json!({ "n": count_for_emit }), EmitOptions::default());
+                        emit_fn(
+                            emit_type,
+                            json!({ "n": count_for_emit }),
+                            EmitOptions::default(),
+                        );
                         None
                     },
                     vec![json!(count)],
@@ -186,10 +190,7 @@ fn ping_pong_ttl_inheritance_terminates_naturally() {
         ping_emits >= 2,
         "ping emitted multiple times before TTL exhaust: {log:?}"
     );
-    assert!(
-        pong_emits >= 2,
-        "pong emitted multiple times: {log:?}"
-    );
+    assert!(pong_emits >= 2, "pong emitted multiple times: {log:?}");
     assert!(
         ping_recvs >= 1,
         "ping received from pong at least once: {log:?}"

@@ -86,8 +86,5 @@ fn main() {
             .status();
     }
 
-    println!(
-        "cargo:rustc-env=GRX_GO_TEST_DYLIB={}",
-        dll_path.display()
-    );
+    println!("cargo:rustc-env=GRX_GO_TEST_DYLIB={}", dll_path.display());
 }

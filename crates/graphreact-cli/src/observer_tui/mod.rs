@@ -55,11 +55,9 @@ use ws_client::{run_ws_task, WsCtx};
 pub async fn run(target: TlsObserverTarget) -> Result<(), CommandError> {
     let parsed = Target::parse(&target.target)
         .map_err(|e| CommandError::ClusterArg(format!("--target: {e}")))?;
-    let token = observer_client::resolve_token(
-        target.token_env.as_deref(),
-        target.token_file.as_deref(),
-    )
-    .map_err(|e| CommandError::ClusterArg(format!("token: {e}")))?;
+    let token =
+        observer_client::resolve_token(target.token_env.as_deref(), target.token_file.as_deref())
+            .map_err(|e| CommandError::ClusterArg(format!("token: {e}")))?;
     let tls_mode = if target.insecure_no_tls {
         TlsMode::InsecureSkipVerify
     } else {
@@ -99,11 +97,7 @@ pub async fn run(target: TlsObserverTarget) -> Result<(), CommandError> {
         token,
         tls: tls_mode,
     });
-    let ws_handle = tokio::spawn(run_ws_task(
-        ws_ctx,
-        state_tx.clone(),
-        shutdown_rx.clone(),
-    ));
+    let ws_handle = tokio::spawn(run_ws_task(ws_ctx, state_tx.clone(), shutdown_rx.clone()));
 
     let render_result = render_loop(state_tx, state_rx, focused_tx, shutdown_tx).await;
     let _ = poller_handle.await;
@@ -117,11 +111,11 @@ async fn render_loop(
     focused_tx: watch::Sender<Option<String>>,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<(), CommandError> {
-    let _guard = TerminalGuard::enter()
-        .map_err(|e| CommandError::Io(io::Error::other(e.to_string())))?;
+    let _guard =
+        TerminalGuard::enter().map_err(|e| CommandError::Io(io::Error::other(e.to_string())))?;
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)
-        .map_err(|e| CommandError::Io(io::Error::other(e.to_string())))?;
+    let mut terminal =
+        Terminal::new(backend).map_err(|e| CommandError::Io(io::Error::other(e.to_string())))?;
 
     let mut events = EventStream::new();
     // ratatui re-render cadence — the polling task drives state

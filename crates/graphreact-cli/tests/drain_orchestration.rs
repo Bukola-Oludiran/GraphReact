@@ -29,18 +29,14 @@ fn pair_tls(name_a: &str, name_b: &str) -> (TlsConfig, TlsConfig) {
     let ca_der: CertificateDer<'static> = ca_cert.der().clone();
 
     let make_leaf = |name: &str| -> TlsConfig {
-        let mut params =
-            rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
+        let mut params = rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
         params.subject_alt_names.push(rcgen::SanType::DnsName(
             name.to_string().try_into().expect("san name"),
         ));
         let kp = rcgen::KeyPair::generate().expect("leaf keygen");
-        let cert = params
-            .signed_by(&kp, &ca_cert, &ca_kp)
-            .expect("leaf sign");
+        let cert = params.signed_by(&kp, &ca_cert, &ca_kp).expect("leaf sign");
         let cert_der: CertificateDer<'static> = cert.der().clone();
-        let key_der: PrivateKeyDer<'static> =
-            PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
+        let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
         TlsConfig::from_pem_bytes(vec![cert_der], key_der, vec![ca_der.clone()], true)
             .expect("tls from pem bytes")
     };
@@ -89,6 +85,7 @@ async fn boot_daemon(with_observer: bool) -> graphreact_cli::commands::DaemonHan
         tls,
         peers: Vec::new(),
         runtime: graphreact_cli::cli::RuntimeArg::Null,
+        go_build: Default::default(),
         net_tick: fast_tick(),
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
@@ -124,7 +121,10 @@ async fn start_drain_completes_immediately_when_inflight_empty() {
         outcome.in_flight_settled,
         "no in-flight requests → drain should settle (got {outcome:?})"
     );
-    assert!(!outcome.deadline_exceeded, "deadline was 5s; nothing pending");
+    assert!(
+        !outcome.deadline_exceeded,
+        "deadline was 5s; nothing pending"
+    );
     assert!(
         outcome.cluster_quiesced,
         "empty cluster handshake population should quiesce"

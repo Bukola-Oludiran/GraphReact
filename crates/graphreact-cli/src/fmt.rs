@@ -153,8 +153,7 @@ mod tests {
 
     #[test]
     fn fmt_is_idempotent() {
-        let input =
-            "<Graph id=\"g\"><A id=\"a\"><B id=\"b\" v={3} /></A></Graph>";
+        let input = "<Graph id=\"g\"><A id=\"a\"><B id=\"b\" v={3} /></A></Graph>";
         let once = round_trip(input);
         let file = Parser::parse_file(&once).expect("re-parse");
         let twice = format_file(&file);

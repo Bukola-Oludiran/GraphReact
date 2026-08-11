@@ -248,9 +248,7 @@ fn format_rfc3339_millis(time: SystemTime) -> String {
     let secs = dur.as_secs();
     let millis = dur.subsec_millis();
     let (year, month, day, hour, min, sec) = unix_to_civil(secs);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
 }
 
 /// Convert UNIX timestamp (seconds) to civil date (Y, M, D, h, m, s)
@@ -258,7 +256,11 @@ fn format_rfc3339_millis(time: SystemTime) -> String {
 /// by `chrono` and `time` crates internally — exact through 9999
 /// CE, no leap-second handling (Prometheus / Loki / Elastic don't
 /// honour them either, so the parity is fine).
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn unix_to_civil(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let day_secs: u64 = secs % 86_400;
     let days: i64 = (secs / 86_400) as i64;
@@ -418,8 +420,7 @@ mod tests {
         use tracing_subscriber::Registry;
 
         let buf = SharedBuffer::new();
-        let subscriber =
-            Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
+        let subscriber = Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
 
         with_default(subscriber, || {
             tracing::info!("first");
@@ -447,8 +448,7 @@ mod tests {
         use tracing_subscriber::Registry;
 
         let buf = SharedBuffer::new();
-        let subscriber =
-            Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
+        let subscriber = Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
         with_default(subscriber, || tracing::info!("now"));
 
         let out = buf.snapshot();

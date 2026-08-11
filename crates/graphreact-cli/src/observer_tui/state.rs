@@ -129,7 +129,9 @@ impl Pane {
 pub enum TraceEntry {
     /// Operator-visible divider when `process_start_id` changes
     /// mid-session — the daemon was restarted under our feet.
-    TargetRestarted { ts_ms: u64 },
+    TargetRestarted {
+        ts_ms: u64,
+    },
     Message(MessageRow),
 }
 
@@ -231,7 +233,10 @@ impl ObserverState {
     /// last-known state stays visible while the reconnect happens.
     pub fn record_disconnect(&mut self, reason: String, retry_in_ms: u64) {
         self.last_error = Some(reason.clone());
-        self.connection = Connection::Disconnected { reason, retry_in_ms };
+        self.connection = Connection::Disconnected {
+            reason,
+            retry_in_ms,
+        };
     }
 
     /// Operator-facing label for the focused trace node, or `None`

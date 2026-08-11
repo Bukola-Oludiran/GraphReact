@@ -188,10 +188,7 @@ impl NodeRegistry {
     /// Snapshot the current peer set. Caller-side use cases:
     /// `grx cluster status`, `pg` gossip target list.
     pub fn list(&self) -> Vec<NodeId> {
-        self.peers
-            .iter()
-            .map(|r| r.value().node.clone())
-            .collect()
+        self.peers.iter().map(|r| r.value().node.clone()).collect()
     }
 
     /// **M15 Phase 10.** Snapshot the current peer set as
@@ -200,10 +197,7 @@ impl NodeRegistry {
     /// that doesn't require holding any DashMap reference
     /// across the per-peer iteration.
     pub fn snapshot_handles(&self) -> Vec<Arc<PeerHandle>> {
-        self.peers
-            .iter()
-            .map(|r| Arc::clone(r.value()))
-            .collect()
+        self.peers.iter().map(|r| Arc::clone(r.value())).collect()
     }
 
     /// Number of currently-connected peers. O(1).

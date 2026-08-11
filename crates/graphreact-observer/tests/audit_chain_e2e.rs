@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use graphreact_observer::{
-    replay_audit_chain, spawn_management_api_with_options, BearerToken, BindConfig,
-    FileAuditSink, MetricsInner, SnapshotRequest, SpawnOptions,
+    replay_audit_chain, spawn_management_api_with_options, BearerToken, BindConfig, FileAuditSink,
+    MetricsInner, SnapshotRequest, SpawnOptions,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -204,7 +204,10 @@ async fn no_token_chain_carries_bind_and_response() {
     // Arc threaded through spawn_with_options → audit::log_bind →
     // FileAuditSink::append → on-disk NDJSON.
     assert!(!records.is_empty(), "at least the bind record");
-    let bind = records.iter().find(|r| r.kind == "bind").expect("bind kind");
+    let bind = records
+        .iter()
+        .find(|r| r.kind == "bind")
+        .expect("bind kind");
     assert_eq!(bind.seq, 0);
     // tls + auth fields from the structured fan-out
     assert_eq!(bind.fields["tls"], serde_json::Value::Bool(false));
@@ -244,18 +247,10 @@ async fn auth_fail_lands_in_chain_under_bad_token() {
         .filter(|r| r.kind == "auth_fail")
         .collect::<Vec<_>>();
     assert_eq!(bind_count, 1, "exactly one bind record on a fresh chain");
-    assert_eq!(
-        auth_fail.len(),
-        2,
-        "two auth_fail records: missing + wrong"
-    );
+    assert_eq!(auth_fail.len(), 2, "two auth_fail records: missing + wrong");
     let reasons: Vec<&str> = auth_fail
         .iter()
-        .map(|r| {
-            r.fields["reason"]
-                .as_str()
-                .expect("reason is a string")
-        })
+        .map(|r| r.fields["reason"].as_str().expect("reason is a string"))
         .collect();
     assert!(reasons.contains(&"missing"));
     assert!(reasons.contains(&"wrong"));
@@ -290,9 +285,7 @@ async fn no_sink_default_keeps_legacy_behavior() {
         .expect("spawn");
     let addr = server.local_addr;
     let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
-    let drain = tokio::spawn(async move {
-        while let Some(_req) = snapshot_rx.recv().await {}
-    });
+    let drain = tokio::spawn(async move { while let Some(_req) = snapshot_rx.recv().await {} });
 
     let (status, _) = http_get(&format!("http://{addr}/v1/healthz"), None).await;
     assert_eq!(status, 200);

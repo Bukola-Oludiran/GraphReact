@@ -45,8 +45,7 @@ fn warn_with_message_and_fields_preserves_both() {
     use tracing_subscriber::Registry;
 
     let buf = SharedBuffer::new();
-    let subscriber =
-        Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
+    let subscriber = Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
 
     with_default(subscriber, || {
         tracing::warn!(
@@ -109,8 +108,7 @@ fn levels_are_uppercase_strings() {
     use tracing_subscriber::Registry;
 
     let buf = SharedBuffer::new();
-    let subscriber =
-        Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
+    let subscriber = Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
 
     with_default(subscriber, || {
         tracing::trace!("trace");
@@ -150,8 +148,7 @@ fn audit_target_events_pass_through() {
     use tracing_subscriber::Registry;
 
     let buf = SharedBuffer::new();
-    let subscriber =
-        Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
+    let subscriber = Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
 
     with_default(subscriber, || {
         // Mirrors graphreact_observer::audit::log_response.
@@ -184,8 +181,7 @@ fn span_context_is_captured_when_present() {
     use tracing_subscriber::Registry;
 
     let buf = SharedBuffer::new();
-    let subscriber =
-        Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
+    let subscriber = Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
 
     with_default(subscriber, || {
         let span = tracing::info_span!("reload", peer = "alice");
@@ -211,8 +207,7 @@ fn span_field_omitted_when_event_is_top_level() {
     use tracing_subscriber::Registry;
 
     let buf = SharedBuffer::new();
-    let subscriber =
-        Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
+    let subscriber = Registry::default().with(TracingJsonLayer::new(Box::new(buf.clone())));
 
     with_default(subscriber, || {
         tracing::info!("top-level");

@@ -62,10 +62,12 @@ pub enum GrxParseError {
     // (`[a-zA-Z_][a-zA-Z0-9_]*`); stricter than `id` because
     // dot-prefix splice addressing (`rf.ANT1`) makes hyphens
     // ambiguous in `{expr}` values.
-    #[error("[{loc}] `<import as=\"{alias}\">` is not a valid alias \
+    #[error(
+        "[{loc}] `<import as=\"{alias}\">` is not a valid alias \
              — must match `[a-zA-Z_][a-zA-Z0-9_]*` \
              (note: stricter than `id` attributes because dot-prefix \
-             splice addressing makes hyphens ambiguous in `{{expr}}` values)")]
+             splice addressing makes hyphens ambiguous in `{{expr}}` values)"
+    )]
     InvalidImportAlias { alias: String, loc: SourceLoc },
 
     // PCBPnR Phase 5-D §2.2. `<Subgraph name="...">` requires a name
@@ -75,8 +77,10 @@ pub enum GrxParseError {
 
     // PCBPnR Phase 5-D §2.2. Within a single file, two `<Subgraph>`
     // blocks may not share a name.
-    #[error("[{second_loc}] subgraph `{name}` already declared at {first_loc} \
-             — names must be unique within a file")]
+    #[error(
+        "[{second_loc}] subgraph `{name}` already declared at {first_loc} \
+             — names must be unique within a file"
+    )]
     DuplicateSubgraphName {
         name: String,
         first_loc: SourceLoc,
@@ -84,10 +88,14 @@ pub enum GrxParseError {
     },
 
     // PCBPnR Phase 5-D §2.3 — Subsystem splice errors.
-    #[error("[{loc}] `<Subsystem>` requires a `ref` attribute (form: `<alias>:<name>` or `<name>`)")]
+    #[error(
+        "[{loc}] `<Subsystem>` requires a `ref` attribute (form: `<alias>:<name>` or `<name>`)"
+    )]
     SubsystemMissingRef { loc: SourceLoc },
 
-    #[error("[{loc}] `<Subsystem>` requires an `id` attribute (the local id the splice is bound to)")]
+    #[error(
+        "[{loc}] `<Subsystem>` requires an `id` attribute (the local id the splice is bound to)"
+    )]
     SubsystemMissingId { loc: SourceLoc },
 
     #[error(
@@ -120,9 +128,7 @@ pub enum GrxParseError {
 
     // PCBPnR Phase 5-D follow-on — external definition body file
     // (`<Component src="./body.py"/>`) couldn't be read.
-    #[error(
-        "[{loc}] failed to read external body for `<{component}>` from `{path}`: {source}"
-    )]
+    #[error("[{loc}] failed to read external body for `<{component}>` from `{path}`: {source}")]
     DefinitionBodyIo {
         component: String,
         path: String,
@@ -152,18 +158,22 @@ pub enum GrxParseError {
     // component tag. Cross-file collisions (after multi-file +
     // aliasing + splicing) surface here too, since both sides carry
     // attrs.
-    #[error("[{second_loc}] node `{id}` already declared at {first_loc} \
+    #[error(
+        "[{second_loc}] node `{id}` already declared at {first_loc} \
              — multi-parent references must be attribute-free \
-             (only `id=` is allowed on the re-mention)")]
+             (only `id=` is allowed on the re-mention)"
+    )]
     IdConflictWithAttrs {
         id: String,
         first_loc: SourceLoc,
         second_loc: SourceLoc,
     },
 
-    #[error("[{second_loc}] node `{id}` redeclared as `<{second_component}>` \
+    #[error(
+        "[{second_loc}] node `{id}` redeclared as `<{second_component}>` \
              but first declared as `<{first_component}>` at {first_loc} \
-             — multi-parent references must use the same component tag")]
+             — multi-parent references must use the same component tag"
+    )]
     IdComponentMismatch {
         id: String,
         first_component: String,

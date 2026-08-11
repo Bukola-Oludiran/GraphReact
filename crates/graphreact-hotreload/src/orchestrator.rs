@@ -200,8 +200,7 @@ pub struct ReloadOrchestrator<A: EngineAdapter> {
     /// lock-free shape as Scheduler + dist's slots; the
     /// `TelemetrySinkRef` wrapper lets `Arc<dyn TelemetrySink>` live
     /// in `arc_swap` (which requires `T: Sized`).
-    telemetry_sink:
-        arc_swap::ArcSwapOption<graphreact_core::TelemetrySinkRef>,
+    telemetry_sink: arc_swap::ArcSwapOption<graphreact_core::TelemetrySinkRef>,
 }
 
 impl<A: EngineAdapter> ReloadOrchestrator<A> {
@@ -223,10 +222,7 @@ impl<A: EngineAdapter> ReloadOrchestrator<A> {
     /// `Cluster::install_telemetry_sink` for unified consumer
     /// registration; a `MultiplexSink` from `graphreact-observer`
     /// fans out to multiple consumers behind a single handle.
-    pub fn install_telemetry_sink(
-        &self,
-        sink: std::sync::Arc<dyn graphreact_core::TelemetrySink>,
-    ) {
+    pub fn install_telemetry_sink(&self, sink: std::sync::Arc<dyn graphreact_core::TelemetrySink>) {
         self.telemetry_sink.store(Some(std::sync::Arc::new(
             graphreact_core::TelemetrySinkRef::new(sink),
         )));
@@ -265,11 +261,7 @@ impl<A: EngineAdapter> ReloadOrchestrator<A> {
     /// per-edge apply results plus any errors. The orchestrator
     /// continues past per-node errors so a failure on one node
     /// doesn't block the rest of the delta from applying.
-    pub fn apply(
-        &mut self,
-        scheduler: &mut Scheduler,
-        delta: ReloadDelta,
-    ) -> ReloadOutcome {
+    pub fn apply(&mut self, scheduler: &mut Scheduler, delta: ReloadDelta) -> ReloadOutcome {
         let mut outcome = ReloadOutcome::new();
         let (compat, incompat, topology) = match delta {
             ReloadDelta::NoChange => return outcome,
@@ -323,9 +315,9 @@ impl<A: EngineAdapter> ReloadOrchestrator<A> {
         // point.
         if !incompat.is_empty() {
             if let Err(e) = wait_for_global_quiescence(scheduler, self.quiescence_timeout) {
-                outcome
-                    .errors
-                    .push(ApplyError::Scheduler(format!("safe-point wait failed: {e}")));
+                outcome.errors.push(ApplyError::Scheduler(format!(
+                    "safe-point wait failed: {e}"
+                )));
                 // Continue anyway — bounded-by-timeout drain is
                 // best-effort. The per-node remount path itself
                 // doesn't require strict pre-quiescence to be
@@ -610,9 +602,9 @@ impl<A: EngineAdapter> ReloadOrchestrator<A> {
             Ok(_) => outcome
                 .nodes
                 .push((node_id.to_string(), NodeApplyOutcome::Remounted)),
-            Err(e) => outcome
-                .errors
-                .push(ApplyError::Scheduler(format!("add_node_at_runtime failed: {e}"))),
+            Err(e) => outcome.errors.push(ApplyError::Scheduler(format!(
+                "add_node_at_runtime failed: {e}"
+            ))),
         }
     }
 
@@ -644,7 +636,12 @@ impl<A: EngineAdapter> ReloadOrchestrator<A> {
         outcome: &mut ReloadOutcome,
     ) {
         match delta {
-            EdgeDelta::Added { source, target, attrs: _, kind: _ } => {
+            EdgeDelta::Added {
+                source,
+                target,
+                attrs: _,
+                kind: _,
+            } => {
                 let mut g = scheduler.graph.borrow_mut();
                 if g.has_node(source) && g.has_node(target) {
                     g.add_edge(source.clone(), target.clone(), None, Attrs::new());
@@ -653,7 +650,11 @@ impl<A: EngineAdapter> ReloadOrchestrator<A> {
                         .push((source.clone(), target.clone(), EdgeApplyOutcome::Added));
                 }
             }
-            EdgeDelta::Removed { source, target, kind: _ } => {
+            EdgeDelta::Removed {
+                source,
+                target,
+                kind: _,
+            } => {
                 let mut g = scheduler.graph.borrow_mut();
                 let _ = g.remove_edge(source, target, None);
                 outcome
@@ -717,10 +718,7 @@ fn restore_guards(scheduler: &mut Scheduler, guards: &[RollbackGuard]) -> Rollba
 /// caller-supplied post-edit IR through so the new node mounts with
 /// the new IR's props (which may have changed in the way that
 /// triggered the Incompatible classification).
-fn snapshot_node_for_remount(
-    scheduler: &Scheduler,
-    node_id: &str,
-) -> Option<(Attrs, Vec<String>)> {
+fn snapshot_node_for_remount(scheduler: &Scheduler, node_id: &str) -> Option<(Attrs, Vec<String>)> {
     scheduler.key_for(node_id)?;
     let connect_to = scheduler
         .graph

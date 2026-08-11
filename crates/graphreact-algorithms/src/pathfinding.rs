@@ -34,9 +34,8 @@ pub type EdgeFilter = Arc<dyn Fn(&str, &str, &str, &Attrs) -> bool + Send + Sync
 /// the JS and Rust ports. Pass `None` when the directory hasn't been
 /// built (e.g., outside a scheduler context); heuristics that need the
 /// directory should treat `None` as "no structural info available."
-pub type PathHeuristic = Arc<
-    dyn Fn(&str, &str, &CommunicationGraph, Option<&GraphDirectory>) -> f64 + Send + Sync,
->;
+pub type PathHeuristic =
+    Arc<dyn Fn(&str, &str, &CommunicationGraph, Option<&GraphDirectory>) -> f64 + Send + Sync>;
 
 /// Options for `shortest_path` and `all_paths`.
 #[derive(Default, Clone)]
@@ -249,7 +248,10 @@ pub fn astar_path(
     g_score.insert(source.to_string(), 0.0);
 
     let mut f_score: FxHashMap<String, f64> = FxHashMap::default();
-    f_score.insert(source.to_string(), heuristic(source, target, graph, directory));
+    f_score.insert(
+        source.to_string(),
+        heuristic(source, target, graph, directory),
+    );
 
     let mut came_from: FxHashMap<String, String> = FxHashMap::default();
     let mut open: FxHashSet<String> = FxHashSet::default();

@@ -206,8 +206,16 @@ fn process_children(
         match child {
             GrxNode::Node(node) if node.component == "Subsystem" => {
                 splice_subsystem(
-                    node, parent_id, depth, parent_path, id_prefix, subgraphs,
-                    splice_stack, nodes, edges, seen_ids,
+                    node,
+                    parent_id,
+                    depth,
+                    parent_path,
+                    id_prefix,
+                    subgraphs,
+                    splice_stack,
+                    nodes,
+                    edges,
+                    seen_ids,
                 )?;
             }
             GrxNode::Node(node) => {
@@ -417,7 +425,10 @@ fn splice_subsystem(
         let mut chain = splice_stack.join(" → ");
         chain.push_str(" → ");
         chain.push_str(&qualified_lookup);
-        return Err(GrxParseError::SpliceCycle { chain, loc: node.loc });
+        return Err(GrxParseError::SpliceCycle {
+            chain,
+            loc: node.loc,
+        });
     }
 
     let subgraph = subgraphs
@@ -557,7 +568,11 @@ pub fn ir_to_json(ir: &GrxIr) -> JsonValue {
             obj.insert(
                 "parentPath".to_string(),
                 JsonValue::Array(
-                    n.parent_path.iter().cloned().map(JsonValue::String).collect(),
+                    n.parent_path
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect(),
                 ),
             );
             obj.insert("attrs".to_string(), JsonValue::Object(n.attrs.clone()));
@@ -672,7 +687,10 @@ mod tests {
         let f = Parser::parse_file("<Graph id=\"g\"><Foo id=\"f\" v={1} /></Graph>").expect("ok");
         let ir = build_ir(&f).expect("build_ir ok");
         let n = &ir.nodes[0];
-        assert_eq!(n.attrs.get("component"), Some(&JsonValue::String("Foo".to_string())));
+        assert_eq!(
+            n.attrs.get("component"),
+            Some(&JsonValue::String("Foo".to_string()))
+        );
         assert_eq!(n.attrs.get("_depth"), Some(&JsonValue::Number(0.into())));
         assert_eq!(n.attrs.get("v"), Some(&JsonValue::Number(1.into())));
         assert!(n.attrs.contains_key("_parentPath"));
@@ -704,10 +722,7 @@ mod tests {
 
     #[test]
     fn ir_to_json_round_trips_basic_shape() {
-        let ir = parse_to_ir(
-            "<Graph id=\"g\"><A id=\"a\"><B id=\"b\" /></A></Graph>",
-        )
-        .expect("ok");
+        let ir = parse_to_ir("<Graph id=\"g\"><A id=\"a\"><B id=\"b\" /></A></Graph>").expect("ok");
         let json = ir_to_json(&ir);
         let s = serde_json::to_string(&json).expect("serialise");
         assert!(s.contains("\"graphId\":\"g\""));
@@ -793,9 +808,19 @@ def init():
         // 4 nodes: a, c, l. Wait — that's 3. Let me recount: Agg, Counter, Logger.
         assert_eq!(ir.nodes.len(), 3, "Counter `c` should be created once");
         // Counter's attrs come from the FIRST occurrence (initialCount=0, label="Alpha").
-        let counter = ir.nodes.iter().find(|n| n.id == "c").expect("counter present");
-        assert_eq!(counter.attrs.get("initialCount"), Some(&JsonValue::Number(0.into())));
-        assert_eq!(counter.attrs.get("label"), Some(&JsonValue::String("Alpha".to_string())));
+        let counter = ir
+            .nodes
+            .iter()
+            .find(|n| n.id == "c")
+            .expect("counter present");
+        assert_eq!(
+            counter.attrs.get("initialCount"),
+            Some(&JsonValue::Number(0.into()))
+        );
+        assert_eq!(
+            counter.attrs.get("label"),
+            Some(&JsonValue::String("Alpha".to_string()))
+        );
         // Structural edges: Agg→Counter and Logger→Counter (multi-parent).
         let sources: Vec<_> = ir.edges.iter().map(|e| e.source.as_str()).collect();
         assert!(sources.contains(&"a"), "edge from Agg expected");
@@ -815,7 +840,11 @@ def init():
         .expect("parse ok");
         let err = build_ir(&f).expect_err("collision must error");
         match err {
-            crate::error::GrxParseError::IdConflictWithAttrs { id, first_loc, second_loc } => {
+            crate::error::GrxParseError::IdConflictWithAttrs {
+                id,
+                first_loc,
+                second_loc,
+            } => {
                 assert_eq!(id, "c");
                 assert_ne!(first_loc, second_loc, "both locs must be distinct");
                 assert!(
@@ -1028,14 +1057,21 @@ def init():
     style="position:absolute; left:30mm; top:5mm; rotate:90deg; layer:F.Cu" />
 </Graph>"#;
         let ir = parse_to_ir(src).expect("parse + ir ok");
-        let ant = ir.nodes.iter().find(|n| n.id == "ANT1").expect("ant present");
+        let ant = ir
+            .nodes
+            .iter()
+            .find(|n| n.id == "ANT1")
+            .expect("ant present");
         // The style key is consumed; the desugared form appears.
         assert!(!ant.attrs.contains_key("style"), "style key consumed");
         let at = ant.attrs.get("at").expect("at present");
         assert_eq!(at["x"], 30.0);
         assert_eq!(at["y"], 5.0);
         assert_eq!(at["rot"], 90.0);
-        assert_eq!(ant.attrs.get("layer"), Some(&JsonValue::String("F.Cu".to_string())));
+        assert_eq!(
+            ant.attrs.get("layer"),
+            Some(&JsonValue::String("F.Cu".to_string()))
+        );
         // Source-level `footprint` attribute rides through unchanged.
         assert_eq!(
             ant.attrs.get("footprint"),
@@ -1075,7 +1111,10 @@ def init():
         assert_eq!(bbox["y"], 5.0);
         assert_eq!(bbox["w"], 12.0);
         assert_eq!(bbox["h"], 10.0);
-        assert_eq!(rf.attrs.get("layers"), Some(&JsonValue::String("F.Cu,In1.Cu".to_string())));
+        assert_eq!(
+            rf.attrs.get("layers"),
+            Some(&JsonValue::String("F.Cu,In1.Cu".to_string()))
+        );
         // Inner component still spliced under rf.
         assert!(ir.nodes.iter().any(|n| n.id == "rf.A"));
     }
@@ -1118,7 +1157,11 @@ def init():
     style="impedance:50; tolerance:10; preferred-layer:F.Cu; pin-layer:strict" />
 </Graph>"#;
         let ir = parse_to_ir(src).expect("parse + ir ok");
-        let n = ir.nodes.iter().find(|n| n.id == "ANT_FEED").expect("net present");
+        let n = ir
+            .nodes
+            .iter()
+            .find(|n| n.id == "ANT_FEED")
+            .expect("net present");
         assert_eq!(n.attrs["impedance"]["z0"], 50.0);
         assert_eq!(n.attrs["impedance"]["tol"], 10.0);
         assert_eq!(n.attrs["preferred-layer"], "F.Cu");
@@ -1172,6 +1215,9 @@ def init():
         // language assignment for tooling / debugging.
         let json = ir_to_json(&ir);
         let s = serde_json::to_string(&json).expect("serialise");
-        assert!(s.contains("\"lang\":\"python\""), "expected lang in json: {s}");
+        assert!(
+            s.contains("\"lang\":\"python\""),
+            "expected lang in json: {s}"
+        );
     }
 }

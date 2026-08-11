@@ -19,8 +19,8 @@ fn fixture_path(rel: &str) -> PathBuf {
 fn in_file_subsystem_ref_resolves_to_subgraph_loc() {
     let path = fixture_path("splice-root.grx");
     let resolved = resolve_multi_file(&path).expect("resolves");
-    let target = resolve_subsystem_target(&resolved, "ShelfA")
-        .expect("in-file subsystem ref resolves");
+    let target =
+        resolve_subsystem_target(&resolved, "ShelfA").expect("in-file subsystem ref resolves");
     assert_eq!(target.subgraph_name, "ShelfA");
     assert_eq!(target.file_path, path.canonicalize().unwrap());
     assert!(target.loc.line >= 1);
@@ -30,12 +30,10 @@ fn in_file_subsystem_ref_resolves_to_subgraph_loc() {
 fn aliased_subsystem_ref_resolves_into_imported_file() {
     let path = fixture_path("multi-file/root.grx");
     let resolved = resolve_multi_file(&path).expect("resolves");
-    let target = resolve_subsystem_target(&resolved, "rf:Bandpass")
-        .expect("aliased subsystem ref resolves");
+    let target =
+        resolve_subsystem_target(&resolved, "rf:Bandpass").expect("aliased subsystem ref resolves");
     assert_eq!(target.subgraph_name, "Bandpass");
-    let expected_path = fixture_path("multi-file/shelf.grx")
-        .canonicalize()
-        .unwrap();
+    let expected_path = fixture_path("multi-file/shelf.grx").canonicalize().unwrap();
     assert_eq!(target.file_path, expected_path);
 }
 

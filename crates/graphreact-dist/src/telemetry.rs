@@ -59,7 +59,8 @@ impl TelemetrySinkSlot {
     /// calls this once after `Cluster::start` returns; in production
     /// nobody re-installs at steady state.
     pub fn install(&self, sink: Arc<dyn TelemetrySink>) {
-        self.inner.store(Some(Arc::new(TelemetrySinkRef::new(sink))));
+        self.inner
+            .store(Some(Arc::new(TelemetrySinkRef::new(sink))));
     }
 
     /// Drop the installed sink. After this returns, `with_sink`

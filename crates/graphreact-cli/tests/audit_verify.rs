@@ -59,12 +59,7 @@ fn audit_verify_succeeds_on_clean_chain() {
     }
 
     let mut cmd = Command::cargo_bin("grx").expect("binary present");
-    let assertion = cmd
-        .arg("audit")
-        .arg("verify")
-        .arg(&path)
-        .assert()
-        .success();
+    let assertion = cmd.arg("audit").arg("verify").arg(&path).assert().success();
     let out = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
     assert!(
         out.contains("audit chain OK: 3 records"),
@@ -104,12 +99,7 @@ fn audit_verify_fails_on_tampered_chain() {
     std::fs::write(&path, mutated).expect("write");
 
     let mut cmd = Command::cargo_bin("grx").expect("binary present");
-    let assertion = cmd
-        .arg("audit")
-        .arg("verify")
-        .arg(&path)
-        .assert()
-        .failure();
+    let assertion = cmd.arg("audit").arg("verify").arg(&path).assert().failure();
     let err = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
     assert!(
         err.contains("tamper detected at seq=1"),
@@ -122,15 +112,7 @@ fn audit_verify_fails_on_missing_file() {
     let dir = TempDir::new("grx-cli-audit-missing");
     let path = dir.path.join("never-written.ndjson");
     let mut cmd = Command::cargo_bin("grx").expect("binary present");
-    let assertion = cmd
-        .arg("audit")
-        .arg("verify")
-        .arg(&path)
-        .assert()
-        .failure();
+    let assertion = cmd.arg("audit").arg("verify").arg(&path).assert().failure();
     let err = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
-    assert!(
-        err.contains("audit chain I/O"),
-        "stderr was: {err:?}"
-    );
+    assert!(err.contains("audit chain I/O"), "stderr was: {err:?}");
 }

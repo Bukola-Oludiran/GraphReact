@@ -105,8 +105,12 @@ fn print_help() {
     eprintln!();
     eprintln!("Subcommands:");
     eprintln!("  bench                       Run benchmarks across the workspace");
-    eprintln!("  hyperfine                   Wall-clock startup bench for `grx run` across engines");
-    eprintln!("                              (M14.8.x-followon Phase H — requires hyperfine on PATH)");
+    eprintln!(
+        "  hyperfine                   Wall-clock startup bench for `grx run` across engines"
+    );
+    eprintln!(
+        "                              (M14.8.x-followon Phase H — requires hyperfine on PATH)"
+    );
     eprintln!("  napi-build                  Build the @graphreact/native NAPI artifact (debug)");
     eprintln!("  napi-build --release        Same, optimized build");
     eprintln!("  fixtures                    Regenerate graspologic golden fixtures");
@@ -115,7 +119,9 @@ fn print_help() {
     eprintln!();
     eprintln!("  webkit-clone [opts]         Clone or fetch+checkout WebKit at the pinned");
     eprintln!("                              ref into `vendor/WebKit/`. (M12.3b-phase2)");
-    eprintln!("    --ref <commit>            Override the pinned ref (also $GRAPHREACT_WEBKIT_REF)");
+    eprintln!(
+        "    --ref <commit>            Override the pinned ref (also $GRAPHREACT_WEBKIT_REF)"
+    );
     eprintln!("    --full-history            Disable the default shallow `--depth=1` clone");
     eprintln!("    --dry-run                 Print commands that would run, do not execute");
     eprintln!();
@@ -147,8 +153,7 @@ fn zig_build(release: bool) -> Result<(), String> {
             eprintln!("xtask zig-build: using zig {version}");
         }
         _ => {
-            return Err(
-                "zig is not installed or not on $PATH.\n\
+            return Err("zig is not installed or not on $PATH.\n\
                  \n\
                  The Zig bridge at zig/bridge/ produces the JSC engine\n\
                  static library that `graphreact-engine-jsc` links\n\
@@ -167,8 +172,7 @@ fn zig_build(release: bool) -> Result<(), String> {
                  Once installed, re-run `cargo xtask zig-build` to\n\
                  produce the static libraries under\n\
                  zig/bridge/zig-out/lib/."
-                    .to_string(),
-            );
+                .to_string());
         }
     }
 
@@ -194,7 +198,11 @@ fn zig_build(release: bool) -> Result<(), String> {
     eprintln!(
         "xtask zig-build: cpython bridge target Python {minor}{thread} via {source}",
         minor = py.minor,
-        thread = if py.free_threaded { "t (PEP 703 free-threaded)" } else { "" },
+        thread = if py.free_threaded {
+            "t (PEP 703 free-threaded)"
+        } else {
+            ""
+        },
         source = py.source,
     );
     cmd.arg(format!("-Dpython_include={}", py.include_dir));
@@ -253,7 +261,9 @@ fn napi_build(release: bool) -> Result<(), String> {
     if release {
         cmd.arg("--release");
     }
-    let status = cmd.status().map_err(|e| format!("cargo build failed: {e}"))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("cargo build failed: {e}"))?;
     if !status.success() {
         return Err(format!("cargo build exited with {status}"));
     }
@@ -463,8 +473,7 @@ fn hyperfine() -> Result<(), String> {
     // + a process-unique subdir to avoid stomping on parallel
     // xtask runs.
     let tmp = std::env::temp_dir().join(format!("grx-hyperfine-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp)
-        .map_err(|e| format!("create tempdir {}: {e}", tmp.display()))?;
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("create tempdir {}: {e}", tmp.display()))?;
 
     let py_fixture = tmp.join("startup-py.grx");
     std::fs::write(
@@ -537,9 +546,7 @@ fn parse_per_msg(line: &str) -> Result<u64, String> {
         .split_whitespace()
         .find(|tok| tok.starts_with("per_msg="))
         .ok_or_else(|| format!("no per_msg= token in: {line}"))?;
-    let value = token
-        .trim_start_matches("per_msg=")
-        .trim_end_matches("ns");
+    let value = token.trim_start_matches("per_msg=").trim_end_matches("ns");
     value
         .parse::<u64>()
         .map_err(|e| format!("can't parse per_msg value '{value}': {e}"))
@@ -648,7 +655,11 @@ fn run_pkg_config(args: &[&str]) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 // ---------------------------------------------------------------------

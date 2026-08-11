@@ -181,10 +181,7 @@ impl TelemetrySink for WebSocketSink {
     }
 
     fn on_node_evaluate_start(&self, ev: &NodeEvaluateStart<'_>) {
-        let _ = self
-            .inner
-            .tx
-            .send(from_node_evaluate_start(ev, unix_ms()));
+        let _ = self.inner.tx.send(from_node_evaluate_start(ev, unix_ms()));
     }
 
     fn on_node_evaluate_end(&self, ev: &NodeEvaluateEnd<'_>) {
@@ -208,10 +205,7 @@ impl TelemetrySink for WebSocketSink {
     }
 
     fn on_supervisor_decision(&self, ev: &SupervisorDecisionMade<'_>) {
-        let _ = self
-            .inner
-            .tx
-            .send(from_supervisor_decision(ev, unix_ms()));
+        let _ = self.inner.tx.send(from_supervisor_decision(ev, unix_ms()));
     }
 
     fn on_remote_message(&self, ev: &RemoteMessage<'_>) {
@@ -285,11 +279,7 @@ pub async fn ws_handler(
     upgrade.on_upgrade(move |socket| handle_ws_connection(socket, sink, filter))
 }
 
-async fn handle_ws_connection(
-    mut socket: WebSocket,
-    sink: WebSocketSink,
-    filter: EventFilter,
-) {
+async fn handle_ws_connection(mut socket: WebSocket, sink: WebSocketSink, filter: EventFilter) {
     let _guard = sink.enter_active();
     let mut rx = sink.subscribe();
     loop {
@@ -387,9 +377,7 @@ fn sse_stream(
                             Ok(s) => s,
                             Err(_) => continue,
                         };
-                        let evt = SseEvent::default()
-                            .event("telemetry")
-                            .data(payload);
+                        let evt = SseEvent::default().event("telemetry").data(payload);
                         return Some((Ok(evt), (rx, sink, filter, active, false)));
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -399,9 +387,7 @@ fn sse_stream(
                             missed,
                         };
                         let payload = serde_json::to_string(&resync).unwrap_or_default();
-                        let evt = SseEvent::default()
-                            .event("resync")
-                            .data(payload);
+                        let evt = SseEvent::default().event("resync").data(payload);
                         return Some((Ok(evt), (rx, sink, filter, active, true)));
                     }
                     Err(broadcast::error::RecvError::Closed) => return None,

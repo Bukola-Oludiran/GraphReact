@@ -36,11 +36,7 @@ pub enum CompletionContext {
 
 /// Build the completion list for the given position.
 #[must_use]
-pub fn build_completions(
-    file: &GrxFile,
-    source: &str,
-    pos: Position,
-) -> Vec<CompletionItem> {
+pub fn build_completions(file: &GrxFile, source: &str, pos: Position) -> Vec<CompletionItem> {
     match classify_completion_context(source, pos) {
         CompletionContext::TagName => tag_completions(file),
         CompletionContext::AttributeName { tag } => attribute_completions(&tag),
@@ -103,9 +99,7 @@ fn classify_in_string(prefix: &str) -> Option<CompletionContext> {
     let before = &prefix[..open];
     let eq = before.rfind('=')?;
     let before_eq = &before[..eq];
-    let attr_name = before_eq
-        .rsplit(|c: char| c.is_whitespace())
-        .next()?;
+    let attr_name = before_eq.rsplit(|c: char| c.is_whitespace()).next()?;
     if attr_name == "style" {
         // Inside style="…". Walk forwards from `open + 1` to see
         // whether we're in a property-name slot or after a `:` (value
@@ -234,7 +228,10 @@ mod tests {
     fn tag_name_context_inside_open_lt() {
         let src = "<Gr";
         let pos = Position::new(0, 3);
-        assert_eq!(classify_completion_context(src, pos), CompletionContext::TagName);
+        assert_eq!(
+            classify_completion_context(src, pos),
+            CompletionContext::TagName
+        );
     }
 
     #[test]

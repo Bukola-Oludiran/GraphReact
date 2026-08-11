@@ -426,7 +426,10 @@ mod tests {
         server_cookie: SecretCookie,
         client_cookie: SecretCookie,
         client_expected_peer_arg: &str,
-    ) -> (Result<HandshakeResult, DistError>, Result<HandshakeResult, DistError>) {
+    ) -> (
+        Result<HandshakeResult, DistError>,
+        Result<HandshakeResult, DistError>,
+    ) {
         let (alice, bob) = dev_tls::pair("alice", "bob").expect("pair");
         let (alice_stream, bob_stream) = tokio::io::duplex(64 * 1024);
         let alice_cfg = alice.config.clone();
@@ -690,11 +693,7 @@ mod rolling_version_tests {
         fields: Vec<(String, String)>,
     }
     impl tracing::field::Visit for AuditFieldVisitor {
-        fn record_debug(
-            &mut self,
-            field: &tracing::field::Field,
-            value: &dyn std::fmt::Debug,
-        ) {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             self.fields
                 .push((field.name().to_string(), format!("{value:?}")));
         }
@@ -821,8 +820,7 @@ mod rolling_version_tests {
             // and write the bytes.
             // Phase γ: floor is now MIN_SUPPORTED_VERSION=5, which is
             // a v5-shape Hello (carries capabilities_bitmap).
-            let raw_frame =
-                build_v5_hello_frame(MIN_SUPPORTED_VERSION, "bob@127.0.0.1", 2, 0);
+            let raw_frame = build_v5_hello_frame(MIN_SUPPORTED_VERSION, "bob@127.0.0.1", 2, 0);
             // `Connection` does not expose its inner stream. We
             // work around by piggy-backing on `WireFrame`'s codec:
             // we can write the bytes via `framed.get_mut()` once
@@ -830,17 +828,16 @@ mod rolling_version_tests {
             // raw write path — re-acquiring the inner stream via
             // `Framed::into_parts`.
             let parts = conn.into_parts();
-            let (mut tls_stream, _codec, mut read_buf, mut write_buf) = (
-                parts.io,
-                parts.codec,
-                parts.read_buf,
-                parts.write_buf,
-            );
+            let (mut tls_stream, _codec, mut read_buf, mut write_buf) =
+                (parts.io, parts.codec, parts.read_buf, parts.write_buf);
             // Drain any pending write_buf bytes that the codec may
             // have left there (none expected this early in the
             // handshake, but it costs nothing to flush).
             if !write_buf.is_empty() {
-                tls_stream.write_all(&write_buf).await.map_err(DistError::from)?;
+                tls_stream
+                    .write_all(&write_buf)
+                    .await
+                    .map_err(DistError::from)?;
                 write_buf.clear();
             }
             tls_stream
@@ -980,7 +977,10 @@ mod rolling_version_tests {
             let mut tls_stream = parts.io;
             let mut write_buf = parts.write_buf;
             if !write_buf.is_empty() {
-                tls_stream.write_all(&write_buf).await.map_err(DistError::from)?;
+                tls_stream
+                    .write_all(&write_buf)
+                    .await
+                    .map_err(DistError::from)?;
                 write_buf.clear();
             }
             tls_stream
@@ -1074,7 +1074,10 @@ mod rolling_version_tests {
             let mut tls_stream = parts.io;
             let mut write_buf = parts.write_buf;
             if !write_buf.is_empty() {
-                tls_stream.write_all(&write_buf).await.map_err(DistError::from)?;
+                tls_stream
+                    .write_all(&write_buf)
+                    .await
+                    .map_err(DistError::from)?;
                 write_buf.clear();
             }
             tls_stream
@@ -1172,8 +1175,14 @@ mod rolling_version_tests {
             result
         });
 
-        let server = server_task.await.expect("server join").expect("server handshake");
-        let client = client_task.await.expect("client join").expect("client handshake");
+        let server = server_task
+            .await
+            .expect("server join")
+            .expect("server handshake");
+        let client = client_task
+            .await
+            .expect("client join")
+            .expect("client handshake");
 
         assert_eq!(server.effective_capabilities, expected_effective);
         assert_eq!(client.effective_capabilities, expected_effective);

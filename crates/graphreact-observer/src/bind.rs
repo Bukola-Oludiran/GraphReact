@@ -39,7 +39,8 @@ use crate::tls::ServerTlsConfig;
 /// Default observer bind address. 127.0.0.1:9090 — Prometheus's
 /// conventional default scrape port, scoped to loopback so the
 /// no-flags case is safe by construction.
-pub const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9090);
+pub const DEFAULT_BIND: SocketAddr =
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9090);
 
 /// Resolved observer-server bind configuration. Owns the
 /// [`BearerToken`] (or `None` if unset) and the
@@ -197,7 +198,6 @@ impl BindConfig {
         self.addr.ip().is_loopback()
     }
 }
-
 
 #[cfg(test)]
 mod tests {

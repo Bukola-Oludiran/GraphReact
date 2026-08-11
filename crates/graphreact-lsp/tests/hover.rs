@@ -38,11 +38,7 @@ fn hover_over_counter_tag_returns_markdown() {
 fn hover_over_subsystem_ref_returns_splice_target_text() {
     let src = include_str!("fixtures/splice-root.grx");
     let file = Parser::parse_file(src).expect("parses");
-    let line_no = src
-        .lines()
-        .position(|l| l.contains("<Subsystem"))
-        .unwrap()
-        + 1;
+    let line_no = src.lines().position(|l| l.contains("<Subsystem")).unwrap() + 1;
     let line_text = src.lines().nth(line_no - 1).unwrap();
     let col = line_text.find("ShelfA").unwrap() + 2; // inside the string
     let pos = pos_for(line_no, col + 1, src);

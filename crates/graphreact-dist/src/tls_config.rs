@@ -16,7 +16,7 @@
 use rustls::client::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ServerConfig, WebPkiClientVerifier};
-use rustls::{ALL_VERSIONS, RootCertStore};
+use rustls::{RootCertStore, ALL_VERSIONS};
 use std::sync::Arc;
 
 use crate::DistError;

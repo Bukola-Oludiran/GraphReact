@@ -151,15 +151,16 @@ pub struct DryMountReport {
 }
 
 /// Parse + dry-mount a `.grx` file using the given engine.
-pub fn dry_mount(
-    path: &std::path::Path,
-    engine: &mut dyn Engine,
-) -> RuntimeResult<DryMountReport> {
+pub fn dry_mount(path: &std::path::Path, engine: &mut dyn Engine) -> RuntimeResult<DryMountReport> {
     let resolved = resolve_multi_file(path)?;
 
     // Concatenate root + imported definition blocks.
-    let mut definitions: Vec<(String, String, String, graphreact_grx_parser::ast::ComponentLang)> =
-        Vec::new();
+    let mut definitions: Vec<(
+        String,
+        String,
+        String,
+        graphreact_grx_parser::ast::ComponentLang,
+    )> = Vec::new();
     for d in &resolved.root.definitions {
         definitions.push((
             resolved.root_path.display().to_string(),
@@ -179,9 +180,13 @@ pub fn dry_mount(
         }
     }
 
-    let graph = resolved.root.graph.as_ref().ok_or_else(|| RuntimeError::NoGraph {
-        path: resolved.root_path.display().to_string(),
-    })?;
+    let graph = resolved
+        .root
+        .graph
+        .as_ref()
+        .ok_or_else(|| RuntimeError::NoGraph {
+            path: resolved.root_path.display().to_string(),
+        })?;
 
     let built = graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
         imports: resolved.root.imports.clone(),
@@ -196,14 +201,20 @@ pub fn dry_mount(
         edges: built.edges,
         definitions: definitions
             .iter()
-            .map(|(_, comp, code, lang)| graphreact_grx_parser::ir::IrDefinition {
-                component: comp.clone(),
-                code: code.clone(),
-                lang: *lang,
-                source_loc: graphreact_grx_parser::SourceLoc::default(),
-            })
+            .map(
+                |(_, comp, code, lang)| graphreact_grx_parser::ir::IrDefinition {
+                    component: comp.clone(),
+                    code: code.clone(),
+                    lang: *lang,
+                    source_loc: graphreact_grx_parser::SourceLoc::default(),
+                },
+            )
             .collect(),
-        imports: resolved.imports.iter().map(|i| i.path.display().to_string()).collect(),
+        imports: resolved
+            .imports
+            .iter()
+            .map(|i| i.path.display().to_string())
+            .collect(),
     };
 
     engine.initialize()?;
@@ -287,8 +298,12 @@ pub fn dry_mount_jsc(
     // Concatenate root + imported definition blocks. Same as the
     // legacy path — definitions are component-name-keyed bodies, not
     // per-node.
-    let mut definitions: Vec<(String, String, String, graphreact_grx_parser::ast::ComponentLang)> =
-        Vec::new();
+    let mut definitions: Vec<(
+        String,
+        String,
+        String,
+        graphreact_grx_parser::ast::ComponentLang,
+    )> = Vec::new();
     for d in &resolved.root.definitions {
         definitions.push((
             resolved.root_path.display().to_string(),
@@ -308,9 +323,13 @@ pub fn dry_mount_jsc(
         }
     }
 
-    let graph = resolved.root.graph.as_ref().ok_or_else(|| RuntimeError::NoGraph {
-        path: resolved.root_path.display().to_string(),
-    })?;
+    let graph = resolved
+        .root
+        .graph
+        .as_ref()
+        .ok_or_else(|| RuntimeError::NoGraph {
+            path: resolved.root_path.display().to_string(),
+        })?;
 
     let built = graphreact_grx_parser::ir::build_ir(&graphreact_grx_parser::GrxFile {
         imports: resolved.root.imports.clone(),
@@ -325,14 +344,20 @@ pub fn dry_mount_jsc(
         edges: built.edges,
         definitions: definitions
             .iter()
-            .map(|(_, comp, code, lang)| graphreact_grx_parser::ir::IrDefinition {
-                component: comp.clone(),
-                code: code.clone(),
-                lang: *lang,
-                source_loc: graphreact_grx_parser::SourceLoc::default(),
-            })
+            .map(
+                |(_, comp, code, lang)| graphreact_grx_parser::ir::IrDefinition {
+                    component: comp.clone(),
+                    code: code.clone(),
+                    lang: *lang,
+                    source_loc: graphreact_grx_parser::SourceLoc::default(),
+                },
+            )
             .collect(),
-        imports: resolved.imports.iter().map(|i| i.path.display().to_string()).collect(),
+        imports: resolved
+            .imports
+            .iter()
+            .map(|i| i.path.display().to_string())
+            .collect(),
     };
 
     Engine::initialize(engine)?;
@@ -848,9 +873,7 @@ fn build_node_ctx(node: &graphreact_grx_parser::ir::IrNode) -> HostValue {
         // via host callbacks routed through the graph directory.
         (
             "directory".to_string(),
-            HV::Object(vec![
-                ("_stub".to_string(), HV::Bool(true)),
-            ]),
+            HV::Object(vec![("_stub".to_string(), HV::Bool(true))]),
         ),
     ])
 }

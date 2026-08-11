@@ -173,7 +173,11 @@ pub fn resugar_attrs(tag_name: &str, attrs: &AttrMap) -> Resugared {
         push_prop(&mut buf, "preferred-layer", s);
     }
     if let Some(strict) = attrs.get("layer-strict").and_then(JsonValue::as_bool) {
-        push_prop(&mut buf, "pin-layer", if strict { "strict" } else { "prefer" });
+        push_prop(
+            &mut buf,
+            "pin-layer",
+            if strict { "strict" } else { "prefer" },
+        );
     }
 
     // -- Group 4: dimensional objects (drill / diameter / padding /
@@ -458,7 +462,10 @@ mod tests {
         );
         let r = resugar_attrs("Via", &attrs);
         let s = r.style.expect("style present");
-        assert!(s.contains("clip-path: circle(0.3mm at 0mm 0mm)"), "got: {s}");
+        assert!(
+            s.contains("clip-path: circle(0.3mm at 0mm 0mm)"),
+            "got: {s}"
+        );
     }
 
     #[test]
@@ -558,7 +565,10 @@ mod tests {
         a.insert("at".into(), serde_json::json!({"x": 5.0, "y": 5.0}));
         let r = resugar_attrs("Component", &a);
         assert!(r.style.unwrap().contains("left: 5mm"));
-        assert_eq!(r.remaining.get("footprint"), Some(&JsonValue::String("0402".into())));
+        assert_eq!(
+            r.remaining.get("footprint"),
+            Some(&JsonValue::String("0402".into()))
+        );
         assert_eq!(r.remaining.get("id"), Some(&JsonValue::String("R1".into())));
     }
 

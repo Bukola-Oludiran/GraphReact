@@ -148,9 +148,7 @@ impl RingBufferTelemetry {
     /// Per-node ring depth — useful for testing wrap behaviour.
     #[must_use]
     pub fn depth(&self, node_id: &str) -> usize {
-        self.inner
-            .get(node_id)
-            .map_or(0, |lock| lock.read().len())
+        self.inner.get(node_id).map_or(0, |lock| lock.read().len())
     }
 
     /// Number of nodes that have received at least one message.

@@ -202,9 +202,9 @@ async fn connect_and_stream(
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), WsClientError> {
     let url = build_ws_url(&ctx.target);
-    let mut request = url.into_client_request().map_err(|e| {
-        WsClientError::InvalidUrl(format!("{e}"))
-    })?;
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| WsClientError::InvalidUrl(format!("{e}")))?;
     if let Some(t) = ctx.token.as_deref() {
         let val = HeaderValue::from_str(&format!("Bearer {t}"))
             .map_err(|e| WsClientError::InvalidUrl(format!("token header: {e}")))?;
@@ -275,10 +275,7 @@ fn apply_event(state_tx: &watch::Sender<ObserverState>, ev: WsTelemetryEvent) {
         };
         state_tx.send_modify(|s| {
             s.push_trace(TraceEntry::Message(row.clone()));
-            s.recent_messages
-                .entry(to.clone())
-                .or_default()
-                .push(row);
+            s.recent_messages.entry(to.clone()).or_default().push(row);
         });
     }
 }
@@ -311,7 +308,13 @@ mod tests {
         let s = r#"{"kind":"message_delivered","ts_ms":1234,"from":"a","to":"b","type":"ping","ttl":4,"direct":false,"accepted":true}"#;
         let ev: WsTelemetryEvent = serde_json::from_str(s).unwrap();
         match ev {
-            WsTelemetryEvent::MessageDelivered { from, to, ttl, accepted, .. } => {
+            WsTelemetryEvent::MessageDelivered {
+                from,
+                to,
+                ttl,
+                accepted,
+                ..
+            } => {
                 assert_eq!(from, "a");
                 assert_eq!(to, "b");
                 assert_eq!(ttl, 4);

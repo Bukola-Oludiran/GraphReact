@@ -143,9 +143,8 @@ impl ServerTlsConfig {
                 path: "<bytes>".into(),
             });
         }
-        let server = build_server_config(cert_chain, private_key).map_err(|detail| {
-            TlsError::Rustls { detail }
-        })?;
+        let server = build_server_config(cert_chain, private_key)
+            .map_err(|detail| TlsError::Rustls { detail })?;
         Ok(Self {
             server: RotatableServerConfig::new(Arc::new(server)),
         })
@@ -176,11 +175,10 @@ impl ServerTlsConfig {
         if cert_chain.is_empty() {
             return Err(TlsRotationError::EmptyCertChain);
         }
-        let private_key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| {
-            TlsRotationError::KeyParse {
+        let private_key =
+            PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| TlsRotationError::KeyParse {
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
         let mut next = build_server_config(cert_chain, private_key)
             .map_err(|detail| TlsRotationError::Rustls { detail })?;
         // Preserve the operator's ALPN configuration through the
@@ -252,8 +250,7 @@ mod tests {
     fn loads_self_signed_cert_via_rcgen() {
         use rustls::pki_types::PrivatePkcs8KeyDer;
 
-        let mut params =
-            rcgen::CertificateParams::new(vec!["observer.local".into()]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["observer.local".into()]).unwrap();
         params.subject_alt_names.push(rcgen::SanType::DnsName(
             "observer.local".to_string().try_into().unwrap(),
         ));
@@ -261,8 +258,7 @@ mod tests {
         let cert = params.self_signed(&key).unwrap();
 
         let cert_der: CertificateDer<'static> = cert.der().clone();
-        let key_der: PrivateKeyDer<'static> =
-            PrivatePkcs8KeyDer::from(key.serialize_der()).into();
+        let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key.serialize_der()).into();
 
         let cfg = ServerTlsConfig::from_pem_bytes(vec![cert_der], key_der).unwrap();
         // Sanity: the rustls provider produced a usable config that
@@ -277,8 +273,7 @@ mod tests {
         // bug — rustls would later panic, so we surface it early.
         use rustls::pki_types::PrivatePkcs8KeyDer;
         let key = rcgen::KeyPair::generate().unwrap();
-        let key_der: PrivateKeyDer<'static> =
-            PrivatePkcs8KeyDer::from(key.serialize_der()).into();
+        let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key.serialize_der()).into();
         let err = ServerTlsConfig::from_pem_bytes(vec![], key_der)
             .err()
             .expect("expected error");

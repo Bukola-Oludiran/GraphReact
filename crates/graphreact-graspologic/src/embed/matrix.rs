@@ -66,10 +66,7 @@ pub fn adjacency_matrix(graph: &CommunicationGraph, weight_attribute: &str) -> M
 /// `1.0` when missing or non-numeric.
 pub(crate) fn edge_weight(attrs: &Attrs, attr_name: &str) -> f64 {
     #[allow(clippy::redundant_closure_for_method_calls)]
-    attrs
-        .get(attr_name)
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0)
+    attrs.get(attr_name).and_then(|v| v.as_f64()).unwrap_or(1.0)
 }
 
 /// Replace the matrix diagonal with the per-node mean of `(in + out)`
@@ -392,8 +389,7 @@ mod tests {
         // d = [1, 2, 1]; mean = 4/3; d_r = [1+4/3, 2+4/3, 1+4/3]
         let l = to_laplacian(a.as_ref(), LaplacianForm::RDad, None).expect("ok");
         let mean = 4.0_f64 / 3.0;
-        let expected_01 =
-            (1.0_f64 / (1.0 + mean).sqrt()) * 1.0 * (1.0_f64 / (2.0 + mean).sqrt());
+        let expected_01 = (1.0_f64 / (1.0 + mean).sqrt()) * 1.0 * (1.0_f64 / (2.0 + mean).sqrt());
         assert!((l[(0, 1)] - expected_01).abs() < 1e-12);
     }
 

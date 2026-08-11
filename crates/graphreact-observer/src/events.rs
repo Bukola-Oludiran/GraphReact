@@ -208,9 +208,7 @@ impl TelemetryEvent {
             | TelemetryEvent::NodeUnmounted { node_id, .. } => node_id == want,
             TelemetryEvent::MessageDelivered { from, to, .. }
             | TelemetryEvent::RemoteMessage { from, to, .. } => from == want || to == want,
-            TelemetryEvent::TopologyEvent { node_id, .. } => {
-                node_id.as_deref() == Some(want)
-            }
+            TelemetryEvent::TopologyEvent { node_id, .. } => node_id.as_deref() == Some(want),
             TelemetryEvent::SupervisorDecision { failed_id, .. } => failed_id == want,
             TelemetryEvent::TickStart { .. }
             | TelemetryEvent::TickEnd { .. }
@@ -311,10 +309,7 @@ pub fn from_topology_event(ev: &TopologyEventOccurred<'_>, ts_ms: u64) -> Teleme
 }
 
 #[must_use]
-pub fn from_supervisor_decision(
-    ev: &SupervisorDecisionMade<'_>,
-    ts_ms: u64,
-) -> TelemetryEvent {
+pub fn from_supervisor_decision(ev: &SupervisorDecisionMade<'_>, ts_ms: u64) -> TelemetryEvent {
     TelemetryEvent::SupervisorDecision {
         ts_ms,
         failed_id: ev.failed_id.to_string(),

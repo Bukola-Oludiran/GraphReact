@@ -447,9 +447,8 @@ impl GoEngine {
                     .into(),
             )
         })?;
-        let json = call_with_buffer(|out, cap, written| unsafe {
-            invoke(token, out, cap, written)
-        })?;
+        let json =
+            call_with_buffer(|out, cap, written| unsafe { invoke(token, out, cap, written) })?;
         let value: serde_json::Value = serde_json::from_str(&json)
             .map_err(|e| EngineError::Internal(format!("invoke_callback envelope: {e}")))?;
         Ok(json_to_host_value(value))
@@ -956,4 +955,3 @@ mod unit_tests {
         assert_eq!(arr.len(), 4);
     }
 }
-

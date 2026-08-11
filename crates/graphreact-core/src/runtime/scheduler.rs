@@ -375,24 +375,21 @@ pub type RemoteSink = std::sync::Arc<dyn Fn(&Message) -> bool + Send + Sync>;
 /// remote-target string, and the freshly allocated ref. The dist
 /// crate uses these to ship a `MonitorRequest` packet and to record
 /// the entry in its per-peer fan-out index.
-pub type RemoteMonitorSink =
-    std::sync::Arc<dyn Fn(NodeKey, &str, &str, MonitorRef) + Send + Sync>;
+pub type RemoteMonitorSink = std::sync::Arc<dyn Fn(NodeKey, &str, &str, MonitorRef) + Send + Sync>;
 
 /// **M14.5.** Callback fired after a `(observer, sentinel)` link is
 /// recorded locally for a `use_link("name@other")`. Receives the
 /// observer's `NodeKey`, the observer's bare local id, and the
 /// full remote-target string. Returns `true` if the dist crate
 /// considered the request routable.
-pub type RemoteLinkSink =
-    std::sync::Arc<dyn Fn(NodeKey, &str, &str) -> bool + Send + Sync>;
+pub type RemoteLinkSink = std::sync::Arc<dyn Fn(NodeKey, &str, &str) -> bool + Send + Sync>;
 
 /// **M14.5.** Callback fired by `use_unlink("name@other")`. Same
 /// arguments as [`RemoteLinkSink`]; the dist crate ships an
 /// `Unlink` packet and updates its per-observer link counter,
 /// pushing onto `pending_remote_unlinks` if the observer no longer
 /// has any remote links pending.
-pub type RemoteUnlinkSink =
-    std::sync::Arc<dyn Fn(NodeKey, &str, &str) + Send + Sync>;
+pub type RemoteUnlinkSink = std::sync::Arc<dyn Fn(NodeKey, &str, &str) + Send + Sync>;
 
 /// **M14.5.** Callback fired by [`Scheduler::unmount_with_reason`]
 /// after the local `__DOWN__` / `__EXIT__` fan-out completes.
@@ -401,8 +398,7 @@ pub type RemoteUnlinkSink =
 /// any inbound monitors targeting the unmounting node and (b)
 /// prune outbound translation tables that may contain stale
 /// references to the now-unmounted observer.
-pub type UnmountHook =
-    std::sync::Arc<dyn Fn(&str, &ExitReason) + Send + Sync>;
+pub type UnmountHook = std::sync::Arc<dyn Fn(&str, &ExitReason) + Send + Sync>;
 
 /// **M14.6.** Group-membership operation. Carried by the
 /// [`RemoteGroupSink`] callback to indicate whether a member is
@@ -419,8 +415,7 @@ pub enum GroupOp {
 /// uses it to ship `PgJoin` / `PgLeave` packets to peers and to
 /// update its own view of local membership for inbound
 /// `PgBroadcast` fan-out.
-pub type RemoteGroupSink =
-    std::sync::Arc<dyn Fn(GroupOp, &str, &str) + Send + Sync>;
+pub type RemoteGroupSink = std::sync::Arc<dyn Fn(GroupOp, &str, &str) + Send + Sync>;
 
 /// **M14.10.** Decision returned by [`SuperviseDecisionHook`] when
 /// a supervisor is about to restart a failed child. Allows external
@@ -452,9 +447,8 @@ pub enum SuperviseDecision {
 /// The hook MUST NOT borrow the scheduler — it is invoked while the
 /// scheduler holds internal `RefCell` borrows during the unmount
 /// path. Same constraint as [`UnmountHook`].
-pub type SuperviseDecisionHook = std::sync::Arc<
-    dyn Fn(SupervisorKey, &str, &ExitReason) -> SuperviseDecision + Send + Sync,
->;
+pub type SuperviseDecisionHook =
+    std::sync::Arc<dyn Fn(SupervisorKey, &str, &ExitReason) -> SuperviseDecision + Send + Sync>;
 
 /// **M-Prod sub-track #4 Phase γ (M14.11).** Cross-node delegated-
 /// restart request — pushed by the dist crate's per-connection
@@ -535,9 +529,8 @@ struct DeferredSupervisorDecision {
 /// of `group`. The `from` argument is already qualified with the
 /// local node name (or unchanged if already qualified) so peers
 /// receive an authoritative `from` field.
-pub type RemoteBroadcastSink = std::sync::Arc<
-    dyn Fn(&str, &str, &str, &serde_json::Value) + Send + Sync,
->;
+pub type RemoteBroadcastSink =
+    std::sync::Arc<dyn Fn(&str, &str, &str, &serde_json::Value) + Send + Sync>;
 
 /// Mutation a hook callback wants the scheduler to apply once the current
 /// evaluation pass finishes. Drained at the head of each `process_batch`
@@ -563,10 +556,7 @@ pub enum PendingMutation {
     /// Applied inside `drain_pending_mutations` so the graph isn't
     /// mutated mid-evaluation. No-op if either endpoint is missing or
     /// the edge already exists.
-    AcceptEdge {
-        from: String,
-        to: String,
-    },
+    AcceptEdge { from: String, to: String },
 }
 
 impl Default for Scheduler {
@@ -772,7 +762,9 @@ impl Scheduler {
     /// [`crate::telemetry`] for the full discipline.
     pub fn install_telemetry_sink(&self, sink: Arc<dyn crate::telemetry::TelemetrySink>) {
         self.telemetry
-            .store(Some(Arc::new(crate::telemetry::TelemetrySinkRef::new(sink))));
+            .store(Some(Arc::new(crate::telemetry::TelemetrySinkRef::new(
+                sink,
+            ))));
     }
 
     /// Clear any installed telemetry sink. After this returns, the
@@ -1138,8 +1130,7 @@ impl Scheduler {
         // entire batch so per-callsite cost is just an `Option`
         // null-check — no Arc clone, no atomic refcount per event.
         let telemetry_guard = self.telemetry.load();
-        let telemetry: Option<&Arc<crate::telemetry::TelemetrySinkRef>> =
-            telemetry_guard.as_ref();
+        let telemetry: Option<&Arc<crate::telemetry::TelemetrySinkRef>> = telemetry_guard.as_ref();
         if let Some(sink) = telemetry {
             sink.on_scheduler_tick_start(&crate::telemetry::SchedulerTickStart::default());
         }
@@ -1163,10 +1154,7 @@ impl Scheduler {
             // ~1 sample/ms cadence under load.
             if let Some(sink) = telemetry {
                 let snapshot = self.queue_depths_snapshot();
-                sink.on_queue_depths(&crate::telemetry::QueueDepths {
-                    depth,
-                    snapshot,
-                });
+                sink.on_queue_depths(&crate::telemetry::QueueDepths { depth, snapshot });
             }
 
             // Apply any deferred ctx-mutations (spawnChild / unmount /
@@ -1286,8 +1274,7 @@ impl Scheduler {
         }
         *self.running.borrow_mut() = true;
         let telemetry_guard = self.telemetry.load();
-        let telemetry: Option<&Arc<crate::telemetry::TelemetrySinkRef>> =
-            telemetry_guard.as_ref();
+        let telemetry: Option<&Arc<crate::telemetry::TelemetrySinkRef>> = telemetry_guard.as_ref();
         if let Some(sink) = telemetry {
             sink.on_scheduler_tick_start(&crate::telemetry::SchedulerTickStart::default());
         }
@@ -1308,10 +1295,7 @@ impl Scheduler {
 
             if let Some(sink) = telemetry {
                 let snapshot = self.queue_depths_snapshot();
-                sink.on_queue_depths(&crate::telemetry::QueueDepths {
-                    depth,
-                    snapshot,
-                });
+                sink.on_queue_depths(&crate::telemetry::QueueDepths { depth, snapshot });
             }
 
             // Apply any deferred ctx-mutations from the previous round.
@@ -1551,17 +1535,13 @@ impl Scheduler {
         let telemetry_snapshot: Option<Arc<crate::telemetry::TelemetrySinkRef>> =
             self.telemetry.load_full();
         if let Some(sink) = &telemetry_snapshot {
-            sink.on_node_evaluate_start(&crate::telemetry::NodeEvaluateStart {
-                node_id: &node_id,
-            });
+            sink.on_node_evaluate_start(&crate::telemetry::NodeEvaluateStart { node_id: &node_id });
         }
 
         evaluate_node_async(node_rc, ctx, hook_ctx).await;
 
         if let Some(sink) = &telemetry_snapshot {
-            sink.on_node_evaluate_end(&crate::telemetry::NodeEvaluateEnd {
-                node_id: &node_id,
-            });
+            sink.on_node_evaluate_end(&crate::telemetry::NodeEvaluateEnd { node_id: &node_id });
         }
 
         // M12.3a-followon-E: sync manifest into the runtime-shared
@@ -1578,9 +1558,7 @@ impl Scheduler {
                     .insert(node_id.clone(), p);
             }
             None => {
-                self.edge_accept_predicates
-                    .borrow_mut()
-                    .remove(&node_id);
+                self.edge_accept_predicates.borrow_mut().remove(&node_id);
             }
         }
 
@@ -1727,9 +1705,7 @@ impl Scheduler {
         // first, telemetry second).
         if let Some(id) = removed_id.as_deref() {
             if let Some(sink) = self.telemetry.load().as_ref() {
-                sink.on_node_unmounted(&crate::telemetry::NodeUnmounted::from_reason(
-                    id, &reason,
-                ));
+                sink.on_node_unmounted(&crate::telemetry::NodeUnmounted::from_reason(id, &reason));
             }
         }
 
@@ -1964,10 +1940,7 @@ impl Scheduler {
     /// `GET /v1/nodes/{id}`. Returns `None` if no node with the
     /// given ID is currently registered.
     #[must_use]
-    pub fn introspect_node(
-        &self,
-        id: &str,
-    ) -> Option<crate::telemetry::NodeIntrospection> {
+    pub fn introspect_node(&self, id: &str) -> Option<crate::telemetry::NodeIntrospection> {
         let directory = self.directory.borrow();
         let entry = directory.find_by_id(id)?;
         let supervisor = self
@@ -2016,19 +1989,22 @@ impl Scheduler {
         if let Some(h) = &hook {
             match h(sup_key, failed_id, reason) {
                 SuperviseDecision::Proceed => {}
-                SuperviseDecision::Defer { reason: defer_reason, retry_after } => {
+                SuperviseDecision::Defer {
+                    reason: defer_reason,
+                    retry_after,
+                } => {
                     tracing::debug!(
                         "supervisor decision deferred for child `{failed_id}` under sup {sup_key:?}: {defer_reason}"
                     );
-                    self.pending_supervisor_decisions
-                        .borrow_mut()
-                        .push(DeferredSupervisorDecision {
+                    self.pending_supervisor_decisions.borrow_mut().push(
+                        DeferredSupervisorDecision {
                             sup_key,
                             failed_id: failed_id.to_string(),
                             reason: reason.clone(),
                             deferred_at: std::time::Instant::now(),
                             retry_after,
-                        });
+                        },
+                    );
                     return Ok(());
                 }
             }
@@ -2163,16 +2139,16 @@ impl Scheduler {
             let handlers = node_rc.borrow().topology_handlers.clone();
             // Install HookCtx for the receiver so handlers can call
             // `use_emit`, ctx mutations, etc., the same as inside a body.
-            let neighbors = self.graph.borrow().neighbors(&receiving_id).unwrap_or_default();
+            let neighbors = self
+                .graph
+                .borrow()
+                .neighbors(&receiving_id)
+                .unwrap_or_default();
             let hook_ctx = self.build_hook_ctx(receiving_key, receiving_id.clone(), neighbors);
             set_hook_ctx(Some(hook_ctx));
             for (handler, options) in handlers {
-                if !matches_filter_for(
-                    &self.graph.borrow(),
-                    &receiving_id,
-                    event,
-                    options.as_ref(),
-                ) {
+                if !matches_filter_for(&self.graph.borrow(), &receiving_id, event, options.as_ref())
+                {
                     continue;
                 }
                 handler(event);
@@ -2225,20 +2201,15 @@ impl Scheduler {
         // discipline as `process_batch`. No Arc clone on the hot
         // path.
         let telemetry_guard = self.telemetry.load();
-        let telemetry: Option<&Arc<crate::telemetry::TelemetrySinkRef>> =
-            telemetry_guard.as_ref();
+        let telemetry: Option<&Arc<crate::telemetry::TelemetrySinkRef>> = telemetry_guard.as_ref();
         if let Some(sink) = telemetry {
-            sink.on_node_evaluate_start(&crate::telemetry::NodeEvaluateStart {
-                node_id: &node_id,
-            });
+            sink.on_node_evaluate_start(&crate::telemetry::NodeEvaluateStart { node_id: &node_id });
         }
 
         evaluate_node(node_rc, ctx, hook_ctx);
 
         if let Some(sink) = telemetry {
-            sink.on_node_evaluate_end(&crate::telemetry::NodeEvaluateEnd {
-                node_id: &node_id,
-            });
+            sink.on_node_evaluate_end(&crate::telemetry::NodeEvaluateEnd { node_id: &node_id });
         }
 
         // M12.3a-followon-E: sync the freshly-stored manifest into
@@ -2260,9 +2231,7 @@ impl Scheduler {
                     .insert(node_id.clone(), p);
             }
             None => {
-                self.edge_accept_predicates
-                    .borrow_mut()
-                    .remove(&node_id);
+                self.edge_accept_predicates.borrow_mut().remove(&node_id);
             }
         }
 
@@ -2341,12 +2310,8 @@ impl Scheduler {
                 None => false,
             }
         } else {
-            let policy = resolve_channel_policy(
-                &target_rc.borrow(),
-                &msg.from,
-                &self.graph.borrow(),
-                None,
-            );
+            let policy =
+                resolve_channel_policy(&target_rc.borrow(), &msg.from, &self.graph.borrow(), None);
             let accept_listed = if is_ingress {
                 // **M-Ingress.** HTTP-injected messages: default-deny
                 // unless the manifest opts in. Phase 1 uses
@@ -2433,7 +2398,11 @@ impl Scheduler {
         // so handlers can call `use_emit`, `ctx_spawn_child`, etc. — same
         // surface available from inside the component body.
         let target_id = target_rc.borrow().id.clone();
-        let target_neighbors = self.graph.borrow().neighbors(&target_id).unwrap_or_default();
+        let target_neighbors = self
+            .graph
+            .borrow()
+            .neighbors(&target_id)
+            .unwrap_or_default();
         let hook_ctx = self.build_hook_ctx(target_key, target_id, target_neighbors);
         set_hook_ctx(Some(hook_ctx));
 
@@ -2666,11 +2635,11 @@ impl Scheduler {
                     // the lookup AND the message's `to` field so
                     // existing single-node handlers continue to see
                     // bare local IDs.
-                    let final_ttl =
-                        match edge_ttl_table.get(&(from.clone(), lookup_target.clone())) {
-                            Some(&edge_cap) => proposed_ttl.min(edge_cap),
-                            None => proposed_ttl,
-                        };
+                    let final_ttl = match edge_ttl_table.get(&(from.clone(), lookup_target.clone()))
+                    {
+                        Some(&edge_cap) => proposed_ttl.min(edge_cap),
+                        None => proposed_ttl,
+                    };
                     let mut msg = create_message(
                         r#type,
                         from.clone(),
@@ -2801,11 +2770,7 @@ impl Scheduler {
     /// `true` if the (observer, target) link was established —
     /// locally if the target resolves, or via the dist sink for
     /// remote targets.
-    fn make_register_link(
-        &self,
-        this: NodeKey,
-        this_id: String,
-    ) -> Rc<dyn Fn(&str) -> bool> {
+    fn make_register_link(&self, this: NodeKey, this_id: String) -> Rc<dyn Fn(&str) -> bool> {
         let links = Rc::clone(&self.links);
         let id_to_key = self.id_to_key.clone();
         let our_node = self.node_name.read().clone();
@@ -2820,8 +2785,12 @@ impl Scheduler {
                 links.borrow_mut().add(this, target_key);
                 return true;
             }
-            let Some(sentinel) = sentinel else { return false };
-            let Some(sink) = sink.as_ref() else { return false };
+            let Some(sentinel) = sentinel else {
+                return false;
+            };
+            let Some(sink) = sink.as_ref() else {
+                return false;
+            };
             // Idempotent at the LinkRegistry level — `add` is a
             // set insertion. The dist sink is responsible for
             // bookkeeping per-peer link counts so the sentinel
@@ -2832,11 +2801,7 @@ impl Scheduler {
         })
     }
 
-    fn make_unregister_link(
-        &self,
-        this: NodeKey,
-        this_id: String,
-    ) -> Rc<dyn Fn(&str)> {
+    fn make_unregister_link(&self, this: NodeKey, this_id: String) -> Rc<dyn Fn(&str)> {
         let links = Rc::clone(&self.links);
         let id_to_key = self.id_to_key.clone();
         let our_node = self.node_name.read().clone();
@@ -2876,8 +2841,7 @@ impl Scheduler {
                 monitors.remove(mref);
             }
         }
-        let unlinks: Vec<NodeKey> =
-            std::mem::take(&mut *self.pending_remote_unlinks.lock());
+        let unlinks: Vec<NodeKey> = std::mem::take(&mut *self.pending_remote_unlinks.lock());
         if !unlinks.is_empty() {
             if let Some(sentinel) = *self.remote_sentinel.read() {
                 let mut links = self.links.borrow_mut();
@@ -2931,8 +2895,7 @@ impl Scheduler {
                     completed: false,
                     error_kind: Some("unknown_child"),
                     reason: Some("child id not found in scheduler".to_string()),
-                    duration_ms: u64::try_from(started.elapsed().as_millis())
-                        .unwrap_or(u64::MAX),
+                    duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 });
                 continue;
             };
@@ -2944,8 +2907,7 @@ impl Scheduler {
                     completed: false,
                     error_kind: Some("not_supervised"),
                     reason: Some("child is not governed by any supervisor".to_string()),
-                    duration_ms: u64::try_from(started.elapsed().as_millis())
-                        .unwrap_or(u64::MAX),
+                    duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 });
                 continue;
             }
@@ -2982,8 +2944,7 @@ impl Scheduler {
                 completed,
                 error_kind,
                 reason,
-                duration_ms: u64::try_from(started.elapsed().as_millis())
-                    .unwrap_or(u64::MAX),
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             });
         }
         if !outcomes.is_empty() {
@@ -3017,7 +2978,8 @@ impl Scheduler {
             if !self.supervisors.contains_key(entry.sup_key) {
                 tracing::debug!(
                     "supervisor decision dropped for child `{}` — supervisor {:?} no longer exists",
-                    entry.failed_id, entry.sup_key
+                    entry.failed_id,
+                    entry.sup_key
                 );
                 continue;
             }
@@ -3052,28 +3014,27 @@ impl Scheduler {
                     // the hook released the deferral; Escalated if the
                     // retry_after deadline elapsed).
                     if let Some(sink) = self.telemetry.load().as_ref() {
-                        sink.on_supervisor_decision(
-                            &crate::telemetry::SupervisorDecisionMade {
-                                failed_id: &entry.failed_id,
-                                reason: entry.reason.as_str(),
-                                action: if escalated {
-                                    crate::telemetry::SupervisorAction::Escalated
-                                } else {
-                                    crate::telemetry::SupervisorAction::Proceeded
-                                },
+                        sink.on_supervisor_decision(&crate::telemetry::SupervisorDecisionMade {
+                            failed_id: &entry.failed_id,
+                            reason: entry.reason.as_str(),
+                            action: if escalated {
+                                crate::telemetry::SupervisorAction::Escalated
+                            } else {
+                                crate::telemetry::SupervisorAction::Proceeded
                             },
-                        );
+                        });
                     }
                 }
-                SuperviseDecision::Defer { reason: _, retry_after } => {
+                SuperviseDecision::Defer {
+                    reason: _,
+                    retry_after,
+                } => {
                     if let Some(sink) = self.telemetry.load().as_ref() {
-                        sink.on_supervisor_decision(
-                            &crate::telemetry::SupervisorDecisionMade {
-                                failed_id: &entry.failed_id,
-                                reason: entry.reason.as_str(),
-                                action: crate::telemetry::SupervisorAction::Deferred,
-                            },
-                        );
+                        sink.on_supervisor_decision(&crate::telemetry::SupervisorDecisionMade {
+                            failed_id: &entry.failed_id,
+                            reason: entry.reason.as_str(),
+                            action: crate::telemetry::SupervisorAction::Deferred,
+                        });
                     }
                     keep.push(DeferredSupervisorDecision {
                         // A later Defer can shorten/lengthen the
@@ -3086,9 +3047,7 @@ impl Scheduler {
             }
         }
         if !keep.is_empty() {
-            self.pending_supervisor_decisions
-                .borrow_mut()
-                .extend(keep);
+            self.pending_supervisor_decisions.borrow_mut().extend(keep);
         }
     }
 
@@ -3144,9 +3103,9 @@ impl Scheduler {
     fn make_unmount_self(&self, id: String) -> Rc<dyn Fn()> {
         let pending = Rc::clone(&self.pending_mutations);
         Rc::new(move || {
-            pending.borrow_mut().push(PendingMutation::UnmountNode {
-                id: id.clone(),
-            });
+            pending
+                .borrow_mut()
+                .push(PendingMutation::UnmountNode { id: id.clone() });
         })
     }
 
@@ -3267,11 +3226,7 @@ impl Scheduler {
                         // time evaluation instead. Predicates not
                         // registered fall through to default-accept (the
                         // pre-followon-F behavior).
-                        let predicate = self
-                            .edge_accept_predicates
-                            .borrow()
-                            .get(&to)
-                            .cloned();
+                        let predicate = self.edge_accept_predicates.borrow().get(&to).cloned();
                         if let Some(p) = predicate {
                             if !p(&from, "") {
                                 continue;

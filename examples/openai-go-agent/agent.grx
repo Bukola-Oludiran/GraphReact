@@ -1,0 +1,58 @@
+<!--
+  OpenAI Responses API from a GraphReact Go node.
+
+  The API call is message-driven, not mount-driven, so compiling and
+  starting this example never makes a network request. Inject a
+  `prompt` message only after configuring GRX_SECRET_OPENAI_API_KEY.
+-->
+<OpenAIAgent lang="go">
+import (
+    "context"
+    "time"
+
+    openai "github.com/openai/openai-go/v3"
+    "github.com/openai/openai-go/v3/option"
+    "github.com/openai/openai-go/v3/responses"
+)
+
+func OpenAIAgentBody(ctx Ctx) Manifest {
+    emit := UseEmit()
+    UseMessage("prompt", func(message map[string]interface{}) {
+        payload, _ := message["payload"].(map[string]interface{})
+        prompt, _ := payload["text"].(string)
+        apiKey := ctx.Secret("OPENAI_API_KEY")
+        if apiKey == "" {
+            emit("openai_error", map[string]interface{}{"error": "OPENAI_API_KEY is unavailable"})
+            return
+        }
+
+        requestContext, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+        defer cancel()
+        client := openai.NewClient(option.WithAPIKey(apiKey))
+        response, err := client.Responses.New(requestContext, responses.ResponseNewParams{
+            Model: openai.ChatModelGPT5_2,
+            Input: responses.ResponseNewParamsInputUnion{OfString: openai.String(prompt)},
+        })
+        if err != nil {
+            emit("openai_error", map[string]interface{}{"error": err.Error()})
+            return
+        }
+        emit("completion", map[string]interface{}{
+            "response_id": response.ID,
+            "text": response.OutputText(),
+        })
+    })
+
+    return Manifest{
+        ID:              ctx.ID,
+        Accepts:         []string{"prompt"},
+        AcceptsExternal: []string{"prompt"},
+        Emits:           []string{"completion", "openai_error"},
+        NeedsSecret:     []string{"OPENAI_API_KEY"},
+    }
+}
+</OpenAIAgent>
+
+<Graph id="openai-go-agent">
+  <OpenAIAgent id="agent" />
+</Graph>

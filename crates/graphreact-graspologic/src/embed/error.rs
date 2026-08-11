@@ -33,9 +33,7 @@ pub enum EmbedError {
         cols: usize,
     },
 
-    #[error(
-        "covariate matrix has {cov_rows} rows; expected one row per vertex ({n_vertices})"
-    )]
+    #[error("covariate matrix has {cov_rows} rows; expected one row per vertex ({n_vertices})")]
     CovariateMismatch { cov_rows: usize, n_vertices: usize },
 
     #[error("regularizer must be ≥ 0, got {value}")]

@@ -159,11 +159,7 @@ impl JscEngine {
     /// vendored TCP-bound listener and for symmetry with
     /// `--debug=cpython:<port>` (which IS port-bound via debugpy).
     /// Today the JSC bridge ignores it on macOS lockdownd discovery.
-    pub fn enable_debugger(
-        &mut self,
-        iso: IsolateHandle,
-        port: u16,
-    ) -> EngineResult<()> {
+    pub fn enable_debugger(&mut self, iso: IsolateHandle, port: u16) -> EngineResult<()> {
         if self.inspector_installed.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -409,9 +405,8 @@ where
         let rc = call(buf.as_mut_ptr().cast(), cap, &mut written);
         if rc == ffi::GR_OK {
             buf.truncate(written);
-            return String::from_utf8(buf).map_err(|_| {
-                EngineError::Internal("non-utf8 result from jsc bridge".into())
-            });
+            return String::from_utf8(buf)
+                .map_err(|_| EngineError::Internal("non-utf8 result from jsc bridge".into()));
         }
         if rc == ffi::GR_ERR_BUFFER_TOO_SMALL {
             cap = (written.max(cap * 2)).min(RESULT_BUFFER_MAX);
@@ -890,9 +885,7 @@ mod tests {
         let mut e = JscEngine::new();
         e.initialize().expect("init");
         let iso = e.create_isolate(IsolateOptions::default()).expect("create");
-        let m = e
-            .eval_module(iso, "test", "return null;")
-            .expect("eval ok");
+        let m = e.eval_module(iso, "test", "return null;").expect("eval ok");
         assert!(m.0 > 0);
         e.dispose_isolate(iso).expect("dispose");
         e.shutdown().expect("shutdown");
@@ -947,7 +940,9 @@ mod tests {
         let map: std::collections::HashMap<String, &HostValue> =
             pairs.iter().map(|(k, v)| (k.clone(), v)).collect();
         assert!(matches!(map.get("hello"), Some(HostValue::String(s)) if s == "world"));
-        assert!(matches!(map.get("count"), Some(HostValue::Number(n)) if (*n - 7.0).abs() < f64::EPSILON));
+        assert!(
+            matches!(map.get("count"), Some(HostValue::Number(n)) if (*n - 7.0).abs() < f64::EPSILON)
+        );
         e.dispose_isolate(iso).expect("dispose");
         e.shutdown().expect("shutdown");
     }
@@ -1080,7 +1075,10 @@ mod tests {
         }
 
         let collected = observations.lock();
-        assert_eq!(collected.as_slice(), &["first".to_string(), "second".to_string()]);
+        assert_eq!(
+            collected.as_slice(),
+            &["first".to_string(), "second".to_string()]
+        );
         drop(collected);
 
         e.dispose_isolate(iso).expect("dispose");
@@ -1136,7 +1134,11 @@ mod tests {
         // The body returns its observed ctx.id back as a string —
         // proves ctx is a real arg, not a global stub.
         let fn_handle = e
-            .eval_component(iso, "Echo", "return { observedId: ctx.id, accepts: [], emits: [] };")
+            .eval_component(
+                iso,
+                "Echo",
+                "return { observedId: ctx.id, accepts: [], emits: [] };",
+            )
             .expect("eval_component");
 
         let ctx_a = HostValue::Object(vec![
@@ -1205,7 +1207,9 @@ mod tests {
             panic!("expected manifest object");
         };
         let by_key: std::collections::HashMap<String, HostValue> = pairs.into_iter().collect();
-        assert!(matches!(by_key.get("threshold"), Some(HostValue::Number(n)) if (*n - 42.0).abs() < f64::EPSILON));
+        assert!(
+            matches!(by_key.get("threshold"), Some(HostValue::Number(n)) if (*n - 42.0).abs() < f64::EPSILON)
+        );
         assert!(matches!(by_key.get("label"), Some(HostValue::String(s)) if s == "alpha"));
 
         e.dispose_isolate(iso).expect("dispose");
@@ -1246,8 +1250,12 @@ mod tests {
         // Phase 3a hooks are still no-op stubs: useState returns
         // [initial, noop], so count == 0; useMemo returns the factory
         // result, so x == 99.
-        assert!(matches!(by_key.get("count"), Some(HostValue::Number(n)) if (*n - 0.0).abs() < f64::EPSILON));
-        assert!(matches!(by_key.get("x"), Some(HostValue::Number(n)) if (*n - 99.0).abs() < f64::EPSILON));
+        assert!(
+            matches!(by_key.get("count"), Some(HostValue::Number(n)) if (*n - 0.0).abs() < f64::EPSILON)
+        );
+        assert!(
+            matches!(by_key.get("x"), Some(HostValue::Number(n)) if (*n - 99.0).abs() < f64::EPSILON)
+        );
 
         e.dispose_isolate(iso).expect("dispose");
         e.shutdown().expect("shutdown");
@@ -1312,10 +1320,15 @@ mod tests {
         // Repeat call short-circuits via the AtomicBool guard before
         // crossing the FFI boundary; observable as Ok(()) without
         // any framework-level error.
-        e.enable_debugger(iso, 9229).expect("second enable (idempotent)");
-        e.enable_debugger(iso, 9229).expect("third enable (idempotent)");
+        e.enable_debugger(iso, 9229)
+            .expect("second enable (idempotent)");
+        e.enable_debugger(iso, 9229)
+            .expect("third enable (idempotent)");
         let after = e.is_inspector_enabled(iso).expect("read after");
-        assert!(after, "context flag should still be true after idempotent calls");
+        assert!(
+            after,
+            "context flag should still be true after idempotent calls"
+        );
         e.dispose_isolate(iso).expect("dispose");
         e.shutdown().expect("shutdown");
     }
@@ -1327,7 +1340,9 @@ mod tests {
         e.initialize().expect("init");
         // Garbage handle — never minted by gr_jsc_isolate_create.
         let bogus = IsolateHandle(u64::MAX);
-        let err = e.enable_debugger(bogus, 9229).expect_err("garbage handle must error");
+        let err = e
+            .enable_debugger(bogus, 9229)
+            .expect_err("garbage handle must error");
         assert!(
             matches!(err, EngineError::InvalidIsolate),
             "expected InvalidIsolate, got: {err:?}"

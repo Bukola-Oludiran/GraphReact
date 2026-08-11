@@ -91,10 +91,7 @@ fn scheduler_tick_with_depth_cap_sets_error_status() {
     let spans = exporter.get_finished_spans().expect("spans");
     let span = &spans[0];
     assert!(
-        matches!(
-            span.status,
-            opentelemetry::trace::Status::Error { .. }
-        ),
+        matches!(span.status, opentelemetry::trace::Status::Error { .. }),
         "depth-cap-terminated tick should have Error status, got: {:?}",
         span.status,
     );
@@ -107,9 +104,7 @@ fn scheduler_tick_with_depth_cap_sets_error_status() {
 fn node_evaluate_creates_child_span_under_tick() {
     let (sink, exporter, provider) = build_test_sink();
     sink.on_scheduler_tick_start(&SchedulerTickStart {});
-    sink.on_node_evaluate_start(&NodeEvaluateStart {
-        node_id: "n1",
-    });
+    sink.on_node_evaluate_start(&NodeEvaluateStart { node_id: "n1" });
     sink.on_node_evaluate_end(&NodeEvaluateEnd { node_id: "n1" });
     sink.on_scheduler_tick_end(&SchedulerTickEnd {
         iterations: 1,
@@ -324,21 +319,35 @@ fn instant_events_fire_on_root_tick_span() {
         .expect("root tick span");
 
     // All events landed on the root span as instant events.
-    let event_names: Vec<&str> = root
-        .events
-        .iter()
-        .map(|e| e.name.as_ref())
-        .collect();
-    assert!(event_names.contains(&"node.mount"), "events: {event_names:?}");
-    assert!(event_names.contains(&"node.unmount"), "events: {event_names:?}");
-    assert!(event_names.contains(&"topology.event"), "events: {event_names:?}");
+    let event_names: Vec<&str> = root.events.iter().map(|e| e.name.as_ref()).collect();
+    assert!(
+        event_names.contains(&"node.mount"),
+        "events: {event_names:?}"
+    );
+    assert!(
+        event_names.contains(&"node.unmount"),
+        "events: {event_names:?}"
+    );
+    assert!(
+        event_names.contains(&"topology.event"),
+        "events: {event_names:?}"
+    );
     assert!(
         event_names.contains(&"supervisor.decision"),
         "events: {event_names:?}"
     );
-    assert!(event_names.contains(&"remote.message"), "events: {event_names:?}");
-    assert!(event_names.contains(&"hot.reload"), "events: {event_names:?}");
-    assert!(event_names.contains(&"queue.depths"), "events: {event_names:?}");
+    assert!(
+        event_names.contains(&"remote.message"),
+        "events: {event_names:?}"
+    );
+    assert!(
+        event_names.contains(&"hot.reload"),
+        "events: {event_names:?}"
+    );
+    assert!(
+        event_names.contains(&"queue.depths"),
+        "events: {event_names:?}"
+    );
 }
 
 /// `current_wire_context` returns Some when an OTel span is active

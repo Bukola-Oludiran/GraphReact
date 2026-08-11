@@ -118,14 +118,7 @@ pub fn attributes_for_tag(tag: &str) -> &'static [&'static str] {
         "Subsystem" => &["ref", "id", "style"],
         "import" => &["src", "as"],
         "edge" => &["source", "target", "ttl", "kind"],
-        "Component" => &[
-            "id",
-            "footprint",
-            "lang",
-            "src",
-            "layer",
-            "style",
-        ],
+        "Component" => &["id", "footprint", "lang", "src", "layer", "style"],
         "Net" => &["id", "impedance", "tolerance", "style"],
         "Pin" => &["id", "net", "pad", "style"],
         "Pad" => &["id", "net", "clearance", "style"],
@@ -200,10 +193,7 @@ pub fn clip_path_shape_markdown(shape: &str) -> String {
 /// Hover Markdown for a well-known tag, if any.
 #[must_use]
 pub fn tag_markdown(tag: &str) -> Option<&'static str> {
-    for entry in STRUCTURAL_TAGS
-        .iter()
-        .chain(PCB_TAGS.iter())
-    {
+    for entry in STRUCTURAL_TAGS.iter().chain(PCB_TAGS.iter()) {
         if entry.name == tag {
             return Some(entry.markdown);
         }

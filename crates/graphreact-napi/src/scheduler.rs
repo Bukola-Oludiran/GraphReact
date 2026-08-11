@@ -316,13 +316,22 @@ impl JsScheduler {
     /// `useGraphQuery` and other introspection.
     #[napi(js_name = "graphNodes")]
     pub fn graph_nodes(&self) -> Vec<String> {
-        self.inner.graph.borrow().nodes().map(String::from).collect()
+        self.inner
+            .graph
+            .borrow()
+            .nodes()
+            .map(String::from)
+            .collect()
     }
 
     /// Direct neighbours of `id` in the live graph.
     #[napi(js_name = "graphNeighbors")]
     pub fn graph_neighbors(&self, id: String) -> Result<Vec<String>> {
-        self.inner.graph.borrow().neighbors(&id).map_err(err_to_napi)
+        self.inner
+            .graph
+            .borrow()
+            .neighbors(&id)
+            .map_err(err_to_napi)
     }
 
     /// Whether the live graph has an edge between `u` and `v`. `key` is
@@ -408,15 +417,12 @@ impl JsScheduler {
     /// its hook state. The node is marked dirty and re-evaluates on the
     /// next batch with the new behavior.
     #[napi(js_name = "replaceComponent")]
-    pub fn replace_component(
-        &mut self,
-        env: Env,
-        id: String,
-        definition: JsObject,
-    ) -> Result<()> {
+    pub fn replace_component(&mut self, env: Env, id: String, definition: JsObject) -> Result<()> {
         let _guard = EnvGuard::new(env);
         let new_def = build_node_definition(env, definition)?;
-        self.inner.replace_definition(&id, new_def).map_err(err_to_napi)
+        self.inner
+            .replace_definition(&id, new_def)
+            .map_err(err_to_napi)
     }
 
     /// Run one synchronous evaluation round of the initial mount cycle
@@ -502,11 +508,10 @@ impl JsScheduler {
     /// directly can install their own.
     #[napi(js_name = "installSourceWakeup")]
     pub fn install_source_wakeup(&mut self, env: Env, callback: JsFunction) -> Result<()> {
-        let tsfn: ThreadsafeFunction<()> = env.create_threadsafe_function(
-            &callback,
-            0,
-            |_ctx: ThreadSafeCallContext<()>| Ok(Vec::<JsUnknown>::new()),
-        )?;
+        let tsfn: ThreadsafeFunction<()> =
+            env.create_threadsafe_function(&callback, 0, |_ctx: ThreadSafeCallContext<()>| {
+                Ok(Vec::<JsUnknown>::new())
+            })?;
         let wake: std::sync::Arc<dyn Fn() + Send + Sync> = {
             let tsfn = tsfn.clone();
             std::sync::Arc::new(move || {
@@ -540,10 +545,7 @@ impl JsScheduler {
         // leak per orphaned cleanup is acceptable.
         let cleanup_ref: Rc<ManuallyDrop<Ref<()>>> =
             Rc::new(ManuallyDrop::new(env.create_reference(cleanup_fn)?));
-        if let Some(immediate) = self
-            .async_state
-            .install_cleanup(cleanup_id, cleanup_ref)
-        {
+        if let Some(immediate) = self.async_state.install_cleanup(cleanup_id, cleanup_ref) {
             // Slot was already obsolete — run cleanup now.
             let cleanup_fn: JsFunction = env.get_reference_value(&immediate)?;
             if let Err(e) = cleanup_fn.call_without_args(None) {
@@ -745,4 +747,3 @@ fn parse_manifest(env: Env, result: JsUnknown) -> Result<PermissionManifest> {
     }
     Ok(manifest)
 }
-

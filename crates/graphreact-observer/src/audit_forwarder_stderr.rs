@@ -73,7 +73,10 @@ impl AuditForwarder for StderrJsonLinesForwarder {
                 return;
             }
         };
-        let _guard = self.guard.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self
+            .guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut handle = std::io::stderr().lock();
         if let Err(err) = handle.write_all(&line) {
             tracing::warn!(
@@ -108,7 +111,10 @@ impl AuditForwarder for StderrJsonLinesForwarder {
         _deadline: Duration,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            let _guard = self.guard.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _guard = self
+                .guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut handle = std::io::stderr().lock();
             handle.flush().is_ok()
         })

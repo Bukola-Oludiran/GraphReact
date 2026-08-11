@@ -478,9 +478,8 @@ where
         let rc = call(buf.as_mut_ptr().cast(), cap, &mut written);
         if rc == ffi::GR_OK {
             buf.truncate(written);
-            return String::from_utf8(buf).map_err(|_| {
-                EngineError::Internal("non-utf8 result from cpython bridge".into())
-            });
+            return String::from_utf8(buf)
+                .map_err(|_| EngineError::Internal("non-utf8 result from cpython bridge".into()));
         }
         if rc == ffi::GR_ERR_BUFFER_TOO_SMALL {
             cap = (written.max(cap * 2)).min(RESULT_BUFFER_MAX);
@@ -982,7 +981,9 @@ mod tests {
         let map: std::collections::HashMap<String, &HostValue> =
             pairs.iter().map(|(k, v)| (k.clone(), v)).collect();
         assert!(matches!(map.get("hello"), Some(HostValue::String(s)) if s == "world"));
-        assert!(matches!(map.get("count"), Some(HostValue::Number(n)) if (*n - 7.0).abs() < f64::EPSILON));
+        assert!(
+            matches!(map.get("count"), Some(HostValue::Number(n)) if (*n - 7.0).abs() < f64::EPSILON)
+        );
         e.dispose_isolate(iso).expect("dispose");
         e.shutdown().expect("shutdown");
     }
@@ -1020,9 +1021,7 @@ mod tests {
         let mut e = CPythonEngine::new();
         e.initialize().expect("init");
         let iso = e.create_isolate(IsolateOptions::default()).expect("create");
-        let m = e
-            .eval_module(iso, "phase2-empty", "x = 1\n")
-            .expect("eval");
+        let m = e.eval_module(iso, "phase2-empty", "x = 1\n").expect("eval");
         let result = e.resolve_function(iso, m, "no_such_function");
         assert!(result.is_err(), "missing attribute must error");
         e.dispose_isolate(iso).expect("dispose");
@@ -1044,7 +1043,11 @@ mod tests {
 
         // Define `secret` in iso_a only.
         let m_a = e
-            .eval_module(iso_a, "iso_a", "secret = 'a-only'\ndef get():\n    return secret\n")
+            .eval_module(
+                iso_a,
+                "iso_a",
+                "secret = 'a-only'\ndef get():\n    return secret\n",
+            )
             .expect("eval a");
         let get_a = e.resolve_function(iso_a, m_a, "get").expect("resolve a");
         match e.call_function(iso_a, get_a, &[]).expect("call a") {
@@ -1497,17 +1500,29 @@ mod tests {
         let mut e = CPythonEngine::new();
         e.initialize().expect("init");
 
-        let iso_a = e.create_isolate(IsolateOptions::default()).expect("create A");
-        let iso_b = e.create_isolate(IsolateOptions::default()).expect("create B");
+        let iso_a = e
+            .create_isolate(IsolateOptions::default())
+            .expect("create A");
+        let iso_b = e
+            .create_isolate(IsolateOptions::default())
+            .expect("create B");
 
         let mut ids_a = Vec::with_capacity(N);
         let mut ids_b = Vec::with_capacity(N);
         for i in 0..N {
             let id_a = e
-                .register_callback(iso_a, &format!("cb_a_{i}"), Box::new(|_| Ok(HostValue::Null)))
+                .register_callback(
+                    iso_a,
+                    &format!("cb_a_{i}"),
+                    Box::new(|_| Ok(HostValue::Null)),
+                )
                 .expect("register A");
             let id_b = e
-                .register_callback(iso_b, &format!("cb_b_{i}"), Box::new(|_| Ok(HostValue::Null)))
+                .register_callback(
+                    iso_b,
+                    &format!("cb_b_{i}"),
+                    Box::new(|_| Ok(HostValue::Null)),
+                )
                 .expect("register B");
             ids_a.push(id_a.0);
             ids_b.push(id_b.0);

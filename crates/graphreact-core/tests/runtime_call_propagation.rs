@@ -119,14 +119,12 @@ fn auto_propagation_tags_first_matching_reply_emit() {
 
     // Inject a call-shape message via the ingress entrypoint with a
     // correlation_id.
-    scheduler
-        .handle()
-        .send_ingress_with_correlation(
-            "aggregator",
-            "query",
-            serde_json::json!({"q": 1}),
-            "call-abc-123",
-        );
+    scheduler.handle().send_ingress_with_correlation(
+        "aggregator",
+        "query",
+        serde_json::json!({"q": 1}),
+        "call-abc-123",
+    );
     scheduler.process_batch().expect("process_batch");
 
     // Exactly ONE on_call_reply event fired, carrying the reply

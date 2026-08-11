@@ -12,13 +12,13 @@
 
 use graphreact_core::{
     Attrs, ChildSpec, CommunicationGraph, ExitReason, NodeContext, NodeDefinition,
-    PermissionManifest, RestartPolicy, RestartStrategy, RestartTracker, Scheduler, SuperviseDecision,
-    Supervisor,
+    PermissionManifest, RestartPolicy, RestartStrategy, RestartTracker, Scheduler,
+    SuperviseDecision, Supervisor,
 };
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn counting_definition(name: &'static str, counter: Rc<Cell<u32>>) -> NodeDefinition {
@@ -67,11 +67,17 @@ fn supervise_decision_proceed_runs_plan_synchronously() {
     let key = scheduler.key_for("child").unwrap();
     scheduler.unmount_with_reason(
         key,
-        ExitReason::Crashed { detail: "boom".into() },
+        ExitReason::Crashed {
+            detail: "boom".into(),
+        },
     );
     scheduler.process_batch().unwrap();
 
-    assert_eq!(runs.get(), 2, "child re-mounted after crash with Proceed hook");
+    assert_eq!(
+        runs.get(),
+        2,
+        "child re-mounted after crash with Proceed hook"
+    );
     assert_eq!(
         scheduler.pending_supervisor_decision_count(),
         0,
@@ -107,7 +113,9 @@ fn supervise_decision_defer_parks_then_proceed_on_next_drain() {
     let key = scheduler.key_for("child").unwrap();
     scheduler.unmount_with_reason(
         key,
-        ExitReason::Crashed { detail: "boom".into() },
+        ExitReason::Crashed {
+            detail: "boom".into(),
+        },
     );
 
     // unmount_with_reason fired execute_supervisor_plan directly,
@@ -153,7 +161,9 @@ fn supervise_decision_escalates_after_retry_after_deadline() {
     let key = scheduler.key_for("child").unwrap();
     scheduler.unmount_with_reason(
         key,
-        ExitReason::Crashed { detail: "boom".into() },
+        ExitReason::Crashed {
+            detail: "boom".into(),
+        },
     );
     scheduler.process_batch().unwrap();
     assert_eq!(runs.get(), 1);

@@ -23,9 +23,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use thiserror::Error;
 
-use crate::embed::{
-    adjacency_spectral_embed_matrix, orthogonal_procrustes, EmbedError,
-};
+use crate::embed::{adjacency_spectral_embed_matrix, orthogonal_procrustes, EmbedError};
 
 #[derive(Debug, Error)]
 pub enum LatentPositionError {
@@ -112,10 +110,7 @@ fn embed(a: MatRef<'_, f64>, n_components: usize) -> Result<Mat<f64>, EmbedError
     Ok(emb.latent_left)
 }
 
-fn procrustes_difference_norm(
-    x1: MatRef<'_, f64>,
-    x2: MatRef<'_, f64>,
-) -> Result<f64, EmbedError> {
+fn procrustes_difference_norm(x1: MatRef<'_, f64>, x2: MatRef<'_, f64>) -> Result<f64, EmbedError> {
     let r = orthogonal_procrustes(x1, x2)?;
     let aligned = x1 * r.as_ref();
     let mut s = 0.0_f64;
@@ -260,11 +255,8 @@ mod tests {
     fn latent_position_test_rejects_shape_mismatch() {
         let a = ring_adjacency(4);
         let b = ring_adjacency(5);
-        let result = latent_position_test(
-            a.as_ref(),
-            b.as_ref(),
-            &LatentPositionOptions::default(),
-        );
+        let result =
+            latent_position_test(a.as_ref(), b.as_ref(), &LatentPositionOptions::default());
         assert!(matches!(result, Err(LatentPositionError::ShapeMismatch)));
     }
 

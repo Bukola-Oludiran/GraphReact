@@ -85,9 +85,7 @@ mod tests {
 
     #[test]
     fn rollback_guard_clones_definition_cheaply() {
-        let def = NodeDefinition::new("Foo", |_: &NodeContext| {
-            PermissionManifest::default()
-        });
+        let def = NodeDefinition::new("Foo", |_: &NodeContext| PermissionManifest::default());
         let g = RollbackGuard::new("n", def);
         assert_eq!(g.node_id, "n");
         // Cloning the guard duplicates the Rc inside the

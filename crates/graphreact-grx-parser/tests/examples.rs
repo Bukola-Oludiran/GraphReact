@@ -72,8 +72,11 @@ fn parses_counter_network_example() {
     ids.sort_unstable();
     assert_eq!(ids, vec!["agg", "counter-a", "counter-b", "logger"]);
     // Each counter has two parents (agg + logger) → 2 edges per counter.
-    let counter_a_in: Vec<_> =
-        ir.edges.iter().filter(|e| e.target == "counter-a").collect();
+    let counter_a_in: Vec<_> = ir
+        .edges
+        .iter()
+        .filter(|e| e.target == "counter-a")
+        .collect();
     assert_eq!(counter_a_in.len(), 2);
     let parents: std::collections::HashSet<&str> =
         counter_a_in.iter().map(|e| e.source.as_str()).collect();
@@ -82,7 +85,10 @@ fn parses_counter_network_example() {
     // Counter-a's `initialCount` and `label` attrs should be on the
     // first occurrence (under agg).
     let counter_a = ir.nodes.iter().find(|n| n.id == "counter-a").unwrap();
-    assert_eq!(counter_a.attrs.get("initialCount"), Some(&serde_json::json!(0)));
+    assert_eq!(
+        counter_a.attrs.get("initialCount"),
+        Some(&serde_json::json!(0))
+    );
     assert_eq!(
         counter_a.attrs.get("label"),
         Some(&serde_json::json!("Alpha"))
@@ -140,8 +146,11 @@ fn resolves_multi_file_greenhouse_transitively() {
 
     // Definitions: 2 from sensors.grx (TempSensor, HumiditySensor) +
     // 2 from outputs.grx (Logger, Aggregator) = 4 total.
-    let total_defs: usize =
-        resolved.imports.iter().map(|i| i.file.definitions.len()).sum();
+    let total_defs: usize = resolved
+        .imports
+        .iter()
+        .map(|i| i.file.definitions.len())
+        .sum();
     assert_eq!(total_defs, 4);
 }
 
@@ -283,9 +292,7 @@ fn external_body_missing_file_errors_with_loc() {
     .expect_err("missing external body must error");
     match err {
         graphreact_grx_parser::GrxParseError::DefinitionBodyIo {
-            component,
-            path,
-            ..
+            component, path, ..
         } => {
             assert_eq!(component, "Counter");
             assert!(path.ends_with("missing.py"), "path: {path}");
@@ -311,7 +318,10 @@ fn external_body_in_memory_load_via_callback() {
 <Graph id="g"><Counter id="c" /></Graph>"#
             .to_string(),
     );
-    files.insert(body_path, "def init(ctx):\n    return {'accepts': []}\n".to_string());
+    files.insert(
+        body_path,
+        "def init(ctx):\n    return {'accepts': []}\n".to_string(),
+    );
     let resolved = resolve_multi_file_with(&board_path, |p| {
         files.get(p).cloned().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, p.display().to_string())
@@ -328,7 +338,11 @@ fn definition_block_code_is_extracted_verbatim() {
     let src = read_fixture("multi-file/sensors.grx");
     let file = Parser::parse_file(&src).expect("parse");
     assert_eq!(file.definitions.len(), 2);
-    let temp = file.definitions.iter().find(|d| d.component == "TempSensor").unwrap();
+    let temp = file
+        .definitions
+        .iter()
+        .find(|d| d.component == "TempSensor")
+        .unwrap();
     assert!(temp.code.contains("useState(0)"));
     assert!(temp.code.contains("emit('sensor-data'"));
     let humid = file

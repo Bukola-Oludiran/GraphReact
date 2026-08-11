@@ -278,6 +278,7 @@ type Manifest struct {{
     Emits               []string                     `json:"emits,omitempty"`
     AcceptsExternal     []string                     `json:"accepts_external,omitempty"`
     AcceptsExternalCall []ExternalCall               `json:"accepts_external_call,omitempty"`
+    NeedsSecret         []string                     `json:"needs_secret,omitempty"`
     Extra               map[string]interface{{}}       `json:"-"`
 }}
 
@@ -1059,6 +1060,9 @@ func marshalManifest(m *Manifest) ([]byte, error) {{
     }}
     if m.AcceptsExternalCall != nil {{
         out["accepts_external_call"] = m.AcceptsExternalCall
+    }}
+    if m.NeedsSecret != nil {{
+        out["needs_secret"] = m.NeedsSecret
     }}
     for k, v := range m.Extra {{
         if _, exists := out[k]; !exists {{

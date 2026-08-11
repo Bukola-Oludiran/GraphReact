@@ -44,11 +44,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use graphreact_engine_zig::EngineError;
-use graphreact_observer::MetricsInner;
 use graphreact_grx_parser::{
     ast::ComponentLang,
     multi_file::{resolve_multi_file, MultiFileResolved},
 };
+use graphreact_observer::MetricsInner;
 
 use crate::goruntime::GoRuntime;
 use crate::jsruntime::JsRuntime;
@@ -188,6 +188,18 @@ pub fn mount_mixed_with_secrets(
     path: &Path,
     secrets: Option<Arc<crate::runtime_secrets::RuntimeSecretContext>>,
 ) -> Result<MixedRuntime, RuntimeError> {
+    mount_mixed_with_options(
+        path,
+        secrets,
+        &crate::goruntime::GoRuntimeBuildOptions::default(),
+    )
+}
+
+pub fn mount_mixed_with_options(
+    path: &Path,
+    secrets: Option<Arc<crate::runtime_secrets::RuntimeSecretContext>>,
+    go_options: &crate::goruntime::GoRuntimeBuildOptions,
+) -> Result<MixedRuntime, RuntimeError> {
     let resolved = resolve_multi_file(path)?;
     let required = required_engines(&resolved);
 
@@ -209,9 +221,7 @@ pub fn mount_mixed_with_secrets(
         n_nodes: 0,
         n_edges: 0,
         n_definitions: 0,
-        empty_fallback: graphreact_core::Scheduler::new(
-            graphreact_core::CommunicationGraph::new(),
-        ),
+        empty_fallback: graphreact_core::Scheduler::new(graphreact_core::CommunicationGraph::new()),
     };
 
     // Pre-build a Go out_dir adjacent to the .grx so the codegen
@@ -222,9 +232,7 @@ pub fn mount_mixed_with_secrets(
         .unwrap_or_else(|| Path::new("."))
         .join(format!(
             ".grx-go-build-{}",
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("mixed")
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("mixed")
         ));
 
     for slot in &required {
@@ -235,18 +243,17 @@ pub fn mount_mixed_with_secrets(
                     engine = "jsc",
                     "MixedRuntime: bringing up JSC slot"
                 );
-                let runtime = match crate::jsruntime::mount_with_scheduler_and_secrets(
-                    path,
-                    secrets.clone(),
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // No previously-initialized engines to tear
-                        // down since JSC is the first slot.
-                        unwind_partial(&mut out);
-                        return Err(e);
-                    }
-                };
+                let runtime =
+                    match crate::jsruntime::mount_with_scheduler_and_secrets(path, secrets.clone())
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // No previously-initialized engines to tear
+                            // down since JSC is the first slot.
+                            unwind_partial(&mut out);
+                            return Err(e);
+                        }
+                    };
                 out.n_nodes = runtime.n_nodes;
                 out.n_edges = runtime.n_edges;
                 out.n_definitions += runtime.n_definitions;
@@ -259,16 +266,15 @@ pub fn mount_mixed_with_secrets(
                     engine = "cpython",
                     "MixedRuntime: bringing up CPython slot"
                 );
-                let runtime = match crate::pyruntime::mount_with_scheduler_and_secrets(
-                    path,
-                    secrets.clone(),
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        unwind_partial(&mut out);
-                        return Err(e);
-                    }
-                };
+                let runtime =
+                    match crate::pyruntime::mount_with_scheduler_and_secrets(path, secrets.clone())
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            unwind_partial(&mut out);
+                            return Err(e);
+                        }
+                    };
                 if out.n_nodes == 0 {
                     out.n_nodes = runtime.n_nodes;
                     out.n_edges = runtime.n_edges;
@@ -283,10 +289,11 @@ pub fn mount_mixed_with_secrets(
                     engine = "go",
                     "MixedRuntime: bringing up Go slot"
                 );
-                let runtime = match crate::goruntime::mount_with_scheduler_and_secrets(
+                let runtime = match crate::goruntime::mount_with_scheduler_and_options(
                     path,
                     &go_out_dir,
                     secrets.clone(),
+                    go_options,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -635,12 +642,14 @@ mod tests {
     use super::*;
     use std::sync::MutexGuard;
 
-    /// JSC's process-global state demands serialised tests across
-    /// the workspace; the cpython process-singleton also serialises
-    /// on the same module-local lock. Mixed-runtime tests acquire
-    /// the JSC lock since JSC is the first engine touched.
-    fn engine_lock() -> MutexGuard<'static, ()> {
-        crate::jsruntime::engine_lock()
+    /// JSC and CPython both carry process-global state. Mixed-runtime
+    /// tests must hold both crate-wide serializers so they cannot race
+    /// either engine's single-runtime tests. Always acquire JSC first,
+    /// matching mixed-runtime initialization order.
+    fn engine_locks() -> (MutexGuard<'static, ()>, MutexGuard<'static, ()>) {
+        let jsc = crate::jsruntime::engine_lock();
+        let cpython = crate::pyruntime::engine_lock();
+        (jsc, cpython)
     }
 
     fn reset_global_state() {
@@ -653,7 +662,7 @@ mod tests {
     /// init order, and tears down cleanly on shutdown.
     #[test]
     fn pure_js_fixture_brings_up_jsc_only() {
-        let _g = engine_lock();
+        let _g = engine_locks();
         reset_global_state();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/js-external-body.grx");
@@ -669,7 +678,7 @@ mod tests {
     /// one slot (CPython) — JSC is NOT initialized.
     #[test]
     fn pure_python_fixture_brings_up_cpython_only() {
-        let _g = engine_lock();
+        let _g = engine_locks();
         reset_global_state();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/python-counter.grx");
@@ -686,7 +695,7 @@ mod tests {
     /// Reverse-order shutdown disposes CPython first, JSC second.
     #[test]
     fn mixed_js_python_fixture_init_order_is_deterministic() {
-        let _g = engine_lock();
+        let _g = engine_locks();
         reset_global_state();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/python-smoke-mixed-rejected.grx");
@@ -710,7 +719,7 @@ mod tests {
     /// the Phase 3 acceptance test below.
     #[test]
     fn phase4_acceptance_engine_mount_count_populates_per_slot() {
-        let _g = engine_lock();
+        let _g = engine_locks();
         reset_global_state();
         let metrics = graphreact_observer::MetricsInner::new();
 
@@ -810,7 +819,7 @@ mod tests {
             );
             return;
         }
-        let _g = engine_lock();
+        let _g = engine_locks();
         reset_global_state();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/mixed-runtime-supervisor.grx");

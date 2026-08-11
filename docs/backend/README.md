@@ -10,7 +10,13 @@
 
 ## What this product is
 
-GraphReact (the Backend product) is a server-side runtime that executes `.grx` systems. A `.grx` file declares nodes (with bodies in JS / Python / future JVM), edges, supervision policies, and message-routing channels. The runtime parses the file, mounts the components, schedules message dispatch, and handles supervision crash-recovery — all server-side.
+GraphReact (the Backend product) is a server-side runtime that executes `.grx` systems. A `.grx` file declares nodes (with bodies in JavaScript, Python, or Go), edges, supervision policies, and message-routing channels. The runtime parses the file, mounts the components, schedules message dispatch, and handles supervision crash-recovery — all server-side.
+
+For the boundary between this backend runtime and a complete managed agent
+platform, see [GraphReact Rust as an Agentic Cloud
+substrate](../agentic-cloud.md). That document treats GraphReact as the
+execution plane and identifies persistence, isolation, agent services, and the
+multi-tenant control plane as distinct layers.
 
 You interact with GraphReact via:
 
@@ -36,6 +42,7 @@ GraphReact (Backend) ships first. GraphReactDB starts materializing after the Ba
 | [`m6.6-engine-parity.md`](m6.6-engine-parity.md) | M6.6 living document — TS feature parity audit; per-engine sign-off matrix |
 | [`m22-mixed-runtime.md`](m22-mixed-runtime.md) | M22 milestone narrative — mixed-runtime daemon (JS + Python + Go in one `.grx`); phases 1-4 shipped 2026-06-17 |
 | [`m23-lsp.md`](m23-lsp.md) | M23 milestone narrative — `.grx` Language Server outer-shell MVP (initialize / diagnostics / hover / goto-definition / completion); shipped 2026-06-17 |
+| [`go-module-dependencies.md`](go-module-dependencies.md) | Deterministic public/private Go modules, offline builds, cache fingerprints, and per-artifact SBOMs |
 
 ## Key milestones for the Backend product
 

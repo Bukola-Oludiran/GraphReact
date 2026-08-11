@@ -67,11 +67,7 @@ impl HostSecretCallback for TestSecretSource {
 /// forwards to the supplied `TestSecretSource`. The closure marshals
 /// the SecretValue's bytes as `HostValue::String` for the JS side —
 /// matches the ADR-0007 UTF-8-string boundary contract.
-fn install_host_secret(
-    e: &mut JscEngine,
-    iso: IsolateHandle,
-    src: Arc<TestSecretSource>,
-) {
+fn install_host_secret(e: &mut JscEngine, iso: IsolateHandle, src: Arc<TestSecretSource>) {
     let cb: BoxCallback = Box::new(move |args| {
         let name = match args.first() {
             Some(HostValue::String(s)) => s.clone(),

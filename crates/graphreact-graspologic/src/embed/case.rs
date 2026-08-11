@@ -336,7 +336,11 @@ fn zhu_ghodsi_pick(eigenvalues: &[f64], n_elbows: usize) -> usize {
     let mut sorted: Vec<f64> = eigenvalues.iter().map(|v| v.abs()).collect();
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let elbows = super::select::select_dimension(&sorted, n_elbows);
-    elbows.last().map(|(idx, _)| *idx).unwrap_or(sorted.len()).max(1)
+    elbows
+        .last()
+        .map(|(idx, _)| *idx)
+        .unwrap_or(sorted.len())
+        .max(1)
 }
 
 #[cfg(test)]
@@ -429,11 +433,7 @@ mod tests {
     fn case_covariate_mismatch_errors() {
         let g = block_clique_graph();
         let y = Mat::<f64>::zeros(5, 1);
-        let result = covariate_assisted_embed(
-            &g,
-            y.as_ref(),
-            &CaseOptions::default(),
-        );
+        let result = covariate_assisted_embed(&g, y.as_ref(), &CaseOptions::default());
         assert!(matches!(result, Err(EmbedError::CovariateMismatch { .. })));
     }
 

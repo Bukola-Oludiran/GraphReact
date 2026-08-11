@@ -143,7 +143,9 @@ pub struct NodeDefinitionBlock {
 /// than what the active runtime supports surfaces as a runtime
 /// error at mount time, not parse time (the parser is
 /// engine-agnostic).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum ComponentLang {
     /// JavaScript / TypeScript body. Routed to the JSC engine.
     #[default]
@@ -195,7 +197,8 @@ impl GraphDecl {
     /// with its parent path (insertion order). Useful when downstream
     /// IR builders need a flat traversal.
     pub fn walk_nodes<'a>(&'a self) -> impl Iterator<Item = WalkedNode<'a>> + 'a {
-        let mut stack: Vec<(usize, Vec<&'a str>, &'a [GrxNode])> = vec![(0, Vec::new(), &self.children)];
+        let mut stack: Vec<(usize, Vec<&'a str>, &'a [GrxNode])> =
+            vec![(0, Vec::new(), &self.children)];
         std::iter::from_fn(move || loop {
             let (depth, path, slice) = stack.last_mut()?;
             if let Some((first, rest)) = slice.split_first() {
@@ -236,10 +239,7 @@ mod tests {
     #[test]
     fn alias_validation_accepts_identifier_shape() {
         for ok in &["rf", "_x", "Mcu", "rf_v2", "_2", "A0"] {
-            assert!(
-                ImportDirective::is_valid_alias(ok),
-                "expected `{ok}` valid"
-            );
+            assert!(ImportDirective::is_valid_alias(ok), "expected `{ok}` valid");
         }
     }
 

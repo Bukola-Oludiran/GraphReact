@@ -38,8 +38,8 @@ pub mod style;
 pub mod treesitter;
 
 pub use ast::{
-    AttrMap, EdgeDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl,
-    NodeDefinitionBlock, SubgraphDecl, WalkedNode,
+    AttrMap, EdgeDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl, NodeDefinitionBlock,
+    SubgraphDecl, WalkedNode,
 };
 pub use error::{GrxParseError, GrxResult, SourceLoc};
 pub use ir::{GrxIr, IrEdge, IrNode};

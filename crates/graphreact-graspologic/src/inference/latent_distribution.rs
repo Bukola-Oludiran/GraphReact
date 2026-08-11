@@ -21,9 +21,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use thiserror::Error;
 
-use crate::embed::{
-    adjacency_spectral_embed_matrix, orthogonal_procrustes, EmbedError,
-};
+use crate::embed::{adjacency_spectral_embed_matrix, orthogonal_procrustes, EmbedError};
 
 use super::dcorr::DcorrError;
 

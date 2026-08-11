@@ -78,10 +78,7 @@ mod tests {
     fn install_jsc_inspector_signature_pinned() {
         // Compile-time check via function pointer coercion — the
         // signature is what makes the function pointer typecheck.
-        let _: fn(
-            &mut JscEngine,
-            IsolateHandle,
-            u16,
-        ) -> Result<(), EngineError> = install_jsc_inspector;
+        let _: fn(&mut JscEngine, IsolateHandle, u16) -> Result<(), EngineError> =
+            install_jsc_inspector;
     }
 }

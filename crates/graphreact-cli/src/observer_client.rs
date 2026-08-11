@@ -77,9 +77,9 @@ impl Target {
         let rest = rest.split('/').next().unwrap_or(rest);
         let (host, port) = match rest.rsplit_once(':') {
             Some((h, p)) => {
-                let port: u16 = p.parse().map_err(|e| {
-                    ObserverClientError::InvalidUrl(format!("port `{p}`: {e}"))
-                })?;
+                let port: u16 = p
+                    .parse()
+                    .map_err(|e| ObserverClientError::InvalidUrl(format!("port `{p}`: {e}")))?;
                 (h.to_string(), port)
             }
             None => {
@@ -194,26 +194,21 @@ fn build_request(host_port: &str, path: &str, token: Option<&str>) -> Vec<u8> {
         Some(t) => format!("Authorization: Bearer {t}\r\n"),
         None => String::new(),
     };
-    format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{auth_line}\r\n"
-    )
-    .into_bytes()
+    format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{auth_line}\r\n")
+        .into_bytes()
 }
 
 async fn plain_round_trip(
     host_port: &str,
     req_bytes: &[u8],
 ) -> Result<Vec<u8>, ObserverClientError> {
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(host_port),
-    )
-    .await
-    .map_err(|_| ObserverClientError::Timeout)?
-    .map_err(|e| ObserverClientError::Connect {
-        addr: host_port.to_string(),
-        detail: e.to_string(),
-    })?;
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(host_port))
+        .await
+        .map_err(|_| ObserverClientError::Timeout)?
+        .map_err(|e| ObserverClientError::Connect {
+            addr: host_port.to_string(),
+            detail: e.to_string(),
+        })?;
     write_request_and_read(&mut stream, req_bytes).await
 }
 
@@ -227,24 +222,19 @@ async fn tls_round_trip(
     let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
         .map_err(|e| ObserverClientError::Tls(format!("server name `{}`: {e}", target.host)))?;
 
-    let tcp = tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(host_port),
-    )
-    .await
-    .map_err(|_| ObserverClientError::Timeout)?
-    .map_err(|e| ObserverClientError::Connect {
-        addr: host_port.to_string(),
-        detail: e.to_string(),
-    })?;
+    let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(host_port))
+        .await
+        .map_err(|_| ObserverClientError::Timeout)?
+        .map_err(|e| ObserverClientError::Connect {
+            addr: host_port.to_string(),
+            detail: e.to_string(),
+        })?;
 
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        connector.connect(server_name, tcp),
-    )
-    .await
-    .map_err(|_| ObserverClientError::Timeout)?
-    .map_err(|e| ObserverClientError::Tls(format!("handshake: {e}")))?;
+    let mut stream =
+        tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| ObserverClientError::Timeout)?
+            .map_err(|e| ObserverClientError::Tls(format!("handshake: {e}")))?;
 
     write_request_and_read(&mut stream, req_bytes).await
 }
@@ -306,9 +296,9 @@ fn build_tls_connector(
                 )));
             }
             for cert in result.certs {
-                roots.add(cert).map_err(|e| {
-                    ObserverClientError::Tls(format!("add native cert: {e}"))
-                })?;
+                roots
+                    .add(cert)
+                    .map_err(|e| ObserverClientError::Tls(format!("add native cert: {e}")))?;
             }
             rustls::ClientConfig::builder()
                 .with_root_certificates(roots)

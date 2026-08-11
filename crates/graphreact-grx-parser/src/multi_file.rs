@@ -345,10 +345,7 @@ pub fn resolve_multi_file_cached(
 /// In-memory variant: provide a callable that returns the source for a
 /// given canonical path. Useful for tests + for the M12 CLI when it
 /// already has files in memory.
-pub fn resolve_multi_file_with<F>(
-    root_path: &Path,
-    mut load: F,
-) -> GrxResult<MultiFileResolved>
+pub fn resolve_multi_file_with<F>(root_path: &Path, mut load: F) -> GrxResult<MultiFileResolved>
 where
     F: FnMut(&Path) -> Result<String, std::io::Error>,
 {
@@ -373,11 +370,7 @@ struct Resolver {
 }
 
 impl Resolver {
-    fn load(
-        &mut self,
-        path: &Path,
-        stack: &mut Vec<PathBuf>,
-    ) -> GrxResult<GrxFile> {
+    fn load(&mut self, path: &Path, stack: &mut Vec<PathBuf>) -> GrxResult<GrxFile> {
         let mut load = |p: &Path| std::fs::read_to_string(p);
         self.load_with(path, stack, &mut load)
     }
@@ -407,11 +400,10 @@ impl Resolver {
             }
             _ => {
                 cache.misses += 1;
-                let source =
-                    std::fs::read_to_string(path).map_err(|source| GrxParseError::Io {
-                        path: path.display().to_string(),
-                        source,
-                    })?;
+                let source = std::fs::read_to_string(path).map_err(|source| GrxParseError::Io {
+                    path: path.display().to_string(),
+                    source,
+                })?;
                 let parsed = Parser::parse_file(&source)?;
                 cache.entries.insert(
                     path.to_path_buf(),
@@ -425,7 +417,10 @@ impl Resolver {
             }
         };
 
-        let parent_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let parent_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
 
         // PCBPnR Phase 5-D follow-on — resolve external definition
         // bodies (`<Component src="./body.py"/>`). The cache key on
@@ -500,11 +495,10 @@ impl Resolver {
             }
             _ => {
                 cache.misses += 1;
-                let source =
-                    std::fs::read_to_string(path).map_err(|source| GrxParseError::Io {
-                        path: path.display().to_string(),
-                        source,
-                    })?;
+                let source = std::fs::read_to_string(path).map_err(|source| GrxParseError::Io {
+                    path: path.display().to_string(),
+                    source,
+                })?;
                 let parsed = Parser::parse_file(&source)?;
                 // Build the tree-sitter tree alongside (we don't
                 // need it for IR construction here — the
@@ -526,7 +520,10 @@ impl Resolver {
             }
         };
 
-        let parent_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let parent_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
 
         // PCBPnR Phase 5-D follow-on — resolve external definition
         // bodies. See note on `load_via_cache`.
@@ -575,7 +572,10 @@ impl Resolver {
             source,
         })?;
         let mut file = Parser::parse_file(&source)?;
-        let parent_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let parent_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
 
         // PCBPnR Phase 5-D follow-on — resolve external definition
         // bodies (`<Component src="./body.py"/>`) relative to the
@@ -715,7 +715,9 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn build_loader(files: HashMap<PathBuf, String>) -> impl FnMut(&Path) -> Result<String, std::io::Error> {
+    fn build_loader(
+        files: HashMap<PathBuf, String>,
+    ) -> impl FnMut(&Path) -> Result<String, std::io::Error> {
         move |p: &Path| {
             files
                 .get(p)
@@ -740,14 +742,14 @@ return { accepts: ['poll'] };
 </TempSensor>"
                 .to_string(),
         );
-        let resolved = resolve_multi_file_with(
-            Path::new("/root/main.grx"),
-            build_loader(files),
-        )
-        .expect("ok");
+        let resolved =
+            resolve_multi_file_with(Path::new("/root/main.grx"), build_loader(files)).expect("ok");
         assert_eq!(resolved.imports.len(), 1);
         assert_eq!(resolved.imports[0].path, PathBuf::from("/root/sensors.grx"));
-        assert_eq!(resolved.imports[0].file.definitions[0].component, "TempSensor");
+        assert_eq!(
+            resolved.imports[0].file.definitions[0].component,
+            "TempSensor"
+        );
     }
 
     #[test]
@@ -763,8 +765,7 @@ return { accepts: ['poll'] };
             PathBuf::from("/c/b.grx"),
             r#"<import src="./a.grx" />"#.to_string(),
         );
-        let result =
-            resolve_multi_file_with(Path::new("/c/a.grx"), build_loader(files));
+        let result = resolve_multi_file_with(Path::new("/c/a.grx"), build_loader(files));
         assert!(matches!(result, Err(GrxParseError::CircularImport { .. })));
     }
 
@@ -783,8 +784,7 @@ return { accepts: ['poll'] };
             PathBuf::from("/c/c.grx"),
             r#"<import src="./a.grx" />"#.to_string(),
         );
-        let result =
-            resolve_multi_file_with(Path::new("/c/a.grx"), build_loader(files));
+        let result = resolve_multi_file_with(Path::new("/c/a.grx"), build_loader(files));
         assert!(matches!(result, Err(GrxParseError::CircularImport { .. })));
     }
 
@@ -807,15 +807,11 @@ return { accepts: ['poll'] };
             r"<Foo>return {accepts: []};</Foo>".to_string(),
         );
         let resolved =
-            resolve_multi_file_with(Path::new("/d/main.grx"), build_loader(files))
-                .expect("ok");
+            resolve_multi_file_with(Path::new("/d/main.grx"), build_loader(files)).expect("ok");
         // shared.grx + other.grx, no duplicate of shared.
         assert_eq!(resolved.imports.len(), 2);
         let paths: Vec<_> = resolved.imports.iter().map(|i| &i.path).collect();
-        let shared_count = paths
-            .iter()
-            .filter(|p| p.ends_with("shared.grx"))
-            .count();
+        let shared_count = paths.iter().filter(|p| p.ends_with("shared.grx")).count();
         assert_eq!(shared_count, 1);
     }
 
@@ -828,8 +824,7 @@ return { accepts: ['poll'] };
 <Graph id="m"></Graph>"#
                 .to_string(),
         );
-        let result =
-            resolve_multi_file_with(Path::new("/e/main.grx"), build_loader(files));
+        let result = resolve_multi_file_with(Path::new("/e/main.grx"), build_loader(files));
         assert!(matches!(result, Err(GrxParseError::Io { .. })));
     }
 
@@ -939,11 +934,7 @@ return { accepts: ['poll'] };
         std::fs::write(&leaf, r"<Foo>const leaf = 2;</Foo>").unwrap();
 
         let _r2 = resolve_multi_file_cached(&root, &mut cache).expect("r2");
-        assert_eq!(
-            cache.hits(),
-            3,
-            "root + a + b should all hit (unchanged)"
-        );
+        assert_eq!(cache.hits(), 3, "root + a + b should all hit (unchanged)");
         assert_eq!(cache.misses(), 1, "only the leaf should miss");
     }
 
@@ -955,8 +946,7 @@ return { accepts: ['poll'] };
     fn explicit_invalidation_forces_reparse() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("solo.grx");
-        std::fs::write(&root, r#"<Foo>x</Foo><Graph id="g"><Foo id="a" /></Graph>"#)
-            .unwrap();
+        std::fs::write(&root, r#"<Foo>x</Foo><Graph id="g"><Foo id="a" /></Graph>"#).unwrap();
 
         let mut cache = ParseCache::new();
         let _r1 = resolve_multi_file_cached(&root, &mut cache).expect("r1");
@@ -985,8 +975,7 @@ return { accepts: ['poll'] };
         files.insert(PathBuf::from("/f/a-sub.grx"), String::new());
         files.insert(PathBuf::from("/f/b.grx"), String::new());
         let resolved =
-            resolve_multi_file_with(Path::new("/f/main.grx"), build_loader(files))
-                .expect("ok");
+            resolve_multi_file_with(Path::new("/f/main.grx"), build_loader(files)).expect("ok");
         let names: Vec<&str> = resolved
             .imports
             .iter()
@@ -1020,11 +1009,7 @@ return { accepts: ['poll'] };
 <Subgraph name="Hub"><Foo id="a"/></Subgraph>"#,
         )
         .unwrap();
-        std::fs::write(
-            &leaf,
-            r#"<Subgraph name="Core"><Foo id="b"/></Subgraph>"#,
-        )
-        .unwrap();
+        std::fs::write(&leaf, r#"<Subgraph name="Core"><Foo id="b"/></Subgraph>"#).unwrap();
 
         let resolved = resolve_multi_file(&root).expect("resolve");
         let combined = resolved.collect_root_subgraphs().expect("collect");
@@ -1057,11 +1042,7 @@ return { accepts: ['poll'] };
 <Subgraph name="Hub"><Foo id="a"/></Subgraph>"#,
         )
         .unwrap();
-        std::fs::write(
-            &leaf,
-            r#"<Subgraph name="Core"><Foo id="b"/></Subgraph>"#,
-        )
-        .unwrap();
+        std::fs::write(&leaf, r#"<Subgraph name="Core"><Foo id="b"/></Subgraph>"#).unwrap();
 
         let resolved = resolve_multi_file(&root).expect("resolve");
         let combined = resolved.collect_root_subgraphs().expect("collect");
@@ -1106,11 +1087,7 @@ return { accepts: ['poll'] };
 <Subgraph name="HubB"><Foo id="hb"/></Subgraph>"#,
         )
         .unwrap();
-        std::fs::write(
-            &leaf,
-            r#"<Subgraph name="Core"><Foo id="b"/></Subgraph>"#,
-        )
-        .unwrap();
+        std::fs::write(&leaf, r#"<Subgraph name="Core"><Foo id="b"/></Subgraph>"#).unwrap();
 
         let resolved = resolve_multi_file(&root).expect("resolve");
         let combined = resolved.collect_root_subgraphs().expect("collect");
@@ -1137,11 +1114,7 @@ return { accepts: ['poll'] };
 <Graph id="r"><Foo id="y" /></Graph>"#,
         )
         .unwrap();
-        std::fs::write(
-            &lib,
-            r#"<Subgraph name="Hub"><Foo id="h"/></Subgraph>"#,
-        )
-        .unwrap();
+        std::fs::write(&lib, r#"<Subgraph name="Hub"><Foo id="h"/></Subgraph>"#).unwrap();
 
         let resolved = resolve_multi_file(&root).expect("resolve");
         let combined = resolved.collect_root_subgraphs().expect("collect");

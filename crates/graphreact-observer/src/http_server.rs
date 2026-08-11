@@ -260,7 +260,11 @@ fn handle_request(
         },
         (_, _) => {
             audit::log_response(peer, &path, 404, 0, None);
-            response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", "not found")
+            response(
+                StatusCode::NOT_FOUND,
+                "text/plain; charset=utf-8",
+                "not found",
+            )
         }
     }
 }
@@ -295,7 +299,11 @@ fn check_auth(req: &Request<Incoming>, ctx: &ServerCtx) -> AuthCheck {
     }
 }
 
-fn response(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
+fn response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: impl Into<Bytes>,
+) -> Response<Full<Bytes>> {
     let mut resp = Response::new(Full::new(body.into()));
     *resp.status_mut() = status;
     resp.headers_mut()
@@ -315,4 +323,3 @@ fn challenge_response() -> Response<Full<Bytes>> {
     );
     resp
 }
-

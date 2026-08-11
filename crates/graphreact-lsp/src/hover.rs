@@ -5,7 +5,9 @@
 //! Markdown payload pulled from [`crate::catalog`].
 
 use graphreact_grx_parser::ast::{GrxFile, GrxNode, NodeDecl};
-use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position, Range};
+use tower_lsp_server::ls_types::{
+    Hover, HoverContents, MarkupContent, MarkupKind, Position, Range,
+};
 
 use crate::catalog::{
     attribute_markdown, clip_path_shape_markdown, clip_path_shapes, style_properties,
@@ -65,11 +67,7 @@ pub fn build_hover(file: &GrxFile, source: &str, pos: Position) -> Option<Hover>
 /// Classify the token at `pos`. Public so the test harness can
 /// exercise classification independently of the LSP wire layer.
 #[must_use]
-pub fn classify_hover_target(
-    file: &GrxFile,
-    source: &str,
-    pos: Position,
-) -> Option<HoverTarget> {
+pub fn classify_hover_target(file: &GrxFile, source: &str, pos: Position) -> Option<HoverTarget> {
     let line_text = nth_line(source, pos.line as usize)?;
     let col = pos.character as usize;
     // Inside an attribute value? Detect by walking back to find the
@@ -233,7 +231,9 @@ fn preceding_tag(line: &str, col: usize) -> Option<String> {
 fn word_is_attribute_shape(line: &str, col: usize, word: &str) -> bool {
     let bytes = line.as_bytes();
     let mut end = col;
-    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-' || bytes[end] == b'_') {
+    while end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'-' || bytes[end] == b'_')
+    {
         end += 1;
     }
     while end < bytes.len() && bytes[end].is_ascii_whitespace() {

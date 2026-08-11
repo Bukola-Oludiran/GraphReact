@@ -92,7 +92,7 @@ use graphreact_core::telemetry::{
 
 use opentelemetry::trace::{
     Link, Span, SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags, TraceId,
-    TracerProvider as _, TraceState, Tracer,
+    TraceState, Tracer, TracerProvider as _,
 };
 use opentelemetry::{Context, ContextGuard, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
@@ -225,12 +225,7 @@ impl OtelSink {
     /// The owned `SdkSpan` MOVES into Context — subsequent access is
     /// via `Context::current().span()` returning a `SpanRef` that
     /// shares the underlying span (interior mutability).
-    fn open_span(
-        &self,
-        name: &'static str,
-        kind: SpanKind,
-        attrs: Vec<KeyValue>,
-    ) -> ContextGuard {
+    fn open_span(&self, name: &'static str, kind: SpanKind, attrs: Vec<KeyValue>) -> ContextGuard {
         let span = self
             .tracer
             .span_builder(name)

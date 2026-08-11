@@ -83,9 +83,7 @@ impl NullEngine {
         F: FnOnce(&mut IsolateState) -> EngineResult<R>,
     {
         let mut guard = self.isolates.lock();
-        let state = guard
-            .get_mut(&iso.0)
-            .ok_or(EngineError::InvalidIsolate)?;
+        let state = guard.get_mut(&iso.0).ok_or(EngineError::InvalidIsolate)?;
         f(state)
     }
 
@@ -273,7 +271,10 @@ mod tests {
         let cb2: BoxCallback = Box::new(|_args| Ok(HostValue::Null));
         e.register_callback(iso, "host_send", cb1).expect("first");
         let r = e.register_callback(iso, "host_send", cb2);
-        assert!(matches!(r, Err(EngineError::CallbackAlreadyRegistered { .. })));
+        assert!(matches!(
+            r,
+            Err(EngineError::CallbackAlreadyRegistered { .. })
+        ));
     }
 
     #[test]

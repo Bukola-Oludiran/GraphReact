@@ -1318,18 +1318,12 @@ pub fn build_router_with_rate_limit_and_proxies(
         // + streaming per-line `{"line": N, "result": "..."}`
         // response. Body cap configurable via
         // `GRX_INGRESS_BULK_LINE_CAP` env var.
-        .route(
-            "/v1/nodes/:id/messages/bulk",
-            post(bulk_inject_handler),
-        )
+        .route("/v1/nodes/:id/messages/bulk", post(bulk_inject_handler))
         .route("/v1/supervisor/tree", get(supervisor_tree))
         // M16-Backend P7 — live event stream (WebSocket primary,
         // SSE fallback). Both paths share the auth middleware +
         // `?node=` / `?type=` / `?since=` filter parsing.
-        .route(
-            "/v1/observer/events",
-            get(crate::websocket::ws_handler),
-        )
+        .route("/v1/observer/events", get(crate::websocket::ws_handler))
         .route(
             "/v1/observer/events.sse",
             get(crate::websocket::sse_handler),
@@ -1830,9 +1824,7 @@ pub struct SpawnOptions {
 /// `draining` fields; this is the call shape `graphreact-cli`
 /// uses when `--observer-audit-log` and/or SIGTERM drain are
 /// wired.
-pub async fn spawn_with_options(
-    opts: SpawnOptions,
-) -> Result<ApiServerHandle, std::io::Error> {
+pub async fn spawn_with_options(opts: SpawnOptions) -> Result<ApiServerHandle, std::io::Error> {
     let SpawnOptions {
         bind,
         metrics,
@@ -1959,25 +1951,23 @@ pub async fn spawn_with_options(
     // Tests pin a deterministic config via `SpawnOptions::trusted_proxies`
     // to avoid the env-var race across parallel runners.
     let trusted = trusted_proxies.or_else(|| {
-        std::env::var("GRX_TRUSTED_PROXIES")
-            .ok()
-            .and_then(|s| {
-                if s.trim().is_empty() {
-                    return None;
+        std::env::var("GRX_TRUSTED_PROXIES").ok().and_then(|s| {
+            if s.trim().is_empty() {
+                return None;
+            }
+            match crate::rate_limit_keys::TrustedProxyConfig::parse(&s) {
+                Ok(cfg) => Some(Arc::new(cfg)),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "graphreact::observer::audit",
+                        event = "trusted_proxies_parse_failure",
+                        detail = %err,
+                        "failed to parse GRX_TRUSTED_PROXIES — X-Forwarded-For will be ignored"
+                    );
+                    None
                 }
-                match crate::rate_limit_keys::TrustedProxyConfig::parse(&s) {
-                    Ok(cfg) => Some(Arc::new(cfg)),
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "graphreact::observer::audit",
-                            event = "trusted_proxies_parse_failure",
-                            detail = %err,
-                            "failed to parse GRX_TRUSTED_PROXIES — X-Forwarded-For will be ignored"
-                        );
-                        None
-                    }
-                }
-            })
+            }
+        })
     });
     let router = build_router_with_rate_limit_and_proxies(state, rl, trusted);
 
@@ -2178,7 +2168,10 @@ async fn accept_loop(
 async fn healthz() -> Response {
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         "ok",
     )
         .into_response()
@@ -2244,7 +2237,10 @@ async fn readyz(State(state): State<ApiState>) -> Response {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [
-                (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                ),
                 (axum::http::header::RETRY_AFTER, "1"),
             ],
             "draining",
@@ -2274,7 +2270,10 @@ async fn readyz(State(state): State<ApiState>) -> Response {
     if ready {
         (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             "ready",
         )
             .into_response()
@@ -2297,7 +2296,10 @@ fn not_ready(reason: &'static str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [
-            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            ),
             (axum::http::header::RETRY_AFTER, "1"),
         ],
         reason,
@@ -2366,7 +2368,9 @@ async fn metrics(State(state): State<ApiState>) -> Response {
         .into_response()
 }
 
-async fn nodes_list(State(state): State<ApiState>) -> Result<Json<Vec<NodeIntrospection>>, Response> {
+async fn nodes_list(
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<NodeIntrospection>>, Response> {
     let (tx, rx) = oneshot::channel();
     state
         .snapshot_tx
@@ -2621,10 +2625,9 @@ async fn delegated_restart_handler(
         )
             .into_response(),
         Ok(DelegatedRestartDispatchResult::Draining) => drain_in_progress_response(),
-        Ok(DelegatedRestartDispatchResult::UnknownPeer) => delegated_restart_error_response(
-            StatusCode::NOT_FOUND,
-            "unknown_peer",
-        ),
+        Ok(DelegatedRestartDispatchResult::UnknownPeer) => {
+            delegated_restart_error_response(StatusCode::NOT_FOUND, "unknown_peer")
+        }
         Ok(DelegatedRestartDispatchResult::CapabilityNotNegotiated) => {
             delegated_restart_error_response(StatusCode::CONFLICT, "capability_not_negotiated")
         }
@@ -2654,10 +2657,8 @@ fn delegated_restart_error_response(status: StatusCode, error: &'static str) -> 
 }
 
 fn delegated_restart_outbound_unavailable_response() -> Response {
-    let mut response = delegated_restart_error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "outbound_unavailable",
-    );
+    let mut response =
+        delegated_restart_error_response(StatusCode::SERVICE_UNAVAILABLE, "outbound_unavailable");
     response.headers_mut().insert(
         axum::http::header::RETRY_AFTER,
         HeaderValue::from_static("1"),
@@ -2731,10 +2732,7 @@ async fn inject_call_handler(
     // Subscribe immediately after the admission check. If drain
     // races this point, watch subscription snapshots the published
     // deadline and the admitted call is still bounded by it.
-    let mut drain_deadline = state
-        .draining
-        .as_ref()
-        .map(DrainFlag::subscribe_deadline);
+    let mut drain_deadline = state.draining.as_ref().map(DrainFlag::subscribe_deadline);
     let _inflight = state.ingress_in_flight.enter();
     // Server-side correlation_id mint. UUIDv4 keeps the space
     // wide enough that operator-driven `correlation_id` reuse is
@@ -2753,7 +2751,10 @@ async fn inject_call_handler(
     // sink can resolve even if dispatch + emit happen faster than
     // we can register (small but real race window).
     let (reply_tx, reply_rx) = oneshot::channel::<Value>();
-    let Some(guard) = state.pending_calls.register(correlation_id.clone(), reply_tx) else {
+    let Some(guard) = state
+        .pending_calls
+        .register(correlation_id.clone(), reply_tx)
+    else {
         return service_unavailable("pending_calls registry full");
     };
 
@@ -3069,9 +3070,7 @@ async fn bulk_inject_handler(
                                 return;
                             }
                             if line_num >= line_cap as u64 {
-                                let _ =
-                                    write_result(&out_tx, line_num, "exceeded_line_cap")
-                                        .await;
+                                let _ = write_result(&out_tx, line_num, "exceeded_line_cap").await;
                                 return;
                             }
                         }
@@ -3086,10 +3085,8 @@ async fn bulk_inject_handler(
             while let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
                 let line = buf.split_to(nl_pos + 1);
                 let line_text = &line[..line.len() - 1]; // drop the trailing '\n'
-                // Strip optional CR from CRLF-terminated lines.
-                let line_text = line_text
-                    .strip_suffix(b"\r")
-                    .unwrap_or(line_text);
+                                                         // Strip optional CR from CRLF-terminated lines.
+                let line_text = line_text.strip_suffix(b"\r").unwrap_or(line_text);
                 // Empty lines (NDJSON tolerates / ignores them):
                 // skip without incrementing line_num. Real
                 // application clients should not emit blanks
@@ -3099,16 +3096,11 @@ async fn bulk_inject_handler(
                     continue;
                 }
                 if line_num >= line_cap as u64 {
-                    let _ =
-                        write_result(&out_tx, line_num, "exceeded_line_cap").await;
+                    let _ = write_result(&out_tx, line_num, "exceeded_line_cap").await;
                     return;
                 }
-                let result = process_bulk_line(
-                    &state_ref(&snapshot_tx, &idem_cache),
-                    &id,
-                    line_text,
-                )
-                .await;
+                let result =
+                    process_bulk_line(&state_ref(&snapshot_tx, &idem_cache), &id, line_text).await;
                 if write_line_result(&out_tx, line_num, &result).await.is_err() {
                     return;
                 }
@@ -3122,16 +3114,10 @@ async fn bulk_inject_handler(
         // EOF with leftover bytes (no trailing newline) — treat
         // the remainder as the last line if non-empty.
         if !buf.is_empty() {
-            let line_text = buf
-                .strip_suffix(b"\r")
-                .unwrap_or(&buf);
+            let line_text = buf.strip_suffix(b"\r").unwrap_or(&buf);
             if !line_text.is_empty() && line_num < line_cap as u64 {
-                let result = process_bulk_line(
-                    &state_ref(&snapshot_tx, &idem_cache),
-                    &id,
-                    line_text,
-                )
-                .await;
+                let result =
+                    process_bulk_line(&state_ref(&snapshot_tx, &idem_cache), &id, line_text).await;
                 let _ = write_line_result(&out_tx, line_num, &result).await;
             }
         }
@@ -3228,9 +3214,7 @@ async fn process_bulk_line(
     match rx.await {
         Ok(BulkInjectResult::Accepted) => BulkLineDisposition::Accepted,
         Ok(BulkInjectResult::NodeNotFound) => BulkLineDisposition::NodeNotFound,
-        Ok(BulkInjectResult::RejectedByManifest) => {
-            BulkLineDisposition::RejectedByManifest
-        }
+        Ok(BulkInjectResult::RejectedByManifest) => BulkLineDisposition::RejectedByManifest,
         Err(_) => BulkLineDisposition::BridgeDropped,
     }
 }
@@ -3359,9 +3343,7 @@ fn bridge_saturated_response() -> Response {
 /// `Retry-After` so a future shape change inside the layer cannot
 /// silently downgrade the operator-visible back-off contract.
 #[cfg(test)]
-fn rate_limited_response_from_error(
-    err: tower_governor::GovernorError,
-) -> Response {
+fn rate_limited_response_from_error(err: tower_governor::GovernorError) -> Response {
     // Phase A back-compat wrapper. Defaults the bucket discriminator
     // to `"per_ip"` so the existing in-module unit-test surface stays
     // bit-for-bit (those tests don't pass through the per-layer
@@ -3429,9 +3411,7 @@ fn rate_limited_response_from_error_with_bucket(
             // Overwrite the (possibly-folded-in) Retry-After with
             // the clamped value LAST so the header matches the
             // documented 1-second-minimum contract.
-            if let Ok(value) =
-                axum::http::HeaderValue::from_str(&retry_after.to_string())
-            {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
                 resp.headers_mut()
                     .insert(axum::http::header::RETRY_AFTER, value);
             }
@@ -3755,53 +3735,52 @@ async fn auth_layer_rbac(
                 None => verifier.verify(candidate_bytes),
             };
             match verify_outcome {
-                Ok(verified) => match crate::jwt_oidc::derive_role(
-                    &verified,
-                    verifier.role_mapping(),
-                ) {
-                    Ok(role) => {
-                        let role_str: &str = match &role {
-                            crate::rbac::Role::Admin => "admin",
-                            crate::rbac::Role::ReadOnly => "read_only",
-                            crate::rbac::Role::Custom(_) => "custom",
-                        };
-                        if crate::jwt_oidc::check_route_for_role(&role, route) {
-                            crate::audit::log_jwt_auth_success(
+                Ok(verified) => {
+                    match crate::jwt_oidc::derive_role(&verified, verifier.role_mapping()) {
+                        Ok(role) => {
+                            let role_str: &str = match &role {
+                                crate::rbac::Role::Admin => "admin",
+                                crate::rbac::Role::ReadOnly => "read_only",
+                                crate::rbac::Role::Custom(_) => "custom",
+                            };
+                            if crate::jwt_oidc::check_route_for_role(&role, route) {
+                                crate::audit::log_jwt_auth_success(
+                                    &peer_repr,
+                                    &verified.sub,
+                                    &verified.iss,
+                                    route,
+                                    role_str,
+                                    Some(verified.kid.as_str()),
+                                    verified.exp_unix_ms,
+                                    state.audit_sink.as_ref(),
+                                );
+                                req.extensions_mut().insert(AuthenticatedPrincipal {
+                                    token_id: verified.sub.clone(),
+                                    is_admin: matches!(role, crate::rbac::Role::Admin),
+                                });
+                                return next.run(req).await;
+                            }
+                            crate::audit::log_jwt_auth_fail(
                                 &peer_repr,
-                                &verified.sub,
-                                &verified.iss,
-                                route,
-                                role_str,
+                                "authz_deny",
+                                Some(verified.iss.as_str()),
                                 Some(verified.kid.as_str()),
-                                verified.exp_unix_ms,
                                 state.audit_sink.as_ref(),
                             );
-                            req.extensions_mut().insert(AuthenticatedPrincipal {
-                                token_id: verified.sub.clone(),
-                                is_admin: matches!(role, crate::rbac::Role::Admin),
-                            });
-                            return next.run(req).await;
+                            return forbidden_response();
                         }
-                        crate::audit::log_jwt_auth_fail(
-                            &peer_repr,
-                            "authz_deny",
-                            Some(verified.iss.as_str()),
-                            Some(verified.kid.as_str()),
-                            state.audit_sink.as_ref(),
-                        );
-                        return forbidden_response();
+                        Err(err) => {
+                            crate::audit::log_jwt_auth_fail(
+                                &peer_repr,
+                                err.reason_str(),
+                                Some(verified.iss.as_str()),
+                                Some(verified.kid.as_str()),
+                                state.audit_sink.as_ref(),
+                            );
+                            return challenge_response();
+                        }
                     }
-                    Err(err) => {
-                        crate::audit::log_jwt_auth_fail(
-                            &peer_repr,
-                            err.reason_str(),
-                            Some(verified.iss.as_str()),
-                            Some(verified.kid.as_str()),
-                            state.audit_sink.as_ref(),
-                        );
-                        return challenge_response();
-                    }
-                },
+                }
                 Err(
                     crate::jwt_oidc::JwtVerifyError::MissingKid
                     | crate::jwt_oidc::JwtVerifyError::UnknownKid,
@@ -3881,12 +3860,7 @@ async fn auth_layer_rbac(
     };
 
     if snap.check_route(entry, route) {
-        crate::audit::log_auth_success(
-            &entry.id.0,
-            route,
-            role_str,
-            state.audit_sink.as_ref(),
-        );
+        crate::audit::log_auth_success(&entry.id.0, route, role_str, state.audit_sink.as_ref());
         req.extensions_mut().insert(AuthenticatedPrincipal {
             token_id: entry.id.0.clone(),
             is_admin: matches!(entry.role, crate::rbac::Role::Admin),
@@ -3907,7 +3881,10 @@ async fn auth_layer_rbac(
 fn challenge_response() -> Response {
     let mut resp = (
         StatusCode::UNAUTHORIZED,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         "401 unauthorized",
     )
         .into_response();
@@ -3932,7 +3909,10 @@ fn challenge_response() -> Response {
 fn forbidden_response() -> Response {
     (
         StatusCode::FORBIDDEN,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         "403 forbidden",
     )
         .into_response()
@@ -4020,7 +4000,10 @@ mod tests {
         let mut request = axum::http::Request::builder()
             .method(Method::POST)
             .uri("/v1/admin/cluster/delegated-restart")
-            .header(axum::http::header::AUTHORIZATION, "Bearer delegated-restart-token")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                "Bearer delegated-restart-token",
+            )
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(
                 r#"{"peer":"worker","child_node_id":"child-a"}"#,
@@ -4056,10 +4039,7 @@ mod tests {
             }
         });
 
-        let response = app
-            .oneshot(delegated_restart_http_request())
-            .await
-            .unwrap();
+        let response = app.oneshot(delegated_restart_http_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4080,10 +4060,7 @@ mod tests {
         let (state, _snapshot_rx) = delegated_restart_test_state(role);
         let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
 
-        let response = app
-            .oneshot(delegated_restart_http_request())
-            .await
-            .unwrap();
+        let response = app.oneshot(delegated_restart_http_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4104,15 +4081,9 @@ mod tests {
         state.snapshot_tx = full_tx;
         let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
 
-        let response = app
-            .oneshot(delegated_restart_http_request())
-            .await
-            .unwrap();
+        let response = app.oneshot(delegated_restart_http_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers()[axum::http::header::RETRY_AFTER],
-            "1"
-        );
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
     }
 
     #[tokio::test]
@@ -4129,10 +4100,7 @@ mod tests {
             }
         });
 
-        let response = app
-            .oneshot(delegated_restart_http_request())
-            .await
-            .unwrap();
+        let response = app.oneshot(delegated_restart_http_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4158,10 +4126,7 @@ mod tests {
             }
         });
 
-        let response = app
-            .oneshot(delegated_restart_http_request())
-            .await
-            .unwrap();
+        let response = app.oneshot(delegated_restart_http_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4182,10 +4147,7 @@ mod tests {
         state.draining = Some(drain);
         let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
 
-        let response = app
-            .oneshot(delegated_restart_http_request())
-            .await
-            .unwrap();
+        let response = app.oneshot(delegated_restart_http_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -4260,10 +4222,7 @@ mod rate_limit_tests {
         // metric's cardinality by hammering random URIs.
         assert_eq!(classify_protected_path("/v1/foo"), "unknown");
         assert_eq!(classify_protected_path("/v1/nodes/"), "unknown");
-        assert_eq!(
-            classify_protected_path("/v1/nodes/abc/weird"),
-            "unknown"
-        );
+        assert_eq!(classify_protected_path("/v1/nodes/abc/weird"), "unknown");
         assert_eq!(classify_protected_path("/"), "unknown");
         assert_eq!(classify_protected_path(""), "unknown");
     }
@@ -4291,12 +4250,11 @@ mod rate_limit_tests {
         // `error` to triage `{rate_limited, bridge_saturated,
         // draining, scheduler_first_batch_pending,
         // cluster_no_peers_connected}`.
-        let resp = rate_limited_response_from_error(
-            tower_governor::GovernorError::TooManyRequests {
+        let resp =
+            rate_limited_response_from_error(tower_governor::GovernorError::TooManyRequests {
                 wait_time: 7,
                 headers: None,
-            },
-        );
+            });
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = resp
             .headers()
@@ -4319,12 +4277,11 @@ mod rate_limit_tests {
         // A `wait_time` of 0 would tell a client to retry
         // immediately, which spins. Clamp at 1s to match
         // bridge_saturated_response's `Retry-After: 1` baseline.
-        let resp = rate_limited_response_from_error(
-            tower_governor::GovernorError::TooManyRequests {
+        let resp =
+            rate_limited_response_from_error(tower_governor::GovernorError::TooManyRequests {
                 wait_time: 0,
                 headers: None,
-            },
-        );
+            });
         let retry_after = resp
             .headers()
             .get(axum::http::header::RETRY_AFTER)
@@ -4352,12 +4309,11 @@ mod rate_limit_tests {
             axum::http::header::RETRY_AFTER,
             axum::http::HeaderValue::from_static("0"),
         );
-        let resp = rate_limited_response_from_error(
-            tower_governor::GovernorError::TooManyRequests {
+        let resp =
+            rate_limited_response_from_error(tower_governor::GovernorError::TooManyRequests {
                 wait_time: 0,
                 headers: Some(sabotage),
-            },
-        );
+            });
         let retry_after = resp
             .headers()
             .get(axum::http::header::RETRY_AFTER)
@@ -4378,9 +4334,8 @@ mod rate_limit_tests {
         // the shape so a regression that drops the inject site
         // surfaces as a loud 500 in audit logs rather than a
         // silent 200.
-        let resp = rate_limited_response_from_error(
-            tower_governor::GovernorError::UnableToExtractKey,
-        );
+        let resp =
+            rate_limited_response_from_error(tower_governor::GovernorError::UnableToExtractKey);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -4496,7 +4451,10 @@ mod rate_limit_tests {
         }
         let alice_429 = alice_statuses.iter().filter(|s| **s == 429).count();
         let bob_429 = bob_statuses.iter().filter(|s| **s == 429).count();
-        assert_eq!(alice_429, 0, "alice (10.0.0.1) under cap, got {alice_statuses:?}");
+        assert_eq!(
+            alice_429, 0,
+            "alice (10.0.0.1) under cap, got {alice_statuses:?}"
+        );
         assert_eq!(bob_429, 0, "bob (10.0.0.2) under cap, got {bob_statuses:?}");
         // Now a 3rd request from alice — same IP, over burst —
         // MUST 429. This locks the per-IP discrimination: if the

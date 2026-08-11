@@ -38,15 +38,10 @@ async fn spawn_with_drain_responder(
         tls: None,
     };
     let drain = DrainFlag::new();
-    let mut server = spawn_management_api_with_drain(
-        bind,
-        metrics,
-        4242,
-        None,
-        Some(drain.clone()),
-    )
-    .await
-    .expect("spawn");
+    let mut server =
+        spawn_management_api_with_drain(bind, metrics, 4242, None, Some(drain.clone()))
+            .await
+            .expect("spawn");
     let ingress = server.ingress_in_flight.clone();
     let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
     let drain_task = tokio::spawn(async move {
@@ -62,9 +57,8 @@ async fn spawn_with_drain_responder(
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
-                    let _ = oneshot_tx.send(
-                        graphreact_observer::InjectMessageWithReplyDisposition::Dispatched,
-                    );
+                    let _ = oneshot_tx
+                        .send(graphreact_observer::InjectMessageWithReplyDisposition::Dispatched);
                 }
                 _ => {}
             }
@@ -85,19 +79,13 @@ async fn readyz_returns_draining_after_start_drain() {
         tls: None,
     };
     let drain = DrainFlag::new();
-    let mut server = spawn_management_api_with_drain(
-        bind,
-        metrics.clone(),
-        7,
-        None,
-        Some(drain.clone()),
-    )
-    .await
-    .expect("spawn");
+    let mut server =
+        spawn_management_api_with_drain(bind, metrics.clone(), 7, None, Some(drain.clone()))
+            .await
+            .expect("spawn");
     let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
-    let _noop: JoinHandle<()> = tokio::spawn(async move {
-        while snapshot_rx.recv().await.is_some() {}
-    });
+    let _noop: JoinHandle<()> =
+        tokio::spawn(async move { while snapshot_rx.recv().await.is_some() {} });
 
     // Make the baseline predicate green: simulate a first batch tick.
     metrics.process_batch_duration.observe(100_000);
@@ -165,8 +153,7 @@ async fn inject_endpoint_refuses_with_draining_after_drain_flip() {
 /// body is the JSON `{"error":"draining","retry_after_secs":1}`.
 #[tokio::test]
 async fn call_endpoint_refuses_with_draining_after_drain_flip() {
-    let (server, _drain_task, drain, _ingress) =
-        spawn_with_drain_responder(Duration::ZERO).await;
+    let (server, _drain_task, drain, _ingress) = spawn_with_drain_responder(Duration::ZERO).await;
     assert!(drain.start(10_000));
 
     let (status, body) = http_post_with_headers(
@@ -198,9 +185,8 @@ async fn inflight_inject_completes_through_drain_settles_counter() {
     // Fire the inject in a background task so we can poll the
     // counter while it's in-flight.
     let url2 = url.clone();
-    let inject = tokio::spawn(async move {
-        http_post(&url2, r#"{"type":"calibrate","payload":{}}"#).await
-    });
+    let inject =
+        tokio::spawn(async move { http_post(&url2, r#"{"type":"calibrate","payload":{}}"#).await });
 
     // Wait long enough for the request to register but not finish.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -227,8 +213,7 @@ async fn inflight_inject_completes_through_drain_settles_counter() {
 /// counters before the outer daemon deadline needs to escalate.
 #[tokio::test]
 async fn inflight_call_timeout_is_truncated_by_drain_deadline() {
-    let (server, _drain_task, drain, ingress) =
-        spawn_with_drain_responder(Duration::ZERO).await;
+    let (server, _drain_task, drain, ingress) = spawn_with_drain_responder(Duration::ZERO).await;
     let pending_calls = server.pending_calls.clone();
     let url = format!("http://{}/v1/nodes/alpha/call", server.local_addr);
     let call = tokio::spawn(async move {
@@ -335,9 +320,7 @@ async fn http_get(url: &str) -> (Status, String) {
         .map(|(hp, p)| (hp, format!("/{p}")))
         .unwrap_or((after_scheme, "/".into()));
     let mut stream = TcpStream::connect(host_port).await.expect("connect");
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.expect("send");
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.expect("read");
@@ -345,7 +328,12 @@ async fn http_get(url: &str) -> (Status, String) {
     let (head, body) = response.split_once("\r\n\r\n").expect("framing");
     let mut lines = head.lines();
     let status_line = lines.next().expect("status");
-    let code: u16 = status_line.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
     let mut retry_after = None;
     for h in lines {
         if let Some((name, value)) = h.split_once(':') {
@@ -387,7 +375,12 @@ async fn http_post_with_headers(url: &str, body: &str) -> (Status, String) {
     let (head, body) = response.split_once("\r\n\r\n").expect("framing");
     let mut lines = head.lines();
     let status_line = lines.next().expect("status");
-    let code: u16 = status_line.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
     let mut retry_after = None;
     for h in lines {
         if let Some((name, value)) = h.split_once(':') {

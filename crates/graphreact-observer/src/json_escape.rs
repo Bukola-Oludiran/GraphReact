@@ -84,8 +84,8 @@ mod tests {
         escape_json_str(&mut buf, raw);
         buf.push(b'"');
         let s = std::str::from_utf8(&buf).expect("valid utf-8");
-        let parsed: String =
-            serde_json::from_str(s).unwrap_or_else(|e| panic!("round-trip parse failed for {raw:?}: {e}"));
+        let parsed: String = serde_json::from_str(s)
+            .unwrap_or_else(|e| panic!("round-trip parse failed for {raw:?}: {e}"));
         assert_eq!(parsed, raw, "round-trip mismatch for {raw:?}");
     }
 
@@ -126,8 +126,7 @@ mod tests {
             hand_rolled.push(b'"');
             escape_json_str(&mut hand_rolled, raw);
             hand_rolled.push(b'"');
-            let serde_out =
-                serde_json::to_string(&raw).expect("serde encodes single ascii char");
+            let serde_out = serde_json::to_string(&raw).expect("serde encodes single ascii char");
             assert_eq!(
                 std::str::from_utf8(&hand_rolled).expect("utf-8"),
                 serde_out,

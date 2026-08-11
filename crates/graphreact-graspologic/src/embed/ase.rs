@@ -12,9 +12,7 @@ use faer::{Mat, MatRef};
 use graphreact_core::CommunicationGraph;
 
 use super::error::{EmbedError, EmbedResult};
-use super::matrix::{
-    adjacency_matrix, augment_diagonal_in_place, is_almost_symmetric,
-};
+use super::matrix::{adjacency_matrix, augment_diagonal_in_place, is_almost_symmetric};
 use super::select::{select_svd, SelectSvd};
 
 #[derive(Debug, Clone)]
@@ -174,8 +172,7 @@ mod tests {
         // Two disjoint cliques (block-diagonal adjacency). ASE latent
         // positions for the two blocks should be separated.
         let a = block_diagonal_matrix(5, 2, 1.0);
-        let emb = adjacency_spectral_embed_matrix(a.as_ref(), Some(2), 1, Some(false))
-            .expect("ok");
+        let emb = adjacency_spectral_embed_matrix(a.as_ref(), Some(2), 1, Some(false)).expect("ok");
         assert_eq!(emb.n_components, 2);
         assert_eq!(emb.latent_left.nrows(), 10);
         assert!(emb.latent_right.is_none());
@@ -199,8 +196,7 @@ mod tests {
             a[(i, j)] = 1.0;
             a[(j, i)] = 1.0;
         }
-        let emb = adjacency_spectral_embed_matrix(a.as_ref(), Some(3), 1, Some(false))
-            .expect("ok");
+        let emb = adjacency_spectral_embed_matrix(a.as_ref(), Some(3), 1, Some(false)).expect("ok");
         let mut sv = emb.singular_values.clone();
         sv.sort_by(|a, b| b.partial_cmp(a).unwrap());
         assert!((sv[0] - 2.0).abs() < 1e-10);
@@ -220,12 +216,9 @@ mod tests {
                 }
             }
         }
-        let e1 = adjacency_spectral_embed_matrix(a.as_ref(), Some(2), 1, Some(false))
-            .expect("ok");
-        let e2 = adjacency_spectral_embed_matrix(a.as_ref(), Some(2), 1, Some(false))
-            .expect("ok");
-        let d = procrustes_distance(e1.latent_left.as_ref(), e2.latent_left.as_ref())
-            .expect("ok");
+        let e1 = adjacency_spectral_embed_matrix(a.as_ref(), Some(2), 1, Some(false)).expect("ok");
+        let e2 = adjacency_spectral_embed_matrix(a.as_ref(), Some(2), 1, Some(false)).expect("ok");
+        let d = procrustes_distance(e1.latent_left.as_ref(), e2.latent_left.as_ref()).expect("ok");
         assert!(d < 1e-8, "expected aligned distance ~0, got {d}");
     }
 
@@ -305,8 +298,7 @@ mod tests {
         a[(0, 1)] = 1.0;
         a[(1, 2)] = 1.0;
         a[(0, 2)] = 0.5;
-        let emb = adjacency_spectral_embed_matrix(a.as_ref(), Some(2), 1, None)
-            .expect("ok");
+        let emb = adjacency_spectral_embed_matrix(a.as_ref(), Some(2), 1, None).expect("ok");
         assert!(emb.latent_right.is_some());
     }
 
@@ -329,15 +321,8 @@ mod tests {
             },
         )
         .expect("ok");
-        let from_matrix = adjacency_spectral_embed_matrix(
-            direct.as_ref(),
-            Some(1),
-            1,
-            Some(false),
-        )
-        .expect("ok");
-        assert!(
-            (from_graph.singular_values[0] - from_matrix.singular_values[0]).abs() < 1e-12
-        );
+        let from_matrix =
+            adjacency_spectral_embed_matrix(direct.as_ref(), Some(1), 1, Some(false)).expect("ok");
+        assert!((from_graph.singular_values[0] - from_matrix.singular_values[0]).abs() < 1e-12);
     }
 }

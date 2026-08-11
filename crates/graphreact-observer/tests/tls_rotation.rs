@@ -55,8 +55,7 @@ struct TestCert {
 }
 
 fn mint_test_cert(common_name: &str) -> TestCert {
-    let mut params =
-        rcgen::CertificateParams::new(vec![common_name.to_string()]).unwrap();
+    let mut params = rcgen::CertificateParams::new(vec![common_name.to_string()]).unwrap();
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         common_name.to_string().try_into().unwrap(),
     ));
@@ -102,11 +101,17 @@ fn rotate_swaps_in_new_config() {
 
     let rot = RotatableServerConfig::new(cfg_a.clone());
     let pre = rot.current();
-    assert!(Arc::ptr_eq(&pre, &cfg_a), "initial snapshot must point at A");
+    assert!(
+        Arc::ptr_eq(&pre, &cfg_a),
+        "initial snapshot must point at A"
+    );
 
     rot.rotate(cfg_b.clone());
     let post = rot.current();
-    assert!(Arc::ptr_eq(&post, &cfg_b), "post-rotation snapshot must point at B");
+    assert!(
+        Arc::ptr_eq(&post, &cfg_b),
+        "post-rotation snapshot must point at B"
+    );
     // The pre-rotation snapshot must still point at A — proves the
     // rotation does NOT invalidate in-flight references.
     assert!(
@@ -122,7 +127,10 @@ async fn reload_tls_rejects_garbage_pem() {
     let cert_a = mint_test_cert("err-cert.test");
     let handle = spawn_test_observer(&cert_a).await;
     // Cert bytes that don't decode as a CERTIFICATE PEM block.
-    let result = handle.reload_tls(b"-----BEGIN GARBAGE-----\nnope\n", cert_a.key_pem.as_bytes());
+    let result = handle.reload_tls(
+        b"-----BEGIN GARBAGE-----\nnope\n",
+        cert_a.key_pem.as_bytes(),
+    );
     match result {
         Err(TlsRotationError::CertParse { .. } | TlsRotationError::EmptyCertChain) => {}
         other => panic!("expected CertParse/EmptyCertChain, got {other:?}"),
@@ -140,7 +148,10 @@ async fn reload_tls_rejects_garbage_pem() {
 async fn reload_tls_rejects_garbage_key() {
     let cert_a = mint_test_cert("err-key.test");
     let handle = spawn_test_observer(&cert_a).await;
-    let result = handle.reload_tls(cert_a.cert_pem.as_bytes(), b"-----BEGIN GARBAGE KEY-----\nnope\n");
+    let result = handle.reload_tls(
+        cert_a.cert_pem.as_bytes(),
+        b"-----BEGIN GARBAGE KEY-----\nnope\n",
+    );
     match result {
         Err(TlsRotationError::KeyParse { .. }) => {}
         other => panic!("expected KeyParse, got {other:?}"),
@@ -182,22 +193,14 @@ async fn readyz_is_red_only_while_tls_rotation_guard_is_alive() {
     let handle = spawn_management_api(bind, metrics, 0).await.expect("spawn");
 
     let guard = handle.begin_tls_rotation().expect("TLS readiness state");
-    let (status, body) = tls_http_get_readyz(
-        handle.local_addr,
-        "readyz-rotation.test",
-        &cert.cert_der,
-    )
-    .await;
+    let (status, body) =
+        tls_http_get_readyz(handle.local_addr, "readyz-rotation.test", &cert.cert_der).await;
     assert_eq!(status, 503);
     assert_eq!(body, "tls_rotation_in_progress");
 
     drop(guard);
-    let (status, body) = tls_http_get_readyz(
-        handle.local_addr,
-        "readyz-rotation.test",
-        &cert.cert_der,
-    )
-    .await;
+    let (status, body) =
+        tls_http_get_readyz(handle.local_addr, "readyz-rotation.test", &cert.cert_der).await;
     assert_eq!(status, 200);
     assert_eq!(body, "ready");
     handle.shutdown().await;
@@ -463,9 +466,7 @@ fn tls_reload_audit_event_fires() {
 
 // ---------- shared helpers ----------
 
-async fn spawn_test_observer(
-    cert: &TestCert,
-) -> graphreact_observer::ApiServerHandle {
+async fn spawn_test_observer(cert: &TestCert) -> graphreact_observer::ApiServerHandle {
     let metrics = Arc::new(MetricsInner::new());
     let bind = BindConfig {
         addr: "127.0.0.1:0".parse().unwrap(),
@@ -501,9 +502,11 @@ async fn dial_and_capture_peer_cert(
     let connector = TlsConnector::from(Arc::new(client_cfg));
 
     let tcp = TcpStream::connect(addr).await.expect("tcp connect");
-    let dns_name = rustls::pki_types::ServerName::try_from(sni.to_string())
-        .expect("sni parses");
-    let tls = connector.connect(dns_name, tcp).await.expect("tls handshake");
+    let dns_name = rustls::pki_types::ServerName::try_from(sni.to_string()).expect("sni parses");
+    let tls = connector
+        .connect(dns_name, tcp)
+        .await
+        .expect("tls handshake");
     let (_io, session) = tls.get_ref();
     let chain = session
         .peer_certificates()
@@ -531,12 +534,12 @@ async fn tls_http_get_readyz(
     let connector = TlsConnector::from(Arc::new(client_cfg));
     let tcp = TcpStream::connect(addr).await.expect("tcp connect");
     let server_name = rustls::pki_types::ServerName::try_from(sni.to_string()).expect("SNI");
-    let mut tls = connector.connect(server_name, tcp).await.expect("TLS connect");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("TLS connect");
     tls.write_all(
-        format!(
-            "GET /v1/readyz HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n"
-        )
-        .as_bytes(),
+        format!("GET /v1/readyz HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n").as_bytes(),
     )
     .await
     .expect("write request");

@@ -134,10 +134,7 @@ pub trait AuditForwarder: Debug + Send + Sync {
     /// (the workspace doesn't pull in `async-trait` and the
     /// `dyn AuditForwarder` call site reaches the method via the
     /// trait object).
-    fn drain<'a>(
-        &'a self,
-        _deadline: Duration,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+    fn drain<'a>(&'a self, _deadline: Duration) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async { true })
     }
 
@@ -421,11 +418,7 @@ impl ForwarderHub {
             // outstanding records by waiting for the worker join
             // through a clone-and-drop helper executed on a
             // background task.
-            let join_handle = entry
-                .join
-                .lock()
-                .ok()
-                .and_then(|mut g| g.take());
+            let join_handle = entry.join.lock().ok().and_then(|mut g| g.take());
             joins.push((entry.name, entry.forwarder.clone(), join_handle));
         }
         // Drop all entry-side senders by force: each forwarder

@@ -73,15 +73,18 @@ pub mod wire;
 pub(crate) mod dev_tls;
 
 pub use cluster::{Cluster, ClusterConfig};
+pub use cluster::{
+    DelegatedRestartError, DelegatedRestartHandle, DelegatedRestartIssued,
+    DelegatedRestartResultEvent, DEFAULT_DELEGATED_RESTART_TIMEOUT,
+};
 pub use discovery::{Discovery, DnsDiscovery, StaticDiscovery};
 pub use error::DistError;
-pub use handshake::{client_handshake, server_handshake, should_keep_outbound, HandshakeResult};
-pub use node_id::{Creation, NodeId, RemoteNodeRef};
 pub use groups::{DistGroups, MIN_GOSSIP_INTERVAL};
+pub use handshake::{client_handshake, server_handshake, should_keep_outbound, HandshakeResult};
 pub use net_tick::{NetSplitPolicy, NetTickConfig};
+pub use node_id::{Creation, NodeId, RemoteNodeRef};
 pub use observability::{
-    WireTracingHook, WireTracingHookSlot, INGRESS_CALL_V1_CAPABILITY,
-    OBSERVER_OTEL_V1_CAPABILITY,
+    WireTracingHook, WireTracingHookSlot, INGRESS_CALL_V1_CAPABILITY, OBSERVER_OTEL_V1_CAPABILITY,
 };
 pub use registry::{NodeRegistry, PeerHandle};
 pub use reload::{
@@ -94,15 +97,10 @@ pub use telemetry::TelemetrySinkSlot;
 pub use tls_config::TlsConfig;
 pub use transport::{Connection, Listener};
 pub use wire::{
-    CAP_AUDIT_CHAIN, CAP_DELEGATED_RESTART, CAP_MIXED_RUNTIME, DelegatedRestartAckOutcome,
-    DelegatedRestartReasonCode, DelegatedRestartResultOutcome, MAX_FRAME_BYTES,
-    MIN_SUPPORTED_VERSION, Packet, PacketType, PgBroadcast, ReloadModulePacket,
-    RestartDelegationAck, RestartDelegationRequest, RestartDelegationResult, WireCodec,
-    WireExitReason, WireFrame, WIRE_VERSION,
-};
-pub use cluster::{
-    DelegatedRestartError, DelegatedRestartHandle, DelegatedRestartIssued,
-    DelegatedRestartResultEvent, DEFAULT_DELEGATED_RESTART_TIMEOUT,
+    DelegatedRestartAckOutcome, DelegatedRestartReasonCode, DelegatedRestartResultOutcome, Packet,
+    PacketType, PgBroadcast, ReloadModulePacket, RestartDelegationAck, RestartDelegationRequest,
+    RestartDelegationResult, WireCodec, WireExitReason, WireFrame, CAP_AUDIT_CHAIN,
+    CAP_DELEGATED_RESTART, CAP_MIXED_RUNTIME, MAX_FRAME_BYTES, MIN_SUPPORTED_VERSION, WIRE_VERSION,
 };
 
 /// Result alias used throughout the dist crate.

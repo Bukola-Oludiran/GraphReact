@@ -176,8 +176,7 @@ fn bench_case_e(c: &mut Criterion) {
 
     c.bench_function("scheduler_overhead/case_e_with_subscriber", |b| {
         b.iter(|| {
-            let subscriber = Registry::default()
-                .with(TracingJsonLayer::new(Box::new(io::sink())));
+            let subscriber = Registry::default().with(TracingJsonLayer::new(Box::new(io::sink())));
             with_default(subscriber, || {
                 let mut scheduler = build_ring_scheduler();
                 scheduler.install_telemetry_sink(PrometheusSink::new().into_arc());
@@ -276,9 +275,7 @@ fn bench_case_g_otel_sink(c: &mut Criterion) {
 #[cfg(feature = "otel-test")]
 fn bench_case_g_batch(c: &mut Criterion) {
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::trace::{
-        BatchSpanProcessor, InMemorySpanExporter, SdkTracerProvider,
-    };
+    use opentelemetry_sdk::trace::{BatchSpanProcessor, InMemorySpanExporter, SdkTracerProvider};
 
     // Build a multi-thread runtime once, reused across criterion
     // iterations. The provider + processor are created inside the
@@ -300,9 +297,7 @@ fn bench_case_g_batch(c: &mut Criterion) {
                     .with_span_processor(processor)
                     .build();
                 let tracer = provider.tracer("graphreact-observer-bench");
-                let sink = std::sync::Arc::new(
-                    graphreact_observer::OtelSink::with_tracer(tracer),
-                );
+                let sink = std::sync::Arc::new(graphreact_observer::OtelSink::with_tracer(tracer));
                 let mut scheduler = build_ring_scheduler();
                 scheduler.install_telemetry_sink(sink as Arc<dyn TelemetrySink>);
                 drive_rounds(&mut scheduler);
@@ -359,10 +354,7 @@ fn build_external_inject_scheduler() -> Scheduler {
     for i in 0..RING_NODE_COUNT {
         let node_id = format!("n{i}");
         let definition = NodeDefinition::new(&node_id, |_ctx: &NodeContext| {
-            let mut m = PermissionManifest::new(
-                vec!["hop".to_string()],
-                vec!["hop".to_string()],
-            );
+            let mut m = PermissionManifest::new(vec!["hop".to_string()], vec!["hop".to_string()]);
             m.accepts_external.push("hop".to_string());
             m
         });

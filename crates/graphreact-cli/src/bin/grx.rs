@@ -8,9 +8,9 @@ use clap::Parser;
 
 use graphreact_cli::cli::{Cli, ClusterOp, Command};
 use graphreact_cli::commands::{
-    drive_handle_until, format_parse_error, load_tls_from_paths, parse_peer_entry,
-    resolve_cookie, run_check, run_completions, run_fmt, run_init, run_parse, run_reload,
-    run_run, run_run_watch, run_version, start_daemon, validate_debug_against_runtime,
+    drive_handle_until, format_parse_error, load_tls_from_paths, parse_peer_entry, resolve_cookie,
+    run_check, run_completions, run_fmt, run_init, run_parse, run_reload, run_run_watch,
+    run_version, start_daemon, validate_debug_against_runtime, validate_go_build_options,
     CommandError, ConnectOptions, DaemonOptions, FmtOutcome,
 };
 use graphreact_dist::{NetSplitPolicy, NetTickConfig, NodeId};
@@ -52,12 +52,25 @@ fn dispatch(runtime: &tokio::runtime::Runtime, command: Command) -> Result<(), C
             watch,
             debug,
             debug_no_wait,
+            go_offline,
+            go_module_cache,
         } => {
+            let go_options = graphreact_cli::goruntime::GoRuntimeBuildOptions {
+                offline: go_offline,
+                module_cache: go_module_cache,
+            };
+            validate_go_build_options(runtime_arg, &go_options)?;
             let debug = validate_debug_against_runtime(debug, runtime_arg)?;
             if watch {
                 run_run_watch(&path, runtime_arg, debug, !debug_no_wait)?;
             } else {
-                let out = run_run(&path, runtime_arg, debug, !debug_no_wait)?;
+                let out = graphreact_cli::commands::run_run_with_go_options(
+                    &path,
+                    runtime_arg,
+                    debug,
+                    !debug_no_wait,
+                    go_options,
+                )?;
                 print!("{out}");
             }
         }
@@ -137,13 +150,11 @@ fn dispatch(runtime: &tokio::runtime::Runtime, command: Command) -> Result<(), C
     Ok(())
 }
 
-fn dispatch_cluster(
-    runtime: &tokio::runtime::Runtime,
-    op: ClusterOp,
-) -> Result<(), CommandError> {
+fn dispatch_cluster(runtime: &tokio::runtime::Runtime, op: ClusterOp) -> Result<(), CommandError> {
     match op {
         ClusterOp::Daemon {
             path,
+            dev_loopback,
             node_id,
             listen,
             cookie_env,
@@ -153,6 +164,8 @@ fn dispatch_cluster(
             ca,
             peers,
             runtime: engine,
+            go_offline,
+            go_module_cache,
             duration_secs,
             observer_bind,
             observer_token_env,
@@ -172,6 +185,11 @@ fn dispatch_cluster(
             debug_no_wait,
             drain_deadline_secs,
         } => {
+            let go_options = graphreact_cli::goruntime::GoRuntimeBuildOptions {
+                offline: go_offline,
+                module_cache: go_module_cache,
+            };
+            validate_go_build_options(engine, &go_options)?;
             let debug = validate_debug_against_runtime(debug, engine)?;
             // M16-Backend P3 — install the unified JSON-log
             // subscriber globally so the daemon's tracing::* events
@@ -187,15 +205,60 @@ fn dispatch_cluster(
                 );
                 let _ = tracing::subscriber::set_global_default(subscriber);
             }
-            let node_id: NodeId = node_id.parse().map_err(|e| {
-                CommandError::ClusterArg(format!("--node-id: {e}"))
-            })?;
-            let cookie = resolve_cookie(cookie_env.as_deref(), cookie_file.as_deref())?;
-            let tls = load_tls_from_paths(&cert, &key, &ca)?;
             let peers: Vec<_> = peers
                 .iter()
                 .map(|p| parse_peer_entry(p))
                 .collect::<Result<Vec<_>, _>>()?;
+            let (node_id, listen, cookie, tls) = if dev_loopback {
+                if node_id.is_some()
+                    || listen.is_some()
+                    || cookie_env.is_some()
+                    || cookie_file.is_some()
+                    || cert.is_some()
+                    || key.is_some()
+                    || ca.is_some()
+                    || !peers.is_empty()
+                {
+                    return Err(CommandError::ClusterArg(
+                        "--dev-loopback conflicts with --node-id, --listen, cookie/TLS flags, and --peers"
+                            .into(),
+                    ));
+                }
+                if observer_token_env.is_some()
+                    || observer_token_file.is_some()
+                    || observer_cert.is_some()
+                    || observer_key.is_some()
+                {
+                    return Err(CommandError::ClusterArg(
+                        "--dev-loopback refuses observer token/TLS credential flags".into(),
+                    ));
+                }
+                if observer_bind.is_some_and(|addr| !addr.ip().is_loopback()) {
+                    return Err(CommandError::ClusterArg(
+                        "--dev-loopback requires a loopback --observer-bind".into(),
+                    ));
+                }
+                graphreact_cli::commands::dev_loopback_cluster_material()?
+            } else {
+                let node_id: NodeId = node_id
+                    .ok_or_else(|| CommandError::ClusterArg("--node-id is required".into()))?
+                    .parse()
+                    .map_err(|e| CommandError::ClusterArg(format!("--node-id: {e}")))?;
+                let listen = listen
+                    .ok_or_else(|| CommandError::ClusterArg("--listen is required".into()))?;
+                let cookie = resolve_cookie(cookie_env.as_deref(), cookie_file.as_deref())?;
+                let cert = cert
+                    .as_ref()
+                    .ok_or_else(|| CommandError::ClusterArg("--cert is required".into()))?;
+                let key = key
+                    .as_ref()
+                    .ok_or_else(|| CommandError::ClusterArg("--key is required".into()))?;
+                let ca = ca
+                    .as_ref()
+                    .ok_or_else(|| CommandError::ClusterArg("--ca is required".into()))?;
+                let tls = load_tls_from_paths(cert, key, ca)?;
+                (node_id, listen, cookie, tls)
+            };
             // M16-Backend P2 — only build a BindConfig when the
             // operator actually passed `--observer-bind`. The
             // shape-rule that `BindConfig::from_flags` enforces is
@@ -217,14 +280,17 @@ fn dispatch_cluster(
                 }),
                 _ => None,
             };
-            let observer_bind = if observer_bind.is_some()
+            let observer_bind = if dev_loopback
+                || observer_bind.is_some()
                 || observer_token_env.is_some()
                 || observer_token_file.is_some()
                 || observer_cert.is_some()
                 || observer_key.is_some()
             {
                 let flags = graphreact_observer::BindFlags {
-                    addr: observer_bind,
+                    addr: observer_bind.or_else(|| {
+                        dev_loopback.then(|| "127.0.0.1:9090".parse().expect("literal socket"))
+                    }),
                     token_env: observer_token_env,
                     token_file: observer_token_file,
                     cert: observer_cert,
@@ -245,6 +311,7 @@ fn dispatch_cluster(
                 tls,
                 peers,
                 runtime: engine,
+                go_build: go_options,
                 net_tick: NetTickConfig::default(),
                 net_split_policy: NetSplitPolicy::default(),
                 duration_secs,
@@ -313,9 +380,9 @@ fn dispatch_cluster(
             duration_secs,
         } => {
             let (peer_id, peer_addr) = parse_peer_entry(&peer)?;
-            let node_id: NodeId = node_id.parse().map_err(|e| {
-                CommandError::ClusterArg(format!("--node-id: {e}"))
-            })?;
+            let node_id: NodeId = node_id
+                .parse()
+                .map_err(|e| CommandError::ClusterArg(format!("--node-id: {e}")))?;
             let cookie = resolve_cookie(cookie_env.as_deref(), cookie_file.as_deref())?;
             let tls = load_tls_from_paths(&cert, &key, &ca)?;
             let opts = ConnectOptions {
@@ -367,8 +434,10 @@ fn format_top_level_error(err: &CommandError, path: Option<&Path>) -> String {
     if let (CommandError::Parser(parse_err), Some(p)) = (err, path) {
         return format_parse_error(parse_err, p);
     }
-    if let (CommandError::Runtime(graphreact_cli::runtime::RuntimeError::Parser(parse_err)), Some(p)) =
-        (err, path)
+    if let (
+        CommandError::Runtime(graphreact_cli::runtime::RuntimeError::Parser(parse_err)),
+        Some(p),
+    ) = (err, path)
     {
         return format_parse_error(parse_err, p);
     }

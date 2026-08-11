@@ -38,7 +38,13 @@ fn well_formed_fixture_emits_no_errors() {
     let ir = parse_to_ir(src).expect("parses ok");
     assert_eq!(ir.graph_id, "counter-net");
     assert_eq!(ir.nodes.len(), 3);
-    assert_eq!(ir.edges.iter().filter(|e| matches!(e.kind, graphreact_grx_parser::ir::EdgeKind::Explicit)).count(), 2);
+    assert_eq!(
+        ir.edges
+            .iter()
+            .filter(|e| matches!(e.kind, graphreact_grx_parser::ir::EdgeKind::Explicit))
+            .count(),
+        2
+    );
 }
 
 #[test]

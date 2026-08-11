@@ -27,9 +27,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use graphreact_observer::{
-    replay_audit_chain, spawn_management_api_with_options, BearerToken, BindConfig,
-    FileAuditSink, MetricsInner, RateLimitConfig, Role, RotatableRegistry, SnapshotRequest,
-    SpawnOptions, TokenEntry, TokenId, TokenRegistry, TrustedProxyConfig,
+    replay_audit_chain, spawn_management_api_with_options, BearerToken, BindConfig, FileAuditSink,
+    MetricsInner, RateLimitConfig, Role, RotatableRegistry, SnapshotRequest, SpawnOptions,
+    TokenEntry, TokenId, TokenRegistry, TrustedProxyConfig,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -189,7 +189,10 @@ async fn two_tokens_have_independent_per_token_buckets() {
 
     // T_admin floods → trips per-token cap.
     let admin_resps = flood_get_n_with_headers(addr, "/v1/identity", 10, |_| {
-        vec![("Authorization".to_string(), format!("Bearer {}", std::str::from_utf8(t_admin).unwrap()))]
+        vec![(
+            "Authorization".to_string(),
+            format!("Bearer {}", std::str::from_utf8(t_admin).unwrap()),
+        )]
     })
     .await;
     let admin_blocked = admin_resps.iter().filter(|(s, _)| *s == 429).count();
@@ -200,10 +203,17 @@ async fn two_tokens_have_independent_per_token_buckets() {
     );
     // T_read uses a totally separate bucket — one request must pass.
     let read_resp = flood_get_n_with_headers(addr, "/v1/identity", 1, |_| {
-        vec![("Authorization".to_string(), format!("Bearer {}", std::str::from_utf8(t_read).unwrap()))]
+        vec![(
+            "Authorization".to_string(),
+            format!("Bearer {}", std::str::from_utf8(t_read).unwrap()),
+        )]
     })
     .await;
-    assert_eq!(read_resp[0].0, 200, "T_read should pass (independent bucket), got {}", read_resp[0].0);
+    assert_eq!(
+        read_resp[0].0, 200,
+        "T_read should pass (independent bucket), got {}",
+        read_resp[0].0
+    );
 
     server.shutdown().await;
     drain.abort();
@@ -220,8 +230,7 @@ async fn no_match_bucket_caps_garbage_tokens() {
     let rl = RateLimitConfig::for_tests_with_per_token(1, 100, 1, 2);
     let dir = TempDir::new("grx-no-match-bucket");
     let audit_path = dir.path.join("audit.ndjson");
-    let (server, drain, addr, metrics) =
-        spawn_rich(rl, Some(rbac), None, Some(&audit_path)).await;
+    let (server, drain, addr, metrics) = spawn_rich(rl, Some(rbac), None, Some(&audit_path)).await;
 
     // Each request carries different per-request bogus tokens; they
     // all collapse to the SAME NoMatch bucket which only has burst=2.
@@ -287,11 +296,13 @@ async fn per_token_caps_before_per_ip_when_token_cap_is_tighter() {
     let rl = RateLimitConfig::for_tests_with_per_token(1, 100, 1, 2);
     let dir = TempDir::new("grx-token-precedence");
     let audit_path = dir.path.join("audit.ndjson");
-    let (server, drain, addr, _metrics) =
-        spawn_rich(rl, Some(rbac), None, Some(&audit_path)).await;
+    let (server, drain, addr, _metrics) = spawn_rich(rl, Some(rbac), None, Some(&audit_path)).await;
 
     let resps = flood_get_n_with_headers(addr, "/v1/identity", 10, |_| {
-        vec![("Authorization".to_string(), format!("Bearer {}", std::str::from_utf8(t_admin).unwrap()))]
+        vec![(
+            "Authorization".to_string(),
+            format!("Bearer {}", std::str::from_utf8(t_admin).unwrap()),
+        )]
     })
     .await;
     let blocked = resps.iter().filter(|(s, _)| *s == 429).count();
@@ -339,7 +350,10 @@ async fn x_forwarded_for_ignored_without_trusted_proxies_env() {
     })
     .await;
     let blocked = resps.iter().filter(|(s, _)| *s == 429).count();
-    assert!(blocked >= 1, "loopback peer should still trip the per-IP bucket");
+    assert!(
+        blocked >= 1,
+        "loopback peer should still trip the per-IP bucket"
+    );
 
     server.shutdown().await;
     drain.abort();
@@ -432,11 +446,12 @@ async fn phase_a_per_ip_path_bit_for_bit() {
     let records = replay_audit_chain(&audit_path).expect("chain ok");
     let per_ip: Vec<_> = records
         .iter()
-        .filter(|r| {
-            r.kind == "rate_limit_blocked" && r.fields["bucket"].as_str() == Some("per_ip")
-        })
+        .filter(|r| r.kind == "rate_limit_blocked" && r.fields["bucket"].as_str() == Some("per_ip"))
         .collect();
-    assert!(!per_ip.is_empty(), "expected ≥1 audit record with bucket=per_ip");
+    assert!(
+        !per_ip.is_empty(),
+        "expected ≥1 audit record with bucket=per_ip"
+    );
 }
 
 /// **Sanity (smoke).** Build a Role::Custom registry and confirm
@@ -453,7 +468,10 @@ async fn per_token_bucket_works_for_custom_role() {
     let (server, drain, addr, _metrics) = spawn_rich(rl, Some(rbac), None, None).await;
 
     let resps = flood_get_n_with_headers(addr, "/v1/identity", 10, |_| {
-        vec![("Authorization".to_string(), format!("Bearer {}", std::str::from_utf8(t_custom).unwrap()))]
+        vec![(
+            "Authorization".to_string(),
+            format!("Bearer {}", std::str::from_utf8(t_custom).unwrap()),
+        )]
     })
     .await;
     let blocked = resps.iter().filter(|(s, _)| *s == 429).count();

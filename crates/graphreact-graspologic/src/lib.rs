@@ -30,16 +30,16 @@ pub use cluster::{
 };
 pub use embed::{
     adjacency_matrices, adjacency_matrix, adjacency_spectral_embed,
-    adjacency_spectral_embed_matrix, augment_diagonal, average_matrices,
-    covariate_assisted_embed, is_almost_symmetric, laplacian_spectral_embed,
-    laplacian_spectral_embed_matrix, multiple_adjacency_spectral_embed, omnibus_embed,
-    orthogonal_procrustes, procrustes_distance, select_dimension, select_svd, to_laplacian,
-    AseOptions, CaseEmbedding, CaseOptions, EmbedError, Embedding, LaplacianForm, LseOptions,
-    MaseEmbedding, MaseOptions, OmniEmbedding, OmniOptions, SelectSvd,
+    adjacency_spectral_embed_matrix, augment_diagonal, average_matrices, covariate_assisted_embed,
+    is_almost_symmetric, laplacian_spectral_embed, laplacian_spectral_embed_matrix,
+    multiple_adjacency_spectral_embed, omnibus_embed, orthogonal_procrustes, procrustes_distance,
+    select_dimension, select_svd, to_laplacian, AseOptions, CaseEmbedding, CaseOptions, EmbedError,
+    Embedding, LaplacianForm, LseOptions, MaseEmbedding, MaseOptions, OmniEmbedding, OmniOptions,
+    SelectSvd,
 };
 pub use inference::{
-    distance_correlation, latent_distribution_test, latent_position_test, sample_rdpg,
-    DcorrError, LatentDistributionError, LatentDistributionOptions, LatentDistributionTest,
+    distance_correlation, latent_distribution_test, latent_position_test, sample_rdpg, DcorrError,
+    LatentDistributionError, LatentDistributionOptions, LatentDistributionTest,
     LatentPositionError, LatentPositionOptions, LatentPositionTest,
 };
 pub use match_::{

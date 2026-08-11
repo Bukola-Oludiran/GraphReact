@@ -102,25 +102,23 @@ impl IncrementalParser {
     ///
     /// Returns `Err` if no prior tree is available (caller must
     /// invoke [`Self::parse`] first).
-    pub fn reparse(&mut self, edits: &[tree_sitter::InputEdit], new_source: &str) -> GrxResult<&Tree> {
-        let mut prev = self
-            .last_tree
-            .take()
-            .ok_or_else(|| {
-                GrxParseError::lex(
-                    "IncrementalParser::reparse called before initial parse",
-                    SourceLoc::new(1, 1),
-                )
-            })?;
+    pub fn reparse(
+        &mut self,
+        edits: &[tree_sitter::InputEdit],
+        new_source: &str,
+    ) -> GrxResult<&Tree> {
+        let mut prev = self.last_tree.take().ok_or_else(|| {
+            GrxParseError::lex(
+                "IncrementalParser::reparse called before initial parse",
+                SourceLoc::new(1, 1),
+            )
+        })?;
         for edit in edits {
             prev.edit(edit);
         }
-        let new_tree = self
-            .parser
-            .parse(new_source, Some(&prev))
-            .ok_or_else(|| {
-                GrxParseError::lex("tree-sitter reparse returned None", SourceLoc::new(1, 1))
-            })?;
+        let new_tree = self.parser.parse(new_source, Some(&prev)).ok_or_else(|| {
+            GrxParseError::lex("tree-sitter reparse returned None", SourceLoc::new(1, 1))
+        })?;
         self.last_tree = Some(new_tree);
         self.last_source = new_source.to_string();
         Ok(self.last_tree.as_ref().expect("just set"))
@@ -476,7 +474,6 @@ fn build_definition_decl(def_block: Node<'_>, source: &str) -> GrxResult<NodeDef
     })
 }
 
-
 fn first_error_node(node: Node<'_>) -> Option<Node<'_>> {
     if node.is_error() || node.is_missing() {
         return Some(node);
@@ -513,7 +510,6 @@ fn extract_graph_id(graph: Node<'_>, source: &str) -> GrxResult<(String, SourceL
     Ok((id, node_loc(graph).into_inner()))
 }
 
-
 fn parse_attribute(attr: Node<'_>, source: &str) -> GrxResult<(String, Option<JsonValue>)> {
     let mut name: Option<String> = None;
     let mut value: Option<JsonValue> = None;
@@ -541,7 +537,10 @@ fn parse_attribute(attr: Node<'_>, source: &str) -> GrxResult<(String, Option<Js
 fn parse_string_literal(node: Node<'_>, source: &str) -> String {
     // Strip the surrounding quotes; resolve `\\X` escape sequences.
     let raw = node_text(node, source);
-    let inner = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(raw);
+    let inner = raw
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(raw);
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
@@ -584,7 +583,6 @@ fn extract_tag_name(open_tag: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-
 fn node_text<'src>(node: Node<'_>, source: &'src str) -> &'src str {
     let bytes = source.as_bytes();
     let start = node.start_byte().min(bytes.len());
@@ -623,7 +621,8 @@ mod tests {
 
     #[test]
     fn parse_minimal_graph_via_treesitter() {
-        let ir = parse_to_ir_via_treesitter(r#"<Graph id="g"><A id="a" /></Graph>"#).expect("parse");
+        let ir =
+            parse_to_ir_via_treesitter(r#"<Graph id="g"><A id="a" /></Graph>"#).expect("parse");
         assert_eq!(ir.graph_id, "g");
         assert_eq!(ir.nodes.len(), 1);
         assert_eq!(ir.nodes[0].id, "a");
@@ -641,7 +640,10 @@ mod tests {
         assert_eq!(ir.graph_id, "g");
         assert_eq!(ir.nodes.len(), 3);
         assert_eq!(ir.edges.len(), 2);
-        assert!(ir.edges.iter().all(|e| e.kind == crate::ir::EdgeKind::Structural));
+        assert!(ir
+            .edges
+            .iter()
+            .all(|e| e.kind == crate::ir::EdgeKind::Structural));
     }
 
     #[test]
@@ -655,7 +657,10 @@ mod tests {
         assert_eq!(ir.edges[0].source, "a");
         assert_eq!(ir.edges[0].target, "b");
         assert_eq!(
-            ir.edges[0].attrs.get("ttl").and_then(serde_json::Value::as_u64),
+            ir.edges[0]
+                .attrs
+                .get("ttl")
+                .and_then(serde_json::Value::as_u64),
             Some(5)
         );
     }
@@ -924,17 +929,12 @@ def init():
             include_str!("../tests/fixtures/multi-file/outputs.grx"),
         ];
         for (i, src) in fixtures.iter().enumerate() {
-            let a = parse_to_ir(src).unwrap_or_else(|e| {
-                panic!("fixture {i}: hand-rolled parser failed: {e:?}")
-            });
-            let b = parse_to_ir_via_treesitter(src).unwrap_or_else(|e| {
-                panic!("fixture {i}: tree-sitter parser failed: {e:?}")
-            });
+            let a = parse_to_ir(src)
+                .unwrap_or_else(|e| panic!("fixture {i}: hand-rolled parser failed: {e:?}"));
+            let b = parse_to_ir_via_treesitter(src)
+                .unwrap_or_else(|e| panic!("fixture {i}: tree-sitter parser failed: {e:?}"));
             assert_eq!(a.graph_id, b.graph_id, "fixture {i}: graph_id mismatch");
-            assert_eq!(
-                a.imports, b.imports,
-                "fixture {i}: imports mismatch"
-            );
+            assert_eq!(a.imports, b.imports, "fixture {i}: imports mismatch");
             // IR equality is too strict on `source_loc` (line/col
             // numbering can differ between the hand-rolled token-
             // based locator and tree-sitter's tree-walk locator).
@@ -951,10 +951,7 @@ def init():
                 .iter()
                 .map(|n| (&n.id, &n.component, &n.depth, &n.parent_path))
                 .collect();
-            assert_eq!(
-                a_nodes, b_nodes,
-                "fixture {i}: nodes mismatch"
-            );
+            assert_eq!(a_nodes, b_nodes, "fixture {i}: nodes mismatch");
             let a_edges: Vec<_> = a
                 .edges
                 .iter()
@@ -965,10 +962,7 @@ def init():
                 .iter()
                 .map(|e| (&e.source, &e.target, &e.kind))
                 .collect();
-            assert_eq!(
-                a_edges, b_edges,
-                "fixture {i}: edges mismatch"
-            );
+            assert_eq!(a_edges, b_edges, "fixture {i}: edges mismatch");
             let a_defs: Vec<_> = a
                 .definitions
                 .iter()
@@ -979,10 +973,7 @@ def init():
                 .iter()
                 .map(|d| (&d.component, &d.code, &d.lang))
                 .collect();
-            assert_eq!(
-                a_defs, b_defs,
-                "fixture {i}: definitions mismatch"
-            );
+            assert_eq!(a_defs, b_defs, "fixture {i}: definitions mismatch");
         }
     }
 
@@ -1046,9 +1037,7 @@ def init():
         // describe the edit via `tree_sitter::InputEdit` and call
         // `reparse`. Tree-sitter reuses unchanged subtrees so the
         // work is proportional to the edit region.
-        let edit_pos = src
-            .find("priority={50}")
-            .expect("find priority literal");
+        let edit_pos = src.find("priority={50}").expect("find priority literal");
         let edit_pos_after = edit_pos + "priority={".len() + 2; // points just after `50`
         let mut new_src = src.clone();
         new_src.replace_range(edit_pos_after..edit_pos_after, "0");
@@ -1116,7 +1105,13 @@ const emoji = "🦀";
         let ir = parse_to_ir_via_treesitter(src).expect("parse");
         assert_eq!(ir.definitions.len(), 1);
         let body = &ir.definitions[0].code;
-        assert!(body.contains("→"), "tree-sitter should preserve →; got: {body:?}");
-        assert!(body.contains("🦀"), "tree-sitter should preserve 🦀; got: {body:?}");
+        assert!(
+            body.contains("→"),
+            "tree-sitter should preserve →; got: {body:?}"
+        );
+        assert!(
+            body.contains("🦀"),
+            "tree-sitter should preserve 🦀; got: {body:?}"
+        );
     }
 }

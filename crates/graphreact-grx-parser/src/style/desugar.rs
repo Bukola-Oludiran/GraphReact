@@ -106,8 +106,7 @@ pub fn desugar_style(tag_name: &str, attrs: &mut AttrMap) -> Result<(), StyleErr
 
     // Index by name for quick lookup of dependent properties
     // (width/height for clip-path inset, drill/diameter for via, etc.).
-    let mut by_name: std::collections::HashMap<&str, &str> =
-        std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for (k, v) in &props {
         by_name.insert(k.as_str(), v.as_str());
     }
@@ -135,9 +134,9 @@ pub fn desugar_style(tag_name: &str, attrs: &mut AttrMap) -> Result<(), StyleErr
         // Per §3.3 we ALLOW omitting position when only `clip-path:
         // circle(...)` is present (it's self-sufficient). Only flag
         // when left/top/width/height are used.
-        let strict_geometry = props.iter().any(|(p, _)| {
-            matches!(p.as_str(), "left" | "top" | "width" | "height")
-        });
+        let strict_geometry = props
+            .iter()
+            .any(|(p, _)| matches!(p.as_str(), "left" | "top" | "width" | "height"));
         if strict_geometry {
             return Err(StyleError::MissingPositionAbsolute);
         }
@@ -184,8 +183,9 @@ pub fn desugar_style(tag_name: &str, attrs: &mut AttrMap) -> Result<(), StyleErr
             "rotate" => at_rot = Some(parse_deg(prop, value)?),
             "transform" => {
                 let val = value.trim();
-                if let Some(inner) =
-                    val.strip_prefix("rotate(").and_then(|s| s.strip_suffix(')'))
+                if let Some(inner) = val
+                    .strip_prefix("rotate(")
+                    .and_then(|s| s.strip_suffix(')'))
                 {
                     at_rot = Some(parse_deg(prop, inner.trim())?);
                 } else {
@@ -256,9 +256,7 @@ pub fn desugar_style(tag_name: &str, attrs: &mut AttrMap) -> Result<(), StyleErr
                     other => {
                         return Err(StyleError::UnknownProperty {
                             property: format!("pin-layer: {other}"),
-                            suggestion: Some(
-                                "pin-layer: strict OR pin-layer: prefer".into(),
-                            ),
+                            suggestion: Some("pin-layer: strict OR pin-layer: prefer".into()),
                         });
                     }
                 };
@@ -376,10 +374,12 @@ fn parse_mm(prop: &str, value: &str) -> Result<f64, StyleError> {
 fn parse_deg(prop: &str, value: &str) -> Result<f64, StyleError> {
     let v = value.trim();
     if let Some(num) = v.strip_suffix("deg") {
-        num.trim().parse::<f64>().map_err(|_| StyleError::BadNumber {
-            property: prop.to_string(),
-            value: value.to_string(),
-        })
+        num.trim()
+            .parse::<f64>()
+            .map_err(|_| StyleError::BadNumber {
+                property: prop.to_string(),
+                value: value.to_string(),
+            })
     } else {
         // Bare number for `rotate` allowed (CSS uses degrees by default in some specs)
         v.parse::<f64>().map_err(|_| StyleError::BadNumber {
@@ -532,7 +532,10 @@ mod tests {
 
     #[test]
     fn via_drill_diameter() {
-        let attrs = run("Via", "from-layer:F.Cu; to-layer:In1.Cu; drill:0.3mm; diameter:0.6mm");
+        let attrs = run(
+            "Via",
+            "from-layer:F.Cu; to-layer:In1.Cu; drill:0.3mm; diameter:0.6mm",
+        );
         assert_eq!(attrs["from-layer"], "F.Cu");
         assert_eq!(attrs["to-layer"], "In1.Cu");
         assert_eq!(attrs["drill"]["d"], 0.3);
@@ -599,24 +602,15 @@ mod tests {
     #[test]
     fn css_units_cm_in_px_canonicalize_to_mm() {
         // 1cm = 10mm
-        let a = run(
-            "Component",
-            "position:absolute; left:1cm; top:0mm",
-        );
+        let a = run("Component", "position:absolute; left:1cm; top:0mm");
         assert!((a["at"]["x"].as_f64().unwrap() - 10.0).abs() < 1e-9);
 
         // 1in = 25.4mm
-        let b = run(
-            "Component",
-            "position:absolute; left:1in; top:0mm",
-        );
+        let b = run("Component", "position:absolute; left:1in; top:0mm");
         assert!((b["at"]["x"].as_f64().unwrap() - 25.4).abs() < 1e-9);
 
         // 96px = 25.4mm (CSS reference px @ 96 DPI)
-        let c = run(
-            "Component",
-            "position:absolute; left:96px; top:0mm",
-        );
+        let c = run("Component", "position:absolute; left:96px; top:0mm");
         assert!((c["at"]["x"].as_f64().unwrap() - 25.4).abs() < 1e-9);
     }
 
@@ -641,7 +635,10 @@ mod tests {
         attrs.insert("style".into(), JsonValue::String("imprdance:50".into()));
         let err = desugar_style("Net", &mut attrs).expect_err("must reject");
         match err {
-            StyleError::UnknownProperty { property, suggestion } => {
+            StyleError::UnknownProperty {
+                property,
+                suggestion,
+            } => {
                 assert_eq!(property, "imprdance");
                 assert_eq!(suggestion.as_deref(), Some("impedance"));
             }

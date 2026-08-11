@@ -37,10 +37,10 @@ pub mod omni;
 pub mod procrustes;
 pub mod select;
 
-pub use ase::{
-    adjacency_spectral_embed, adjacency_spectral_embed_matrix, AseOptions, Embedding,
+pub use ase::{adjacency_spectral_embed, adjacency_spectral_embed_matrix, AseOptions, Embedding};
+pub use case::{
+    covariate_assisted_embed, covariate_assisted_embed_matrix, CaseEmbedding, CaseOptions,
 };
-pub use case::{covariate_assisted_embed, covariate_assisted_embed_matrix, CaseEmbedding, CaseOptions};
 pub use error::{EmbedError, EmbedResult};
 pub use lse::{laplacian_spectral_embed, laplacian_spectral_embed_matrix, LseOptions};
 pub use mase::{multiple_adjacency_spectral_embed, MaseEmbedding, MaseOptions};

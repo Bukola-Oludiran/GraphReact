@@ -126,7 +126,12 @@ fn fires_node_unmounted_with_reason_string() {
     let mut scheduler = build_two_node_scheduler();
     scheduler.install_telemetry_sink(sink.into_arc());
     let alpha_key = scheduler.key_for("alpha").expect("alpha key");
-    scheduler.unmount_with_reason(alpha_key, ExitReason::Crashed { detail: "oops".to_string() });
+    scheduler.unmount_with_reason(
+        alpha_key,
+        ExitReason::Crashed {
+            detail: "oops".to_string(),
+        },
+    );
     scheduler.process_batch().expect("batch");
     let out = buf.snapshot();
     let unmount_line = out

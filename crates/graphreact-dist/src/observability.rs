@@ -131,7 +131,10 @@ impl WireTracingHookSlot {
     /// the current thread.
     #[must_use]
     pub fn extract_outbound(&self) -> Option<[u8; 24]> {
-        self.inner.read().as_ref().and_then(|h| h.extract_outbound())
+        self.inner
+            .read()
+            .as_ref()
+            .and_then(|h| h.extract_outbound())
     }
 
     /// Whether a hook is currently installed. Useful for debug
@@ -186,7 +189,9 @@ mod tests {
         let slot = WireTracingHookSlot::default();
         slot.install(Arc::new(FixtureHook));
         assert!(slot.is_installed());
-        let got = slot.extract_outbound().expect("installed hook returns Some");
+        let got = slot
+            .extract_outbound()
+            .expect("installed hook returns Some");
         assert_eq!(got[0], 1);
         assert_eq!(got[23], 24);
     }

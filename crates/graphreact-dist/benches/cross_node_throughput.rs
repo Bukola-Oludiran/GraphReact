@@ -82,8 +82,7 @@ fn pair_tls(name_a: &str, name_b: &str) -> (TlsConfig, TlsConfig) {
         let kp = rcgen::KeyPair::generate().expect("leaf keygen");
         let cert = params.signed_by(&kp, &ca_cert, &ca_kp).expect("leaf sign");
         let cert_der: CertificateDer<'static> = cert.der().clone();
-        let key_der: PrivateKeyDer<'static> =
-            PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
+        let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
         TlsConfig::from_pem_bytes(vec![cert_der], key_der, vec![ca_der.clone()], true)
             .expect("tls from pem bytes")
     };

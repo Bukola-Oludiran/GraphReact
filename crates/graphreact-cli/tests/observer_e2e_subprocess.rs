@@ -56,8 +56,7 @@ fn write_pem_artifacts(name: &str) -> PemArtifacts {
     let ca_path = dir.path().join("ca.pem");
     std::fs::write(&ca_path, ca_pem).expect("write ca pem");
 
-    let mut params =
-        rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
+    let mut params = rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         name.to_string().try_into().expect("san name"),
     ));
@@ -70,7 +69,12 @@ fn write_pem_artifacts(name: &str) -> PemArtifacts {
     std::fs::write(&cert_path, cert_pem).expect("write cert pem");
     std::fs::write(&key_path, key_pem).expect("write key pem");
 
-    PemArtifacts { _tempdir: dir, cert: cert_path, key: key_path, ca: ca_path }
+    PemArtifacts {
+        _tempdir: dir,
+        cert: cert_path,
+        key: key_path,
+        ca: ca_path,
+    }
 }
 
 /// Pick an ephemeral-but-stable loopback port for the daemon's
@@ -143,9 +147,7 @@ fn spawn_observer_daemon(
                 let mut r = BufReader::new(stderr);
                 let _ = std::io::Read::read_to_string(&mut r, &mut stderr_buf);
             }
-            panic!(
-                "daemon did not emit `grx-observer-ready` within 15s; stderr:\n{stderr_buf}"
-            );
+            panic!("daemon did not emit `grx-observer-ready` within 15s; stderr:\n{stderr_buf}");
         }
         let mut line = String::new();
         if reader.read_line(&mut line).expect("read daemon stdout") == 0 {
@@ -228,16 +230,12 @@ fn observer_subprocess_serves_v1_routes_with_bearer_auth() {
 
     // ---- /v1/identity (auth-checked; missing token → 401) ----
     let (status_no_auth, _) = http_get(observer_addr, "/v1/identity", None);
-    assert_eq!(
-        status_no_auth, 401,
-        "identity must require auth"
-    );
+    assert_eq!(status_no_auth, 401, "identity must require auth");
 
     // ---- /v1/identity with valid bearer → 200 + JSON ----
     let (status, body) = http_get(observer_addr, "/v1/identity", Some(bearer));
     assert_eq!(status, 200, "identity with valid bearer must succeed");
-    let identity: serde_json::Value =
-        serde_json::from_str(&body).expect("parse identity JSON");
+    let identity: serde_json::Value = serde_json::from_str(&body).expect("parse identity JSON");
     assert!(
         identity
             .get("process_start_id")
@@ -289,10 +287,7 @@ fn observer_subprocess_serves_v1_routes_with_bearer_auth() {
 
     // ---- /v1/metrics with WRONG bearer → 401 ----
     let (status_wrong, _) = http_get(observer_addr, "/v1/metrics", Some("wrong-token"));
-    assert_eq!(
-        status_wrong, 401,
-        "metrics with wrong bearer must reject"
-    );
+    assert_eq!(status_wrong, 401, "metrics with wrong bearer must reject");
 
     // Wait for daemon to exit naturally (--duration-secs 8). The
     // daemon's signal handler will close the observer task gracefully.

@@ -7,8 +7,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::ast::{
-    AttrMap, EdgeDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl,
-    NodeDefinitionBlock,
+    AttrMap, EdgeDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl, NodeDefinitionBlock,
 };
 use crate::error::{GrxParseError, GrxResult, SourceLoc};
 use crate::lexer::{Lexer, Token, TokenType};
@@ -211,15 +210,17 @@ impl Parser {
         // attributes are tolerated but ignored; phase 3+ may use them.
         let attrs = self.parse_attributes()?;
         let lang = match attrs.get("lang") {
-            Some(JsonValue::String(s)) => crate::ast::ComponentLang::from_attr_str(s).ok_or_else(
-                || GrxParseError::parse(
-                    format!(
-                        "unknown `lang` value `{s}` for definition `<{component}>` — \
+            Some(JsonValue::String(s)) => {
+                crate::ast::ComponentLang::from_attr_str(s).ok_or_else(|| {
+                    GrxParseError::parse(
+                        format!(
+                            "unknown `lang` value `{s}` for definition `<{component}>` — \
                          supported: \"js\" (default) / \"python\" / \"go\""
-                    ),
-                    open.loc,
-                ),
-            )?,
+                        ),
+                        open.loc,
+                    )
+                })?
+            }
             Some(_) => {
                 return Err(GrxParseError::parse(
                     format!("`lang` attribute on `<{component}>` must be a string literal"),
@@ -521,9 +522,7 @@ mod tests {
 
     #[test]
     fn parses_nested_nodes() {
-        let g = graph(
-            "<Graph id=\"x\"><Outer id=\"o\"><Inner id=\"i\" /></Outer></Graph>",
-        );
+        let g = graph("<Graph id=\"x\"><Outer id=\"o\"><Inner id=\"i\" /></Outer></Graph>");
         let outer = match &g.children[0] {
             GrxNode::Node(n) => n,
             GrxNode::Edge(_) => panic!("expected node"),
@@ -547,14 +546,16 @@ mod tests {
 
     #[test]
     fn parses_node_with_string_and_expr_attrs() {
-        let g = graph(
-            "<Graph id=\"x\"><Counter id=\"c\" label=\"hi\" initialCount={10} /></Graph>",
-        );
+        let g =
+            graph("<Graph id=\"x\"><Counter id=\"c\" label=\"hi\" initialCount={10} /></Graph>");
         let n = match &g.children[0] {
             GrxNode::Node(n) => n,
             GrxNode::Edge(_) => panic!("expected node"),
         };
-        assert_eq!(n.attrs.get("label"), Some(&JsonValue::String("hi".to_string())));
+        assert_eq!(
+            n.attrs.get("label"),
+            Some(&JsonValue::String("hi".to_string()))
+        );
         assert_eq!(
             n.attrs.get("initialCount"),
             Some(&JsonValue::Number(10.into()))
@@ -624,8 +625,10 @@ mod tests {
 
     #[test]
     fn parses_aliased_import() {
-        let f = file(r#"<import src="./rf.grx" as="rf" />
-<Graph id="g"><Logger id="log" /></Graph>"#);
+        let f = file(
+            r#"<import src="./rf.grx" as="rf" />
+<Graph id="g"><Logger id="log" /></Graph>"#,
+        );
         assert_eq!(f.imports.len(), 1);
         assert_eq!(f.imports[0].src, "./rf.grx");
         assert_eq!(f.imports[0].alias.as_deref(), Some("rf"));
@@ -711,7 +714,11 @@ mod tests {
 </Subgraph>"#;
         let err = Parser::parse_file(src).expect_err("duplicate name must reject");
         match err {
-            GrxParseError::DuplicateSubgraphName { name, first_loc, second_loc } => {
+            GrxParseError::DuplicateSubgraphName {
+                name,
+                first_loc,
+                second_loc,
+            } => {
                 assert_eq!(name, "X");
                 assert_ne!(first_loc, second_loc);
             }
@@ -721,9 +728,8 @@ mod tests {
 
     #[test]
     fn rejects_subgraph_without_name() {
-        let err =
-            Parser::parse_file("<Subgraph>\n  <Component id=\"A\" />\n</Subgraph>")
-                .expect_err("missing name must reject");
+        let err = Parser::parse_file("<Subgraph>\n  <Component id=\"A\" />\n</Subgraph>")
+            .expect_err("missing name must reject");
         assert!(matches!(err, GrxParseError::MissingSubgraphName { .. }));
     }
 
@@ -731,8 +737,10 @@ mod tests {
 
     #[test]
     fn parses_self_closing_definition_with_external_src() {
-        let f = file(r#"<Counter src="./counter.py" lang="python" />
-<Graph id="g"><Counter id="c" /></Graph>"#);
+        let f = file(
+            r#"<Counter src="./counter.py" lang="python" />
+<Graph id="g"><Counter id="c" /></Graph>"#,
+        );
         assert_eq!(f.definitions.len(), 1);
         let def = &f.definitions[0];
         assert_eq!(def.component, "Counter");
@@ -776,8 +784,10 @@ mod tests {
 
     #[test]
     fn accepts_underscore_alias() {
-        let f = file(r#"<import src="./rf.grx" as="_rf_v2" />
-<Graph id="g"><Logger id="log" /></Graph>"#);
+        let f = file(
+            r#"<import src="./rf.grx" as="_rf_v2" />
+<Graph id="g"><Logger id="log" /></Graph>"#,
+        );
         assert_eq!(f.imports[0].alias.as_deref(), Some("_rf_v2"));
     }
 
@@ -802,7 +812,8 @@ return { accepts: ['poll'] };
         // tags them so the runtime routes them through the CPython
         // engine. The lexer's raw-content trigger ("non-reserved tag,
         // no `id` attr") still fires because there's no `id`.
-        let src = "<Sensor lang=\"python\">\ndef init():\n    return {'accepts': ['poll']}\n</Sensor>";
+        let src =
+            "<Sensor lang=\"python\">\ndef init():\n    return {'accepts': ['poll']}\n</Sensor>";
         let f = file(src);
         assert_eq!(f.definitions.len(), 1);
         assert_eq!(f.definitions[0].component, "Sensor");
@@ -878,9 +889,7 @@ return { accepts: ['poll'] };
 
     #[test]
     fn ast_walk_yields_depth_and_path() {
-        let g = graph(
-            "<Graph id=\"g\"><A id=\"a\"><B id=\"b\"><C id=\"c\" /></B></A></Graph>",
-        );
+        let g = graph("<Graph id=\"g\"><A id=\"a\"><B id=\"b\"><C id=\"c\" /></B></A></Graph>");
         let walked: Vec<_> = g.walk_nodes().collect();
         assert_eq!(walked.len(), 3);
         assert_eq!(walked[0].depth, 0);

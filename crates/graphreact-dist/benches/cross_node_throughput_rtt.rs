@@ -95,10 +95,7 @@ impl AsyncWrite for DelayedDuplex {
         Pin::new(&mut self.get_mut().inner).poll_write(cx, data)
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let me = self.get_mut();
         if me.pending_flush_delay.is_none() {
             me.pending_flush_delay = Some(Box::pin(tokio::time::sleep(me.delay)));
@@ -114,10 +111,7 @@ impl AsyncWrite for DelayedDuplex {
         Pin::new(&mut me.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
@@ -142,8 +136,7 @@ fn pair_tls(name_a: &str, name_b: &str) -> (TlsConfig, TlsConfig) {
         let kp = rcgen::KeyPair::generate().expect("leaf keygen");
         let cert = params.signed_by(&kp, &ca_cert, &ca_kp).expect("leaf sign");
         let cert_der: CertificateDer<'static> = cert.der().clone();
-        let key_der: PrivateKeyDer<'static> =
-            PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
+        let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
         TlsConfig::from_pem_bytes(vec![cert_der], key_der, vec![ca_der.clone()], true)
             .expect("tls from pem bytes")
     };

@@ -564,7 +564,10 @@ impl FileAuditSink {
     /// path is the on-disk target.
     #[must_use]
     pub fn path(&self) -> PathBuf {
-        self.state.lock().map(|g| g.path.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|g| g.path.clone())
+            .unwrap_or_default()
     }
 
     /// Inspect-only accessor for the configured fsync mode.
@@ -806,12 +809,10 @@ fn open_audit_file(path: &Path) -> Result<File, AuditChainError> {
         use std::os::unix::fs::OpenOptionsExt;
         open_opts.mode(0o600);
     }
-    let file = open_opts
-        .open(path)
-        .map_err(|err| AuditChainError::Io {
-            path: path.to_path_buf(),
-            source: err,
-        })?;
+    let file = open_opts.open(path).map_err(|err| AuditChainError::Io {
+        path: path.to_path_buf(),
+        source: err,
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -861,7 +862,11 @@ fn unix_secs_to_utc_components(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     // public domain). Shifts the epoch so March-based year-boundary
     // simplifies leap-year handling.
     days += 719_468;
-    let era = if days >= 0 { days / 146_097 } else { (days - 146_096) / 146_097 };
+    let era = if days >= 0 {
+        days / 146_097
+    } else {
+        (days - 146_096) / 146_097
+    };
     let doe = (days - era * 146_097) as u64;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = (yoe as i64) + era * 400;
@@ -1144,12 +1149,7 @@ impl AuditSink for FileAuditSink {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let r = append_one_locked(
-                &mut state,
-                input.kind,
-                &input.fields,
-                self.metrics.as_ref(),
-            );
+            let r = append_one_locked(&mut state, input.kind, &input.fields, self.metrics.as_ref());
             // Fsync policy fork stays HERE, under the lock, so
             // PerWrite's inline `sync_data` runs on the same writer
             // the append landed on. Batched mode signals the
@@ -1238,12 +1238,11 @@ pub fn replay(path: impl AsRef<Path>) -> Result<Vec<AuditRecord>, AuditChainErro
         if line.is_empty() {
             continue;
         }
-        let record: AuditRecord = serde_json::from_str(&line).map_err(|err| {
-            AuditChainError::Parse {
+        let record: AuditRecord =
+            serde_json::from_str(&line).map_err(|err| AuditChainError::Parse {
                 line_index: idx,
                 detail: err.to_string(),
-            }
-        })?;
+            })?;
         if record.seq != expected_seq {
             return Err(AuditChainError::SequenceGap {
                 expected_seq,
@@ -1574,7 +1573,12 @@ mod tests {
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         // Permissions on Unix include the file-type bits in the upper
         // bits; mask down to the user/group/other triplet.
-        assert_eq!(mode & 0o777, 0o600, "expected 0o600 on create, got {:o}", mode & 0o777);
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "expected 0o600 on create, got {:o}",
+            mode & 0o777
+        );
     }
 
     /// Pair test for the above: pre-existing audit-log files (e.g. one
@@ -1589,8 +1593,7 @@ mod tests {
         let path = tmp.path().join("preexisting.ndjson");
         // Plant a world-readable file at the target path FIRST.
         std::fs::write(&path, b"").expect("plant");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("chmod 644");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
         let pre_mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(pre_mode & 0o777, 0o644, "test setup: file should be 0o644");
         // Now open via FileAuditSink and confirm the mode tightens.

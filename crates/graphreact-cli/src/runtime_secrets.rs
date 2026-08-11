@@ -207,6 +207,37 @@ impl RuntimeSecretContext {
         Some(decoded)
     }
 
+    /// Read a build-time operator secret authorized by an external,
+    /// non-secret policy file (currently `go.auth.json`). This is
+    /// intentionally separate from guest `needs_secret`: dependency
+    /// resolution happens before any node manifest is mounted.
+    #[must_use]
+    pub fn read_build_utf8(&self, name: &str, allowed: &[String]) -> Option<String> {
+        self.read_utf8("__go_build__", name, allowed)
+    }
+
+    /// Record Go dependency credential resolution without ever
+    /// attaching the credential value to tracing or durable audit data.
+    pub fn audit_go_credential_resolution(&self, host: &str, name: &str, success: bool) {
+        let outcome = if success { "success" } else { "failure" };
+        tracing::info!(
+            target: "graphreact::observer::audit",
+            event = "go_credential_resolution",
+            host,
+            secret = name,
+            outcome,
+            "Go dependency credential resolved"
+        );
+        self.fan(AuditRecordInput {
+            kind: "go_credential_resolution",
+            fields: serde_json::json!({
+                "host": host,
+                "secret": name,
+                "outcome": outcome,
+            }),
+        });
+    }
+
     fn log_deny(&self, node_id: &str, name: &str, reason: &'static str) {
         self.count_failure(reason);
         tracing::warn!(
@@ -321,7 +352,10 @@ mod tests {
             ]
         );
         let serialized = serde_json::to_string(
-            &records.iter().map(|record| &record.fields).collect::<Vec<_>>(),
+            &records
+                .iter()
+                .map(|record| &record.fields)
+                .collect::<Vec<_>>(),
         )
         .expect("serialize audit fields");
         assert!(!serialized.contains("top-secret"));

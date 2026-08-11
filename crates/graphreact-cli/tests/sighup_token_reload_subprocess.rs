@@ -31,8 +31,7 @@ fn write_cluster_pem(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
     let ca_path = dir.join("ca.pem");
     std::fs::write(&ca_path, ca_pem).expect("write ca pem");
 
-    let mut params =
-        rcgen::CertificateParams::new(vec!["alice".into()]).expect("leaf params");
+    let mut params = rcgen::CertificateParams::new(vec!["alice".into()]).expect("leaf params");
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         "alice".to_string().try_into().expect("san"),
     ));
@@ -80,7 +79,12 @@ fn send_sighup(pid: u32) {
     let pid_t: i32 = i32::try_from(pid).expect("pid_t");
     // SAFETY: kill with valid pid + SIGHUP is standard POSIX.
     let rc = unsafe { kill(pid_t, 1) };
-    assert_eq!(rc, 0, "kill SIGHUP failed: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        rc,
+        0,
+        "kill SIGHUP failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 fn pid_derived_port() -> u16 {

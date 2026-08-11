@@ -478,7 +478,9 @@ pub struct Exit {
 pub enum WireExitReason {
     Normal,
     Shutdown,
-    Crashed { detail: String },
+    Crashed {
+        detail: String,
+    },
     /// Synthesized by the dist crate when a peer connection drops or
     /// the tick threshold is exceeded. Maps to OTP's `noconnection`
     /// reason string.

@@ -57,9 +57,7 @@ pub fn multiple_adjacency_spectral_embed(
     opts: &MaseOptions,
 ) -> EmbedResult<MaseEmbedding> {
     if matrices.len() < 2 {
-        return Err(EmbedError::TooFewGraphs {
-            n: matrices.len(),
-        });
+        return Err(EmbedError::TooFewGraphs { n: matrices.len() });
     }
     let n = matrices[0].nrows();
     if matrices[0].ncols() != n {
@@ -97,7 +95,11 @@ pub fn multiple_adjacency_spectral_embed(
     };
     let mut per_graph_svds: Vec<SelectSvd> = Vec::with_capacity(prepped.len());
     for m in &prepped {
-        per_graph_svds.push(select_svd(m.as_ref(), Some(initial_components), opts.n_elbows)?);
+        per_graph_svds.push(select_svd(
+            m.as_ref(),
+            Some(initial_components),
+            opts.n_elbows,
+        )?);
     }
 
     let best_dim = match opts.n_components {
@@ -125,7 +127,11 @@ pub fn multiple_adjacency_spectral_embed(
         let off = i * best_dim;
         for r in 0..n {
             for c in 0..best_dim {
-                let scale = if scaled { svd.s[c].max(0.0).sqrt() } else { 1.0 };
+                let scale = if scaled {
+                    svd.s[c].max(0.0).sqrt()
+                } else {
+                    1.0
+                };
                 stacked_u[(r, off + c)] = svd.u[(r, c)] * scale;
                 // V[r][c] = vt[c][r]
                 stacked_v[(r, off + c)] = svd.vt[(c, r)] * scale;

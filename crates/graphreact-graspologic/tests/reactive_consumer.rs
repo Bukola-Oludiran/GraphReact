@@ -19,7 +19,13 @@ fn make_graph() -> CommunicationGraph {
     for i in 0..5 {
         g.add_node(format!("n{}", i), Attrs::new());
     }
-    for &(u, v) in &[("n0", "n1"), ("n1", "n2"), ("n2", "n3"), ("n3", "n4"), ("n0", "n4")] {
+    for &(u, v) in &[
+        ("n0", "n1"),
+        ("n1", "n2"),
+        ("n2", "n3"),
+        ("n3", "n4"),
+        ("n0", "n4"),
+    ] {
         g.add_edge(u, v, None, Attrs::new());
     }
     g

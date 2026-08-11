@@ -66,12 +66,18 @@ pub enum Command {
         /// init(ctx)` fire on first run.
         #[arg(long, default_value_t = false, requires = "debug")]
         debug_no_wait: bool,
+        /// Resolve Go modules strictly from the selected module cache;
+        /// never contact a proxy or VCS host.
+        #[arg(long, default_value_t = false)]
+        go_offline: bool,
+        /// Override the Go module download cache used by Go or mixed
+        /// runtimes. The cache is read-only in `--go-offline` mode.
+        #[arg(long)]
+        go_module_cache: Option<PathBuf>,
     },
     /// Parse + validate a `.grx` file without executing anything.
     /// Reports parse and import errors. TS-CLI parity for `grx check`.
-    Check {
-        path: PathBuf,
-    },
+    Check { path: PathBuf },
     /// Print the parser AST or built IR.
     ///
     /// Replaces TS's `grx build` (which transpiled `.grx` → `.ts` for
@@ -427,16 +433,22 @@ pub enum ClusterOp {
         /// runs an empty cluster, useful as a relay or for tests.
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Start a single-node, loopback-only development daemon with an
+        /// ephemeral cookie and in-memory mTLS identity. Defaults the cluster
+        /// listener to `127.0.0.1:0` and observer to `127.0.0.1:9090`.
+        /// Refuses peers, non-loopback binds, and production credential flags.
+        #[arg(long, default_value_t = false)]
+        dev_loopback: bool,
         /// Cluster identity, parsed as `name@host` (e.g.
         /// `alice@127.0.0.1`). Carried in the OTP-style handshake;
         /// peers reference this exact form.
-        #[arg(long)]
-        node_id: String,
+        #[arg(long, required_unless_present = "dev_loopback")]
+        node_id: Option<String>,
         /// TCP socket the listener binds to. Use `127.0.0.1:0` in
         /// tests for an ephemeral port; use a fixed port in
         /// production.
-        #[arg(long)]
-        listen: SocketAddr,
+        #[arg(long, required_unless_present = "dev_loopback")]
+        listen: Option<SocketAddr>,
         /// Read the cluster cookie from this environment variable.
         /// Mutually exclusive with `--cookie-file`.
         #[arg(long, conflicts_with = "cookie_file")]
@@ -448,14 +460,14 @@ pub enum ClusterOp {
         #[arg(long, conflicts_with = "cookie_env")]
         cookie_file: Option<PathBuf>,
         /// PEM-encoded leaf cert chain for this node's identity.
-        #[arg(long)]
-        cert: PathBuf,
+        #[arg(long, required_unless_present = "dev_loopback")]
+        cert: Option<PathBuf>,
         /// PEM-encoded private key matching `--cert`.
-        #[arg(long)]
-        key: PathBuf,
+        #[arg(long, required_unless_present = "dev_loopback")]
+        key: Option<PathBuf>,
         /// PEM-encoded trust anchor (typically the cluster's CA cert).
-        #[arg(long)]
-        ca: PathBuf,
+        #[arg(long, required_unless_present = "dev_loopback")]
+        ca: Option<PathBuf>,
         /// Comma-separated peer list. Each entry parses as
         /// `name@host:port` — host:port doubles as the cluster
         /// identity (NodeId) AND the dial address (SocketAddr).
@@ -465,6 +477,12 @@ pub enum ClusterOp {
         /// `null` for engine-free relay daemons.
         #[arg(long, default_value_t = RuntimeArg::Null)]
         runtime: RuntimeArg,
+        /// Resolve Go modules strictly from the selected module cache.
+        #[arg(long, default_value_t = false)]
+        go_offline: bool,
+        /// Override the Go module download cache for Go/mixed mounts.
+        #[arg(long)]
+        go_module_cache: Option<PathBuf>,
         /// Exit after this many seconds. For tests + scripted
         /// shutdowns; absent = run until SIGINT.
         #[arg(long)]
@@ -725,11 +743,9 @@ pub enum RuntimeArg {
     Cpython,
     /// Go engine (M17-phase1+2+3a+3b SHIPPED). Loads a cgo +
     /// c-shared artifact produced by `graphreact-codegen-go` +
-    /// `go build -buildmode=c-shared`. The bare `--runtime=go` path
-    /// constructs a `GoEngine` without an artifact wired; production
-    /// use should route through `goruntime::GoRuntime::build_and_load`
-    /// instead. Full hook surface (M6.6 parity) lands at M17 phase
-    /// 3c-h per the later-milestone plan.
+    /// `go build -buildmode=c-shared`. The `--runtime=go` path
+    /// discovers a sidecar module when present, produces a verified
+    /// artifact, and mounts it through `goruntime::GoRuntime`.
     Go,
     /// **M22 — Mixed-runtime daemon.** Brings up every engine
     /// (JSC + CPython + Go) whose `lang` appears in the `.grx`
@@ -753,5 +769,39 @@ impl std::fmt::Display for RuntimeArg {
             Self::Go => write!(f, "go"),
             Self::Mixed => write!(f, "mixed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod greenhouse_dev_tests {
+    use super::{Cli, ClusterOp, Command};
+    use clap::Parser;
+
+    #[test]
+    fn dev_loopback_is_the_only_required_cluster_identity_flag() {
+        let cli = Cli::try_parse_from([
+            "grx",
+            "cluster",
+            "daemon",
+            "--dev-loopback",
+            "--path",
+            "greenhouse.grx",
+            "--runtime",
+            "go",
+        ])
+        .expect("dev loopback parses without production credentials");
+        assert!(matches!(
+            cli.command,
+            Command::Cluster { op } if matches!(*op, ClusterOp::Daemon { dev_loopback: true, .. })
+        ));
+    }
+
+    #[test]
+    fn production_daemon_still_requires_identity_and_tls_flags() {
+        let error = Cli::try_parse_from(["grx", "cluster", "daemon"])
+            .expect_err("production shape must remain fail-closed");
+        let rendered = error.to_string();
+        assert!(rendered.contains("--node-id"));
+        assert!(rendered.contains("--cert"));
     }
 }

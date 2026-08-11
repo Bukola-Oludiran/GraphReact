@@ -76,7 +76,10 @@ pub enum WatcherError {
     Init(#[from] notify::Error),
     /// Failed to register a path with the watcher.
     #[error("file watcher watch({path}) failed: {source}")]
-    Watch { path: PathBuf, source: notify::Error },
+    Watch {
+        path: PathBuf,
+        source: notify::Error,
+    },
 }
 
 /// Cross-platform file watcher with atomic-save coalescing.
@@ -120,8 +123,8 @@ impl FileWatcher {
         let (out_tx, out_rx) = mpsc::channel::<WatchEvent>(EVENT_CHANNEL_CAPACITY);
 
         let raw_tx_for_handler = raw_tx.clone();
-        let mut watcher: RecommendedWatcher = notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| {
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let Ok(event) = res else {
                     return;
                 };
@@ -132,8 +135,7 @@ impl FileWatcher {
                         kind,
                     });
                 }
-            },
-        )?;
+            })?;
 
         for p in paths {
             let path = p.as_ref().to_path_buf();
@@ -335,7 +337,10 @@ mod tests {
         rx: &mut mpsc::Receiver<WatchEvent>,
         timeout: Duration,
     ) -> Option<WatchEvent> {
-        tokio::time::timeout(timeout, rx.recv()).await.ok().flatten()
+        tokio::time::timeout(timeout, rx.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Canonicalize for comparison — macOS prefixes tempdir paths
@@ -380,7 +385,10 @@ mod tests {
             .expect("watcher should fire Modified within 500ms");
         match event {
             WatchEvent::Modified { path } => assert_eq!(canon(&path), canon(&file)),
-            WatchEvent::Removed { path } => panic!("expected Modified, got Removed {{path: {}}}", path.display()),
+            WatchEvent::Removed { path } => panic!(
+                "expected Modified, got Removed {{path: {}}}",
+                path.display()
+            ),
         }
     }
 
@@ -417,7 +425,10 @@ mod tests {
             .expect("first coalesced event should arrive");
         match first {
             WatchEvent::Modified { path } => assert_eq!(canon(&path), canon(&file)),
-            WatchEvent::Removed { path } => panic!("expected Modified, got Removed {{path: {}}}", path.display()),
+            WatchEvent::Removed { path } => panic!(
+                "expected Modified, got Removed {{path: {}}}",
+                path.display()
+            ),
         }
 
         // After receiving the coalesced event there should be no

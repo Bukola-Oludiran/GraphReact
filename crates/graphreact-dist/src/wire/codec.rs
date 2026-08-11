@@ -126,9 +126,9 @@ impl WireCodec {
             PacketType::RestartDelegationRequest => Packet::RestartDelegationRequest(
                 postcard::from_bytes::<RestartDelegationRequest>(payload)?,
             ),
-            PacketType::RestartDelegationAck => Packet::RestartDelegationAck(
-                postcard::from_bytes::<RestartDelegationAck>(payload)?,
-            ),
+            PacketType::RestartDelegationAck => {
+                Packet::RestartDelegationAck(postcard::from_bytes::<RestartDelegationAck>(payload)?)
+            }
             PacketType::RestartDelegationResult => Packet::RestartDelegationResult(
                 postcard::from_bytes::<RestartDelegationResult>(payload)?,
             ),

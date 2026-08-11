@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use graphreact_observer::{
-    replay_audit_chain, AuditChainConfig, AuditForwarder, AuditRecord, AuditRecordInput,
-    AuditSink, FileAuditSink, ForwarderHub, MetricsInner, SpoolFileForwarder,
+    replay_audit_chain, AuditChainConfig, AuditForwarder, AuditRecord, AuditRecordInput, AuditSink,
+    FileAuditSink, ForwarderHub, MetricsInner, SpoolFileForwarder,
 };
 
 /// In-tree minimal tempdir shim — no new dev-dep.
@@ -130,7 +130,11 @@ async fn happy_path_every_record_reaches_forwarder() {
     let chain = replay_audit_chain(&path).expect("replay");
     assert_eq!(chain.len(), 5);
     let captured = captured.lock().unwrap();
-    assert_eq!(captured.len(), 5, "every appended record reaches the forwarder");
+    assert_eq!(
+        captured.len(),
+        5,
+        "every appended record reaches the forwarder"
+    );
     for (idx, rec) in captured.iter().enumerate() {
         assert_eq!(rec.seq, idx as u64);
         assert_eq!(rec.this_hash, chain[idx].this_hash);
@@ -197,7 +201,10 @@ async fn drain_is_bounded_when_forwarders_idle() {
         });
     }
     let drained = hub.drain(Duration::from_secs(2)).await;
-    assert!(drained, "drain returns within the deadline when forwarders idle");
+    assert!(
+        drained,
+        "drain returns within the deadline when forwarders idle"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use graphreact_core::{
-    telemetry::{MessageDelivered, NodeMounted, SchedulerTickStart, SupervisorAction, SupervisorDecisionMade},
+    telemetry::{
+        MessageDelivered, NodeMounted, SchedulerTickStart, SupervisorAction, SupervisorDecisionMade,
+    },
     TelemetrySink,
 };
 use graphreact_observer::{
@@ -30,10 +32,7 @@ async fn spawn_with_ws() -> ApiServerHandle {
 }
 
 fn fire_messages(server: &ApiServerHandle) {
-    let ws = server
-        .websocket
-        .as_ref()
-        .expect("websocket sink installed");
+    let ws = server.websocket.as_ref().expect("websocket sink installed");
     ws.on_message_delivered(&MessageDelivered {
         from: "alice",
         to: "bob",
@@ -63,9 +62,7 @@ fn fire_messages(server: &ApiServerHandle) {
 async fn ws_connect(
     addr: std::net::SocketAddr,
     query: &str,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let url = format!("ws://{addr}/v1/observer/events{query}");
     let (socket, _resp) = tokio_tungstenite::connect_async(&url)
         .await
@@ -144,10 +141,7 @@ async fn ws_node_filter_matches_from_or_to() {
 #[tokio::test]
 async fn ws_lag_resync_kicks_subscriber_with_resync_frame() {
     let server = spawn_with_ws().await;
-    let ws = server
-        .websocket
-        .as_ref()
-        .expect("websocket sink installed");
+    let ws = server.websocket.as_ref().expect("websocket sink installed");
     let mut socket = ws_connect(server.local_addr, "").await;
     tokio::time::sleep(Duration::from_millis(30)).await;
     // Force broadcast lag by firing > BROADCAST_CAPACITY (1024) events
@@ -214,7 +208,10 @@ async fn sse_route_streams_events_as_data_lines() {
     fire_messages(&server);
     let body = body_task.await.expect("collect").unwrap_or_default();
     assert!(body.contains("event: telemetry"), "sse body: {body}");
-    assert!(body.contains("\"kind\":\"message_delivered\""), "sse body: {body}");
+    assert!(
+        body.contains("\"kind\":\"message_delivered\""),
+        "sse body: {body}"
+    );
     server.shutdown().await;
 }
 
@@ -228,9 +225,7 @@ async fn http_get(url: &str) -> String {
         .map(|(hp, p)| (hp, format!("/{p}")))
         .unwrap_or((after_scheme, "/".into()));
     let mut stream = TcpStream::connect(host_port).await.expect("tcp connect");
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.expect("send");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.expect("read");

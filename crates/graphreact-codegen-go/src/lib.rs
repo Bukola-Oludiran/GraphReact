@@ -59,6 +59,7 @@ use graphreact_grx_parser::ir::GrxIr;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub mod module;
 pub mod prelude;
 
 /// Errors surfaced by the M17 build-step codegen pipeline.
@@ -92,6 +93,8 @@ pub enum CodegenError {
          The codegen pipeline only runs when at least one Go body is present."
     )]
     NoGoBodies,
+    #[error("graphreact-codegen-go: Go module configuration error: {0}")]
+    Module(String),
 }
 
 /// Output of a successful M17 phase 3b build — a c-shared artifact
@@ -111,6 +114,14 @@ pub struct BuildArtifact {
     /// by M17 phase 3g hot-reload to short-circuit re-load when the
     /// artifact is unchanged.
     pub library_sha256_hex: String,
+    /// SHA-256 over every deterministic build input. Unlike the
+    /// library hash this is available before invoking the compiler
+    /// and drives safe artifact reuse.
+    pub build_fingerprint_hex: String,
+    /// CycloneDX 1.4 SBOM emitted beside the shared library.
+    pub sbom_path: PathBuf,
+    /// Deterministic Go module inventory emitted beside the library.
+    pub dependency_inventory_path: PathBuf,
 }
 
 /// Codegen orchestrator. The public API surface is intentionally
@@ -149,6 +160,18 @@ impl Codegen {
     /// - [`CodegenError::Io`] for any file-write failure (typically a
     ///   permissions or missing-directory issue).
     pub fn emit_prelude(&self, ir: &GrxIr, out_dir: &Path) -> Result<(), CodegenError> {
+        self.emit_prelude_with_module(ir, out_dir, None)
+    }
+
+    /// Emit sources for either the legacy standalone module or a
+    /// caller-owned sidecar module. A discovered sidecar remains the
+    /// source of truth: GraphReact never copies or rewrites it.
+    pub fn emit_prelude_with_module(
+        &self,
+        ir: &GrxIr,
+        out_dir: &Path,
+        module: Option<&module::GoModule>,
+    ) -> Result<(), CodegenError> {
         let go_defs: Vec<_> = ir
             .definitions
             .iter()
@@ -164,7 +187,15 @@ impl Codegen {
         })?;
 
         write_file(&out_dir.join("grx_prelude.go"), &prelude::render())?;
-        write_file(&out_dir.join("go.mod"), &prelude::render_go_mod())?;
+        let generated_mod = out_dir.join("go.mod");
+        if module.is_none() {
+            write_file(&generated_mod, &prelude::render_go_mod())?;
+        } else if generated_mod.exists() {
+            fs::remove_file(&generated_mod).map_err(|source| CodegenError::Io {
+                path: generated_mod,
+                source,
+            })?;
+        }
 
         for def in &go_defs {
             let safe = sanitize_filename(&def.component);
@@ -172,8 +203,7 @@ impl Codegen {
             write_file(&body_path, &wrap_body(&def.component, &def.code))?;
         }
 
-        let component_names: Vec<String> =
-            go_defs.iter().map(|d| d.component.clone()).collect();
+        let component_names: Vec<String> = go_defs.iter().map(|d| d.component.clone()).collect();
         write_file(
             &out_dir.join("dispatch.go"),
             &prelude::render_dispatch(&component_names),
@@ -202,6 +232,16 @@ impl Codegen {
         src_dir: &Path,
         out_dir: &Path,
     ) -> Result<BuildArtifact, CodegenError> {
+        self.build_artifact_with_options(src_dir, out_dir, &module::GoBuildOptions::default())
+    }
+
+    /// Deterministic module-aware build entry point.
+    pub fn build_artifact_with_options(
+        &self,
+        src_dir: &Path,
+        out_dir: &Path,
+        options: &module::GoBuildOptions,
+    ) -> Result<BuildArtifact, CodegenError> {
         let go_bin = std::env::var("GO").unwrap_or_else(|_| "go".to_string());
         let probe = Command::new(&go_bin).arg("version").output();
         if !matches!(&probe, Ok(out) if out.status.success()) {
@@ -212,17 +252,28 @@ impl Codegen {
             path: out_dir.to_path_buf(),
             source,
         })?;
+        let canonical_out_dir = fs::canonicalize(out_dir).map_err(|source| CodegenError::Io {
+            path: out_dir.to_path_buf(),
+            source,
+        })?;
 
         let lib_name = format!(
             "{prefix}grx_go{suffix}",
             prefix = std::env::consts::DLL_PREFIX,
             suffix = std::env::consts::DLL_SUFFIX,
         );
-        let library_path = out_dir.join(&lib_name);
+        let library_path = canonical_out_dir.join(&lib_name);
 
-        let output = Command::new(&go_bin)
-            .current_dir(src_dir)
+        let prepared = module::prepare_build(&go_bin, src_dir, &canonical_out_dir, options)?;
+        if let Some(hit) =
+            module::try_cached_artifact(&library_path, &canonical_out_dir, &prepared)?
+        {
+            return Ok(hit);
+        }
+        module::run_go_verify(&go_bin, src_dir, &prepared)?;
+        let output = module::go_command(&go_bin, src_dir, &prepared)
             .arg("build")
+            .arg("-mod=readonly")
             .arg("-buildmode=c-shared")
             .arg("-o")
             .arg(&library_path)
@@ -236,8 +287,8 @@ impl Codegen {
         if !output.status.success() {
             return Err(CodegenError::GoBuildFailed {
                 status: output.status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                stdout: module::redact_output(&prepared, &output.stdout),
+                stderr: module::redact_output(&prepared, &output.stderr),
             });
         }
 
@@ -266,11 +317,23 @@ impl Codegen {
             None
         };
 
-        Ok(BuildArtifact {
+        let (dependency_inventory_path, sbom_path) = module::write_supply_chain_evidence(
+            &go_bin,
+            src_dir,
+            &canonical_out_dir,
+            &prepared,
+            &library_sha256_hex,
+        )?;
+        let artifact = BuildArtifact {
             library_path,
             header_path,
             library_sha256_hex,
-        })
+            build_fingerprint_hex: prepared.fingerprint_hex.clone(),
+            sbom_path,
+            dependency_inventory_path,
+        };
+        module::write_cache_record(&canonical_out_dir, &artifact)?;
+        Ok(artifact)
     }
 }
 
@@ -291,7 +354,13 @@ fn write_file(path: &Path, contents: &str) -> Result<(), CodegenError> {
 /// filename is safe to drop on disk + safe to import in Go.
 fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -778,7 +847,81 @@ mod tests {
         if let Some(h) = &artifact.header_path {
             assert!(h.exists());
         }
+    }
 
+    #[test]
+    fn sidecar_module_builds_local_dependency_and_reuses_verified_artifact() {
+        let probe = Command::new("go").arg("version").output();
+        if !matches!(&probe, Ok(out) if out.status.success()) {
+            eprintln!("skipping sidecar-module test: `go` not on PATH");
+            return;
+        }
+        let root = tempdir();
+        std::fs::create_dir_all(root.path().join("dep")).unwrap();
+        std::fs::write(
+            root.path().join("go.mod"),
+            "module example.test/app\n\ngo 1.22\n\nrequire example.test/dep v0.0.0\nreplace example.test/dep => ./dep\n",
+        ).unwrap();
+        std::fs::write(root.path().join("go.sum"), "").unwrap();
+        std::fs::write(
+            root.path().join("dep/go.mod"),
+            "module example.test/dep\n\ngo 1.22\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("dep/dep.go"),
+            "package dep\nconst Value = 7\n",
+        )
+        .unwrap();
+        let entry = root.path().join("system.grx");
+        std::fs::write(&entry, "<Graph id=\"module-test\"></Graph>\n").unwrap();
+        let module = module::discover_module(&entry, std::slice::from_ref(&entry))
+            .unwrap()
+            .unwrap();
+        let out = root.path().join(".grx-go-build-system");
+        let ir = ir_with_go_body(
+            "Smoke",
+            "import \"example.test/dep\"\nfunc SmokeBody(ctx Ctx) Manifest { _ = dep.Value; return Manifest{} }\n",
+        );
+        let codegen = Codegen::new();
+        codegen
+            .emit_prelude_with_module(&ir, &out, Some(&module))
+            .unwrap();
+        let options = module::GoBuildOptions {
+            module: Some(module),
+            ..Default::default()
+        };
+        let first = codegen
+            .build_artifact_with_options(&out, &out, &options)
+            .unwrap();
+        assert!(first.sbom_path.is_file());
+        assert!(first.dependency_inventory_path.is_file());
+        let second = codegen
+            .build_artifact_with_options(&out, &out, &options)
+            .unwrap();
+        assert_eq!(first.build_fingerprint_hex, second.build_fingerprint_hex);
+        assert_eq!(first.library_sha256_hex, second.library_sha256_hex);
+        let sbom: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&first.sbom_path).unwrap()).unwrap();
+        assert_eq!(sbom["specVersion"], "1.4");
+        assert_eq!(
+            sbom["metadata"]["component"]["hashes"][0]["content"],
+            first.library_sha256_hex
+        );
+        assert_eq!(
+            sbom["components"][1]["properties"][0]["name"],
+            "graphreact:goReplacement"
+        );
+
+        std::fs::write(
+            root.path().join("dep/dep.go"),
+            "package dep\nconst Value = 8\n",
+        )
+        .unwrap();
+        let changed = codegen
+            .build_artifact_with_options(&out, &out, &options)
+            .unwrap();
+        assert_ne!(first.build_fingerprint_hex, changed.build_fingerprint_hex);
     }
 
     // ---- minimal tempdir helper to avoid pulling in the tempfile dep ----
@@ -801,7 +944,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("grx-codegen-go-test-{}-{}", std::process::id(), n));
+        let p =
+            std::env::temp_dir().join(format!("grx-codegen-go-test-{}-{}", std::process::id(), n));
         fs::create_dir_all(&p).unwrap();
         TempDir(p)
     }

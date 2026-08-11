@@ -105,12 +105,11 @@ impl DrainFlag {
         // Emit BEFORE the flip so any reader that races us can't
         // observe `is_draining()==true` without `drain_started`
         // already being in the audit stream.
-        match self.inner.draining.compare_exchange(
-            false,
-            true,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self
+            .inner
+            .draining
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => {
                 // We're the winner — but we need the audit row
                 // to be observable BEFORE the flag flip from the
@@ -136,9 +135,7 @@ impl DrainFlag {
         self.inner.draining.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn subscribe_deadline(
-        &self,
-    ) -> tokio::sync::watch::Receiver<Option<DrainDeadline>> {
+    pub(crate) fn subscribe_deadline(&self) -> tokio::sync::watch::Receiver<Option<DrainDeadline>> {
         self.inner.deadline_tx.subscribe()
     }
 }
@@ -217,11 +214,7 @@ impl Drop for InflightGuard {
 /// it fires. The drain coordinator on the CLI side composes
 /// [`DrainFlag::start`] + this helper around the in-flight-await
 /// loop.
-pub fn log_drain_completed(
-    duration: Duration,
-    in_flight_settled: bool,
-    cluster_quiesced: bool,
-) {
+pub fn log_drain_completed(duration: Duration, in_flight_settled: bool, cluster_quiesced: bool) {
     crate::audit::log_drain_completed(
         duration_to_ms_u64(duration),
         in_flight_settled,

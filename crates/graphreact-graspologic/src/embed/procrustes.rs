@@ -20,10 +20,7 @@ use graphreact_linalg::svd as linalg_svd;
 use super::error::{EmbedError, EmbedResult};
 
 /// Solve `min_R || X R − Y ||_F` over orthogonal `R`.
-pub fn orthogonal_procrustes(
-    x: MatRef<'_, f64>,
-    y: MatRef<'_, f64>,
-) -> EmbedResult<Mat<f64>> {
+pub fn orthogonal_procrustes(x: MatRef<'_, f64>, y: MatRef<'_, f64>) -> EmbedResult<Mat<f64>> {
     if x.nrows() != y.nrows() || x.ncols() != y.ncols() {
         return Err(EmbedError::ShapeMismatch {
             rows0: x.nrows(),
@@ -66,10 +63,7 @@ pub fn orthogonal_procrustes(
 
 /// Apply the Procrustes-optimal rotation to align `x` with `y`,
 /// returning `||X R − Y||_F`.
-pub fn procrustes_distance(
-    x: MatRef<'_, f64>,
-    y: MatRef<'_, f64>,
-) -> EmbedResult<f64> {
+pub fn procrustes_distance(x: MatRef<'_, f64>, y: MatRef<'_, f64>) -> EmbedResult<f64> {
     let rmat = orthogonal_procrustes(x, y)?;
     let aligned = x * rmat.as_ref();
     let mut sum_sq = 0.0;

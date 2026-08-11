@@ -32,25 +32,21 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 /// configurations callers can stuff into `DaemonOptions::tls`.
 fn pair_tls(name_a: &str, name_b: &str) -> (TlsConfig, TlsConfig) {
     let ca_kp = rcgen::KeyPair::generate().expect("ca keygen");
-    let mut ca_params = rcgen::CertificateParams::new(vec!["grx-cli-test CA".into()])
-        .expect("ca params");
+    let mut ca_params =
+        rcgen::CertificateParams::new(vec!["grx-cli-test CA".into()]).expect("ca params");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_cert = ca_params.self_signed(&ca_kp).expect("ca self-sign");
     let ca_der: CertificateDer<'static> = ca_cert.der().clone();
 
     let make_leaf = |name: &str| -> TlsConfig {
-        let mut params = rcgen::CertificateParams::new(vec![name.into()])
-            .expect("leaf params");
+        let mut params = rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
         params.subject_alt_names.push(rcgen::SanType::DnsName(
             name.to_string().try_into().expect("san name"),
         ));
         let kp = rcgen::KeyPair::generate().expect("leaf keygen");
-        let cert = params
-            .signed_by(&kp, &ca_cert, &ca_kp)
-            .expect("leaf sign");
+        let cert = params.signed_by(&kp, &ca_cert, &ca_kp).expect("leaf sign");
         let cert_der: CertificateDer<'static> = cert.der().clone();
-        let key_der: PrivateKeyDer<'static> =
-            PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
+        let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
         TlsConfig::from_pem_bytes(vec![cert_der], key_der, vec![ca_der.clone()], true)
             .expect("tls from pem bytes")
     };
@@ -87,6 +83,7 @@ async fn daemon_accepts_peer_with_matching_cookie() {
         tls: alice_tls,
         peers: Vec::new(),
         runtime: graphreact_cli::cli::RuntimeArg::Null,
+        go_build: Default::default(),
         net_tick: fast_tick(),
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
@@ -117,6 +114,7 @@ async fn daemon_accepts_peer_with_matching_cookie() {
         tls: bob_tls,
         peers: vec![(parse_id("alice@127.0.0.1"), alice_addr)],
         runtime: graphreact_cli::cli::RuntimeArg::Null,
+        go_build: Default::default(),
         net_tick: fast_tick(),
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
@@ -170,6 +168,7 @@ async fn daemon_rejects_peer_with_cookie_mismatch() {
         tls: alice_tls,
         peers: Vec::new(),
         runtime: graphreact_cli::cli::RuntimeArg::Null,
+        go_build: Default::default(),
         net_tick: fast_tick(),
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
@@ -198,6 +197,7 @@ async fn daemon_rejects_peer_with_cookie_mismatch() {
         tls: bob_tls,
         peers: vec![(parse_id("alice@127.0.0.1"), alice_addr)],
         runtime: graphreact_cli::cli::RuntimeArg::Null,
+        go_build: Default::default(),
         net_tick: fast_tick(),
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
@@ -246,8 +246,7 @@ async fn world_readable_cookie_file_rejected_with_printable_error() {
     let path = dir.join("cookie");
     let mut f = std::fs::File::create(&path).expect("create cookie file");
     f.write_all(b"some-secret").expect("write cookie");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-        .expect("chmod 644");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
 
     let err = resolve_cookie(None, Some(&path)).expect_err("expected mode rejection");
     let rendered = format!("{err}");

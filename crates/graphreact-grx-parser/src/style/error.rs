@@ -14,9 +14,11 @@ pub enum StyleError {
         suggestion: Option<String>,
     },
 
-    #[error("CSS property `{property}` value `{value}` has unsupported unit \
+    #[error(
+        "CSS property `{property}` value `{value}` has unsupported unit \
              — accepted suffixes are `mm`, `cm`, `in`, `px` (bare numbers \
-             without a unit are rejected to avoid silent unit confusion)")]
+             without a unit are rejected to avoid silent unit confusion)"
+    )]
     BadUnit { property: String, value: String },
 
     #[error(
@@ -34,22 +36,30 @@ pub enum StyleError {
     )]
     MissingPositionAbsolute,
 
-    #[error("malformed `clip-path` value `{snippet}` — supported forms: \
+    #[error(
+        "malformed `clip-path` value `{snippet}` — supported forms: \
              inset(0 0 0 0 [round Rmm]), circle(Rmm at Xmm Ymm), \
              ellipse(Rxmm Rymm at Xmm Ymm), polygon(p1, p2, ...), \
-             path('M ... Z'), kicad-shape(\"name\", {{...}})")]
+             path('M ... Z'), kicad-shape(\"name\", {{...}})"
+    )]
     MalformedClipPath { snippet: String },
 
-    #[error("CSS `transform: {transform_kind}` not supported in v1 \
-             — only `rotate(Ndeg)` is recognized")]
+    #[error(
+        "CSS `transform: {transform_kind}` not supported in v1 \
+             — only `rotate(Ndeg)` is recognized"
+    )]
     UnknownTransform { transform_kind: String },
 
-    #[error("`clip-path: inset(...)` requires `width:Nmm` and `height:Nmm` \
-             sibling properties to fill the rect dimensions")]
+    #[error(
+        "`clip-path: inset(...)` requires `width:Nmm` and `height:Nmm` \
+             sibling properties to fill the rect dimensions"
+    )]
     InsetMissingWidthHeight,
 
-    #[error("CSS value `{value}` for property `{property}` could not be \
-             parsed as a number")]
+    #[error(
+        "CSS value `{value}` for property `{property}` could not be \
+             parsed as a number"
+    )]
     BadNumber { property: String, value: String },
 }
 

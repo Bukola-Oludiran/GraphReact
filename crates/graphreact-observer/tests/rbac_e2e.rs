@@ -256,10 +256,9 @@ async fn healthz_bypasses_rbac() {
     // unauthenticated public route.
     assert!(records.iter().any(|r| r.kind == "bind"), "bind record");
     assert!(
-        !records.iter().any(|r| matches!(
-            r.kind.as_str(),
-            "auth_success" | "auth_fail" | "authz_deny"
-        )),
+        !records
+            .iter()
+            .any(|r| matches!(r.kind.as_str(), "auth_success" | "auth_fail" | "authz_deny")),
         "no auth-side records on a public route, got: {records:?}"
     );
 }

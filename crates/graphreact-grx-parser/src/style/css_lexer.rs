@@ -83,8 +83,7 @@ mod tests {
 
     #[test]
     fn tokenizes_multiple_properties() {
-        let result =
-            tokenize_style("position: absolute; left: 30mm; top: 5mm").expect("ok");
+        let result = tokenize_style("position: absolute; left: 30mm; top: 5mm").expect("ok");
         assert_eq!(
             result,
             vec![
@@ -104,8 +103,7 @@ mod tests {
 
     #[test]
     fn strips_block_comments() {
-        let result = tokenize_style("left:30mm; /* TODO: review */ layer:F.Cu")
-            .expect("ok");
+        let result = tokenize_style("left:30mm; /* TODO: review */ layer:F.Cu").expect("ok");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, "left");
         assert_eq!(result[1].0, "layer");

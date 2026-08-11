@@ -635,10 +635,9 @@ use graphreact_core::{
     use_spawn_child as core_use_spawn_child, use_state as core_use_state,
     use_topology as core_use_topology, use_unlink as core_use_unlink,
     use_unmount_self as core_use_unmount_self, AsyncEffectCleanup, Attrs, CommunicationGraph,
-    ComposeChildSpec, EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource,
-    GraphDirectory, IncomingMessage, MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition,
-    PermissionManifest, Scheduler, Signal, Subscription, TopologyEvent, TopologyEventKind,
-    TopologyFilterOptions,
+    ComposeChildSpec, EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource, GraphDirectory,
+    IncomingMessage, MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest,
+    Scheduler, Signal, Subscription, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
 };
 use graphreact_engine_cpython::{invoke_global_static, CPythonEngine};
 use graphreact_engine_zig::{
@@ -891,11 +890,7 @@ fn tracked_token_count() -> usize {
 /// [`PyRuntime::process_batch`] after the scheduler settles, while
 /// the engine + iso TLS are still installed via
 /// [`PyEngineGuard::with_directory`] so Python re-entry succeeds.
-fn release_tokens_for_node(
-    engine: &Rc<RefCell<CPythonEngine>>,
-    iso: IsolateHandle,
-    node_id: &str,
-) {
+fn release_tokens_for_node(engine: &Rc<RefCell<CPythonEngine>>, iso: IsolateHandle, node_id: &str) {
     let tokens = drain_node_tokens(node_id);
     if tokens.is_empty() {
         return;
@@ -905,14 +900,12 @@ fn release_tokens_for_node(
         .into_iter()
         .map(|t| HostValue::Number(t as f64))
         .collect();
-    if let Err(e) = engine.borrow_mut().invoke_global(
-        iso,
-        "__release_tokens",
-        &[HostValue::Array(arr)],
-    ) {
-        eprintln!(
-            "[graphreact-cli] __release_tokens dispatch failed for node {node_id}: {e}"
-        );
+    if let Err(e) =
+        engine
+            .borrow_mut()
+            .invoke_global(iso, "__release_tokens", &[HostValue::Array(arr)])
+    {
+        eprintln!("[graphreact-cli] __release_tokens dispatch failed for node {node_id}: {e}");
     }
 }
 
@@ -1917,10 +1910,7 @@ fn build_host_effect_async_callback() -> BoxCallback {
                                 let _ = invoke_global_static(
                                     iso,
                                     "__invoke_callback",
-                                    &[
-                                        HostValue::Number(ct as f64),
-                                        HostValue::Array(vec![]),
-                                    ],
+                                    &[HostValue::Number(ct as f64), HostValue::Array(vec![])],
                                 );
                                 #[allow(clippy::cast_precision_loss)]
                                 let _ = invoke_global_static(
@@ -2370,10 +2360,7 @@ fn topology_event_to_host_value(event: &TopologyEvent) -> HostValue {
             ("nodeId".to_string(), HostValue::String(node_id.clone())),
         ]),
         TopologyEvent::NodeRemoved { node_id } => HostValue::Object(vec![
-            (
-                "kind".to_string(),
-                HostValue::String("node-removed".into()),
-            ),
+            ("kind".to_string(), HostValue::String("node-removed".into())),
             ("nodeId".to_string(), HostValue::String(node_id.clone())),
         ]),
         TopologyEvent::EdgeAdded { u, v, key } => HostValue::Object(vec![
@@ -2383,19 +2370,13 @@ fn topology_event_to_host_value(event: &TopologyEvent) -> HostValue {
             ("key".to_string(), HostValue::String(key.clone())),
         ]),
         TopologyEvent::EdgeRemoved { u, v, key } => HostValue::Object(vec![
-            (
-                "kind".to_string(),
-                HostValue::String("edge-removed".into()),
-            ),
+            ("kind".to_string(), HostValue::String("edge-removed".into())),
             ("u".to_string(), HostValue::String(u.clone())),
             ("v".to_string(), HostValue::String(v.clone())),
             ("key".to_string(), HostValue::String(key.clone())),
         ]),
         TopologyEvent::EdgeUpdated { u, v, key } => HostValue::Object(vec![
-            (
-                "kind".to_string(),
-                HostValue::String("edge-updated".into()),
-            ),
+            ("kind".to_string(), HostValue::String("edge-updated".into())),
             ("u".to_string(), HostValue::String(u.clone())),
             ("v".to_string(), HostValue::String(v.clone())),
             ("key".to_string(), HostValue::String(key.clone())),
@@ -2423,7 +2404,10 @@ fn build_host_directory_find_by_id_callback() -> BoxCallback {
             Some(entry) => Ok(HostValue::Object(vec![
                 ("id".to_string(), HostValue::String(entry.id.clone())),
                 ("role".to_string(), HostValue::String(entry.role.clone())),
-                ("depth".to_string(), HostValue::Number(f64::from(entry.depth))),
+                (
+                    "depth".to_string(),
+                    HostValue::Number(f64::from(entry.depth)),
+                ),
                 (
                     "path".to_string(),
                     HostValue::Array(
@@ -2785,7 +2769,9 @@ fn build_host_graph_cycle_detection_callback() -> BoxCallback {
             Some(edges) => HostValue::Array(
                 edges
                     .into_iter()
-                    .map(|(u, v)| HostValue::Array(vec![HostValue::String(u), HostValue::String(v)]))
+                    .map(|(u, v)| {
+                        HostValue::Array(vec![HostValue::String(u), HostValue::String(v)])
+                    })
                     .collect(),
             ),
             None => HostValue::Null,
@@ -2859,7 +2845,9 @@ impl DirectedAdj for Tier2Adj {
     }
 
     fn has_edge(&self, u: &str, v: &str) -> bool {
-        self.out.get(u).is_some_and(|outs| outs.iter().any(|t| t == v))
+        self.out
+            .get(u)
+            .is_some_and(|outs| outs.iter().any(|t| t == v))
     }
 }
 
@@ -3911,7 +3899,9 @@ impl DirectedAdj for Tier3Adj {
     }
 
     fn has_edge(&self, u: &str, v: &str) -> bool {
-        self.out.get(u).is_some_and(|outs| outs.iter().any(|t| t == v))
+        self.out
+            .get(u)
+            .is_some_and(|outs| outs.iter().any(|t| t == v))
     }
 }
 
@@ -4062,9 +4052,7 @@ fn build_host_edge_accept_handler_callback() -> BoxCallback {
             match result {
                 Ok(envelope) => predicate_bool_from_envelope(envelope),
                 Err(e) => {
-                    eprintln!(
-                        "[graphreact-cli] use_edge_accept_handler invocation failed: {e}"
-                    );
+                    eprintln!("[graphreact-cli] use_edge_accept_handler invocation failed: {e}");
                     // On invocation failure, default-accept so a buggy
                     // predicate doesn't silently sever Tier 3
                     // reachability.
@@ -4552,13 +4540,14 @@ fn build_compose_spec_from_host_value(value: HostValue) -> Result<ComposeChildSp
     }
 
     let id = id.ok_or_else(|| EngineError::Internal("ComposeChildSpec: missing `id`".into()))?;
-    let component_token = component_token
-        .ok_or_else(|| EngineError::Internal("ComposeChildSpec: missing `componentToken`".into()))?;
+    let component_token = component_token.ok_or_else(|| {
+        EngineError::Internal("ComposeChildSpec: missing `componentToken`".into())
+    })?;
 
     let engine = current_engine()
         .ok_or_else(|| EngineError::Internal("compose spec: engine TLS unset".into()))?;
-    let iso = current_iso()
-        .ok_or_else(|| EngineError::Internal("compose spec: iso TLS unset".into()))?;
+    let iso =
+        current_iso().ok_or_else(|| EngineError::Internal("compose spec: iso TLS unset".into()))?;
 
     let definition_name = format!("PyChild::{id}");
     let definition = NodeDefinition::new(
@@ -4768,9 +4757,7 @@ fn build_host_use_source_callback() -> BoxCallback {
             }
         };
         let deps: Vec<Value> = match args.get(1) {
-            Some(HostValue::Array(arr)) => {
-                arr.iter().cloned().map(HostValue::into_json).collect()
-            }
+            Some(HostValue::Array(arr)) => arr.iter().cloned().map(HostValue::into_json).collect(),
             None | Some(HostValue::Null) => Vec::new(),
             other => {
                 return Err(EngineError::Internal(format!(
@@ -4910,11 +4897,7 @@ fn install_hook_prelude(
     // invoker calls host_effect_async_complete which signals the
     // parked Sender. The closure registered via core_use_effect_async
     // awaits the Receiver; settlement → AsyncEffectCleanup or None.
-    engine.register_callback(
-        iso,
-        "host_effect_async",
-        build_host_effect_async_callback(),
-    )?;
+    engine.register_callback(iso, "host_effect_async", build_host_effect_async_callback())?;
     engine.register_callback(
         iso,
         "host_effect_async_complete",
@@ -5123,11 +5106,7 @@ fn install_hook_prelude(
     // Rc clones; subsequent renders re-enter CPython via
     // invoke_global("__invoke_callback", ...).
     engine.register_callback(iso, "host_spawn_child", build_host_spawn_child_callback())?;
-    engine.register_callback(
-        iso,
-        "host_unmount_self",
-        build_host_unmount_self_callback(),
-    )?;
+    engine.register_callback(iso, "host_unmount_self", build_host_unmount_self_callback())?;
     engine.register_callback(iso, "host_compose", build_host_compose_callback())?;
     // Phase 3e-β — supervision hooks. All pure HOOK_CTX-shaped reads
     // (Tier A from 3d-β framing) — no token registry, no engine
@@ -5140,16 +5119,8 @@ fn install_hook_prelude(
     engine.register_callback(iso, "host_demonitor", build_host_demonitor_callback())?;
     engine.register_callback(iso, "host_link", build_host_link_callback())?;
     engine.register_callback(iso, "host_unlink", build_host_unlink_callback())?;
-    engine.register_callback(
-        iso,
-        "host_group_join",
-        build_host_group_join_callback(),
-    )?;
-    engine.register_callback(
-        iso,
-        "host_group_leave",
-        build_host_group_leave_callback(),
-    )?;
+    engine.register_callback(iso, "host_group_join", build_host_group_join_callback())?;
+    engine.register_callback(iso, "host_group_leave", build_host_group_leave_callback())?;
     // Phase 3e-γ — event-source surface. host_use_source decodes
     // descriptors from the `use_source(factory_fn, deps)` Python
     // wrapper and dispatches to graphreact-core's `core_use_source`.
@@ -5158,11 +5129,7 @@ fn install_hook_prelude(
     // (`crate::sources::http_source` / `crate::sources::watch_source`
     // + tokio + notify in Cargo.toml + tokio runtime in `grx`
     // main()) is already in place from JSC.
-    engine.register_callback(
-        iso,
-        "host_use_source",
-        build_host_use_source_callback(),
-    )?;
+    engine.register_callback(iso, "host_use_source", build_host_use_source_callback())?;
     // Eval the Python prelude — installs use_state / use_effect /
     // use_effect_async / use_emit / use_message / use_memo /
     // use_callback / use_reducer / use_neighbors / use_topology /
@@ -5636,7 +5603,9 @@ fn build_py_node_definition(
     NodeDefinition::new(name, move |ctx: &NodeContext| -> PermissionManifest {
         let _guard = ComponentEvalGuard::new(&ctx.id);
         let host_ctx = build_host_ctx(ctx);
-        let result = engine.borrow_mut().call_function(iso, fn_handle, &[host_ctx]);
+        let result = engine
+            .borrow_mut()
+            .call_function(iso, fn_handle, &[host_ctx]);
         match result {
             Ok(manifest) => host_value_to_manifest(manifest),
             Err(e) => {
@@ -5807,9 +5776,7 @@ mod manifest_extraction_tests {
             ("emits".to_string(), HostValue::Array(vec![])),
             (
                 "needs_secret".to_string(),
-                HostValue::Array(vec![
-                    HostValue::String("DATABASE_URL".to_string()),
-                ]),
+                HostValue::Array(vec![HostValue::String("DATABASE_URL".to_string())]),
             ),
         ]);
         let m = host_value_to_manifest(hv);
@@ -6723,8 +6690,10 @@ def body(ctx):
         let fn_ping = eval_python_body(&engine_rc, iso, "PingPP", body_ping);
         let fn_pong = eval_python_body(&engine_rc, iso, "PongPP", body_pong);
 
-        let def_ping = build_py_node_definition("PingPP".into(), Rc::clone(&engine_rc), iso, fn_ping);
-        let def_pong = build_py_node_definition("PongPP".into(), Rc::clone(&engine_rc), iso, fn_pong);
+        let def_ping =
+            build_py_node_definition("PingPP".into(), Rc::clone(&engine_rc), iso, fn_ping);
+        let def_pong =
+            build_py_node_definition("PongPP".into(), Rc::clone(&engine_rc), iso, fn_pong);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -6826,7 +6795,9 @@ def body(ctx):
         reset_global_state();
         let mut engine = CPythonEngine::new();
         engine.initialize().expect("init");
-        let iso = engine.create_isolate(IsolateOptions::default()).expect("create");
+        let iso = engine
+            .create_isolate(IsolateOptions::default())
+            .expect("create");
         install_hook_prelude(&mut engine, iso, None).expect("prelude");
 
         // A standalone Python module should see use_state on builtins.
@@ -6853,7 +6824,13 @@ def body(ctx):
             HostValue::Array(found) => {
                 let names: Vec<String> = found
                     .into_iter()
-                    .filter_map(|v| if let HostValue::String(s) = v { Some(s) } else { None })
+                    .filter_map(|v| {
+                        if let HostValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 for required in &[
                     "use_state",
@@ -6905,7 +6882,9 @@ def body(ctx):
         reset_global_state();
         let mut engine = CPythonEngine::new();
         engine.initialize().expect("init");
-        let iso = engine.create_isolate(IsolateOptions::default()).expect("create");
+        let iso = engine
+            .create_isolate(IsolateOptions::default())
+            .expect("create");
         install_hook_prelude(&mut engine, iso, None).expect("prelude");
         let module = engine
             .eval_module(
@@ -6914,7 +6893,9 @@ def body(ctx):
                 "def probe():\n    ctx = __augment_ctx({})\n    return callable(ctx.get('secret')) and ctx['secret']('TOKEN') is None\n",
             )
             .expect("eval");
-        let probe = engine.resolve_function(iso, module, "probe").expect("resolve");
+        let probe = engine
+            .resolve_function(iso, module, "probe")
+            .expect("resolve");
         assert_eq!(
             engine.call_function(iso, probe, &[]).expect("call"),
             HostValue::Bool(true)
@@ -6940,7 +6921,8 @@ def body(ctx):
             fn get(
                 &self,
                 name: &str,
-            ) -> Result<graphreact_secrets::SecretValue, graphreact_secrets::SecretsError> {
+            ) -> Result<graphreact_secrets::SecretValue, graphreact_secrets::SecretsError>
+            {
                 if name == "TOKEN" {
                     graphreact_secrets::SecretValue::from_string("allowed-value".into())
                 } else {
@@ -7025,8 +7007,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "MemoConst", body);
-        let def =
-            build_py_node_definition("MemoConst".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("MemoConst".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -7052,7 +7033,10 @@ def body(ctx):
 
         {
             let observed = observations.lock();
-            let factory_runs = observed.iter().filter(|s| s.as_str() == "factory-ran").count();
+            let factory_runs = observed
+                .iter()
+                .filter(|s| s.as_str() == "factory-ran")
+                .count();
             assert_eq!(
                 factory_runs, 1,
                 "factory should run once across 3 renders with constant deps: {observed:?}"
@@ -7100,8 +7084,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "MemoDep", body);
-        let def =
-            build_py_node_definition("MemoDep".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("MemoDep".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -7135,9 +7118,18 @@ def body(ctx):
                 3,
                 "factory should run 3× as deps change: {observed:?}"
             );
-            assert_eq!(factory_runs[0], "factory:0", "first run sees count=0: {observed:?}");
-            assert_eq!(factory_runs[1], "factory:5", "second run sees count=5: {observed:?}");
-            assert_eq!(factory_runs[2], "factory:7", "third run sees count=7: {observed:?}");
+            assert_eq!(
+                factory_runs[0], "factory:0",
+                "first run sees count=0: {observed:?}"
+            );
+            assert_eq!(
+                factory_runs[1], "factory:5",
+                "second run sees count=5: {observed:?}"
+            );
+            assert_eq!(
+                factory_runs[2], "factory:7",
+                "third run sees count=7: {observed:?}"
+            );
             // Also verify the memoed values reach the body.
             assert!(observed.iter().any(|s| s == "value=0"), "{observed:?}");
             assert!(observed.iter().any(|s| s == "value=10"), "{observed:?}");
@@ -7178,8 +7170,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "CbStable", body);
-        let def =
-            build_py_node_definition("CbStable".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("CbStable".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -7260,8 +7251,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "Reducer", body);
-        let def =
-            build_py_node_definition("Reducer".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("Reducer".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -7455,7 +7445,8 @@ def body(ctx):
                 "filter excludes b: {observed:?}"
             );
             assert!(
-                observed.contains(&"keep:a".to_string()) && observed.contains(&"keep:c".to_string()),
+                observed.contains(&"keep:a".to_string())
+                    && observed.contains(&"keep:c".to_string()),
                 "kept a and c: {observed:?}"
             );
             assert!(
@@ -7493,8 +7484,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "Watcher", body);
-        let def =
-            build_py_node_definition("Watcher".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("Watcher".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -7572,8 +7562,7 @@ def body(ctx):
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "HostA", body);
         let fn_guest = eval_python_body(&engine_rc, iso, "GuestA", no_op_body);
-        let def_host =
-            build_py_node_definition("HostA".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def_host = build_py_node_definition("HostA".into(), Rc::clone(&engine_rc), iso, fn_h);
         let def_guest =
             build_py_node_definition("GuestA".into(), Rc::clone(&engine_rc), iso, fn_guest);
 
@@ -7656,8 +7645,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "Watcher", body);
-        let def =
-            build_py_node_definition("Watcher".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("Watcher".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -7787,8 +7775,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "Querier", body);
-        let def =
-            build_py_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -7879,8 +7866,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "FallbackBody", body);
-        let def =
-            build_py_node_definition("FallbackBody".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("FallbackBody".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut graph = CommunicationGraph::new();
         graph.add_node("solo".to_string(), Attrs::new());
@@ -7964,8 +7950,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "PathQuerier", body);
-        let def =
-            build_py_node_definition("PathQuerier".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("PathQuerier".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -8049,8 +8034,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "Traverser", body);
-        let def =
-            build_py_node_definition("Traverser".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("Traverser".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -8137,8 +8121,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "Components", body);
-        let def =
-            build_py_node_definition("Components".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("Components".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -8220,8 +8203,7 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_h = eval_python_body(&engine_rc, iso, "LiveWatcher", body);
-        let def =
-            build_py_node_definition("LiveWatcher".into(), Rc::clone(&engine_rc), iso, fn_h);
+        let def = build_py_node_definition("LiveWatcher".into(), Rc::clone(&engine_rc), iso, fn_h);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -8313,9 +8295,19 @@ def body(ctx):
         graph.add_node("sink".to_string(), Attrs::new());
         graph.add_node("observer".to_string(), Attrs::new());
         graph.add_node("querier".to_string(), Attrs::new());
-        graph.add_edge("producer".to_string(), "worker".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "producer".to_string(),
+            "worker".to_string(),
+            None,
+            Attrs::new(),
+        );
         graph.add_edge("worker".to_string(), "sink".to_string(), None, Attrs::new());
-        graph.add_edge("producer".to_string(), "observer".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "producer".to_string(),
+            "observer".to_string(),
+            None,
+            Attrs::new(),
+        );
         // querier needs Tier 1 edges to reach everyone for Tier 2's
         // structural flavor — but the test queries from 'producer', not
         // from 'querier', so querier just needs to participate in the
@@ -8359,18 +8351,32 @@ def body(ctx):
         let observer_fn = eval_python_body(&engine_rc, iso, "Observer", observer_body);
         let querier_fn = eval_python_body(&engine_rc, iso, "Querier", querier_body);
 
-        let producer_def = build_py_node_definition("Producer".into(), Rc::clone(&engine_rc), iso, producer_fn);
-        let worker_def = build_py_node_definition("Worker".into(), Rc::clone(&engine_rc), iso, worker_fn);
+        let producer_def =
+            build_py_node_definition("Producer".into(), Rc::clone(&engine_rc), iso, producer_fn);
+        let worker_def =
+            build_py_node_definition("Worker".into(), Rc::clone(&engine_rc), iso, worker_fn);
         let sink_def = build_py_node_definition("Sink".into(), Rc::clone(&engine_rc), iso, sink_fn);
-        let observer_def = build_py_node_definition("Observer".into(), Rc::clone(&engine_rc), iso, observer_fn);
-        let querier_def = build_py_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, querier_fn);
+        let observer_def =
+            build_py_node_definition("Observer".into(), Rc::clone(&engine_rc), iso, observer_fn);
+        let querier_def =
+            build_py_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, querier_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(producer_def, "producer".to_string(), Attrs::new(), 0_u32).expect("reg producer");
-        scheduler.register_node(worker_def, "worker".to_string(), Attrs::new(), 0_u32).expect("reg worker");
-        scheduler.register_node(sink_def, "sink".to_string(), Attrs::new(), 0_u32).expect("reg sink");
-        scheduler.register_node(observer_def, "observer".to_string(), Attrs::new(), 0_u32).expect("reg observer");
-        scheduler.register_node(querier_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg querier");
+        scheduler
+            .register_node(producer_def, "producer".to_string(), Attrs::new(), 0_u32)
+            .expect("reg producer");
+        scheduler
+            .register_node(worker_def, "worker".to_string(), Attrs::new(), 0_u32)
+            .expect("reg worker");
+        scheduler
+            .register_node(sink_def, "sink".to_string(), Attrs::new(), 0_u32)
+            .expect("reg sink");
+        scheduler
+            .register_node(observer_def, "observer".to_string(), Attrs::new(), 0_u32)
+            .expect("reg observer");
+        scheduler
+            .register_node(querier_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg querier");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -8390,7 +8396,9 @@ def body(ctx):
         {
             let observed = observations.lock();
             assert!(
-                observed.iter().any(|s| s == "reachable:producer,sink,worker"),
+                observed
+                    .iter()
+                    .any(|s| s == "reachable:producer,sink,worker"),
                 "BFS via 'process' reaches producer/worker/sink (sorted): {observed:?}"
             );
             assert!(
@@ -8423,8 +8431,18 @@ def body(ctx):
         for id in ["producer", "mid", "terminal", "querier"] {
             graph.add_node(id.to_string(), Attrs::new());
         }
-        graph.add_edge("producer".to_string(), "mid".to_string(), None, Attrs::new());
-        graph.add_edge("mid".to_string(), "terminal".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "producer".to_string(),
+            "mid".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "mid".to_string(),
+            "terminal".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: Arc<parking_lot::Mutex<Vec<String>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -8462,10 +8480,18 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(p_def, "producer".to_string(), Attrs::new(), 0_u32).expect("reg producer");
-        scheduler.register_node(m_def, "mid".to_string(), Attrs::new(), 0_u32).expect("reg mid");
-        scheduler.register_node(t_def, "terminal".to_string(), Attrs::new(), 0_u32).expect("reg terminal");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg querier");
+        scheduler
+            .register_node(p_def, "producer".to_string(), Attrs::new(), 0_u32)
+            .expect("reg producer");
+        scheduler
+            .register_node(m_def, "mid".to_string(), Attrs::new(), 0_u32)
+            .expect("reg mid");
+        scheduler
+            .register_node(t_def, "terminal".to_string(), Attrs::new(), 0_u32)
+            .expect("reg terminal");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg querier");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -8563,11 +8589,21 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(a_def, "a".to_string(), Attrs::new(), 0_u32).expect("reg a");
-        scheduler.register_node(b_def, "b".to_string(), Attrs::new(), 0_u32).expect("reg b");
-        scheduler.register_node(c_def, "c".to_string(), Attrs::new(), 0_u32).expect("reg c");
-        scheduler.register_node(d_def, "d".to_string(), Attrs::new(), 0_u32).expect("reg d");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(a_def, "a".to_string(), Attrs::new(), 0_u32)
+            .expect("reg a");
+        scheduler
+            .register_node(b_def, "b".to_string(), Attrs::new(), 0_u32)
+            .expect("reg b");
+        scheduler
+            .register_node(c_def, "c".to_string(), Attrs::new(), 0_u32)
+            .expect("reg c");
+        scheduler
+            .register_node(d_def, "d".to_string(), Attrs::new(), 0_u32)
+            .expect("reg d");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -8650,10 +8686,18 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(a_def, "a".to_string(), Attrs::new(), 0_u32).expect("reg a");
-        scheduler.register_node(b_def, "b".to_string(), Attrs::new(), 0_u32).expect("reg b");
-        scheduler.register_node(c_def, "c".to_string(), Attrs::new(), 0_u32).expect("reg c");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(a_def, "a".to_string(), Attrs::new(), 0_u32)
+            .expect("reg a");
+        scheduler
+            .register_node(b_def, "b".to_string(), Attrs::new(), 0_u32)
+            .expect("reg b");
+        scheduler
+            .register_node(c_def, "c".to_string(), Attrs::new(), 0_u32)
+            .expect("reg c");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -8748,11 +8792,21 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(a_def, "a".to_string(), Attrs::new(), 0_u32).expect("reg a");
-        scheduler.register_node(b_def, "b".to_string(), Attrs::new(), 0_u32).expect("reg b");
-        scheduler.register_node(c_def, "c".to_string(), Attrs::new(), 0_u32).expect("reg c");
-        scheduler.register_node(d_def, "d".to_string(), Attrs::new(), 0_u32).expect("reg d");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(a_def, "a".to_string(), Attrs::new(), 0_u32)
+            .expect("reg a");
+        scheduler
+            .register_node(b_def, "b".to_string(), Attrs::new(), 0_u32)
+            .expect("reg b");
+        scheduler
+            .register_node(c_def, "c".to_string(), Attrs::new(), 0_u32)
+            .expect("reg c");
+        scheduler
+            .register_node(d_def, "d".to_string(), Attrs::new(), 0_u32)
+            .expect("reg d");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -8834,11 +8888,21 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(a_def, "a".to_string(), Attrs::new(), 0_u32).expect("reg a");
-        scheduler.register_node(b_def, "b".to_string(), Attrs::new(), 0_u32).expect("reg b");
-        scheduler.register_node(c_def, "c".to_string(), Attrs::new(), 0_u32).expect("reg c");
-        scheduler.register_node(d_def, "d".to_string(), Attrs::new(), 0_u32).expect("reg d");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(a_def, "a".to_string(), Attrs::new(), 0_u32)
+            .expect("reg a");
+        scheduler
+            .register_node(b_def, "b".to_string(), Attrs::new(), 0_u32)
+            .expect("reg b");
+        scheduler
+            .register_node(c_def, "c".to_string(), Attrs::new(), 0_u32)
+            .expect("reg c");
+        scheduler
+            .register_node(d_def, "d".to_string(), Attrs::new(), 0_u32)
+            .expect("reg d");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -8922,9 +8986,15 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(p_def, "producer".to_string(), Attrs::new(), 0_u32).expect("reg p");
-        scheduler.register_node(s_def, "sink".to_string(), Attrs::new(), 0_u32).expect("reg s");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(p_def, "producer".to_string(), Attrs::new(), 0_u32)
+            .expect("reg p");
+        scheduler
+            .register_node(s_def, "sink".to_string(), Attrs::new(), 0_u32)
+            .expect("reg s");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9025,9 +9095,15 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(a_def, "alice".to_string(), Attrs::new(), 0_u32).expect("reg alice");
-        scheduler.register_node(b_def, "bob".to_string(), Attrs::new(), 0_u32).expect("reg bob");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(a_def, "alice".to_string(), Attrs::new(), 0_u32)
+            .expect("reg alice");
+        scheduler
+            .register_node(b_def, "bob".to_string(), Attrs::new(), 0_u32)
+            .expect("reg bob");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9113,9 +9189,15 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(a_def, "alice".to_string(), Attrs::new(), 0_u32).expect("reg alice");
-        scheduler.register_node(b_def, "bob".to_string(), Attrs::new(), 0_u32).expect("reg bob");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(a_def, "alice".to_string(), Attrs::new(), 0_u32)
+            .expect("reg alice");
+        scheduler
+            .register_node(b_def, "bob".to_string(), Attrs::new(), 0_u32)
+            .expect("reg bob");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9200,9 +9282,15 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(a_def, "alice".to_string(), Attrs::new(), 0_u32).expect("reg alice");
-        scheduler.register_node(b_def, "bob".to_string(), Attrs::new(), 0_u32).expect("reg bob");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(a_def, "alice".to_string(), Attrs::new(), 0_u32)
+            .expect("reg alice");
+        scheduler
+            .register_node(b_def, "bob".to_string(), Attrs::new(), 0_u32)
+            .expect("reg bob");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9289,9 +9377,15 @@ def body(ctx):
         let mut scheduler = Scheduler::new(graph);
         // Targets at height 0 (predicates installed before src's
         // useEffect fires). src at height 1.
-        scheduler.register_node(v_def, "veto-target".to_string(), Attrs::new(), 0_u32).expect("reg veto");
-        scheduler.register_node(o_def, "open-target".to_string(), Attrs::new(), 0_u32).expect("reg open");
-        scheduler.register_node(s_def, "src".to_string(), Attrs::new(), 1_u32).expect("reg src");
+        scheduler
+            .register_node(v_def, "veto-target".to_string(), Attrs::new(), 0_u32)
+            .expect("reg veto");
+        scheduler
+            .register_node(o_def, "open-target".to_string(), Attrs::new(), 0_u32)
+            .expect("reg open");
+        scheduler
+            .register_node(s_def, "src".to_string(), Attrs::new(), 1_u32)
+            .expect("reg src");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9346,8 +9440,18 @@ def body(ctx):
         noncompliant_attrs.insert("compliant".to_string(), serde_json::json!(false));
         graph.add_node("noncompliant-failover".to_string(), noncompliant_attrs);
         graph.add_node("querier".to_string(), Attrs::new());
-        graph.add_edge("primary".to_string(), "compliant-failover".to_string(), None, Attrs::new());
-        graph.add_edge("primary".to_string(), "noncompliant-failover".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "primary".to_string(),
+            "compliant-failover".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "primary".to_string(),
+            "noncompliant-failover".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: Arc<parking_lot::Mutex<Vec<String>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -9388,14 +9492,28 @@ def body(ctx):
         let q_fn = eval_python_body(&engine_rc, iso, "Q", q_body);
         let p_def = build_py_node_definition("Primary".into(), Rc::clone(&engine_rc), iso, p_fn);
         let c_def = build_py_node_definition("Compliant".into(), Rc::clone(&engine_rc), iso, c_fn);
-        let n_def = build_py_node_definition("Noncompliant".into(), Rc::clone(&engine_rc), iso, n_fn);
+        let n_def =
+            build_py_node_definition("Noncompliant".into(), Rc::clone(&engine_rc), iso, n_fn);
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(p_def, "primary".to_string(), Attrs::new(), 0_u32).expect("reg primary");
-        scheduler.register_node(c_def, "compliant-failover".to_string(), Attrs::new(), 0_u32).expect("reg c");
-        scheduler.register_node(n_def, "noncompliant-failover".to_string(), Attrs::new(), 0_u32).expect("reg n");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(p_def, "primary".to_string(), Attrs::new(), 0_u32)
+            .expect("reg primary");
+        scheduler
+            .register_node(c_def, "compliant-failover".to_string(), Attrs::new(), 0_u32)
+            .expect("reg c");
+        scheduler
+            .register_node(
+                n_def,
+                "noncompliant-failover".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .expect("reg n");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9415,7 +9533,9 @@ def body(ctx):
         {
             let observed = observations.lock();
             assert!(
-                observed.iter().any(|s| s == "compliant:primary,compliant-failover"),
+                observed
+                    .iter()
+                    .any(|s| s == "compliant:primary,compliant-failover"),
                 "A* with compliance heuristic routes to compliant failover: {observed:?}"
             );
             assert!(
@@ -9443,8 +9563,18 @@ def body(ctx):
         for id in ["fractions", "decimals", "calculus", "querier"] {
             graph.add_node(id.to_string(), Attrs::new());
         }
-        graph.add_edge("fractions".to_string(), "decimals".to_string(), None, Attrs::new());
-        graph.add_edge("fractions".to_string(), "calculus".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "fractions".to_string(),
+            "decimals".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "fractions".to_string(),
+            "calculus".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: Arc<parking_lot::Mutex<Vec<String>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -9482,10 +9612,18 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(f_def, "fractions".to_string(), Attrs::new(), 0_u32).expect("reg fractions");
-        scheduler.register_node(d_def, "decimals".to_string(), Attrs::new(), 0_u32).expect("reg decimals");
-        scheduler.register_node(c_def, "calculus".to_string(), Attrs::new(), 0_u32).expect("reg calculus");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(f_def, "fractions".to_string(), Attrs::new(), 0_u32)
+            .expect("reg fractions");
+        scheduler
+            .register_node(d_def, "decimals".to_string(), Attrs::new(), 0_u32)
+            .expect("reg decimals");
+        scheduler
+            .register_node(c_def, "calculus".to_string(), Attrs::new(), 0_u32)
+            .expect("reg calculus");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9525,12 +9663,33 @@ def body(ctx):
         // invader → {open-region → frontier, peace-region}. Peace
         // refuses war; open accepts.
         let mut graph = CommunicationGraph::new();
-        for id in ["invader-region", "open-region", "frontier", "peace-region", "querier"] {
+        for id in [
+            "invader-region",
+            "open-region",
+            "frontier",
+            "peace-region",
+            "querier",
+        ] {
             graph.add_node(id.to_string(), Attrs::new());
         }
-        graph.add_edge("invader-region".to_string(), "open-region".to_string(), None, Attrs::new());
-        graph.add_edge("open-region".to_string(), "frontier".to_string(), None, Attrs::new());
-        graph.add_edge("invader-region".to_string(), "peace-region".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "invader-region".to_string(),
+            "open-region".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "open-region".to_string(),
+            "frontier".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "invader-region".to_string(),
+            "peace-region".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: Arc<parking_lot::Mutex<Vec<String>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -9575,11 +9734,21 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(i_def, "invader-region".to_string(), Attrs::new(), 0_u32).expect("reg invader");
-        scheduler.register_node(o_def, "open-region".to_string(), Attrs::new(), 0_u32).expect("reg open");
-        scheduler.register_node(fr_def, "frontier".to_string(), Attrs::new(), 0_u32).expect("reg frontier");
-        scheduler.register_node(pe_def, "peace-region".to_string(), Attrs::new(), 0_u32).expect("reg peace");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(i_def, "invader-region".to_string(), Attrs::new(), 0_u32)
+            .expect("reg invader");
+        scheduler
+            .register_node(o_def, "open-region".to_string(), Attrs::new(), 0_u32)
+            .expect("reg open");
+        scheduler
+            .register_node(fr_def, "frontier".to_string(), Attrs::new(), 0_u32)
+            .expect("reg frontier");
+        scheduler
+            .register_node(pe_def, "peace-region".to_string(), Attrs::new(), 0_u32)
+            .expect("reg peace");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9599,7 +9768,9 @@ def body(ctx):
         {
             let observed = observations.lock();
             assert!(
-                observed.iter().any(|s| s == "visit:frontier,invader-region,open-region"),
+                observed
+                    .iter()
+                    .any(|s| s == "visit:frontier,invader-region,open-region"),
                 "BFS visits open chain only; peace-region excluded by predicate: {observed:?}"
             );
         }
@@ -9624,10 +9795,30 @@ def body(ctx):
         for id in ["drug", "on-target", "off-target", "kinase", "querier"] {
             graph.add_node(id.to_string(), Attrs::new());
         }
-        graph.add_edge("drug".to_string(), "on-target".to_string(), None, Attrs::new());
-        graph.add_edge("drug".to_string(), "off-target".to_string(), None, Attrs::new());
-        graph.add_edge("on-target".to_string(), "kinase".to_string(), None, Attrs::new());
-        graph.add_edge("off-target".to_string(), "kinase".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "drug".to_string(),
+            "on-target".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "drug".to_string(),
+            "off-target".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "on-target".to_string(),
+            "kinase".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "off-target".to_string(),
+            "kinase".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: Arc<parking_lot::Mutex<Vec<String>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -9670,16 +9861,27 @@ def body(ctx):
         let q_fn = eval_python_body(&engine_rc, iso, "Q", q_body);
         let d_def = build_py_node_definition("Drug".into(), Rc::clone(&engine_rc), iso, d_fn);
         let on_def = build_py_node_definition("OnTarget".into(), Rc::clone(&engine_rc), iso, on_fn);
-        let off_def = build_py_node_definition("OffTarget".into(), Rc::clone(&engine_rc), iso, off_fn);
+        let off_def =
+            build_py_node_definition("OffTarget".into(), Rc::clone(&engine_rc), iso, off_fn);
         let k_def = build_py_node_definition("Kinase".into(), Rc::clone(&engine_rc), iso, k_fn);
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(d_def, "drug".to_string(), Attrs::new(), 0_u32).expect("reg drug");
-        scheduler.register_node(on_def, "on-target".to_string(), Attrs::new(), 0_u32).expect("reg on");
-        scheduler.register_node(off_def, "off-target".to_string(), Attrs::new(), 0_u32).expect("reg off");
-        scheduler.register_node(k_def, "kinase".to_string(), Attrs::new(), 0_u32).expect("reg kinase");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(d_def, "drug".to_string(), Attrs::new(), 0_u32)
+            .expect("reg drug");
+        scheduler
+            .register_node(on_def, "on-target".to_string(), Attrs::new(), 0_u32)
+            .expect("reg on");
+        scheduler
+            .register_node(off_def, "off-target".to_string(), Attrs::new(), 0_u32)
+            .expect("reg off");
+        scheduler
+            .register_node(k_def, "kinase".to_string(), Attrs::new(), 0_u32)
+            .expect("reg kinase");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9732,9 +9934,24 @@ def body(ctx):
         high_trust.insert("trust".to_string(), serde_json::json!(1.0));
         let mut low_trust = Attrs::new();
         low_trust.insert("trust".to_string(), serde_json::json!(0.1));
-        graph.add_edge("alice".to_string(), "high-trust".to_string(), None, high_trust.clone());
-        graph.add_edge("high-trust".to_string(), "bob".to_string(), None, high_trust);
-        graph.add_edge("alice".to_string(), "low-trust".to_string(), None, low_trust.clone());
+        graph.add_edge(
+            "alice".to_string(),
+            "high-trust".to_string(),
+            None,
+            high_trust.clone(),
+        );
+        graph.add_edge(
+            "high-trust".to_string(),
+            "bob".to_string(),
+            None,
+            high_trust,
+        );
+        graph.add_edge(
+            "alice".to_string(),
+            "low-trust".to_string(),
+            None,
+            low_trust.clone(),
+        );
         graph.add_edge("low-trust".to_string(), "bob".to_string(), None, low_trust);
 
         let observations: Arc<parking_lot::Mutex<Vec<String>>> =
@@ -9781,11 +9998,21 @@ def body(ctx):
         let q_def = build_py_node_definition("Q".into(), Rc::clone(&engine_rc), iso, q_fn);
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(a_def, "alice".to_string(), Attrs::new(), 0_u32).expect("reg alice");
-        scheduler.register_node(h_def, "high-trust".to_string(), Attrs::new(), 0_u32).expect("reg h");
-        scheduler.register_node(l_def, "low-trust".to_string(), Attrs::new(), 0_u32).expect("reg l");
-        scheduler.register_node(b_def, "bob".to_string(), Attrs::new(), 0_u32).expect("reg bob");
-        scheduler.register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32).expect("reg q");
+        scheduler
+            .register_node(a_def, "alice".to_string(), Attrs::new(), 0_u32)
+            .expect("reg alice");
+        scheduler
+            .register_node(h_def, "high-trust".to_string(), Attrs::new(), 0_u32)
+            .expect("reg h");
+        scheduler
+            .register_node(l_def, "low-trust".to_string(), Attrs::new(), 0_u32)
+            .expect("reg l");
+        scheduler
+            .register_node(b_def, "bob".to_string(), Attrs::new(), 0_u32)
+            .expect("reg bob");
+        scheduler
+            .register_node(q_def, "querier".to_string(), Attrs::new(), 1_u32)
+            .expect("reg q");
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -10222,7 +10449,9 @@ def body(ctx):
         // from inside a spawned body — the actual count depends on
         // mount ordering relative to the second batch.
         assert!(
-            observed.iter().any(|s| s.starts_with("child-node-count:") && !s.ends_with(":-1")),
+            observed
+                .iter()
+                .any(|s| s.starts_with("child-node-count:") && !s.ends_with(":-1")),
             "spawned child can call use_graph_query (proxy works in spawned bodies): {observed:?}"
         );
 
@@ -10469,8 +10698,7 @@ def body(ctx):
         let fn_tgt = eval_python_body(&engine_rc, iso, "Target", tgt_body);
         let def_obs =
             build_py_node_definition("Observer".into(), Rc::clone(&engine_rc), iso, fn_obs);
-        let def_tgt =
-            build_py_node_definition("Target".into(), Rc::clone(&engine_rc), iso, fn_tgt);
+        let def_tgt = build_py_node_definition("Target".into(), Rc::clone(&engine_rc), iso, fn_tgt);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -10723,12 +10951,10 @@ def body(ctx):
 ";
         let fn_a = eval_python_body(&engine_rc, iso, "RoundTrip", body);
         let fn_b = eval_python_body(&engine_rc, iso, "RoundTripB", noop_body);
-        let def_a =
-            build_py_node_definition("RoundTrip".into(), Rc::clone(&engine_rc), iso, fn_a);
+        let def_a = build_py_node_definition("RoundTrip".into(), Rc::clone(&engine_rc), iso, fn_a);
         // 'b' needs a NodeDefinition for `use_link('b')` to resolve;
         // matches JSC's `phase3e_zeta_use_link_*` pattern.
-        let def_b =
-            build_py_node_definition("RoundTripB".into(), Rc::clone(&engine_rc), iso, fn_b);
+        let def_b = build_py_node_definition("RoundTripB".into(), Rc::clone(&engine_rc), iso, fn_b);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(def_a, "a".to_string(), Attrs::new(), 0_u32)
@@ -10828,10 +11054,7 @@ def body(ctx):
                         let mut kind = String::new();
                         let mut value: u64 = 0;
                         for (k, v) in pairs {
-                            #[allow(
-                                clippy::cast_possible_truncation,
-                                clippy::cast_sign_loss
-                            )]
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             match (k.as_str(), v) {
                                 ("kind", HostValue::String(s)) => kind = s,
                                 ("intervalMs" | "delayMs", HostValue::Number(n)) => {
@@ -11078,8 +11301,7 @@ def body(ctx):
         // file. FSEvents on macOS sometimes drops events arriving in
         // the same kqueue tick as the watch installation.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        std::fs::write(tmpdir.path().join("hello.txt"), b"hello")
-            .expect("write to watched dir");
+        std::fs::write(tmpdir.path().join("hello.txt"), b"hello").expect("write to watched dir");
 
         // Poll for the change event. 5s budget covers FSEvents'
         // ~50-100ms latency with comfortable margin.
@@ -11176,8 +11398,7 @@ def body(ctx):
         let fn_peer = eval_python_body(&engine_rc, iso, "Peer", noop_body);
         let def_leaky =
             build_py_node_definition("Leaky".into(), Rc::clone(&engine_rc), iso, fn_leaky);
-        let def_peer =
-            build_py_node_definition("Peer".into(), Rc::clone(&engine_rc), iso, fn_peer);
+        let def_peer = build_py_node_definition("Peer".into(), Rc::clone(&engine_rc), iso, fn_peer);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -11605,7 +11826,8 @@ def body(ctx):
     return {'accepts': [], 'emits': []}
 ";
         let fn_handle = eval_python_body(&engine_rc, iso, "N", body);
-        let definition = build_py_node_definition("N".into(), Rc::clone(&engine_rc), iso, fn_handle);
+        let definition =
+            build_py_node_definition("N".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "n".to_string(), Attrs::new(), 0_u32)

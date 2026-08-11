@@ -1,0 +1,60 @@
+<!-- Optional read-only narrator. It cannot send control messages to the twin. -->
+<Narrator lang="go">
+import (
+    "context"
+    "encoding/json"
+    "os"
+    "time"
+
+    openai "github.com/openai/openai-go/v3"
+    "github.com/openai/openai-go/v3/option"
+    "github.com/openai/openai-go/v3/responses"
+)
+
+func NarratorBody(ctx Ctx) Manifest {
+    emit := UseEmit()
+    UseMessage("explain", func(message map[string]interface{}) {
+        apiKey := ctx.Secret("OPENAI_API_KEY")
+        model := os.Getenv("OPENAI_MODEL")
+        if apiKey == "" || model == "" {
+            emit("explanation", map[string]interface{}{
+                "ok": false,
+                "provider": "deterministic",
+                "error_category": "configuration",
+                "text": "OpenAI narration is disabled; the independent safety path contained the irrigation fault.",
+            })
+            return
+        }
+
+        snapshot, err := json.Marshal(message["payload"])
+        if err != nil {
+            emit("explanation", map[string]interface{}{"ok": false, "provider": "deterministic", "error_category": "invalid_snapshot", "text": "The supplied twin snapshot could not be explained."})
+            return
+        }
+        prompt := "Explain this greenhouse digital-twin evidence in three short bullets: what happened, why the safety path worked, and the safe operator follow-up. Do not invent measurements or actions. Snapshot: " + string(snapshot)
+        requestContext, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+        defer cancel()
+        client := openai.NewClient(option.WithAPIKey(apiKey))
+        response, err := client.Responses.New(requestContext, responses.ResponseNewParams{
+            Model: model,
+            Input: responses.ResponseNewParamsInputUnion{OfString: openai.String(prompt)},
+        })
+        if err != nil {
+            emit("explanation", map[string]interface{}{"ok": false, "provider": "deterministic", "error_category": "openai_request_failed", "text": "The independent safety path contained the irrigation fault; OpenAI narration was unavailable."})
+            return
+        }
+        emit("explanation", map[string]interface{}{"ok": true, "provider": "openai", "text": response.OutputText(), "response_id": response.ID})
+    })
+    return Manifest{
+        ID: ctx.ID,
+        Accepts: []string{"explain"},
+        Emits: []string{"explanation"},
+        AcceptsExternalCall: []ExternalCall{{RequestType: "explain", ReplyType: "explanation"}},
+        NeedsSecret: []string{"OPENAI_API_KEY"},
+    }
+}
+</Narrator>
+
+<Graph id="greenhouse-twin-narrator">
+  <Narrator id="narrator" role="read-only-explainer" />
+</Graph>

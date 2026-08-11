@@ -56,40 +56,40 @@ use crate::runtime::{resolve_and_assemble_ir_cached, RuntimeError};
 pub fn validate_watch_runtime(runtime: RuntimeArg) -> Result<(), CommandError> {
     match runtime {
         RuntimeArg::Jsc | RuntimeArg::Cpython => Ok(()),
-        RuntimeArg::Null | RuntimeArg::Echo => Err(CommandError::Runtime(
-            RuntimeError::Engine(graphreact_engine_zig::EngineError::Internal(format!(
+        RuntimeArg::Null | RuntimeArg::Echo => Err(CommandError::Runtime(RuntimeError::Engine(
+            graphreact_engine_zig::EngineError::Internal(format!(
                 "`--watch` requires `--runtime jsc` or `--runtime cpython`; got `{runtime}`. \
                  The {runtime} engine has no body to swap.",
-            ))),
-        )),
+            )),
+        ))),
         // M17 Go bodies are pre-compiled to c-shared artifacts —
         // hot-reload of Go bodies needs the M17 phase 3g
         // dynamic-reload story (recompile + dlopen the new
         // artifact) before `--watch --runtime=go` makes sense.
         // Reject early with a clear message until then.
-        RuntimeArg::Go => Err(CommandError::Runtime(
-            RuntimeError::Engine(graphreact_engine_zig::EngineError::Internal(
+        RuntimeArg::Go => Err(CommandError::Runtime(RuntimeError::Engine(
+            graphreact_engine_zig::EngineError::Internal(
                 "`--watch --runtime=go` is not yet supported. M17 Go bodies are pre-compiled \
                  via `go build -buildmode=c-shared`; dynamic reload of c-shared artifacts lands in \
                  M17 phase 3g. Until then, rebuild and restart the daemon to pick up Go body \
                  changes."
                     .into(),
-            )),
-        )),
+            ),
+        ))),
         // **M22.** `--watch --runtime=mixed` requires per-lang diff
         // classification so a Python body edit doesn't trigger a
         // JSC remount (and vice-versa); the existing diff classifier
         // keys on a single runtime. Reject early until M22 phase
         // 5+ extends the classifier to lane edits per-engine.
-        RuntimeArg::Mixed => Err(CommandError::Runtime(
-            RuntimeError::Engine(graphreact_engine_zig::EngineError::Internal(
+        RuntimeArg::Mixed => Err(CommandError::Runtime(RuntimeError::Engine(
+            graphreact_engine_zig::EngineError::Internal(
                 "`--watch --runtime=mixed` is not yet supported. The hot-reload diff \
                  classifier keys on a single runtime; per-lang lane classification lands \
                  in M22 phase 5+. Pin to `--runtime=jsc` or `--runtime=cpython` for watch \
                  mode."
                     .into(),
-            )),
-        )),
+            ),
+        ))),
     }
 }
 
@@ -149,8 +149,8 @@ fn run_jsc_watch_blocking(
             })?;
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let mut runtime = crate::jsruntime::mount_with_scheduler(&path)
-                .map_err(CommandError::Runtime)?;
+            let mut runtime =
+                crate::jsruntime::mount_with_scheduler(&path).map_err(CommandError::Runtime)?;
             // **M16-Backend P9.** Install JSC inspector BEFORE the
             // first `process_batch_async` so Safari Web Inspector
             // sees the JSContext + breakpoints fire on first render.
@@ -165,9 +165,7 @@ fn run_jsc_watch_blocking(
                     runtime.iso,
                     d.port,
                 )
-                .map_err(|e| {
-                    CommandError::ClusterArg(format!("debug install failed: {e}"))
-                })?;
+                .map_err(|e| CommandError::ClusterArg(format!("debug install failed: {e}")))?;
             }
             runtime
                 .process_batch_async()
@@ -192,10 +190,11 @@ fn run_jsc_watch_blocking(
             let adapter = crate::hotreload_adapter::JscReloadAdapter::for_runtime(&runtime);
             let mut orchestrator = ReloadOrchestrator::new(adapter);
             let watch_paths = collect_watch_paths(&path)?;
-            let (_watcher, rx) = FileWatcher::watch(&watch_paths)
-                .map_err(|e| CommandError::Io(std::io::Error::other(format!(
+            let (_watcher, rx) = FileWatcher::watch(&watch_paths).map_err(|e| {
+                CommandError::Io(std::io::Error::other(format!(
                     "FileWatcher::watch failed: {e}"
-                ))))?;
+                )))
+            })?;
 
             // **M15 Phase 1 slice 1A.** Per-process parse cache so
             // unchanged imports skip reparse on every reload event.
@@ -247,8 +246,8 @@ fn run_cpython_watch_blocking(
             })?;
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let mut runtime = crate::pyruntime::mount_with_scheduler(&path)
-                .map_err(CommandError::Runtime)?;
+            let mut runtime =
+                crate::pyruntime::mount_with_scheduler(&path).map_err(CommandError::Runtime)?;
             // **M16-Backend P8.** Install debugpy BEFORE the first
             // `process_batch_async` so `def init(ctx)` breakpoints
             // hit on first mount. Same pattern as `start_daemon`.
@@ -260,9 +259,7 @@ fn run_cpython_watch_blocking(
                     d.port,
                     debug_wait,
                 )
-                .map_err(|e| {
-                    CommandError::ClusterArg(format!("debug install failed: {e}"))
-                })?;
+                .map_err(|e| CommandError::ClusterArg(format!("debug install failed: {e}")))?;
             }
             runtime
                 .process_batch_async()
@@ -287,10 +284,11 @@ fn run_cpython_watch_blocking(
             let adapter = crate::hotreload_adapter::PyReloadAdapter::for_runtime(&runtime);
             let mut orchestrator = ReloadOrchestrator::new(adapter);
             let watch_paths = collect_watch_paths(&path)?;
-            let (_watcher, rx) = FileWatcher::watch(&watch_paths)
-                .map_err(|e| CommandError::Io(std::io::Error::other(format!(
+            let (_watcher, rx) = FileWatcher::watch(&watch_paths).map_err(|e| {
+                CommandError::Io(std::io::Error::other(format!(
                     "FileWatcher::watch failed: {e}"
-                ))))?;
+                )))
+            })?;
 
             // **M15 Phase 1 slice 1A.** Same cache plumbing as the
             // JSC arm — Python authors editing multi-file fixtures
@@ -485,10 +483,7 @@ fn is_relevant(event: &WatchEvent) -> bool {
     let path = match event {
         WatchEvent::Modified { path } | WatchEvent::Removed { path } => path,
     };
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("grx")
-    )
+    matches!(path.extension().and_then(|e| e.to_str()), Some("grx"))
 }
 
 /// Build the union of paths to register with the file watcher: the
@@ -614,7 +609,10 @@ mod tests {
         let err = validate_watch_runtime(RuntimeArg::Null).expect_err("null must be rejected");
         let msg = format!("{err}");
         assert!(msg.contains("watch"), "error must mention --watch: {msg}");
-        assert!(msg.contains("null"), "error must name the rejected runtime: {msg}");
+        assert!(
+            msg.contains("null"),
+            "error must name the rejected runtime: {msg}"
+        );
     }
 
     #[test]
@@ -643,9 +641,11 @@ return { accepts: [], emits: [] };
         let prior = graphreact_grx_parser::ir::parse_to_ir(source).expect("parse prior");
         let mut cache = DiffCache::new();
         let mut parse_cache = ParseCache::new();
-        let event = WatchEvent::Modified { path: fixture.clone() };
-        let (_new_ir, delta) =
-            handle_event(&fixture, &prior, &mut cache, &mut parse_cache, &event).expect("handle ok");
+        let event = WatchEvent::Modified {
+            path: fixture.clone(),
+        };
+        let (_new_ir, delta) = handle_event(&fixture, &prior, &mut cache, &mut parse_cache, &event)
+            .expect("handle ok");
         assert!(
             matches!(delta, ReloadDelta::NoChange),
             "identical content must produce NoChange, got {delta:?}"
@@ -680,9 +680,11 @@ return { accepts: ['v1'], emits: [] };
         let prior = graphreact_grx_parser::ir::parse_to_ir(v1_source).expect("parse prior");
         let mut cache = DiffCache::new();
         let mut parse_cache = ParseCache::new();
-        let event = WatchEvent::Modified { path: fixture.clone() };
-        let (_new_ir, delta) =
-            handle_event(&fixture, &prior, &mut cache, &mut parse_cache, &event).expect("handle ok");
+        let event = WatchEvent::Modified {
+            path: fixture.clone(),
+        };
+        let (_new_ir, delta) = handle_event(&fixture, &prior, &mut cache, &mut parse_cache, &event)
+            .expect("handle ok");
         assert!(
             !matches!(delta, ReloadDelta::NoChange),
             "body change must produce a non-NoChange delta, got {delta:?}"
@@ -710,10 +712,15 @@ return { accepts: [], emits: [] };
         .expect("parse prior");
         let mut cache = DiffCache::new();
         let mut parse_cache = ParseCache::new();
-        let event = WatchEvent::Modified { path: fixture.clone() };
+        let event = WatchEvent::Modified {
+            path: fixture.clone(),
+        };
         match handle_event(&fixture, &prior, &mut cache, &mut parse_cache, &event) {
             Err(WatchHandleError::DeferToNextEvent(reason)) => {
-                assert!(reason.contains("parse error"), "reason should mention parse: {reason}");
+                assert!(
+                    reason.contains("parse error"),
+                    "reason should mention parse: {reason}"
+                );
             }
             other => panic!("expected DeferToNextEvent on parse failure, got {other:?}"),
         }
@@ -739,10 +746,15 @@ return { accepts: [], emits: [] };
         .expect("parse prior");
         let mut cache = DiffCache::new();
         let mut parse_cache = ParseCache::new();
-        let event = WatchEvent::Removed { path: fixture.clone() };
+        let event = WatchEvent::Removed {
+            path: fixture.clone(),
+        };
         match handle_event(&fixture, &prior, &mut cache, &mut parse_cache, &event) {
             Err(WatchHandleError::DeferToNextEvent(reason)) => {
-                assert!(reason.contains("removed"), "reason should mention removed: {reason}");
+                assert!(
+                    reason.contains("removed"),
+                    "reason should mention removed: {reason}"
+                );
             }
             other => panic!("expected DeferToNextEvent on removed, got {other:?}"),
         }
@@ -789,9 +801,7 @@ return { accepts: ['v2'], emits: [] };
         // to the initial write above.
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&root, root_v2).expect("write root v2");
-        let event = WatchEvent::Modified {
-            path: root.clone(),
-        };
+        let event = WatchEvent::Modified { path: root.clone() };
         let _ = handle_event(&root, &prior, &mut diff_cache, &mut parse_cache, &event)
             .expect("first handle_event");
         // First event after a fresh cache: 2 misses (root + leaf).
@@ -811,9 +821,7 @@ return { accepts: ['v3'], emits: [] };
 </Graph>
 "#;
         std::fs::write(&root, root_v3).expect("write root v3");
-        let event = WatchEvent::Modified {
-            path: root.clone(),
-        };
+        let event = WatchEvent::Modified { path: root.clone() };
         let _ = handle_event(&root, &prior, &mut diff_cache, &mut parse_cache, &event)
             .expect("second handle_event");
         // Second event: leaf.grx hits (unchanged), root.grx misses
@@ -833,10 +841,18 @@ return { accepts: ['v3'], emits: [] };
     /// filter).
     #[test]
     fn is_relevant_filters_non_grx_paths() {
-        assert!(is_relevant(&WatchEvent::Modified { path: "/tmp/a.grx".into() }));
-        assert!(is_relevant(&WatchEvent::Removed { path: "/tmp/a.grx".into() }));
-        assert!(!is_relevant(&WatchEvent::Modified { path: "/tmp/a.txt".into() }));
-        assert!(!is_relevant(&WatchEvent::Modified { path: "/tmp/.DS_Store".into() }));
+        assert!(is_relevant(&WatchEvent::Modified {
+            path: "/tmp/a.grx".into()
+        }));
+        assert!(is_relevant(&WatchEvent::Removed {
+            path: "/tmp/a.grx".into()
+        }));
+        assert!(!is_relevant(&WatchEvent::Modified {
+            path: "/tmp/a.txt".into()
+        }));
+        assert!(!is_relevant(&WatchEvent::Modified {
+            path: "/tmp/.DS_Store".into()
+        }));
     }
 
     /// **M15 Phase 9 in-process integration test (JSC).** Synthesises

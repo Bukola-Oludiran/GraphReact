@@ -124,9 +124,8 @@ async fn http_request(url: &str, authorization: Option<&str>) -> (u16, String, S
         Some(a) => format!("Authorization: {a}\r\n"),
         None => String::new(),
     };
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{auth_line}\r\n"
-    );
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{auth_line}\r\n");
     stream.write_all(req.as_bytes()).await.expect("send req");
 
     let mut response = Vec::new();

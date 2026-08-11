@@ -19,9 +19,8 @@ use tower_lsp_server::ls_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, Location, MessageType, OneOf, PositionEncodingKind,
-    Range, ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
-    Uri,
+    InitializeResult, InitializedParams, Location, MessageType, OneOf, PositionEncodingKind, Range,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use tower_lsp_server::{Client, LanguageServer};
 
@@ -79,9 +78,7 @@ impl LanguageServer for GrxLanguageServer {
             // We can serve full-text sync today; incremental sync is
             // a Phase-1B follow-on (would wire through
             // `IncrementalParser::reparse`).
-            text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                TextDocumentSyncKind::FULL,
-            )),
+            text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             position_encoding: Some(PositionEncodingKind::UTF8),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             definition_provider: Some(OneOf::Left(true)),
@@ -129,9 +126,7 @@ impl LanguageServer for GrxLanguageServer {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let td = params.text_document;
-        self.documents
-            .upsert(&td.uri, td.text, td.version)
-            .await;
+        self.documents.upsert(&td.uri, td.text, td.version).await;
         self.refresh_diagnostics(&td.uri).await;
     }
 
@@ -158,7 +153,11 @@ impl LanguageServer for GrxLanguageServer {
     }
 
     async fn hover(&self, params: HoverParams) -> JsonRpcResult<Option<Hover>> {
-        let uri = params.text_document_position_params.text_document.uri.clone();
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .clone();
         let pos = params.text_document_position_params.position;
         let Some(entry) = self.documents.get(&uri).await else {
             return Ok(None);

@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use graphreact_observer::{
-    replay_audit_chain, spawn_management_api_with_options, BearerToken, BindConfig,
-    FileAuditSink, MetricsInner, RateLimitConfig, SnapshotRequest, SpawnOptions,
+    replay_audit_chain, spawn_management_api_with_options, BearerToken, BindConfig, FileAuditSink,
+    MetricsInner, RateLimitConfig, SnapshotRequest, SpawnOptions,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -79,10 +79,10 @@ async fn spawn_with_limit(
         token: token.map(|t| BearerToken::from_bytes(t.to_vec()).unwrap()),
         tls: None,
     };
-    let audit_sink: Option<Arc<dyn graphreact_observer::AuditSink>> =
-        audit_path.map(|p| {
-            Arc::new(FileAuditSink::open(p).expect("open sink")) as Arc<dyn graphreact_observer::AuditSink>
-        });
+    let audit_sink: Option<Arc<dyn graphreact_observer::AuditSink>> = audit_path.map(|p| {
+        Arc::new(FileAuditSink::open(p).expect("open sink"))
+            as Arc<dyn graphreact_observer::AuditSink>
+    });
     let mut server = spawn_management_api_with_options(SpawnOptions {
         bind,
         metrics: metrics.clone(),
@@ -137,19 +137,14 @@ async fn flood_get_n(
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let mut stream = TcpStream::connect(addr).await.expect("tcp connect");
-        let mut req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n"
-        );
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
         if let Some(b) = bearer {
             write!(req, "Authorization: Bearer {b}\r\n").expect("write to string");
         }
         req.push_str("\r\n");
         stream.write_all(req.as_bytes()).await.expect("send req");
         let mut buf = Vec::new();
-        stream
-            .read_to_end(&mut buf)
-            .await
-            .expect("read response");
+        stream.read_to_end(&mut buf).await.expect("read response");
         let resp = String::from_utf8_lossy(&buf).into_owned();
         let (head, body) = resp
             .split_once("\r\n\r\n")
@@ -192,10 +187,8 @@ async fn rate_limit_layer_emits_429_under_burst() {
     // should 429.
     let url_path = "/v1/identity";
     let responses = flood_get_n(addr, url_path, None, 10).await;
-    let blocked: Vec<&(u16, Option<String>, String)> = responses
-        .iter()
-        .filter(|(s, _, _)| *s == 429)
-        .collect();
+    let blocked: Vec<&(u16, Option<String>, String)> =
+        responses.iter().filter(|(s, _, _)| *s == 429).collect();
     assert!(
         !blocked.is_empty(),
         "expected ≥1 429 in burst run; got statuses: {:?}",
@@ -325,8 +318,7 @@ async fn rate_limit_blocked_audit_event_fires() {
     let dir = TempDir::new("grx-ratelimit-audit");
     let audit_path = dir.path.join("audit.ndjson");
     let rl = RateLimitConfig::for_tests(1, 2);
-    let (server, drain, addr, _metrics) =
-        spawn_with_limit(rl, None, Some(&audit_path)).await;
+    let (server, drain, addr, _metrics) = spawn_with_limit(rl, None, Some(&audit_path)).await;
 
     let responses = flood_get_n(addr, "/v1/identity", None, 10).await;
     let blocked_count = responses.iter().filter(|(s, _, _)| *s == 429).count();
@@ -396,7 +388,8 @@ async fn rate_limit_passes_under_cap() {
     let responses = flood_get_n(addr, "/v1/identity", None, 50).await;
     let blocked = responses.iter().filter(|(s, _, _)| *s == 429).count();
     assert_eq!(
-        blocked, 0,
+        blocked,
+        0,
         "no 429s expected under cap; got {blocked} from {} responses",
         responses.len()
     );
@@ -420,9 +413,7 @@ async fn scrape_metrics(addr: std::net::SocketAddr) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     let mut stream = TcpStream::connect(addr).await.expect("tcp connect");
-    let req = format!(
-        "GET /v1/metrics HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET /v1/metrics HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.expect("send");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.expect("read");

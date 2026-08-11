@@ -50,15 +50,12 @@ fn write_pem_artifacts(name_a: &str, name_b: &str) -> PemArtifacts {
     std::fs::write(&ca_path, ca_pem).expect("write ca pem");
 
     let mk_leaf = |name: &str, base: &str| -> (PathBuf, PathBuf) {
-        let mut params =
-            rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
+        let mut params = rcgen::CertificateParams::new(vec![name.into()]).expect("leaf params");
         params.subject_alt_names.push(rcgen::SanType::DnsName(
             name.to_string().try_into().expect("san name"),
         ));
         let kp = rcgen::KeyPair::generate().expect("leaf keygen");
-        let cert = params
-            .signed_by(&kp, &ca_cert, &ca_kp)
-            .expect("leaf sign");
+        let cert = params.signed_by(&kp, &ca_cert, &ca_kp).expect("leaf sign");
         let cert_pem = cert.pem();
         let key_pem = kp.serialize_pem();
         let cert_path = dir.path().join(format!("{base}-cert.pem"));

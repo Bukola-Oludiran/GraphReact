@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use graphreact_core::{MessageDelivered, TelemetrySink};
 use graphreact_observer::{
-    spawn_management_api, ApiServerHandle, BindConfig, MetricsInner, MessageSnapshot,
+    spawn_management_api, ApiServerHandle, BindConfig, MessageSnapshot, MetricsInner,
 };
 use serde_json::Value;
 
@@ -22,7 +22,9 @@ async fn spawn_with_ring() -> ApiServerHandle {
         token: None,
         tls: None,
     };
-    spawn_management_api(bind, metrics, 0xCAFE_BABE).await.expect("spawn")
+    spawn_management_api(bind, metrics, 0xCAFE_BABE)
+        .await
+        .expect("spawn")
 }
 
 #[tokio::test]
@@ -117,8 +119,14 @@ async fn snapshot_payload_field_is_absent() {
     .await;
     let v: Value = serde_json::from_str(&body).unwrap();
     let row = &v.as_array().unwrap()[0];
-    assert!(row.get("payload").is_none(), "payload must NOT appear in response");
-    assert!(row.get("body").is_none(), "body must NOT appear in response");
+    assert!(
+        row.get("payload").is_none(),
+        "payload must NOT appear in response"
+    );
+    assert!(
+        row.get("body").is_none(),
+        "body must NOT appear in response"
+    );
     server.shutdown().await;
 }
 
@@ -156,9 +164,7 @@ async fn http_get(url: &str) -> String {
         .unwrap_or((after_scheme, "/".into()));
 
     let mut stream = TcpStream::connect(host_port).await.expect("tcp connect");
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.expect("send");
 
     let mut buf = Vec::new();
@@ -174,6 +180,9 @@ async fn http_get(url: &str) -> String {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(status, 200, "expected 200 from {url}; got {status}; body: {body}");
+    assert_eq!(
+        status, 200,
+        "expected 200 from {url}; got {status}; body: {body}"
+    );
     body.to_string()
 }

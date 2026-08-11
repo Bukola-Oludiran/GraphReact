@@ -31,9 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use graphreact_cli::commands::{start_daemon, DaemonOptions};
-use graphreact_dist::{
-    NetSplitPolicy, NetTickConfig, NodeId, SecretCookie, TlsConfig,
-};
+use graphreact_dist::{NetSplitPolicy, NetTickConfig, NodeId, SecretCookie, TlsConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 fn fixture(name: &str) -> PathBuf {
@@ -58,8 +56,7 @@ fn pair_tls(name_a: &str, name_b: &str) -> (TlsConfig, TlsConfig) {
         let kp = rcgen::KeyPair::generate().expect("leaf keygen");
         let cert = params.signed_by(&kp, &ca_cert, &ca_kp).expect("leaf sign");
         let cert_der: CertificateDer<'static> = cert.der().clone();
-        let key_der: PrivateKeyDer<'static> =
-            PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
+        let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(kp.serialize_der()).into();
         TlsConfig::from_pem_bytes(vec![cert_der], key_der, vec![ca_der.clone()], true)
             .expect("tls from pem bytes")
     };
@@ -98,6 +95,7 @@ async fn pubsub_demo_two_daemons_jsc_grx_broadcast_fans_out() {
         tls: alice_tls,
         peers: Vec::new(),
         runtime: graphreact_cli::cli::RuntimeArg::Jsc,
+        go_build: Default::default(),
         net_tick: fast_tick(),
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
@@ -129,6 +127,7 @@ async fn pubsub_demo_two_daemons_jsc_grx_broadcast_fans_out() {
         tls: bob_tls,
         peers: vec![(parse_id("alice@127.0.0.1"), alice_addr)],
         runtime: graphreact_cli::cli::RuntimeArg::Jsc,
+        go_build: Default::default(),
         net_tick: fast_tick(),
         net_split_policy: NetSplitPolicy::PauseOnSplit,
         duration_secs: None,
@@ -198,12 +197,7 @@ async fn pubsub_demo_two_daemons_jsc_grx_broadcast_fans_out() {
         // running another body invocation, so just process
         // long enough for the wire transit + delivery to
         // settle.
-        if alice
-            .cluster()
-            .dist_groups()
-            .member_count("chat:general")
-            == 2
-        {
+        if alice.cluster().dist_groups().member_count("chat:general") == 2 {
             // Convergence proxy — once the gossip is stable
             // and we've batched long enough, assume the
             // broadcast has reached both sides.

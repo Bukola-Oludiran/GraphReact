@@ -49,10 +49,9 @@ pub fn validate_graph(
     if matches!(has_cycle(graph), Ok(true)) {
         warnings.push(ValidationWarning {
             level: WarningLevel::Warn,
-            message:
-                "Graph contains cycles. Ensure TTL is configured on cyclic edges to prevent \
+            message: "Graph contains cycles. Ensure TTL is configured on cyclic edges to prevent \
                  infinite message loops."
-                    .into(),
+                .into(),
         });
     }
 
@@ -99,8 +98,14 @@ mod tests {
 
     fn manifest_for(accepts: &[&str], emits: &[&str]) -> PermissionManifest {
         PermissionManifest::new(
-            accepts.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
-            emits.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+            accepts
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
+            emits
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
         )
     }
 

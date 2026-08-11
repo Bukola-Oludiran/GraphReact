@@ -193,9 +193,10 @@ pub fn tick_pass(
         // Send tick. Best-effort — backpressure or closed
         // channel just means we'll catch the staleness next
         // pass.
-        let _ = peer
-            .send_tx
-            .try_send(Packet::Tick(Tick { seq, sent_at_ms: sent_at }));
+        let _ = peer.send_tx.try_send(Packet::Tick(Tick {
+            seq,
+            sent_at_ms: sent_at,
+        }));
 
         let last = peer.last_tick_ms();
         let elapsed = now.saturating_sub(last);
@@ -206,7 +207,8 @@ pub fn tick_pass(
                         "dist net_tick: peer `{peer_name}` partitioned ({elapsed}ms since last \
                          packet, threshold {threshold_ms}ms); ContinueWithStale → disconnecting"
                     );
-                    peer_states.insert(peer_name.clone(), PeerStatus::Partitioned { since_ms: now });
+                    peer_states
+                        .insert(peer_name.clone(), PeerStatus::Partitioned { since_ms: now });
                     // Drop the registry entry; the run_connection
                     // task's send_rx.recv() returns None, the
                     // task exits, and synthesize_disconnect
@@ -229,19 +231,13 @@ pub fn tick_pass(
                     // PauseOnSplit semantics). Once grace
                     // elapses, escalate to ContinueWithStale-
                     // equivalent behaviour.
-                    let suspect_since = match peer_states
-                        .get(&peer_name)
-                        .map(|e| *e.value())
-                    {
+                    let suspect_since = match peer_states.get(&peer_name).map(|e| *e.value()) {
                         Some(
-                            PeerStatus::Suspect { since_ms }
-                            | PeerStatus::Partitioned { since_ms },
+                            PeerStatus::Suspect { since_ms } | PeerStatus::Partitioned { since_ms },
                         ) => since_ms,
                         _ => {
-                            peer_states.insert(
-                                peer_name.clone(),
-                                PeerStatus::Suspect { since_ms: now },
-                            );
+                            peer_states
+                                .insert(peer_name.clone(), PeerStatus::Suspect { since_ms: now });
                             now
                         }
                     };
@@ -253,7 +249,9 @@ pub fn tick_pass(
                         );
                         peer_states.insert(
                             peer_name.clone(),
-                            PeerStatus::Partitioned { since_ms: suspect_since },
+                            PeerStatus::Partitioned {
+                                since_ms: suspect_since,
+                            },
                         );
                         drop(peer);
                         registry.remove_by_name(&peer_name);
@@ -274,9 +272,7 @@ pub fn tick_pass(
             // supervisor decisions can proceed on next batch.
             if let Some(prev) = peer_states.get(&peer_name).map(|e| *e.value()) {
                 if !matches!(prev, PeerStatus::Healthy) {
-                    tracing::info!(
-                        "dist net_tick: peer `{peer_name}` healed; clearing Suspect"
-                    );
+                    tracing::info!("dist net_tick: peer `{peer_name}` healed; clearing Suspect");
                 }
             }
             peer_states.insert(peer_name, PeerStatus::Healthy);
@@ -327,11 +323,7 @@ mod tests {
         (supervision, dist_groups, registry)
     }
 
-    fn insert_peer(
-        reg: &NodeRegistry,
-        name: &str,
-        last_tick_ms: u64,
-    ) -> mpsc::Receiver<Packet> {
+    fn insert_peer(reg: &NodeRegistry, name: &str, last_tick_ms: u64) -> mpsc::Receiver<Packet> {
         let (tx, rx) = mpsc::channel(64);
         let node: NodeId = format!("{name}@127.0.0.1").parse().unwrap();
         let h = Arc::new(PeerHandle::new(node, Creation(1), tx, Vec::new(), 0));
@@ -346,7 +338,10 @@ mod tests {
         let _rx = insert_peer(&reg, "bob", now_ms());
         let h = reg.get_by_name("bob").unwrap();
         let lag = now_ms().saturating_sub(h.last_tick_ms());
-        assert!(lag < 50, "fresh peer last_tick should be ~now (lag {lag}ms)");
+        assert!(
+            lag < 50,
+            "fresh peer last_tick should be ~now (lag {lag}ms)"
+        );
     }
 
     fn fresh_peer_states() -> PeerStates {
@@ -364,7 +359,15 @@ mod tests {
             miss_threshold: 2,
             partition_grace: Duration::from_millis(0),
         };
-        tick_pass(&reg, &sup, &dg, &states, &cfg, NetSplitPolicy::ContinueWithStale, 1);
+        tick_pass(
+            &reg,
+            &sup,
+            &dg,
+            &states,
+            &cfg,
+            NetSplitPolicy::ContinueWithStale,
+            1,
+        );
         assert!(
             reg.get_by_name("bob").is_none(),
             "bob should be removed under ContinueWithStale + stale last_tick"
@@ -385,7 +388,15 @@ mod tests {
             miss_threshold: 2,
             partition_grace: Duration::from_secs(60),
         };
-        tick_pass(&reg, &sup, &dg, &states, &cfg, NetSplitPolicy::PauseOnSplit, 1);
+        tick_pass(
+            &reg,
+            &sup,
+            &dg,
+            &states,
+            &cfg,
+            NetSplitPolicy::PauseOnSplit,
+            1,
+        );
         assert!(
             reg.get_by_name("bob").is_some(),
             "bob should be held under PauseOnSplit within grace window"
@@ -407,10 +418,26 @@ mod tests {
             partition_grace: Duration::from_millis(0),
         };
         // First pass: marks bob as Suspect with since_ms = now.
-        tick_pass(&reg, &sup, &dg, &states, &cfg, NetSplitPolicy::PauseOnSplit, 1);
+        tick_pass(
+            &reg,
+            &sup,
+            &dg,
+            &states,
+            &cfg,
+            NetSplitPolicy::PauseOnSplit,
+            1,
+        );
         // Second pass: grace is zero, so suspect_age >= grace_ms
         // immediately → escalation.
-        tick_pass(&reg, &sup, &dg, &states, &cfg, NetSplitPolicy::PauseOnSplit, 2);
+        tick_pass(
+            &reg,
+            &sup,
+            &dg,
+            &states,
+            &cfg,
+            NetSplitPolicy::PauseOnSplit,
+            2,
+        );
         assert!(
             reg.get_by_name("bob").is_none(),
             "bob should be removed by PauseOnSplit escalation after grace"
@@ -431,7 +458,15 @@ mod tests {
             miss_threshold: 100,
             partition_grace: Duration::from_secs(60),
         };
-        tick_pass(&reg, &sup, &dg, &states, &cfg, NetSplitPolicy::PauseOnSplit, 42);
+        tick_pass(
+            &reg,
+            &sup,
+            &dg,
+            &states,
+            &cfg,
+            NetSplitPolicy::PauseOnSplit,
+            42,
+        );
         let pkt = rx_bob.recv().await.expect("Tick packet");
         match pkt {
             Packet::Tick(t) => {
@@ -441,7 +476,10 @@ mod tests {
             other => panic!("expected Tick, got {other:?}"),
         }
         // Healthy peer's status is Healthy.
-        assert_eq!(states.get("bob").map(|e| *e.value()), Some(PeerStatus::Healthy));
+        assert_eq!(
+            states.get("bob").map(|e| *e.value()),
+            Some(PeerStatus::Healthy)
+        );
     }
 
     #[tokio::test]

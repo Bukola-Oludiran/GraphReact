@@ -55,6 +55,9 @@ tokio-tungstenite.workspace = true
 # dance (which would need workspace `unsafe_code` exemption). Pure
 # Rust, MIT/Apache-2.0, dependency-light.
 rpassword = "7"
+# Loopback-only development daemons generate an in-memory ephemeral cluster
+# identity. Production daemons continue to require operator-supplied mTLS.
+rcgen.workspace = true
 
 [features]
 default = []
@@ -68,7 +71,6 @@ otel = ["graphreact-observer/otel"]
 [dev-dependencies]
 tempfile = "3"
 clap_complete.workspace = true
-rcgen.workspace = true
 assert_cmd = "2"
 # **M16-Backend P11.1.** Validates /v1/metrics output round-trips
 # through the upstream Prometheus exposition parser (catches any

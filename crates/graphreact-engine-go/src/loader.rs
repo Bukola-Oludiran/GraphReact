@@ -155,7 +155,8 @@ impl LoadedRuntime {
         // `Symbol` that borrows from `lib`; we deref to the raw
         // function pointer + drop the Symbol immediately so the
         // borrow doesn't pin the field.
-        let engine_initialize = resolve::<ffi::gr_go_engine_initialize_fn>(&lib, "GrxEngineInitialize")?;
+        let engine_initialize =
+            resolve::<ffi::gr_go_engine_initialize_fn>(&lib, "GrxEngineInitialize")?;
         let engine_shutdown = resolve::<ffi::gr_go_engine_shutdown_fn>(&lib, "GrxEngineShutdown")?;
 
         // engine_live_isolates is optional — used only by stress

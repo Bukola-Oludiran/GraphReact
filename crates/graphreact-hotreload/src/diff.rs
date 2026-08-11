@@ -105,15 +105,32 @@ pub enum NodeDeltaKind {
     PropsChanged,
     /// `lang` attribute changed (Js ↔ Python). Always requires
     /// remount — different engine entirely.
-    LangChanged { old: ComponentLang, new: ComponentLang },
+    LangChanged {
+        old: ComponentLang,
+        new: ComponentLang,
+    },
 }
 
 /// Per-edge change record.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EdgeDelta {
-    Added { source: String, target: String, attrs: AttrMap, kind: EdgeKind },
-    Removed { source: String, target: String, kind: EdgeKind },
-    AttrsChanged { source: String, target: String, kind: EdgeKind, new_attrs: AttrMap },
+    Added {
+        source: String,
+        target: String,
+        attrs: AttrMap,
+        kind: EdgeKind,
+    },
+    Removed {
+        source: String,
+        target: String,
+        kind: EdgeKind,
+    },
+    AttrsChanged {
+        source: String,
+        target: String,
+        kind: EdgeKind,
+        new_attrs: AttrMap,
+    },
 }
 
 /// Per-component cache of body hashes plus per-language hook
@@ -314,7 +331,10 @@ enum BodyClassification {
         new_code: String,
         new_lang: ComponentLang,
     },
-    LangChanged { old: ComponentLang, new: ComponentLang },
+    LangChanged {
+        old: ComponentLang,
+        new: ComponentLang,
+    },
     /// Definition was added in `after`. The runtime side handles
     /// this implicitly when nodes referencing the new definition
     /// mount; classification carries no extra payload.
@@ -375,14 +395,13 @@ fn classify_definition_change(
 fn node_kind_from_body_class(class: &BodyClassification) -> Option<NodeDeltaKind> {
     match class {
         BodyClassification::Unchanged => None,
-        BodyClassification::BodyChangedCompatible {
-            new_code,
-            new_lang,
-        } => Some(NodeDeltaKind::BodyChangedCompatible {
-            component: String::new(), // filled in by caller via NodeDelta.component
-            new_code: new_code.clone(),
-            new_lang: *new_lang,
-        }),
+        BodyClassification::BodyChangedCompatible { new_code, new_lang } => {
+            Some(NodeDeltaKind::BodyChangedCompatible {
+                component: String::new(), // filled in by caller via NodeDelta.component
+                new_code: new_code.clone(),
+                new_lang: *new_lang,
+            })
+        }
         BodyClassification::BodyChangedIncompatible {
             old_code,
             new_code,
@@ -432,9 +451,8 @@ fn diff_edges(before: &[IrEdge], after: &[IrEdge]) -> Vec<EdgeDelta> {
     // the value tuple so downstream EdgeDelta variants reconstruct
     // the typed kind without re-parsing.
     type EdgeKey = (String, String, u8);
-    let key = |e: &IrEdge| -> EdgeKey {
-        (e.source.clone(), e.target.clone(), edge_kind_key(e.kind))
-    };
+    let key =
+        |e: &IrEdge| -> EdgeKey { (e.source.clone(), e.target.clone(), edge_kind_key(e.kind)) };
     let before_map: BTreeMap<EdgeKey, &IrEdge> = before.iter().map(|e| (key(e), e)).collect();
     let after_map: BTreeMap<EdgeKey, &IrEdge> = after.iter().map(|e| (key(e), e)).collect();
 
@@ -521,12 +539,9 @@ mod tests {
         // Phase 3: a body change that ADDS a hook (changing the
         // hook signature length) must stay Incompatible — adding
         // `useState` shifts the slot table.
-        let before = parse(
-            r#"<Foo>const x = 1;</Foo><Graph id="g"><Foo id="a" /></Graph>"#,
-        );
-        let after = parse(
-            r#"<Foo>useState(0); const x = 1;</Foo><Graph id="g"><Foo id="a" /></Graph>"#,
-        );
+        let before = parse(r#"<Foo>const x = 1;</Foo><Graph id="g"><Foo id="a" /></Graph>"#);
+        let after =
+            parse(r#"<Foo>useState(0); const x = 1;</Foo><Graph id="g"><Foo id="a" /></Graph>"#);
         let mut cache = DiffCache::new();
         match classify(&before, &after, &mut cache) {
             ReloadDelta::Incompatible(deltas) => {
@@ -567,9 +582,7 @@ mod tests {
 
     #[test]
     fn added_edge_classifies_topology_only() {
-        let before = parse(
-            r#"<Graph id="g"><A id="a" /><B id="b" /></Graph>"#,
-        );
+        let before = parse(r#"<Graph id="g"><A id="a" /><B id="b" /></Graph>"#);
         let after = parse(
             r#"<Graph id="g"><A id="a" /><B id="b" /><edge source="a" target="b" /></Graph>"#,
         );
@@ -588,9 +601,7 @@ mod tests {
         let before = parse(
             r#"<Graph id="g"><A id="a" /><B id="b" /><edge source="a" target="b" /></Graph>"#,
         );
-        let after = parse(
-            r#"<Graph id="g"><A id="a" /><B id="b" /></Graph>"#,
-        );
+        let after = parse(r#"<Graph id="g"><A id="a" /><B id="b" /></Graph>"#);
         let mut cache = DiffCache::new();
         match classify(&before, &after, &mut cache) {
             ReloadDelta::TopologyOnly(deltas) => {
@@ -650,12 +661,8 @@ mod tests {
 
     #[test]
     fn lang_change_classifies_incompatible() {
-        let before = parse(
-            r#"<Foo lang="js">x</Foo><Graph id="g"><Foo id="f" /></Graph>"#,
-        );
-        let after = parse(
-            r#"<Foo lang="python">x</Foo><Graph id="g"><Foo id="f" /></Graph>"#,
-        );
+        let before = parse(r#"<Foo lang="js">x</Foo><Graph id="g"><Foo id="f" /></Graph>"#);
+        let after = parse(r#"<Foo lang="python">x</Foo><Graph id="g"><Foo id="f" /></Graph>"#);
         let mut cache = DiffCache::new();
         match classify(&before, &after, &mut cache) {
             ReloadDelta::Incompatible(deltas) => {
@@ -673,9 +680,7 @@ mod tests {
         // empty hook signature; string-literal-only edit) plus edge
         // added (TopologyOnly). The classifier produces a Mixed
         // delta with both compat and topology buckets populated.
-        let before = parse(
-            r#"<Foo>x</Foo><Graph id="g"><Foo id="f" /><B id="b" /></Graph>"#,
-        );
+        let before = parse(r#"<Foo>x</Foo><Graph id="g"><Foo id="f" /><B id="b" /></Graph>"#);
         let after = parse(
             r#"<Foo>y</Foo><Graph id="g"><Foo id="f" /><B id="b" /><edge source="f" target="b" /></Graph>"#,
         );
@@ -691,7 +696,9 @@ mod tests {
                     "expected Foo's body change in the compat bucket (Phase 3 promotion)"
                 );
                 assert!(incompat.is_empty(), "no incompat expected here");
-                assert!(topology.iter().any(|e| matches!(e, EdgeDelta::Added { .. })));
+                assert!(topology
+                    .iter()
+                    .any(|e| matches!(e, EdgeDelta::Added { .. })));
             }
             other => panic!("expected Mixed, got {other:?}"),
         }
@@ -701,9 +708,7 @@ mod tests {
     fn mixed_change_with_incompat_body_routes_correctly() {
         // Phase 3: body change that adds a hook (Incompatible) plus
         // edge added (TopologyOnly).
-        let before = parse(
-            r#"<Foo>x</Foo><Graph id="g"><Foo id="f" /><B id="b" /></Graph>"#,
-        );
+        let before = parse(r#"<Foo>x</Foo><Graph id="g"><Foo id="f" /><B id="b" /></Graph>"#);
         let after = parse(
             r#"<Foo>useState(0); x</Foo><Graph id="g"><Foo id="f" /><B id="b" /><edge source="f" target="b" /></Graph>"#,
         );
@@ -716,7 +721,9 @@ mod tests {
             } => {
                 assert!(compat.is_empty());
                 assert!(incompat.iter().any(|d| d.node_id == "f"));
-                assert!(topology.iter().any(|e| matches!(e, EdgeDelta::Added { .. })));
+                assert!(topology
+                    .iter()
+                    .any(|e| matches!(e, EdgeDelta::Added { .. })));
             }
             other => panic!("expected Mixed, got {other:?}"),
         }

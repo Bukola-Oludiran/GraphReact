@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use graphreact_observer::{
-    spawn_management_api, ApiServerHandle, BearerToken, BindConfig, IdempotencyCache,
-    InjectResult, MetricsInner, SnapshotRequest,
+    spawn_management_api, ApiServerHandle, BearerToken, BindConfig, IdempotencyCache, InjectResult,
+    MetricsInner, SnapshotRequest,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -25,16 +25,16 @@ use tokio::task::JoinHandle;
 /// `InjectMessage` with `Accepted` for any node id starting with
 /// "alpha" / "beta", and `NodeNotFound` for anything else. Returns
 /// the server handle + the drain task handle.
-async fn spawn_with_inject_responder(
-    token: Option<&[u8]>,
-) -> (ApiServerHandle, JoinHandle<()>) {
+async fn spawn_with_inject_responder(token: Option<&[u8]>) -> (ApiServerHandle, JoinHandle<()>) {
     let metrics = Arc::new(MetricsInner::new());
     let bind = BindConfig {
         addr: "127.0.0.1:0".parse().unwrap(),
         token: token.map(|t| BearerToken::from_bytes(t.to_vec()).unwrap()),
         tls: None,
     };
-    let mut server = spawn_management_api(bind, metrics, 1234).await.expect("spawn");
+    let mut server = spawn_management_api(bind, metrics, 1234)
+        .await
+        .expect("spawn");
     let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
     let drain_task = tokio::spawn(async move {
         while let Some(req) = snapshot_rx.recv().await {

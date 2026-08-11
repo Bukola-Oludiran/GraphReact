@@ -79,8 +79,7 @@ pub fn modularity_components(
     let two_m = 2.0 * total_edge_weight;
     let mut components: FxHashMap<u64, f64> = FxHashMap::default();
 
-    let community_ids: std::collections::BTreeSet<u64> =
-        partitions.values().copied().collect();
+    let community_ids: std::collections::BTreeSet<u64> = partitions.values().copied().collect();
     for comm in community_ids {
         let intra = within_community.get(&comm).copied().unwrap_or(0.0);
         let total_deg = total_community.get(&comm).copied().unwrap_or(0.0);
@@ -103,8 +102,7 @@ pub fn modularity(
     weight_attribute: &str,
     resolution: f64,
 ) -> Result<f64, ModularityError> {
-    let components =
-        modularity_components(graph, partitions, weight_attribute, resolution)?;
+    let components = modularity_components(graph, partitions, weight_attribute, resolution)?;
     Ok(components.values().sum())
 }
 
@@ -117,10 +115,7 @@ pub(super) fn edge_weight(attrs: &graphreact_core::Attrs, attr_name: &str) -> f6
     // `serde_json` directly — closure form keeps the type inferred
     // through `graphreact_core::Attrs`'s value alias.
     #[allow(clippy::redundant_closure_for_method_calls)]
-    attrs
-        .get(attr_name)
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0)
+    attrs.get(attr_name).and_then(|v| v.as_f64()).unwrap_or(1.0)
 }
 
 fn validate_partition(
@@ -253,10 +248,7 @@ mod tests {
         }
         let q = modularity(&g, &natural, "weight", 1.0).unwrap();
         let expected = 5.0 / 14.0;
-        assert!(
-            (q - expected).abs() < 1e-12,
-            "expected {expected}, got {q}"
-        );
+        assert!((q - expected).abs() < 1e-12, "expected {expected}, got {q}");
     }
 
     #[test]

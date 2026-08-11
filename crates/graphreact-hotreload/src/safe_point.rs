@@ -119,9 +119,7 @@ pub fn wait_for_global_quiescence(
 mod tests {
     use super::*;
     use graphreact_core::runtime::node_instance::NodeDefinition;
-    use graphreact_core::{
-        Attrs, CommunicationGraph, NodeContext, PermissionManifest, Scheduler,
-    };
+    use graphreact_core::{Attrs, CommunicationGraph, NodeContext, PermissionManifest, Scheduler};
 
     fn empty_def(name: &'static str) -> NodeDefinition {
         NodeDefinition::new(name, |_: &NodeContext| PermissionManifest::default())
@@ -132,7 +130,10 @@ mod tests {
         let mut scheduler = Scheduler::new(CommunicationGraph::new());
         scheduler.start().unwrap();
         let res = wait_for_global_quiescence(&mut scheduler, DEFAULT_QUIESCENCE_TIMEOUT);
-        assert!(res.is_ok(), "empty scheduler must reach quiescence: {res:?}");
+        assert!(
+            res.is_ok(),
+            "empty scheduler must reach quiescence: {res:?}"
+        );
     }
 
     #[test]

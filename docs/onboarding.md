@@ -32,7 +32,7 @@ cargo run --release -p graphreact-cli -- run \
 cargo test --workspace --release
 ```
 
-What you should see: structured JSON logs on stdout reporting parser → IR → mount → first tick, then per-tick scheduler events as the counter fixture emits messages. Stdout is the canonical telemetry sink unless you pass `--telemetry=json-file:/path` or wire the Prometheus exporter; the format is documented in [backend/m16-architecture.md](backend/m16-architecture.md).
+What you should see: structured JSON logs on stdout reporting parser → IR → mount → first tick, then per-tick scheduler events as the counter fixture emits messages. Stdout is the canonical telemetry sink unless you pass `--telemetry=json-file:/path` or wire the Prometheus exporter; the format is documented in [backend/m16-architecture.md](backend/m16-architecture.md). For an executable digital-twin walkthrough, see [`examples/greenhouse-twin`](../examples/greenhouse-twin/README.md).
 
 If the Python engine fails to link (no system Python framework, or headers missing), fall back to the null engine for a topology dry-run:
 
@@ -124,6 +124,7 @@ Every milestone tag you will see in commits, doc cross-links, or memory entries:
 | M16-Backend | Observer + telemetry (third BEAM-class property) | SHIPPED 2026-05-08 | [backend/m16-backend-observer.md](backend/m16-backend-observer.md) |
 | M-Ingress | External HTTP ingress substrate (M16.5-Backend) | SHIPPED 2026-05-09 | [backend/m16.5-ingress.md](backend/m16.5-ingress.md) |
 | **M17** | **Go runtime engine bridge (third in-process language host; replaces JVM per Java→Go pivot 2026-06-15)** | PLANNED — replanned 2026-06-15 | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
+| **M17-GoDeps** | **Sidecar `go.mod`/`go.sum`, private-module auth, offline cache, and generated-artifact SBOMs** | **SHIPPED 2026-07-18** | [backend/go-module-dependencies.md](backend/go-module-dependencies.md) |
 | M18 | WebAssembly server-WASM bindings | UNSHIPPED (stub; orthogonal) | [backend/README.md](backend/README.md) + [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
 | **M22** | **Mixed-runtime systems — JS + Python + Go in same `.grx`** | PLANNED — replanned 2026-06-15 | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |
 | **M23** | **LSP server for `.grx` (outer-shell MVP)** | PLANNED — replanned 2026-06-15 | [later-milestone plan](../../../.claude/plans/graphreact-rust-later-milestones.md) |

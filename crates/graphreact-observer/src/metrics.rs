@@ -57,20 +57,20 @@ use std::hash::Hasher;
 /// short of 65ms because Prometheus's `+Inf` bucket (count_total)
 /// implicitly covers everything above the last finite bucket.
 pub const HISTOGRAM_BUCKETS_NS: [u64; 14] = [
-    4_000,         // 4µs
-    8_000,         // 8µs
-    16_000,        // 16µs
-    32_000,        // 32µs
-    64_000,        // 64µs
-    128_000,       // 128µs
-    256_000,       // 256µs
-    512_000,       // 512µs
-    1_024_000,     // ~1ms
-    2_048_000,     // ~2ms
-    4_096_000,     // ~4ms
-    8_192_000,     // ~8ms
-    16_384_000,    // ~16ms
-    32_768_000,    // ~32ms
+    4_000,      // 4µs
+    8_000,      // 8µs
+    16_000,     // 16µs
+    32_000,     // 32µs
+    64_000,     // 64µs
+    128_000,    // 128µs
+    256_000,    // 256µs
+    512_000,    // 512µs
+    1_024_000,  // ~1ms
+    2_048_000,  // ~2ms
+    4_096_000,  // ~4ms
+    8_192_000,  // ~8ms
+    16_384_000, // ~16ms
+    32_768_000, // ~32ms
 ];
 
 /// Number of histogram shards. Trade-off: more shards = less write
@@ -600,9 +600,7 @@ impl MetricsInner {
         }
         self.audit_sink_write_failures
             .entry(key)
-            .or_insert_with(|| {
-                Arc::new(LabeledCounter::new(vec![("kind", kind.to_string())]))
-            })
+            .or_insert_with(|| Arc::new(LabeledCounter::new(vec![("kind", kind.to_string())])))
             .counter
             .inc();
     }
@@ -618,9 +616,7 @@ impl MetricsInner {
         }
         self.secret_read_failures
             .entry(key)
-            .or_insert_with(|| {
-                Arc::new(LabeledCounter::new(vec![("reason", reason.to_string())]))
-            })
+            .or_insert_with(|| Arc::new(LabeledCounter::new(vec![("reason", reason.to_string())])))
             .counter
             .inc();
     }
@@ -639,9 +635,7 @@ impl MetricsInner {
         }
         self.engine_mount_count
             .entry(key)
-            .or_insert_with(|| {
-                Arc::new(LabeledCounter::new(vec![("engine", engine.to_string())]))
-            })
+            .or_insert_with(|| Arc::new(LabeledCounter::new(vec![("engine", engine.to_string())])))
             .counter
             .inc();
     }
@@ -659,9 +653,7 @@ impl MetricsInner {
         }
         self.engine_eval_count
             .entry(key)
-            .or_insert_with(|| {
-                Arc::new(LabeledCounter::new(vec![("engine", engine.to_string())]))
-            })
+            .or_insert_with(|| Arc::new(LabeledCounter::new(vec![("engine", engine.to_string())])))
             .counter
             .inc();
     }
@@ -670,11 +662,7 @@ impl MetricsInner {
     /// The first observation creates the labeled histogram; subsequent
     /// observations take the DashMap read path and a sharded atomic write.
     #[inline]
-    pub fn engine_process_batch_duration_observe(
-        &self,
-        engine: &'static str,
-        duration_ns: u64,
-    ) {
+    pub fn engine_process_batch_duration_observe(&self, engine: &'static str, duration_ns: u64) {
         let key = hash1(engine);
         if let Some(h) = self.engine_process_batch_duration.get(&key) {
             h.histogram.observe(duration_ns);
@@ -683,10 +671,7 @@ impl MetricsInner {
         self.engine_process_batch_duration
             .entry(key)
             .or_insert_with(|| {
-                Arc::new(LabeledHistogram::new(vec![(
-                    "engine",
-                    engine.to_string(),
-                )]))
+                Arc::new(LabeledHistogram::new(vec![("engine", engine.to_string())]))
             })
             .histogram
             .observe(duration_ns);
@@ -725,9 +710,7 @@ impl MetricsInner {
         }
         self.messages_dropped
             .entry(key)
-            .or_insert_with(|| {
-                Arc::new(LabeledCounter::new(vec![("reason", reason.to_string())]))
-            })
+            .or_insert_with(|| Arc::new(LabeledCounter::new(vec![("reason", reason.to_string())])))
             .counter
             .inc();
     }
@@ -757,9 +740,7 @@ impl MetricsInner {
         }
         self.node_unmount
             .entry(key)
-            .or_insert_with(|| {
-                Arc::new(LabeledCounter::new(vec![("reason", reason.to_string())]))
-            })
+            .or_insert_with(|| Arc::new(LabeledCounter::new(vec![("reason", reason.to_string())])))
             .counter
             .inc();
     }
@@ -773,9 +754,7 @@ impl MetricsInner {
         }
         self.supervisor_restarts
             .entry(key)
-            .or_insert_with(|| {
-                Arc::new(LabeledCounter::new(vec![("action", action.to_string())]))
-            })
+            .or_insert_with(|| Arc::new(LabeledCounter::new(vec![("action", action.to_string())])))
             .counter
             .inc();
     }
@@ -958,7 +937,10 @@ mod tests {
         ];
         let mut hashes = std::collections::HashSet::new();
         for (a, b, c) in pairs {
-            assert!(hashes.insert(hash3(a, b, c)), "collision for {a:?}/{b:?}/{c:?}");
+            assert!(
+                hashes.insert(hash3(a, b, c)),
+                "collision for {a:?}/{b:?}/{c:?}"
+            );
         }
     }
 }

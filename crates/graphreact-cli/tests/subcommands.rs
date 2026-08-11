@@ -90,10 +90,12 @@ fn fmt_idempotent_returns_already_formatted() {
 #[test]
 fn fmt_writes_when_check_off() {
     let tmp = tempfile::NamedTempFile::new().expect("tmp");
-    std::fs::write(tmp.path(), "<Graph id=\"x\"><A id=\"a\" /></Graph>")
-        .expect("write");
+    std::fs::write(tmp.path(), "<Graph id=\"x\"><A id=\"a\" /></Graph>").expect("write");
     let outcome = run_fmt(tmp.path(), false).expect("fmt");
-    assert!(matches!(outcome, FmtOutcome::Wrote { .. } | FmtOutcome::AlreadyFormatted));
+    assert!(matches!(
+        outcome,
+        FmtOutcome::Wrote { .. } | FmtOutcome::AlreadyFormatted
+    ));
 }
 
 #[test]
@@ -114,7 +116,13 @@ fn run_with_null_engine_reports_topology() {
 
 #[test]
 fn run_with_null_engine_handles_multi_file() {
-    let out = run_run(&fixture("multi-file/main.grx"), RuntimeArg::Null, None, false).expect("ok");
+    let out = run_run(
+        &fixture("multi-file/main.grx"),
+        RuntimeArg::Null,
+        None,
+        false,
+    )
+    .expect("ok");
     assert!(out.contains("greenhouse"));
     // Definitions across all imported files should be mounted.
     assert!(out.contains("mounted") || out.contains("definitions"));
@@ -131,7 +139,13 @@ fn run_with_echo_engine_completes() {
 #[test]
 fn run_with_echo_engine_handles_multi_file_definitions() {
     let _g = echo_lock();
-    let out = run_run(&fixture("multi-file/main.grx"), RuntimeArg::Echo, None, false).expect("ok");
+    let out = run_run(
+        &fixture("multi-file/main.grx"),
+        RuntimeArg::Echo,
+        None,
+        false,
+    )
+    .expect("ok");
     assert!(out.contains("echo-c"));
     assert!(out.contains("greenhouse"));
     assert!(out.contains("4 definitions") || out.contains("mounted"));
@@ -148,8 +162,14 @@ fn run_with_jsc_engine_dry_mounts_on_macos() {
     // boundary. ping-pong runs to natural termination on JSC; the
     // phase-3d-era `MaxDepthExceeded` fallback is no longer needed.
     let out = run_run(&fixture("ping-pong.grx"), RuntimeArg::Jsc, None, false).expect("jsc run ok");
-    assert!(out.contains("jsc"), "expected engine name `jsc` in output: {out}");
-    assert!(out.contains("ping-pong"), "expected graph id in output: {out}");
+    assert!(
+        out.contains("jsc"),
+        "expected engine name `jsc` in output: {out}"
+    );
+    assert!(
+        out.contains("ping-pong"),
+        "expected graph id in output: {out}"
+    );
 }
 
 #[test]
@@ -174,16 +194,31 @@ fn jsc_lock() -> MutexGuard<'static, ()> {
 #[test]
 fn completions_zsh_emits_compdef_block() {
     let out = run_completions(clap_complete::Shell::Zsh).expect("ok");
-    assert!(out.contains("#compdef grx"), "missing compdef header: {out}");
-    assert!(out.contains("run"), "subcommand `run` should appear in completions");
-    assert!(out.contains("init"), "subcommand `init` should appear in completions");
-    assert!(out.contains("completions"), "subcommand `completions` itself should appear");
+    assert!(
+        out.contains("#compdef grx"),
+        "missing compdef header: {out}"
+    );
+    assert!(
+        out.contains("run"),
+        "subcommand `run` should appear in completions"
+    );
+    assert!(
+        out.contains("init"),
+        "subcommand `init` should appear in completions"
+    );
+    assert!(
+        out.contains("completions"),
+        "subcommand `completions` itself should appear"
+    );
 }
 
 #[test]
 fn completions_bash_emits_complete_call() {
     let out = run_completions(clap_complete::Shell::Bash).expect("ok");
-    assert!(out.contains("complete -F"), "missing `complete -F` directive: {out}");
+    assert!(
+        out.contains("complete -F"),
+        "missing `complete -F` directive: {out}"
+    );
     assert!(out.contains("grx"), "binary name should appear");
 }
 
@@ -236,7 +271,11 @@ fn parser_error_snippet_contains_line_and_caret() {
     // the source line with a caret pointing at the column.
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     // Two missing-id errors and a malformed graph; parser should reject.
-    write!(tmp.as_file(), "<Graph>\n  <NodeType id=\"X\" />\n</Graph>\n").expect("write");
+    write!(
+        tmp.as_file(),
+        "<Graph>\n  <NodeType id=\"X\" />\n</Graph>\n"
+    )
+    .expect("write");
     let err = run_check(tmp.path()).unwrap_err();
     let parse_err = match err {
         graphreact_cli::commands::CommandError::Parser(e) => e,
@@ -244,6 +283,9 @@ fn parser_error_snippet_contains_line_and_caret() {
     };
     let rendered = format_parse_error(&parse_err, tmp.path());
     assert!(rendered.starts_with("error:"), "rendered: {rendered}");
-    assert!(rendered.contains(" --> "), "missing source-pointer line: {rendered}");
+    assert!(
+        rendered.contains(" --> "),
+        "missing source-pointer line: {rendered}"
+    );
     assert!(rendered.contains('^'), "missing caret: {rendered}");
 }

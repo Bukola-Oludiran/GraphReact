@@ -39,17 +39,15 @@ const TEST_JWT_CONFIG: &str = r#"{
 
 fn write_cluster_pem(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
     let ca_kp = rcgen::KeyPair::generate().expect("ca keygen");
-    let mut ca_params =
-        rcgen::CertificateParams::new(vec!["grx-jwks-reload subprocess CA".into()])
-            .expect("ca params");
+    let mut ca_params = rcgen::CertificateParams::new(vec!["grx-jwks-reload subprocess CA".into()])
+        .expect("ca params");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_cert = ca_params.self_signed(&ca_kp).expect("ca self-sign");
     let ca_pem = ca_cert.pem();
     let ca_path = dir.join("ca.pem");
     std::fs::write(&ca_path, ca_pem).expect("write ca pem");
 
-    let mut params =
-        rcgen::CertificateParams::new(vec!["alice".into()]).expect("leaf params");
+    let mut params = rcgen::CertificateParams::new(vec!["alice".into()]).expect("leaf params");
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         "alice".to_string().try_into().expect("san"),
     ));

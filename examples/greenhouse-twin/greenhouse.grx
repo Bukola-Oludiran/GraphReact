@@ -1,0 +1,460 @@
+<!--
+  Digital Greenhouse Twin
+
+  A deterministic executable twin. One tick is five simulated minutes.
+  The normal irrigation-control edge and independent safety-cutoff edge are
+  explicit so the same artifact is executable behavior and an impact map.
+-->
+
+<SimulationClock lang="go">
+import twin "github.com/graphreact/greenhouse-twin/internal/twin"
+
+func SimulationClockBody(ctx Ctx) Manifest {
+    raw, setState := UseState(map[string]interface{}{"tick": 0, "running": false})
+    state, _ := raw.(map[string]interface{})
+    tick := int(twin.Number(state["tick"], 0))
+    running := twin.Boolean(state["running"], false)
+    emit := UseEmit()
+
+    advance := func() {
+        next := tick + 1
+        nextState := map[string]interface{}{"tick": next, "running": running}
+        setState(nextState)
+        emit("sim_tick", map[string]interface{}{"tick": next, "sim_minutes": next * twin.MinutesPerTick})
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": nextState})
+    }
+
+    UseSource(func() EventSource { return TimerSource(1000) }, []interface{}{})
+    UseMessage("tick", func(_ map[string]interface{}) {
+        if running { advance() }
+    })
+    UseMessage("manual_tick", func(_ map[string]interface{}) { advance() })
+    UseMessage("clock_control", func(message map[string]interface{}) {
+        nextRunning := twin.Boolean(twin.Payload(message)["running"], false)
+        nextState := map[string]interface{}{"tick": tick, "running": nextRunning}
+        setState(nextState)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": nextState})
+    })
+    UseMessage("reset", func(_ map[string]interface{}) {
+        nextState := map[string]interface{}{"tick": 0, "running": false}
+        setState(nextState)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": nextState})
+    })
+    UseEffect(func() func() {
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": state})
+        return nil
+    }, []interface{}{})
+
+    return Manifest{ID: ctx.ID, Accepts: []string{"tick", "manual_tick", "clock_control", "reset"}, Emits: []string{"sim_tick", "state_changed"}}
+}
+</SimulationClock>
+
+<SoilSensor lang="go">
+import twin "github.com/graphreact/greenhouse-twin/internal/twin"
+
+func SoilSensorBody(ctx Ctx) Manifest {
+    raw, setState := UseState(map[string]interface{}{"tick": 0, "moisture_pct": twin.InitialMoisture, "valve_open": false, "status": "healthy"})
+    state, _ := raw.(map[string]interface{})
+    moisture := twin.Number(state["moisture_pct"], twin.InitialMoisture)
+    valveOpen := twin.Boolean(state["valve_open"], false)
+    emit := UseEmit()
+
+    UseMessage("sim_tick", func(message map[string]interface{}) {
+        payload := twin.Payload(message)
+        tick := int(twin.Number(payload["tick"], 0))
+        nextMoisture := twin.NextMoisture(moisture, valveOpen)
+        status := "healthy"
+        if nextMoisture < twin.DryThreshold { status = "dry" }
+        nextState := map[string]interface{}{"tick": tick, "moisture_pct": nextMoisture, "valve_open": valveOpen, "status": status}
+        setState(nextState)
+        reading := map[string]interface{}{"tick": tick, "moisture_pct": nextMoisture, "status": status}
+        emit("sensor_reading", reading)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": nextState})
+    })
+    UseMessage("valve_status", func(message map[string]interface{}) {
+        open := twin.Boolean(twin.Payload(message)["open"], false)
+        nextState := twin.CopyMap(state)
+        nextState["valve_open"] = open
+        setState(nextState)
+    })
+    UseMessage("reset", func(_ map[string]interface{}) {
+        nextState := map[string]interface{}{"tick": 0, "moisture_pct": twin.InitialMoisture, "valve_open": false, "status": "healthy"}
+        setState(nextState)
+        emit("sensor_reading", map[string]interface{}{"tick": 0, "moisture_pct": twin.InitialMoisture, "status": "healthy"})
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": nextState})
+    })
+    UseEffect(func() func() {
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": state})
+        return nil
+    }, []interface{}{})
+    return Manifest{ID: ctx.ID, Accepts: []string{"sim_tick", "valve_status", "reset"}, Emits: []string{"sensor_reading", "state_changed"}}
+}
+</SoilSensor>
+
+<IrrigationController lang="go">
+import twin "github.com/graphreact/greenhouse-twin/internal/twin"
+
+func IrrigationControllerBody(ctx Ctx) Manifest {
+    raw, setState := UseState(map[string]interface{}{"tick": 0, "last_action": "idle", "status": "healthy"})
+    state, _ := raw.(map[string]interface{})
+    emit := UseEmit()
+    UseMessage("sensor_reading", func(message map[string]interface{}) {
+        payload := twin.Payload(message)
+        moisture := twin.Number(payload["moisture_pct"], twin.InitialMoisture)
+        tick := int(twin.Number(payload["tick"], 0))
+        action := "idle"
+        if moisture < twin.DryThreshold { action = "open" }
+        if moisture >= twin.CloseThreshold { action = "close" }
+        nextState := map[string]interface{}{"tick": tick, "last_action": action, "status": "healthy"}
+        setState(nextState)
+        if action != "idle" {
+            emit("valve_command", map[string]interface{}{"tick": tick, "action": action, "reason": "soil moisture threshold"})
+        }
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": nextState})
+    })
+    UseMessage("reset", func(_ map[string]interface{}) {
+        nextState := map[string]interface{}{"tick": 0, "last_action": "idle", "status": "healthy"}
+        setState(nextState)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": nextState})
+    })
+    UseEffect(func() func() {
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": state})
+        return nil
+    }, []interface{}{})
+    return Manifest{ID: ctx.ID, Accepts: []string{"sensor_reading", "reset"}, Emits: []string{"valve_command", "state_changed"}}
+}
+</IrrigationController>
+
+<IrrigationValve lang="go">
+import twin "github.com/graphreact/greenhouse-twin/internal/twin"
+
+func IrrigationValveBody(ctx Ctx) Manifest {
+    raw, setState := UseState(map[string]interface{}{"tick": 0, "open": false, "scenario": twin.ScenarioHealthy, "close_ignored": false, "locked_out": false, "status": "closed", "outcome": twin.OutcomeHealthy})
+    state, _ := raw.(map[string]interface{})
+    open := twin.Boolean(state["open"], false)
+    scenario := twin.String(state["scenario"], twin.ScenarioHealthy)
+    lockedOut := twin.Boolean(state["locked_out"], false)
+    tick := int(twin.Number(state["tick"], 0))
+    emit := UseEmit()
+
+    publish := func(next map[string]interface{}, eventKind string, eventMessage string) {
+        setState(next)
+        emit("valve_status", map[string]interface{}{"tick": next["tick"], "open": next["open"], "status": next["status"], "outcome": next["outcome"]})
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+        if eventKind != "" {
+            emit("domain_event", map[string]interface{}{"tick": next["tick"], "node": ctx.ID, "kind": eventKind, "message": eventMessage})
+        }
+    }
+
+    UseMessage("sim_tick", func(message map[string]interface{}) {
+        next := twin.CopyMap(state)
+        next["tick"] = twin.Number(twin.Payload(message)["tick"], float64(tick))
+        publish(next, "", "")
+    })
+    UseMessage("configure_scenario", func(message map[string]interface{}) {
+        next := twin.CopyMap(state)
+        next["scenario"] = twin.String(twin.Payload(message)["scenario"], twin.ScenarioHealthy)
+        next["close_ignored"] = false
+        setState(next)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+    })
+    UseMessage("valve_command", func(message map[string]interface{}) {
+        payload := twin.Payload(message)
+        action := twin.String(payload["action"], "")
+        commandTick := int(twin.Number(payload["tick"], float64(tick)))
+        next := twin.CopyMap(state)
+        next["tick"] = commandTick
+        if action == "open" && !open && !lockedOut && !twin.SafetyLockedOut() {
+            next["open"] = true
+            next["status"] = "open"
+            if scenario == twin.ScenarioStuck { next["outcome"] = twin.OutcomeAtRisk }
+            publish(next, "valve_opened", "Irrigation opened after dry-soil detection")
+            return
+        }
+        if action == "close" && open {
+            if scenario == twin.ScenarioStuck {
+                next["close_ignored"] = true
+                next["status"] = "close_ignored"
+                next["outcome"] = twin.OutcomeAtRisk
+                publish(next, "close_ignored", "Valve ignored the normal control command")
+                return
+            }
+            next["open"] = false
+            next["status"] = "closed"
+            next["outcome"] = twin.OutcomeHealthy
+            publish(next, "valve_closed", "Valve closed through the normal control path")
+        }
+    })
+    UseMessage("emergency_cutoff", func(message map[string]interface{}) {
+        twin.SetSafetyLockout(true)
+        next := twin.CopyMap(state)
+        next["tick"] = twin.Number(twin.Payload(message)["tick"], float64(tick))
+        next["open"] = false
+        next["locked_out"] = true
+        next["status"] = "force_closed"
+        next["outcome"] = twin.OutcomeContained
+        publish(next, "safety_cutoff", "Independent safety path force-closed irrigation")
+    })
+    UseMessage("reset", func(_ map[string]interface{}) {
+        twin.SetSafetyLockout(false)
+        next := map[string]interface{}{"tick": 0, "open": false, "scenario": twin.ScenarioHealthy, "close_ignored": false, "locked_out": false, "status": "closed", "outcome": twin.OutcomeHealthy}
+        publish(next, "reset", "Valve reset closed")
+    })
+    UseEffect(func() func() {
+        emit("valve_status", map[string]interface{}{"tick": 0, "open": false, "status": "closed", "outcome": twin.OutcomeHealthy})
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": state})
+        return nil
+    }, []interface{}{})
+    return Manifest{ID: ctx.ID, Accepts: []string{"sim_tick", "configure_scenario", "valve_command", "emergency_cutoff", "reset"}, Emits: []string{"valve_status", "state_changed", "domain_event"}}
+}
+</IrrigationValve>
+
+<SafetyInterlock lang="go">
+import twin "github.com/graphreact/greenhouse-twin/internal/twin"
+
+func SafetyInterlockBody(ctx Ctx) Manifest {
+    raw, setState := UseState(map[string]interface{}{"tick": 0, "valve_open": false, "open_ticks": 0, "remaining_ticks": twin.MaximumOpenTicks, "status": "armed", "outcome": twin.OutcomeHealthy})
+    state, _ := raw.(map[string]interface{})
+    valveOpen := twin.Boolean(state["valve_open"], false)
+    openTicks := int(twin.Number(state["open_ticks"], 0))
+    emit := UseEmit()
+    UseMessage("valve_status", func(message map[string]interface{}) {
+        payload := twin.Payload(message)
+        nextOpen := twin.Boolean(payload["open"], false)
+        next := twin.CopyMap(state)
+        next["valve_open"] = nextOpen
+        if !nextOpen && twin.String(payload["outcome"], "") != twin.OutcomeContained {
+            next["open_ticks"] = 0
+            next["remaining_ticks"] = twin.MaximumOpenTicks
+        }
+        setState(next)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+    })
+    UseMessage("sim_tick", func(message map[string]interface{}) {
+        tick := int(twin.Number(twin.Payload(message)["tick"], 0))
+        next := twin.CopyMap(state)
+        next["tick"] = tick
+        if valveOpen {
+            count := openTicks + 1
+            next["open_ticks"] = count
+            remaining := twin.MaximumOpenTicks - count
+            if remaining < 0 { remaining = 0 }
+            next["remaining_ticks"] = remaining
+            if count >= twin.MaximumOpenTicks {
+                next["status"] = "tripped"
+                next["outcome"] = twin.OutcomeContained
+                setState(next)
+                emit("emergency_cutoff", map[string]interface{}{"tick": tick, "reason": "maximum irrigation duration exceeded"})
+                emit("alarm_raise", map[string]interface{}{"tick": tick, "level": "critical", "message": "Safety interlock force-closed irrigation"})
+                emit("domain_event", map[string]interface{}{"tick": tick, "node": ctx.ID, "kind": "interlock_tripped", "message": "Safety interlock tripped after three open ticks"})
+                emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+                return
+            }
+        }
+        setState(next)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+    })
+    UseMessage("reset", func(_ map[string]interface{}) {
+        next := map[string]interface{}{"tick": 0, "valve_open": false, "open_ticks": 0, "remaining_ticks": twin.MaximumOpenTicks, "status": "armed", "outcome": twin.OutcomeHealthy}
+        setState(next)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+    })
+    UseEffect(func() func() {
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": state})
+        return nil
+    }, []interface{}{})
+    return Manifest{ID: ctx.ID, Accepts: []string{"valve_status", "sim_tick", "reset"}, Emits: []string{"emergency_cutoff", "alarm_raise", "domain_event", "state_changed"}}
+}
+</SafetyInterlock>
+
+<CropZone lang="go">
+import twin "github.com/graphreact/greenhouse-twin/internal/twin"
+
+func CropZoneBody(ctx Ctx) Manifest {
+    raw, setState := UseState(map[string]interface{}{"tick": 0, "moisture_pct": twin.InitialMoisture, "risk": "none", "status": "protected"})
+    state, _ := raw.(map[string]interface{})
+    emit := UseEmit()
+    UseMessage("sensor_reading", func(message map[string]interface{}) {
+        payload := twin.Payload(message)
+        moisture := twin.Number(payload["moisture_pct"], twin.InitialMoisture)
+        risk := "none"
+        if moisture < twin.DryThreshold { risk = "dry_soil" }
+        next := map[string]interface{}{"tick": twin.Number(payload["tick"], 0), "moisture_pct": moisture, "risk": risk, "status": "protected"}
+        setState(next)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+    })
+    UseMessage("valve_status", func(message map[string]interface{}) {
+        payload := twin.Payload(message)
+        next := twin.CopyMap(state)
+        next["tick"] = twin.Number(payload["tick"], 0)
+        if twin.String(payload["outcome"], "") == twin.OutcomeContained {
+            next["risk"] = "contained_overwatering"
+            next["status"] = "protected"
+        }
+        setState(next)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+    })
+    UseMessage("reset", func(_ map[string]interface{}) {
+        next := map[string]interface{}{"tick": 0, "moisture_pct": twin.InitialMoisture, "risk": "none", "status": "protected"}
+        setState(next)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+    })
+    UseEffect(func() func() {
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": state})
+        return nil
+    }, []interface{}{})
+    return Manifest{ID: ctx.ID, Accepts: []string{"sensor_reading", "valve_status", "reset"}, Emits: []string{"state_changed"}}
+}
+</CropZone>
+
+<RiskAnalyzer lang="go">
+func RiskAnalyzerBody(ctx Ctx) Manifest {
+    emit := UseEmit()
+    graph := UseGraphQuery()
+    risk := map[string]interface{}{
+        "status": "ready",
+        "affected_asset": "crop-zone-a",
+        "normal_control_path": graph.ShortestPath("irrigation-controller", "irrigation-valve"),
+        "surviving_safety_path": graph.ShortestPath("safety-interlock", "irrigation-valve"),
+        "crop_impact_path": graph.ShortestPath("irrigation-valve", "crop-zone-a"),
+        "explanation": "The normal close command failed, but an independent safety edge force-closed irrigation before crop damage.",
+    }
+    UseMessage("reset", func(_ map[string]interface{}) {
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": risk})
+    })
+    UseEffect(func() func() {
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": risk})
+        return nil
+    }, []interface{}{})
+    return Manifest{ID: ctx.ID, Accepts: []string{"reset"}, Emits: []string{"state_changed"}}
+}
+</RiskAnalyzer>
+
+<Alarm lang="go">
+import twin "github.com/graphreact/greenhouse-twin/internal/twin"
+
+func AlarmBody(ctx Ctx) Manifest {
+    raw, setState := UseState(map[string]interface{}{"tick": 0, "active": false, "level": "none", "message": ""})
+    state, _ := raw.(map[string]interface{})
+    emit := UseEmit()
+    UseMessage("alarm_raise", func(message map[string]interface{}) {
+        payload := twin.Payload(message)
+        next := map[string]interface{}{"tick": twin.Number(payload["tick"], 0), "active": true, "level": twin.String(payload["level"], "warning"), "message": twin.String(payload["message"], "Safety alarm")}
+        setState(next)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+        emit("domain_event", map[string]interface{}{"tick": next["tick"], "node": ctx.ID, "kind": "alarm", "message": next["message"]})
+    })
+    UseMessage("reset", func(_ map[string]interface{}) {
+        next := map[string]interface{}{"tick": 0, "active": false, "level": "none", "message": ""}
+        setState(next)
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": next})
+    })
+    UseEffect(func() func() {
+        emit("state_changed", map[string]interface{}{"node": ctx.ID, "state": state})
+        return nil
+    }, []interface{}{})
+    return Manifest{ID: ctx.ID, Accepts: []string{"alarm_raise", "reset"}, Emits: []string{"state_changed", "domain_event"}}
+}
+</Alarm>
+
+<TwinGateway lang="go">
+import twin "github.com/graphreact/greenhouse-twin/internal/twin"
+
+func TwinGatewayBody(ctx Ctx) Manifest {
+    emit := UseEmit()
+    projection := twin.Store()
+    UseMessage("state_changed", func(message map[string]interface{}) {
+        payload := twin.Payload(message)
+        node := twin.String(payload["node"], "unknown")
+        state, _ := payload["state"].(map[string]interface{})
+        if state != nil { projection.Report(node, state) }
+    })
+    UseMessage("domain_event", func(message map[string]interface{}) {
+        payload := twin.Payload(message)
+        projection.AddEvent(twin.DomainEvent{
+            Tick: int(twin.Number(payload["tick"], 0)),
+            Node: twin.String(payload["node"], "unknown"),
+            Kind: twin.String(payload["kind"], "event"),
+            Message: twin.String(payload["message"], ""),
+        })
+    })
+    UseMessage("get_snapshot", func(_ map[string]interface{}) {
+        emit("twin_snapshot", projection.Snapshot())
+    })
+    UseMessage("set_scenario", func(message map[string]interface{}) {
+        scenario := twin.String(twin.Payload(message)["scenario"], "")
+        if err := projection.SetScenario(scenario); err != nil {
+            emit("scenario_set", map[string]interface{}{"ok": false, "error": err.Error()})
+            return
+        }
+        emit("configure_scenario", map[string]interface{}{"scenario": scenario})
+        emit("scenario_set", map[string]interface{}{"ok": true, "scenario": scenario})
+    })
+    UseMessage("set_clock", func(message map[string]interface{}) {
+        running := twin.Boolean(twin.Payload(message)["running"], false)
+        projection.SetClock(running)
+        emit("clock_control", map[string]interface{}{"running": running})
+        emit("clock_set", map[string]interface{}{"ok": true, "running": running})
+    })
+    UseMessage("step", func(_ map[string]interface{}) {
+        emit("manual_tick", map[string]interface{}{})
+        emit("step_complete", map[string]interface{}{"ok": true})
+    })
+    UseMessage("reset", func(_ map[string]interface{}) {
+        projection.Reset()
+        emit("reset", map[string]interface{}{})
+        emit("reset_complete", map[string]interface{}{"ok": true})
+    })
+    UseEffect(func() func() {
+        projection.Reset()
+        return nil
+    }, []interface{}{})
+    return Manifest{
+        ID: ctx.ID,
+        Accepts: []string{"state_changed", "domain_event", "get_snapshot", "set_scenario", "set_clock", "step", "reset"},
+        Emits: []string{"twin_snapshot", "scenario_set", "clock_set", "step_complete", "reset_complete", "configure_scenario", "clock_control", "manual_tick", "reset"},
+        AcceptsExternalCall: []ExternalCall{
+            {RequestType: "get_snapshot", ReplyType: "twin_snapshot"},
+            {RequestType: "set_scenario", ReplyType: "scenario_set"},
+            {RequestType: "set_clock", ReplyType: "clock_set"},
+            {RequestType: "step", ReplyType: "step_complete"},
+            {RequestType: "reset", ReplyType: "reset_complete"},
+        },
+    }
+}
+</TwinGateway>
+
+<Graph id="digital-greenhouse-twin">
+  <SimulationClock id="simulation-clock" role="clock" />
+  <SoilSensor id="soil-sensor-a" role="sensor" unit="percent" />
+  <IrrigationController id="irrigation-controller" role="controller" />
+  <IrrigationValve id="irrigation-valve" role="actuator" />
+  <SafetyInterlock id="safety-interlock" role="safety" maxOpenTicks={3} />
+  <CropZone id="crop-zone-a" role="asset" crop="tomatoes" />
+  <RiskAnalyzer id="risk-analyzer" role="analysis" />
+  <Alarm id="alarm" role="alert" />
+  <TwinGateway id="twin-gateway" role="gateway" />
+
+  <edge source="simulation-clock" target="soil-sensor-a" channel="simulation" />
+  <edge source="simulation-clock" target="irrigation-valve" channel="simulation" />
+  <edge source="simulation-clock" target="safety-interlock" channel="simulation" />
+  <edge source="soil-sensor-a" target="irrigation-controller" channel="reading" />
+  <edge source="soil-sensor-a" target="crop-zone-a" channel="reading" />
+  <edge source="irrigation-controller" target="irrigation-valve" channel="normal-control" />
+  <edge source="irrigation-valve" target="crop-zone-a" channel="water" />
+  <edge source="irrigation-valve" target="soil-sensor-a" channel="status" />
+  <edge source="irrigation-valve" target="safety-interlock" channel="status" />
+  <edge source="safety-interlock" target="irrigation-valve" channel="safety-cutoff" />
+  <edge source="safety-interlock" target="alarm" channel="alarm" />
+  <edge source="risk-analyzer" target="irrigation-valve" channel="impact-analysis" />
+  <edge source="risk-analyzer" target="crop-zone-a" channel="impact-analysis" />
+
+  <edge source="twin-gateway" target="simulation-clock" channel="control" />
+  <edge source="twin-gateway" target="soil-sensor-a" channel="projection" />
+  <edge source="twin-gateway" target="irrigation-controller" channel="projection" />
+  <edge source="twin-gateway" target="irrigation-valve" channel="projection" />
+  <edge source="twin-gateway" target="safety-interlock" channel="projection" />
+  <edge source="twin-gateway" target="crop-zone-a" channel="projection" />
+  <edge source="twin-gateway" target="risk-analyzer" channel="projection" />
+  <edge source="twin-gateway" target="alarm" channel="projection" />
+</Graph>

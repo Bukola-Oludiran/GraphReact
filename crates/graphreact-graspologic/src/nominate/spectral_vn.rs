@@ -15,8 +15,8 @@ use thiserror::Error;
 use graphreact_core::CommunicationGraph;
 
 use crate::embed::{
-    adjacency_matrix, adjacency_spectral_embed, laplacian_spectral_embed, AseOptions,
-    EmbedError, LseOptions,
+    adjacency_matrix, adjacency_spectral_embed, laplacian_spectral_embed, AseOptions, EmbedError,
+    LseOptions,
 };
 
 #[derive(Debug, Error)]
@@ -184,12 +184,7 @@ pub fn spectral_vertex_nomination_from_adjacency(
     n_components: usize,
     n_neighbors: Option<usize>,
 ) -> NominationResult<Vec<Nomination>> {
-    let emb = crate::embed::adjacency_spectral_embed_matrix(
-        a,
-        Some(n_components),
-        1,
-        Some(false),
-    )?;
+    let emb = crate::embed::adjacency_spectral_embed_matrix(a, Some(n_components), 1, Some(false))?;
     spectral_vertex_nomination_matrix(emb.latent_left.as_ref(), seed_indices, n_neighbors)
 }
 
@@ -280,12 +275,9 @@ mod tests {
     #[test]
     fn ranking_is_sorted_by_distance() {
         let g = two_clique_graph();
-        let result = spectral_vertex_nomination(
-            &g,
-            &["n0".to_string()],
-            &NominationOptions::default(),
-        )
-        .expect("ok");
+        let result =
+            spectral_vertex_nomination(&g, &["n0".to_string()], &NominationOptions::default())
+                .expect("ok");
         for w in result[0].distances.windows(2) {
             assert!(w[0] <= w[1] + 1e-12);
         }
@@ -314,11 +306,8 @@ mod tests {
     #[test]
     fn unknown_seed_errors() {
         let g = two_clique_graph();
-        let result = spectral_vertex_nomination(
-            &g,
-            &["nope".to_string()],
-            &NominationOptions::default(),
-        );
+        let result =
+            spectral_vertex_nomination(&g, &["nope".to_string()], &NominationOptions::default());
         assert!(matches!(result, Err(NominationError::UnknownSeed(_))));
     }
 

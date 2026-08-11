@@ -65,26 +65,26 @@ use serde_json::Value;
 use graphreact_core::{
     delay_source as core_delay_source, timer_source as core_timer_source,
     use_accept_edge as core_use_accept_edge, use_compose as core_use_compose,
-    use_demonitor as core_use_demonitor,
-    use_edge_accept_handler as core_use_edge_accept_handler, use_effect as core_use_effect,
-    use_effect_async as core_use_effect_async,
+    use_demonitor as core_use_demonitor, use_edge_accept_handler as core_use_edge_accept_handler,
+    use_effect as core_use_effect, use_effect_async as core_use_effect_async,
     use_emit as core_use_emit, use_group_join as core_use_group_join,
-    use_group_leave as core_use_group_leave, use_link as core_use_link,
-    use_memo as core_use_memo, use_message as core_use_message,
-    use_monitor as core_use_monitor, use_neighbors as core_use_neighbors,
-    use_source as core_use_source, use_spawn_child as core_use_spawn_child,
-    use_state as core_use_state, use_topology as core_use_topology,
-    use_unlink as core_use_unlink, use_unmount_self as core_use_unmount_self, Attrs,
-    CommunicationGraph, ComposeChildSpec, EdgeAcceptPredicate, EffectCleanup, EmitOptions,
-    EventSource, GraphDirectory, IncomingMessage, MonitorRef as CoreMonitorRef, NodeContext,
-    NodeDefinition, PermissionManifest, Scheduler, Signal, Subscription, TopologyEvent,
-    TopologyEventKind, TopologyFilterOptions,
+    use_group_leave as core_use_group_leave, use_link as core_use_link, use_memo as core_use_memo,
+    use_message as core_use_message, use_monitor as core_use_monitor,
+    use_neighbors as core_use_neighbors, use_source as core_use_source,
+    use_spawn_child as core_use_spawn_child, use_state as core_use_state,
+    use_topology as core_use_topology, use_unlink as core_use_unlink,
+    use_unmount_self as core_use_unmount_self, Attrs, CommunicationGraph, ComposeChildSpec,
+    EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource, GraphDirectory, IncomingMessage,
+    MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest, Scheduler,
+    Signal, Subscription, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
 };
 use graphreact_engine_jsc::{drain_microtasks_static, invoke_global_static, JscEngine};
 use graphreact_engine_zig::{
     BoxCallback, Engine, EngineError, FunctionHandle, HostValue, IsolateHandle, IsolateOptions,
 };
-use graphreact_grx_parser::{multi_file::resolve_multi_file, ir::IrNode, GrxFile, GrxIr, SourceLoc};
+use graphreact_grx_parser::{
+    ir::IrNode, multi_file::resolve_multi_file, GrxFile, GrxIr, SourceLoc,
+};
 
 use crate::runtime::RuntimeError;
 use crate::runtime_secrets::RuntimeSecretContext;
@@ -455,11 +455,7 @@ fn tracked_token_count() -> usize {
 /// Errors from the underlying `invoke_global` are surfaced via
 /// `eprintln!` rather than thrown — the sweep is best-effort cleanup
 /// and shouldn't fail the caller.
-fn release_tokens_for_node(
-    engine: &Rc<RefCell<JscEngine>>,
-    iso: IsolateHandle,
-    node_id: &str,
-) {
+fn release_tokens_for_node(engine: &Rc<RefCell<JscEngine>>, iso: IsolateHandle, node_id: &str) {
     let tokens = drain_node_tokens(node_id);
     if tokens.is_empty() {
         return;
@@ -468,14 +464,12 @@ fn release_tokens_for_node(
         .into_iter()
         .map(|t| HostValue::Number(t as f64))
         .collect();
-    if let Err(e) = engine.borrow_mut().invoke_global(
-        iso,
-        "__releaseTokens",
-        &[HostValue::Array(arr)],
-    ) {
-        eprintln!(
-            "[graphreact-cli] __releaseTokens dispatch failed for node {node_id}: {e}"
-        );
+    if let Err(e) =
+        engine
+            .borrow_mut()
+            .invoke_global(iso, "__releaseTokens", &[HostValue::Array(arr)])
+    {
+        eprintln!("[graphreact-cli] __releaseTokens dispatch failed for node {node_id}: {e}");
     }
 }
 
@@ -648,22 +642,17 @@ pub(crate) fn build_host_effect_callback() -> BoxCallback {
         // !Send Rc is fine — the BoxCallback we're inside is
         // Send+Sync, but it doesn't capture engine; it just reads
         // TLS each call.
-        let engine = current_engine().ok_or_else(|| {
-            EngineError::Internal("host_effect: engine TLS unset".into())
-        })?;
-        let iso = current_iso().ok_or_else(|| {
-            EngineError::Internal("host_effect: iso TLS unset".into())
-        })?;
+        let engine = current_engine()
+            .ok_or_else(|| EngineError::Internal("host_effect: engine TLS unset".into()))?;
+        let iso = current_iso()
+            .ok_or_else(|| EngineError::Internal("host_effect: iso TLS unset".into()))?;
 
         core_use_effect(
             move || -> Option<EffectCleanup> {
                 let result = engine.borrow_mut().invoke_global(
                     iso,
                     "__invokeCallback",
-                    &[
-                        HostValue::Number(token as f64),
-                        HostValue::Array(vec![]),
-                    ],
+                    &[HostValue::Number(token as f64), HostValue::Array(vec![])],
                 );
                 let envelope = match result {
                     Ok(v) => v,
@@ -706,10 +695,7 @@ pub(crate) fn build_host_effect_callback() -> BoxCallback {
                     let _ = engine_for_cleanup.borrow_mut().invoke_global(
                         iso_for_cleanup,
                         "__invokeCallback",
-                        &[
-                            HostValue::Number(ct as f64),
-                            HostValue::Array(vec![]),
-                        ],
+                        &[HostValue::Number(ct as f64), HostValue::Array(vec![])],
                     );
                     // Release the JS-side cleanup closure now that
                     // it's run (FnOnce semantics on the Rust side
@@ -786,16 +772,14 @@ pub(crate) fn build_host_effect_async_callback() -> BoxCallback {
             }
         };
 
-        let iso = current_iso().ok_or_else(|| {
-            EngineError::Internal("host_effect_async: iso TLS unset".into())
-        })?;
+        let iso = current_iso()
+            .ok_or_else(|| EngineError::Internal("host_effect_async: iso TLS unset".into()))?;
 
         core_use_effect_async(
             move || {
                 async move {
                     let completion_id = next_effect_async_completion_id();
-                    let (tx, rx) =
-                        tokio::sync::oneshot::channel::<EffectAsyncSettlement>();
+                    let (tx, rx) = tokio::sync::oneshot::channel::<EffectAsyncSettlement>();
                     EFFECT_ASYNC_COMPLETIONS.with(|cell| {
                         cell.borrow_mut().insert(completion_id, tx);
                     });
@@ -811,9 +795,7 @@ pub(crate) fn build_host_effect_async_callback() -> BoxCallback {
                             HostValue::Array(vec![HostValue::Number(completion_id as f64)]),
                         ],
                     ) {
-                        eprintln!(
-                            "[graphreact-cli] useEffectAsync invocation failed: {e}"
-                        );
+                        eprintln!("[graphreact-cli] useEffectAsync invocation failed: {e}");
                         // Reap the parked Sender; nothing's going to
                         // signal it now.
                         EFFECT_ASYNC_COMPLETIONS.with(|cell| {
@@ -884,9 +866,7 @@ pub(crate) fn build_host_effect_async_callback() -> BoxCallback {
                             Some(cleanup)
                         }
                         EffectAsyncSettlement::Throw(msg) => {
-                            eprintln!(
-                                "[graphreact-cli] useEffectAsync rejected: {msg}"
-                            );
+                            eprintln!("[graphreact-cli] useEffectAsync rejected: {msg}");
                             None
                         }
                         EffectAsyncSettlement::Value => None,
@@ -1038,12 +1018,10 @@ pub(crate) fn build_host_message_callback() -> BoxCallback {
             }
         };
 
-        let engine = current_engine().ok_or_else(|| {
-            EngineError::Internal("host_message: engine TLS unset".into())
-        })?;
-        let iso = current_iso().ok_or_else(|| {
-            EngineError::Internal("host_message: iso TLS unset".into())
-        })?;
+        let engine = current_engine()
+            .ok_or_else(|| EngineError::Internal("host_message: engine TLS unset".into()))?;
+        let iso = current_iso()
+            .ok_or_else(|| EngineError::Internal("host_message: iso TLS unset".into()))?;
 
         core_use_message(r#type, move |msg: &IncomingMessage| {
             let host_msg = HostValue::Object(vec![
@@ -1061,9 +1039,7 @@ pub(crate) fn build_host_message_callback() -> BoxCallback {
                 ],
             );
             if let Err(e) = result {
-                eprintln!(
-                    "[graphreact-cli] useMessage handler invocation failed: {e}"
-                );
+                eprintln!("[graphreact-cli] useMessage handler invocation failed: {e}");
             }
         });
         Ok(HostValue::Null)
@@ -1111,9 +1087,8 @@ pub(crate) fn build_host_memo_check_callback() -> BoxCallback {
                 )))
             }
         };
-        let node_id = current_node_id().ok_or_else(|| {
-            EngineError::Internal("host_memo_check: no active node".into())
-        })?;
+        let node_id = current_node_id()
+            .ok_or_else(|| EngineError::Internal("host_memo_check: no active node".into()))?;
         let hook_pos = next_js_hook_index();
         let key = (node_id, hook_pos);
 
@@ -1243,12 +1218,10 @@ pub(crate) fn build_host_topology_callback() -> BoxCallback {
         };
         let filter = parse_topology_filter(args.get(1));
 
-        let engine = current_engine().ok_or_else(|| {
-            EngineError::Internal("host_topology: engine TLS unset".into())
-        })?;
-        let iso = current_iso().ok_or_else(|| {
-            EngineError::Internal("host_topology: iso TLS unset".into())
-        })?;
+        let engine = current_engine()
+            .ok_or_else(|| EngineError::Internal("host_topology: engine TLS unset".into()))?;
+        let iso = current_iso()
+            .ok_or_else(|| EngineError::Internal("host_topology: iso TLS unset".into()))?;
 
         core_use_topology(
             move |event: &TopologyEvent| {
@@ -1262,9 +1235,7 @@ pub(crate) fn build_host_topology_callback() -> BoxCallback {
                     ],
                 );
                 if let Err(e) = result {
-                    eprintln!(
-                        "[graphreact-cli] useTopology handler invocation failed: {e}"
-                    );
+                    eprintln!("[graphreact-cli] useTopology handler invocation failed: {e}");
                 }
             },
             filter,
@@ -1407,7 +1378,10 @@ pub(crate) fn build_host_directory_find_by_id_callback() -> BoxCallback {
             Some(entry) => Ok(HostValue::Object(vec![
                 ("id".to_string(), HostValue::String(entry.id.clone())),
                 ("role".to_string(), HostValue::String(entry.role.clone())),
-                ("depth".to_string(), HostValue::Number(f64::from(entry.depth))),
+                (
+                    "depth".to_string(),
+                    HostValue::Number(f64::from(entry.depth)),
+                ),
                 (
                     "path".to_string(),
                     HostValue::Array(
@@ -1772,7 +1746,9 @@ pub(crate) fn build_host_graph_cycle_detection_callback() -> BoxCallback {
             Some(edges) => HostValue::Array(
                 edges
                     .into_iter()
-                    .map(|(u, v)| HostValue::Array(vec![HostValue::String(u), HostValue::String(v)]))
+                    .map(|(u, v)| {
+                        HostValue::Array(vec![HostValue::String(u), HostValue::String(v)])
+                    })
                     .collect(),
             ),
             None => HostValue::Null,
@@ -1920,7 +1896,9 @@ impl DirectedAdj for Tier2Adj {
     }
 
     fn has_edge(&self, u: &str, v: &str) -> bool {
-        self.out.get(u).is_some_and(|outs| outs.iter().any(|t| t == v))
+        self.out
+            .get(u)
+            .is_some_and(|outs| outs.iter().any(|t| t == v))
     }
 }
 
@@ -1938,7 +1916,9 @@ impl DirectedAdj for Tier3Adj {
     }
 
     fn has_edge(&self, u: &str, v: &str) -> bool {
-        self.out.get(u).is_some_and(|outs| outs.iter().any(|t| t == v))
+        self.out
+            .get(u)
+            .is_some_and(|outs| outs.iter().any(|t| t == v))
     }
 }
 
@@ -2269,8 +2249,7 @@ fn tier2_strongconnect(
         }
     }
 
-    if lowlink.get(v).copied().unwrap_or(usize::MAX)
-        == index.get(v).copied().unwrap_or(usize::MAX)
+    if lowlink.get(v).copied().unwrap_or(usize::MAX) == index.get(v).copied().unwrap_or(usize::MAX)
     {
         let mut component: Vec<String> = Vec::new();
         loop {
@@ -3194,9 +3173,7 @@ pub(crate) fn build_host_edge_accept_handler_callback() -> BoxCallback {
             match result {
                 Ok(envelope) => predicate_bool_from_envelope(envelope),
                 Err(e) => {
-                    eprintln!(
-                        "[graphreact-cli] useEdgeAcceptHandler invocation failed: {e}"
-                    );
+                    eprintln!("[graphreact-cli] useEdgeAcceptHandler invocation failed: {e}");
                     // On invocation failure, fall back to default-accept
                     // so a buggy predicate doesn't silently sever Tier 3
                     // reachability.
@@ -3691,7 +3668,8 @@ pub(crate) fn build_host_use_source_callback() -> BoxCallback {
         }
 
         let kind_str = kind.unwrap_or_default();
-        let factory: Box<dyn FnOnce() -> std::sync::Arc<dyn EventSource>> = match kind_str.as_str() {
+        let factory: Box<dyn FnOnce() -> std::sync::Arc<dyn EventSource>> = match kind_str.as_str()
+        {
             "timer" => Box::new(move || core_timer_source(interval_ms)),
             "delay" => Box::new(move || core_delay_source(delay_ms)),
             // M12.3a-followon-A: http + watch firing now real. Both port
@@ -3867,19 +3845,15 @@ fn build_compose_spec_from_host_value(value: HostValue) -> Result<ComposeChildSp
         }
     }
 
-    let id = id.ok_or_else(|| {
-        EngineError::Internal("ComposeChildSpec: missing `id`".into())
-    })?;
+    let id = id.ok_or_else(|| EngineError::Internal("ComposeChildSpec: missing `id`".into()))?;
     let component_token = component_token.ok_or_else(|| {
         EngineError::Internal("ComposeChildSpec: missing `componentToken`".into())
     })?;
 
-    let engine = current_engine().ok_or_else(|| {
-        EngineError::Internal("compose spec: engine TLS unset".into())
-    })?;
-    let iso = current_iso().ok_or_else(|| {
-        EngineError::Internal("compose spec: iso TLS unset".into())
-    })?;
+    let engine = current_engine()
+        .ok_or_else(|| EngineError::Internal("compose spec: engine TLS unset".into()))?;
+    let iso =
+        current_iso().ok_or_else(|| EngineError::Internal("compose spec: iso TLS unset".into()))?;
 
     let definition_name = format!("JsChild::{id}");
     let definition = NodeDefinition::new(
@@ -3977,10 +3951,7 @@ fn topology_event_to_host_value(event: &TopologyEvent) -> HostValue {
             ("nodeId".to_string(), HostValue::String(node_id.clone())),
         ]),
         TopologyEvent::NodeRemoved { node_id } => HostValue::Object(vec![
-            (
-                "kind".to_string(),
-                HostValue::String("node-removed".into()),
-            ),
+            ("kind".to_string(), HostValue::String("node-removed".into())),
             ("nodeId".to_string(), HostValue::String(node_id.clone())),
         ]),
         TopologyEvent::EdgeAdded { u, v, key } => HostValue::Object(vec![
@@ -3990,19 +3961,13 @@ fn topology_event_to_host_value(event: &TopologyEvent) -> HostValue {
             ("key".to_string(), HostValue::String(key.clone())),
         ]),
         TopologyEvent::EdgeRemoved { u, v, key } => HostValue::Object(vec![
-            (
-                "kind".to_string(),
-                HostValue::String("edge-removed".into()),
-            ),
+            ("kind".to_string(), HostValue::String("edge-removed".into())),
             ("u".to_string(), HostValue::String(u.clone())),
             ("v".to_string(), HostValue::String(v.clone())),
             ("key".to_string(), HostValue::String(key.clone())),
         ]),
         TopologyEvent::EdgeUpdated { u, v, key } => HostValue::Object(vec![
-            (
-                "kind".to_string(),
-                HostValue::String("edge-updated".into()),
-            ),
+            ("kind".to_string(), HostValue::String("edge-updated".into())),
             ("u".to_string(), HostValue::String(u.clone())),
             ("v".to_string(), HostValue::String(v.clone())),
             ("key".to_string(), HostValue::String(key.clone())),
@@ -4437,10 +4402,7 @@ mod manifest_extraction_tests {
         let hv = HostValue::Object(vec![
             ("accepts".to_string(), HostValue::Array(vec![])),
             ("emits".to_string(), HostValue::Array(vec![])),
-            (
-                "needs_secret".to_string(),
-                HostValue::Array(vec![]),
-            ),
+            ("needs_secret".to_string(), HostValue::Array(vec![])),
         ]);
         let m = host_value_to_manifest(hv);
         assert_eq!(m.needs_secret, Some(Vec::<String>::new()));
@@ -4627,8 +4589,12 @@ pub fn mount_with_scheduler_and_secrets(
 
     // Concatenate definitions from root + imports (same shape as
     // dry_mount_jsc).
-    let mut definitions: Vec<(String, String, String, graphreact_grx_parser::ast::ComponentLang)> =
-        Vec::new();
+    let mut definitions: Vec<(
+        String,
+        String,
+        String,
+        graphreact_grx_parser::ast::ComponentLang,
+    )> = Vec::new();
     for d in &resolved.root.definitions {
         definitions.push((
             resolved.root_path.display().to_string(),
@@ -4669,12 +4635,14 @@ pub fn mount_with_scheduler_and_secrets(
         edges: built.edges,
         definitions: definitions
             .iter()
-            .map(|(_, comp, code, lang)| graphreact_grx_parser::ir::IrDefinition {
-                component: comp.clone(),
-                code: code.clone(),
-                lang: *lang,
-                source_loc: SourceLoc::default(),
-            })
+            .map(
+                |(_, comp, code, lang)| graphreact_grx_parser::ir::IrDefinition {
+                    component: comp.clone(),
+                    code: code.clone(),
+                    lang: *lang,
+                    source_loc: SourceLoc::default(),
+                },
+            )
             .collect(),
         imports: resolved
             .imports
@@ -4720,11 +4688,7 @@ pub fn mount_with_scheduler_and_secrets(
         e.register_callback(iso, "host_effect", build_host_effect_callback())?;
         // M12.3b-phase1: useEffectAsync — real impl via JS Promise →
         // Rust Future bridge (oneshot channel keyed by completion id).
-        e.register_callback(
-            iso,
-            "host_effect_async",
-            build_host_effect_async_callback(),
-        )?;
+        e.register_callback(iso, "host_effect_async", build_host_effect_async_callback())?;
         e.register_callback(
             iso,
             "host_effect_async_complete",
@@ -4767,10 +4731,26 @@ pub fn mount_with_scheduler_and_secrets(
             build_host_directory_is_ancestor_callback(),
         )?;
         // 3e-δ: graph-query proxy backing accessors.
-        e.register_callback(iso, "host_graph_neighbors", build_host_graph_neighbors_callback())?;
-        e.register_callback(iso, "host_graph_has_node", build_host_graph_has_node_callback())?;
-        e.register_callback(iso, "host_graph_has_edge", build_host_graph_has_edge_callback())?;
-        e.register_callback(iso, "host_graph_node_count", build_host_graph_node_count_callback())?;
+        e.register_callback(
+            iso,
+            "host_graph_neighbors",
+            build_host_graph_neighbors_callback(),
+        )?;
+        e.register_callback(
+            iso,
+            "host_graph_has_node",
+            build_host_graph_has_node_callback(),
+        )?;
+        e.register_callback(
+            iso,
+            "host_graph_has_edge",
+            build_host_graph_has_edge_callback(),
+        )?;
+        e.register_callback(
+            iso,
+            "host_graph_node_count",
+            build_host_graph_node_count_callback(),
+        )?;
         // M12.3a-followon-B: graph-algorithm accessors on __graphQueryProxy.
         e.register_callback(
             iso,
@@ -4965,7 +4945,9 @@ pub fn mount_with_scheduler_and_secrets(
             continue;
         }
         let module_name = format!("{origin}::{component}");
-        let handle = engine_rc.borrow_mut().eval_component(iso, &module_name, source)?;
+        let handle = engine_rc
+            .borrow_mut()
+            .eval_component(iso, &module_name, source)?;
         component_handles.insert(component.clone(), handle);
     }
 
@@ -4980,12 +4962,8 @@ pub fn mount_with_scheduler_and_secrets(
         let Some(&fn_handle) = component_handles.get(&component_name) else {
             continue;
         };
-        let definition = build_js_node_definition(
-            component_name,
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition(component_name, Rc::clone(&engine_rc), iso, fn_handle);
         let mut props: Attrs = Attrs::new();
         for (k, v) in &node.attrs {
             props.insert(k.clone(), v.clone());
@@ -5023,15 +5001,16 @@ pub fn mount_with_scheduler_and_secrets(
     let pending_unmounts: Arc<parking_lot::Mutex<Vec<String>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     let pending_unmounts_for_listener = Arc::clone(&pending_unmounts);
-    let topology_subscription = scheduler
-        .graph
-        .borrow()
-        .on_topology_change(move |event: &TopologyEvent| {
-            if let TopologyEvent::NodeRemoved { node_id } = event {
-                clear_node_local_state(node_id);
-                pending_unmounts_for_listener.lock().push(node_id.clone());
-            }
-        });
+    let topology_subscription =
+        scheduler
+            .graph
+            .borrow()
+            .on_topology_change(move |event: &TopologyEvent| {
+                if let TopologyEvent::NodeRemoved { node_id } = event {
+                    clear_node_local_state(node_id);
+                    pending_unmounts_for_listener.lock().push(node_id.clone());
+                }
+            });
 
     Ok(JsRuntime {
         engine: engine_rc,
@@ -5091,8 +5070,7 @@ mod tests {
         reset_global_state();
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/js-external-body.grx");
-        let mut runtime =
-            super::mount_with_scheduler(&fixture).expect("mount ok");
+        let mut runtime = super::mount_with_scheduler(&fixture).expect("mount ok");
 
         assert_eq!(runtime.graph_id, "js-external-body");
         assert_eq!(runtime.n_nodes, 1);
@@ -5158,12 +5136,8 @@ mod tests {
         // Set up scheduler; register the node with our JS-backed
         // definition. Default SchedulerHandle (height=0) since
         // there's no hierarchy in this test.
-        let definition = build_js_node_definition(
-            "Counter".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Counter".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "counter-1".to_string(), Attrs::new(), 0_u32)
@@ -5258,12 +5232,8 @@ mod tests {
             .eval_component(iso, "Setter", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Setter".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Setter".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "c-2".to_string(), Attrs::new(), 0_u32)
@@ -5344,12 +5314,8 @@ mod tests {
             .eval_component(iso, "EffectOnce", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "EffectOnce".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("EffectOnce".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "eff-1".to_string(), Attrs::new(), 0_u32)
@@ -5455,12 +5421,8 @@ mod tests {
             .eval_component(iso, "EffectDeps", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "EffectDeps".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("EffectDeps".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "eff-2".to_string(), Attrs::new(), 0_u32)
@@ -5780,12 +5742,8 @@ mod tests {
             .eval_component(iso, "MemoCacher", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "MemoCacher".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("MemoCacher".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "memo-1".to_string(), Attrs::new(), 0_u32)
@@ -5882,12 +5840,8 @@ mod tests {
             .eval_component(iso, "MemoDeps", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "MemoDeps".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("MemoDeps".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "memo-2".to_string(), Attrs::new(), 0_u32)
@@ -5907,10 +5861,8 @@ mod tests {
             .iter()
             .filter(|s| s.starts_with("factory:"))
             .collect();
-        let memo_outputs: Vec<&String> = observed
-            .iter()
-            .filter(|s| s.starts_with("memo:"))
-            .collect();
+        let memo_outputs: Vec<&String> =
+            observed.iter().filter(|s| s.starts_with("memo:")).collect();
         // Factory fires on every render because deps (`[count]`) changed
         // each time. Render 1 (deps unset → 0), render 2 (0 → 5),
         // render 3 (5 → 7). Memoed value is `count * 2`.
@@ -5999,12 +5951,8 @@ mod tests {
             .eval_component(iso, "CbStable", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "CbStable".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("CbStable".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "cb-1".to_string(), Attrs::new(), 0_u32)
@@ -6089,12 +6037,8 @@ mod tests {
             .eval_component(iso, "Reducer", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Reducer".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Reducer".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "rdc-1".to_string(), Attrs::new(), 0_u32)
@@ -6179,12 +6123,8 @@ mod tests {
             .expect("eval");
 
         // Define the hub component on JSC.
-        let definition = build_js_node_definition(
-            "Hub".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Hub".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         // Only register the hub node — the other 3 are pure topology
         // (no scheduler entry needed for this read-only test).
@@ -6199,8 +6139,14 @@ mod tests {
         // each is present, and 'all:' has 3 entries while 'filtered:'
         // has 2 (no 'b').
         let all_count = observed.iter().filter(|s| s.starts_with("all:")).count();
-        let filt_count = observed.iter().filter(|s| s.starts_with("filtered:")).count();
-        assert_eq!(all_count, 3, "useNeighbors() returned 3 neighbors; observed: {observed:?}");
+        let filt_count = observed
+            .iter()
+            .filter(|s| s.starts_with("filtered:"))
+            .count();
+        assert_eq!(
+            all_count, 3,
+            "useNeighbors() returned 3 neighbors; observed: {observed:?}"
+        );
         assert_eq!(filt_count, 2, "filter dropped 'b'; observed: {observed:?}");
         assert!(
             observed.iter().any(|s| s == "all:a")
@@ -6275,12 +6221,8 @@ mod tests {
             .eval_component(iso, "Watcher", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Watcher".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Watcher".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "watcher".to_string(), Attrs::new(), 0_u32)
@@ -6296,7 +6238,10 @@ mod tests {
         // scheduler's topology listener (`on_topology_change`) catches
         // the event into `pending_topology`, which is dispatched on
         // the next `process_batch`.
-        scheduler.graph.borrow_mut().add_node("newcomer".to_string(), Attrs::new());
+        scheduler
+            .graph
+            .borrow_mut()
+            .add_node("newcomer".to_string(), Attrs::new());
 
         // Process the event.
         {
@@ -6381,12 +6326,8 @@ mod tests {
             .eval_component(iso, "Host", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Host".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Host".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "host".to_string(), Attrs::new(), 0_u32)
@@ -6482,12 +6423,8 @@ mod tests {
             .eval_component(iso, "Parent", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Parent".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Parent".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "parent".to_string(), Attrs::new(), 0_u32)
@@ -6583,12 +6520,8 @@ mod tests {
             .eval_component(iso, "Parent", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Parent".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Parent".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "parent".to_string(), Attrs::new(), 0_u32)
@@ -6650,12 +6583,8 @@ mod tests {
                 .expect("host_state");
             e.register_callback(iso, "host_state_set", build_host_state_set_callback())
                 .expect("host_state_set");
-            e.register_callback(
-                iso,
-                "host_unmount_self",
-                build_host_unmount_self_callback(),
-            )
-            .expect("host_unmount_self");
+            e.register_callback(iso, "host_unmount_self", build_host_unmount_self_callback())
+                .expect("host_unmount_self");
             e.register_callback(iso, "host_topology", build_host_topology_callback())
                 .expect("host_topology");
             e.register_callback(
@@ -6700,18 +6629,10 @@ mod tests {
             .eval_component(iso, "Witness", witness_body)
             .expect("eval witness");
 
-        let def_eph = build_js_node_definition(
-            "Ephemeral".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_eph,
-        );
-        let def_wit = build_js_node_definition(
-            "Witness".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_wit,
-        );
+        let def_eph =
+            build_js_node_definition("Ephemeral".into(), Rc::clone(&engine_rc), iso, fn_eph);
+        let def_wit =
+            build_js_node_definition("Witness".into(), Rc::clone(&engine_rc), iso, fn_wit);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(def_eph, "ephemeral".to_string(), Attrs::new(), 0_u32)
@@ -6814,12 +6735,8 @@ mod tests {
             .eval_component(iso, "Composer", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Composer".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Composer".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "composer".to_string(), Attrs::new(), 0_u32)
@@ -6929,12 +6846,8 @@ mod tests {
             .eval_component(iso, "Watcher", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Watcher".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Watcher".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "watcher".to_string(), Attrs::new(), 0_u32)
@@ -6964,7 +6877,11 @@ mod tests {
             });
         }
 
-        let snapshot = Rc::new(GraphSnapshot::from_live(Rc::clone(&scheduler.graph), Rc::clone(&scheduler.manifests), Rc::clone(&scheduler.edge_accept_predicates)));
+        let snapshot = Rc::new(GraphSnapshot::from_live(
+            Rc::clone(&scheduler.graph),
+            Rc::clone(&scheduler.manifests),
+            Rc::clone(&scheduler.edge_accept_predicates),
+        ));
         {
             let _engine_guard = EngineGuard::with_directory(
                 Rc::clone(&engine_rc),
@@ -7052,10 +6969,18 @@ mod tests {
                 build_host_graph_neighbors_callback(),
             )
             .expect("host_graph_neighbors");
-            e.register_callback(iso, "host_graph_has_node", build_host_graph_has_node_callback())
-                .expect("host_graph_has_node");
-            e.register_callback(iso, "host_graph_has_edge", build_host_graph_has_edge_callback())
-                .expect("host_graph_has_edge");
+            e.register_callback(
+                iso,
+                "host_graph_has_node",
+                build_host_graph_has_node_callback(),
+            )
+            .expect("host_graph_has_node");
+            e.register_callback(
+                iso,
+                "host_graph_has_edge",
+                build_host_graph_has_edge_callback(),
+            )
+            .expect("host_graph_has_edge");
             e.register_callback(
                 iso,
                 "host_graph_node_count",
@@ -7102,18 +7027,18 @@ mod tests {
             .eval_component(iso, "Query", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Query".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Query".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "hub".to_string(), Attrs::new(), 0_u32)
             .expect("register");
 
-        let snapshot = Rc::new(GraphSnapshot::from_live(Rc::clone(&scheduler.graph), Rc::clone(&scheduler.manifests), Rc::clone(&scheduler.edge_accept_predicates)));
+        let snapshot = Rc::new(GraphSnapshot::from_live(
+            Rc::clone(&scheduler.graph),
+            Rc::clone(&scheduler.manifests),
+            Rc::clone(&scheduler.edge_accept_predicates),
+        ));
         {
             let _engine_guard = EngineGuard::with_directory(
                 Rc::clone(&engine_rc),
@@ -7222,12 +7147,8 @@ mod tests {
             .eval_component(iso, "Ticker", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Ticker".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Ticker".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "ticker".to_string(), Attrs::new(), 0_u32)
@@ -7281,12 +7202,8 @@ mod tests {
                 .expect("host_message");
             e.register_callback(iso, "host_monitor", build_host_monitor_callback())
                 .expect("host_monitor");
-            e.register_callback(
-                iso,
-                "host_unmount_self",
-                build_host_unmount_self_callback(),
-            )
-            .expect("host_unmount_self");
+            e.register_callback(iso, "host_unmount_self", build_host_unmount_self_callback())
+                .expect("host_unmount_self");
             e.register_callback(
                 iso,
                 "host_observe",
@@ -7329,18 +7246,9 @@ mod tests {
             .eval_component(iso, "Target", tgt_body)
             .expect("eval target");
 
-        let def_obs = build_js_node_definition(
-            "Observer".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_obs,
-        );
-        let def_tgt = build_js_node_definition(
-            "Target".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_tgt,
-        );
+        let def_obs =
+            build_js_node_definition("Observer".into(), Rc::clone(&engine_rc), iso, fn_obs);
+        let def_tgt = build_js_node_definition("Target".into(), Rc::clone(&engine_rc), iso, fn_tgt);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(def_obs, "observer".to_string(), Attrs::new(), 0_u32)
@@ -7431,12 +7339,8 @@ mod tests {
             .eval_component(iso, "Linker", body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Linker".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Linker".into(), Rc::clone(&engine_rc), iso, fn_handle);
         // 'b' needs a NodeDefinition registered with the scheduler
         // for `useLink('b')` to find it via id_to_key. A noop body
         // suffices.
@@ -7445,12 +7349,7 @@ mod tests {
             .borrow_mut()
             .eval_component(iso, "B", noop_body)
             .expect("eval b");
-        let def_b = build_js_node_definition(
-            "B".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_b,
-        );
+        let def_b = build_js_node_definition("B".into(), Rc::clone(&engine_rc), iso, fn_b);
 
         let mut scheduler = Scheduler::new(graph);
         scheduler
@@ -7667,8 +7566,7 @@ mod tests {
                 iso,
                 "host_use_source",
                 Box::new(move |args| {
-                    let HostValue::Object(pairs) =
-                        args.first().cloned().unwrap_or(HostValue::Null)
+                    let HostValue::Object(pairs) = args.first().cloned().unwrap_or(HostValue::Null)
                     else {
                         return Ok(HostValue::Null);
                     };
@@ -7722,7 +7620,11 @@ mod tests {
             descriptors.as_slice(),
             &[
                 ("http".to_string(), 8080_u64, String::new()),
-                ("watch".to_string(), 0_u64, "/tmp/grx-followon-a".to_string()),
+                (
+                    "watch".to_string(),
+                    0_u64,
+                    "/tmp/grx-followon-a".to_string()
+                ),
             ],
             "useSource decoded both http+watch opts; captured: {descriptors:?}"
         );
@@ -7803,12 +7705,8 @@ mod tests {
             .eval_component(iso, "Watcher", &body)
             .expect("eval");
 
-        let definition = build_js_node_definition(
-            "Watcher".into(),
-            Rc::clone(&engine_rc),
-            iso,
-            fn_handle,
-        );
+        let definition =
+            build_js_node_definition("Watcher".into(), Rc::clone(&engine_rc), iso, fn_handle);
         let mut scheduler = Scheduler::new(graph);
         scheduler
             .register_node(definition, "watcher".to_string(), Attrs::new(), 0_u32)
@@ -7825,8 +7723,7 @@ mod tests {
         // file. FSEvents on macOS sometimes drops events arriving in
         // the same kqueue tick as the watch installation.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        std::fs::write(tmpdir.path().join("hello.txt"), b"hello")
-            .expect("write to watched dir");
+        std::fs::write(tmpdir.path().join("hello.txt"), b"hello").expect("write to watched dir");
 
         // Poll for the change event. 5s budget covers FSEvents'
         // ~50-100ms latency with comfortable margin.
@@ -7962,7 +7859,11 @@ mod tests {
             .register_node(definition, "a".to_string(), Attrs::new(), 0_u32)
             .expect("register");
 
-        let snapshot = Rc::new(GraphSnapshot::from_live(Rc::clone(&scheduler.graph), Rc::clone(&scheduler.manifests), Rc::clone(&scheduler.edge_accept_predicates)));
+        let snapshot = Rc::new(GraphSnapshot::from_live(
+            Rc::clone(&scheduler.graph),
+            Rc::clone(&scheduler.manifests),
+            Rc::clone(&scheduler.edge_accept_predicates),
+        ));
         {
             let _engine_guard = EngineGuard::with_directory(
                 Rc::clone(&engine_rc),
@@ -8098,7 +7999,11 @@ mod tests {
             .register_node(definition, "x".to_string(), Attrs::new(), 0_u32)
             .expect("register");
 
-        let snapshot = Rc::new(GraphSnapshot::from_live(Rc::clone(&scheduler.graph), Rc::clone(&scheduler.manifests), Rc::clone(&scheduler.edge_accept_predicates)));
+        let snapshot = Rc::new(GraphSnapshot::from_live(
+            Rc::clone(&scheduler.graph),
+            Rc::clone(&scheduler.manifests),
+            Rc::clone(&scheduler.edge_accept_predicates),
+        ));
         {
             let _engine_guard = EngineGuard::with_directory(
                 Rc::clone(&engine_rc),
@@ -8233,7 +8138,11 @@ mod tests {
             .register_node(definition, "parent".to_string(), Attrs::new(), 0_u32)
             .expect("register");
 
-        let snapshot = Rc::new(GraphSnapshot::from_live(Rc::clone(&scheduler.graph), Rc::clone(&scheduler.manifests), Rc::clone(&scheduler.edge_accept_predicates)));
+        let snapshot = Rc::new(GraphSnapshot::from_live(
+            Rc::clone(&scheduler.graph),
+            Rc::clone(&scheduler.manifests),
+            Rc::clone(&scheduler.edge_accept_predicates),
+        ));
         {
             let _engine_guard = EngineGuard::with_directory(
                 Rc::clone(&engine_rc),
@@ -8307,12 +8216,8 @@ mod tests {
             e.register_callback(iso, "host_memo_store", build_host_memo_store_callback())
                 .expect("host_memo_store");
             // The piece under test.
-            e.register_callback(
-                iso,
-                "host_track_token",
-                build_host_track_token_callback(),
-            )
-            .expect("host_track_token");
+            e.register_callback(iso, "host_track_token", build_host_track_token_callback())
+                .expect("host_track_token");
             iso
         };
 
@@ -8420,7 +8325,12 @@ mod tests {
         // Tier 1 chain: producer↔worker↔sink. Bystander edge:
         // producer↔observer. Observer's manifest has no 'process'
         // overlap, so Tier 2('process') excludes it.
-        graph.add_edge("producer".to_string(), "worker".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "producer".to_string(),
+            "worker".to_string(),
+            None,
+            Attrs::new(),
+        );
         graph.add_edge("worker".to_string(), "sink".to_string(), None, Attrs::new());
         graph.add_edge(
             "producer".to_string(),
@@ -8622,8 +8532,18 @@ mod tests {
         }
         // Tier 1 chain — Tier 2 needs the underlying edges for the
         // policy filter to apply.
-        graph.add_edge("producer".to_string(), "mid".to_string(), None, Attrs::new());
-        graph.add_edge("mid".to_string(), "terminal".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "producer".to_string(),
+            "mid".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "mid".to_string(),
+            "terminal".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -8744,9 +8664,7 @@ mod tests {
         //   pop terminal.
         // Expected: producer > mid > terminal.
         assert!(
-            observed
-                .iter()
-                .any(|s| s == "topo=producer>mid>terminal"),
+            observed.iter().any(|s| s == "topo=producer>mid>terminal"),
             "Tier 2 directed topo sort over the policy-filtered chain; observations: \
              {observed:?}"
         );
@@ -9164,33 +9082,68 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_a = engine_rc.borrow_mut().eval_component(iso, "A", a_body).unwrap();
-        let fn_b = engine_rc.borrow_mut().eval_component(iso, "B", bc_body).unwrap();
-        let fn_c = engine_rc.borrow_mut().eval_component(iso, "C", bc_body).unwrap();
-        let fn_d = engine_rc.borrow_mut().eval_component(iso, "D", d_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Querier", querier_body).unwrap();
+        let fn_a = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "A", a_body)
+            .unwrap();
+        let fn_b = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "B", bc_body)
+            .unwrap();
+        let fn_c = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "C", bc_body)
+            .unwrap();
+        let fn_d = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "D", d_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Querier", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("A".into(), Rc::clone(&engine_rc), iso, fn_a),
-            "a".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("B".into(), Rc::clone(&engine_rc), iso, fn_b),
-            "b".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("C".into(), Rc::clone(&engine_rc), iso, fn_c),
-            "c".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("D".into(), Rc::clone(&engine_rc), iso, fn_d),
-            "d".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("A".into(), Rc::clone(&engine_rc), iso, fn_a),
+                "a".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("B".into(), Rc::clone(&engine_rc), iso, fn_b),
+                "b".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("C".into(), Rc::clone(&engine_rc), iso, fn_c),
+                "c".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("D".into(), Rc::clone(&engine_rc), iso, fn_d),
+                "d".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9254,13 +9207,16 @@ mod tests {
             let mut e = engine_rc.borrow_mut();
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
-            e.register_callback(iso, "host_memo_check", build_host_memo_check_callback()).unwrap();
-            e.register_callback(iso, "host_memo_store", build_host_memo_store_callback()).unwrap();
+            e.register_callback(iso, "host_memo_check", build_host_memo_check_callback())
+                .unwrap();
+            e.register_callback(iso, "host_memo_store", build_host_memo_store_callback())
+                .unwrap();
             e.register_callback(
                 iso,
                 "host_tier2_a_star_path",
                 build_host_tier2_a_star_path_callback(),
-            ).unwrap();
+            )
+            .unwrap();
             e.register_callback(
                 iso,
                 "host_observe",
@@ -9270,7 +9226,8 @@ mod tests {
                     }
                     Ok(HostValue::Null)
                 }),
-            ).unwrap();
+            )
+            .unwrap();
             iso
         };
 
@@ -9283,33 +9240,68 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_s = engine_rc.borrow_mut().eval_component(iso, "Start", start_body).unwrap();
-        let fn_e = engine_rc.borrow_mut().eval_component(iso, "Easy", middle_body).unwrap();
-        let fn_h = engine_rc.borrow_mut().eval_component(iso, "Hard", middle_body).unwrap();
-        let fn_t = engine_rc.borrow_mut().eval_component(iso, "Target", target_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Querier", querier_body).unwrap();
+        let fn_s = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Start", start_body)
+            .unwrap();
+        let fn_e = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Easy", middle_body)
+            .unwrap();
+        let fn_h = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Hard", middle_body)
+            .unwrap();
+        let fn_t = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Target", target_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Querier", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("Start".into(), Rc::clone(&engine_rc), iso, fn_s),
-            "start".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Easy".into(), Rc::clone(&engine_rc), iso, fn_e),
-            "easy".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Hard".into(), Rc::clone(&engine_rc), iso, fn_h),
-            "hard".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Target".into(), Rc::clone(&engine_rc), iso, fn_t),
-            "target".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Start".into(), Rc::clone(&engine_rc), iso, fn_s),
+                "start".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Easy".into(), Rc::clone(&engine_rc), iso, fn_e),
+                "easy".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Hard".into(), Rc::clone(&engine_rc), iso, fn_h),
+                "hard".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Target".into(), Rc::clone(&engine_rc), iso, fn_t),
+                "target".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9331,7 +9323,9 @@ mod tests {
         //                 = (1 + 1) + (1 + 0) = 3.
         // Hard path cost: (1 + 10) + (1 + 0) = 12.
         assert!(
-            observed.iter().any(|s| s == "aStar:prereq=start>easy>target"),
+            observed
+                .iter()
+                .any(|s| s == "aStar:prereq=start>easy>target"),
             "prerequisite-distance heuristic picks easy intermediate; observations: {observed:?}"
         );
         drop(observed);
@@ -9370,10 +9364,22 @@ mod tests {
             let mut e = engine_rc.borrow_mut();
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
-            e.register_callback(iso, "host_memo_check", build_host_memo_check_callback()).unwrap();
-            e.register_callback(iso, "host_memo_store", build_host_memo_store_callback()).unwrap();
-            e.register_callback(iso, "host_tier2_has_edge", build_host_tier2_has_edge_callback()).unwrap();
-            e.register_callback(iso, "host_tier2_neighbors", build_host_tier2_neighbors_callback()).unwrap();
+            e.register_callback(iso, "host_memo_check", build_host_memo_check_callback())
+                .unwrap();
+            e.register_callback(iso, "host_memo_store", build_host_memo_store_callback())
+                .unwrap();
+            e.register_callback(
+                iso,
+                "host_tier2_has_edge",
+                build_host_tier2_has_edge_callback(),
+            )
+            .unwrap();
+            e.register_callback(
+                iso,
+                "host_tier2_neighbors",
+                build_host_tier2_neighbors_callback(),
+            )
+            .unwrap();
             e.register_callback(
                 iso,
                 "host_observe",
@@ -9383,7 +9389,8 @@ mod tests {
                     }
                     Ok(HostValue::Null)
                 }),
-            ).unwrap();
+            )
+            .unwrap();
             iso
         };
 
@@ -9401,23 +9408,44 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_p = engine_rc.borrow_mut().eval_component(iso, "Producer", producer_body).unwrap();
-        let fn_s = engine_rc.borrow_mut().eval_component(iso, "Sink", sink_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Querier", querier_body).unwrap();
+        let fn_p = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Producer", producer_body)
+            .unwrap();
+        let fn_s = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Sink", sink_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Querier", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("Producer".into(), Rc::clone(&engine_rc), iso, fn_p),
-            "producer".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Sink".into(), Rc::clone(&engine_rc), iso, fn_s),
-            "sink".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Producer".into(), Rc::clone(&engine_rc), iso, fn_p),
+                "producer".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Sink".into(), Rc::clone(&engine_rc), iso, fn_s),
+                "sink".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Querier".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9437,7 +9465,9 @@ mod tests {
         let observed = observations.lock();
         // Structural Tier 2: no Tier 1 edge → no Tier 2 edge.
         assert!(
-            observed.iter().any(|s| s == "struct:hasEdge(producer,sink)=false"),
+            observed
+                .iter()
+                .any(|s| s == "struct:hasEdge(producer,sink)=false"),
             "structural Tier 2 reports no edge without Tier 1 backing; observations: {observed:?}"
         );
         assert!(
@@ -9603,23 +9633,44 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_s = engine_rc.borrow_mut().eval_component(iso, "Src", src_body).unwrap();
-        let fn_d = engine_rc.borrow_mut().eval_component(iso, "Dst", dst_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Q", querier_body).unwrap();
+        let fn_s = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Src", src_body)
+            .unwrap();
+        let fn_d = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Dst", dst_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Q", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("Src".into(), Rc::clone(&engine_rc), iso, fn_s),
-            "src".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Dst".into(), Rc::clone(&engine_rc), iso, fn_d),
-            "dst".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Src".into(), Rc::clone(&engine_rc), iso, fn_s),
+                "src".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Dst".into(), Rc::clone(&engine_rc), iso, fn_d),
+                "dst".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9628,16 +9679,20 @@ mod tests {
         ));
         {
             let _g = EngineGuard::with_directory(
-                Rc::clone(&engine_rc), iso,
-                Rc::clone(&scheduler.directory), snapshot,
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
             );
             scheduler.process_batch().expect("batch");
         }
 
         let observed = observations.lock();
         for expected in [
-            "t2:hasEdge=true", "t3:hasEdge=true",
-            "t2:nbrs=dst", "t3:nbrs=dst",
+            "t2:hasEdge=true",
+            "t3:hasEdge=true",
+            "t2:nbrs=dst",
+            "t3:nbrs=dst",
         ] {
             assert!(
                 observed.iter().any(|s| s == expected),
@@ -9674,7 +9729,8 @@ mod tests {
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             register_followon_f_callbacks(
-                &mut e, iso,
+                &mut e,
+                iso,
                 Box::new(move |args| {
                     if let Some(HostValue::String(s)) = args.first() {
                         observations_for_cb.lock().push(s.clone());
@@ -9698,23 +9754,44 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_a = engine_rc.borrow_mut().eval_component(iso, "Alice", alice_body).unwrap();
-        let fn_b = engine_rc.borrow_mut().eval_component(iso, "Bob", bob_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Q", querier_body).unwrap();
+        let fn_a = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Alice", alice_body)
+            .unwrap();
+        let fn_b = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Bob", bob_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Q", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("Alice".into(), Rc::clone(&engine_rc), iso, fn_a),
-            "alice".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Bob".into(), Rc::clone(&engine_rc), iso, fn_b),
-            "bob".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Alice".into(), Rc::clone(&engine_rc), iso, fn_a),
+                "alice".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Bob".into(), Rc::clone(&engine_rc), iso, fn_b),
+                "bob".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9723,17 +9800,23 @@ mod tests {
         ));
         {
             let _g = EngineGuard::with_directory(
-                Rc::clone(&engine_rc), iso,
-                Rc::clone(&scheduler.directory), snapshot,
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
             );
             scheduler.process_batch().expect("batch");
         }
 
         let observed = observations.lock();
-        assert!(observed.iter().any(|s| s == "t3:hasEdge=true"),
-            "predicate-accepted pair appears in Tier 3; observations: {observed:?}");
-        assert!(observed.iter().any(|s| s == "t3:nbrs=bob"),
-            "alice's tier 3 neighbors include bob; observations: {observed:?}");
+        assert!(
+            observed.iter().any(|s| s == "t3:hasEdge=true"),
+            "predicate-accepted pair appears in Tier 3; observations: {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|s| s == "t3:nbrs=bob"),
+            "alice's tier 3 neighbors include bob; observations: {observed:?}"
+        );
         drop(observed);
 
         let mut e = engine_rc.borrow_mut();
@@ -9764,7 +9847,8 @@ mod tests {
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             register_followon_f_callbacks(
-                &mut e, iso,
+                &mut e,
+                iso,
                 Box::new(move |args| {
                     if let Some(HostValue::String(s)) = args.first() {
                         observations_for_cb.lock().push(s.clone());
@@ -9791,23 +9875,44 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_a = engine_rc.borrow_mut().eval_component(iso, "Alice", alice_body).unwrap();
-        let fn_b = engine_rc.borrow_mut().eval_component(iso, "Bob", bob_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Q", querier_body).unwrap();
+        let fn_a = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Alice", alice_body)
+            .unwrap();
+        let fn_b = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Bob", bob_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Q", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("Alice".into(), Rc::clone(&engine_rc), iso, fn_a),
-            "alice".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Bob".into(), Rc::clone(&engine_rc), iso, fn_b),
-            "bob".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Alice".into(), Rc::clone(&engine_rc), iso, fn_a),
+                "alice".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Bob".into(), Rc::clone(&engine_rc), iso, fn_b),
+                "bob".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9816,8 +9921,10 @@ mod tests {
         ));
         {
             let _g = EngineGuard::with_directory(
-                Rc::clone(&engine_rc), iso,
-                Rc::clone(&scheduler.directory), snapshot,
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
             );
             scheduler.process_batch().expect("batch");
         }
@@ -9825,10 +9932,14 @@ mod tests {
         let observed = observations.lock();
         assert!(observed.iter().any(|s| s == "t2:hasEdge=true"),
             "Tier 2 baseline includes alice→bob (manifest match + Tier 1 edge); observations: {observed:?}");
-        assert!(observed.iter().any(|s| s == "t3:hasEdge=false"),
-            "Tier 3 excludes alice→bob because bob's predicate vetoes; observations: {observed:?}");
-        assert!(observed.iter().any(|s| s == "t3:nbrs(alice)="),
-            "alice has no Tier 3 neighbors after veto; observations: {observed:?}");
+        assert!(
+            observed.iter().any(|s| s == "t3:hasEdge=false"),
+            "Tier 3 excludes alice→bob because bob's predicate vetoes; observations: {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|s| s == "t3:nbrs(alice)="),
+            "alice has no Tier 3 neighbors after veto; observations: {observed:?}"
+        );
         drop(observed);
 
         let mut e = engine_rc.borrow_mut();
@@ -9859,10 +9970,7 @@ mod tests {
             let mut e = engine_rc.borrow_mut();
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
-            register_followon_f_callbacks(
-                &mut e, iso,
-                Box::new(|_args| Ok(HostValue::Null)),
-            );
+            register_followon_f_callbacks(&mut e, iso, Box::new(|_args| Ok(HostValue::Null)));
             iso
         };
 
@@ -9883,37 +9991,61 @@ mod tests {
         ";
 
         // Source needs use_effect support to defer the accept calls.
-        engine_rc.borrow_mut().register_callback(
-            iso, "host_state", build_host_state_callback()
-        ).unwrap();
-        engine_rc.borrow_mut().register_callback(
-            iso, "host_state_set", build_host_state_set_callback()
-        ).unwrap();
-        engine_rc.borrow_mut().register_callback(
-            iso, "host_effect", build_host_effect_callback()
-        ).unwrap();
+        engine_rc
+            .borrow_mut()
+            .register_callback(iso, "host_state", build_host_state_callback())
+            .unwrap();
+        engine_rc
+            .borrow_mut()
+            .register_callback(iso, "host_state_set", build_host_state_set_callback())
+            .unwrap();
+        engine_rc
+            .borrow_mut()
+            .register_callback(iso, "host_effect", build_host_effect_callback())
+            .unwrap();
 
-        let fn_s = engine_rc.borrow_mut().eval_component(iso, "Src", src_body).unwrap();
-        let fn_v = engine_rc.borrow_mut().eval_component(iso, "Veto", veto_target_body).unwrap();
-        let fn_o = engine_rc.borrow_mut().eval_component(iso, "Open", open_target_body).unwrap();
+        let fn_s = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Src", src_body)
+            .unwrap();
+        let fn_v = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Veto", veto_target_body)
+            .unwrap();
+        let fn_o = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Open", open_target_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
         // Targets at height 0 (their predicates need to be installed
         // BEFORE drain_pending_mutations sees the AcceptEdge from src).
         // src at height 1 so its useEffect fires after both targets'
         // bodies have synced their predicates into the shared index.
-        scheduler.register_node(
-            build_js_node_definition("Veto".into(), Rc::clone(&engine_rc), iso, fn_v),
-            "veto-target".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Open".into(), Rc::clone(&engine_rc), iso, fn_o),
-            "open-target".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Src".into(), Rc::clone(&engine_rc), iso, fn_s),
-            "src".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Veto".into(), Rc::clone(&engine_rc), iso, fn_v),
+                "veto-target".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Open".into(), Rc::clone(&engine_rc), iso, fn_o),
+                "open-target".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Src".into(), Rc::clone(&engine_rc), iso, fn_s),
+                "src".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -9922,8 +10054,10 @@ mod tests {
         ));
         {
             let _g = EngineGuard::with_directory(
-                Rc::clone(&engine_rc), iso,
-                Rc::clone(&scheduler.directory), snapshot,
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
             );
             scheduler.process_batch().expect("batch");
         }
@@ -9955,7 +10089,12 @@ mod tests {
         reset_global_state();
 
         let mut graph = CommunicationGraph::new();
-        for id in ["primary", "compliant-failover", "noncompliant-failover", "querier"] {
+        for id in [
+            "primary",
+            "compliant-failover",
+            "noncompliant-failover",
+            "querier",
+        ] {
             let mut attrs = Attrs::new();
             // compliant-failover marked compliant; noncompliant left default-true at attr level
             // but its predicate vetoes — different mechanism for the same rejection effect.
@@ -9965,8 +10104,18 @@ mod tests {
             graph.add_node(id.to_string(), attrs);
         }
         // Tier 1: primary connects to BOTH failover candidates.
-        graph.add_edge("primary".to_string(), "compliant-failover".to_string(), None, Attrs::new());
-        graph.add_edge("primary".to_string(), "noncompliant-failover".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "primary".to_string(),
+            "compliant-failover".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "primary".to_string(),
+            "noncompliant-failover".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -9978,7 +10127,8 @@ mod tests {
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             register_followon_f_callbacks(
-                &mut e, iso,
+                &mut e,
+                iso,
                 Box::new(move |args| {
                     if let Some(HostValue::String(s)) = args.first() {
                         observations_for_cb.lock().push(s.clone());
@@ -10011,28 +10161,56 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_p = engine_rc.borrow_mut().eval_component(iso, "P", primary_body).unwrap();
-        let fn_c = engine_rc.borrow_mut().eval_component(iso, "C", compliant_body).unwrap();
-        let fn_n = engine_rc.borrow_mut().eval_component(iso, "N", noncompliant_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Q", querier_body).unwrap();
+        let fn_p = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "P", primary_body)
+            .unwrap();
+        let fn_c = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "C", compliant_body)
+            .unwrap();
+        let fn_n = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "N", noncompliant_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Q", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("P".into(), Rc::clone(&engine_rc), iso, fn_p),
-            "primary".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("C".into(), Rc::clone(&engine_rc), iso, fn_c),
-            "compliant-failover".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("N".into(), Rc::clone(&engine_rc), iso, fn_n),
-            "noncompliant-failover".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("P".into(), Rc::clone(&engine_rc), iso, fn_p),
+                "primary".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("C".into(), Rc::clone(&engine_rc), iso, fn_c),
+                "compliant-failover".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("N".into(), Rc::clone(&engine_rc), iso, fn_n),
+                "noncompliant-failover".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -10041,15 +10219,19 @@ mod tests {
         ));
         {
             let _g = EngineGuard::with_directory(
-                Rc::clone(&engine_rc), iso,
-                Rc::clone(&scheduler.directory), snapshot,
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
             );
             scheduler.process_batch().expect("batch");
         }
 
         let observed = observations.lock();
         assert!(
-            observed.iter().any(|s| s == "compliant-path=primary>compliant-failover"),
+            observed
+                .iter()
+                .any(|s| s == "compliant-path=primary>compliant-failover"),
             "compliance-aware Tier 3 finds the compliant failover; observations: {observed:?}"
         );
         assert!(
@@ -10076,8 +10258,18 @@ mod tests {
         for id in ["fractions", "decimals", "calculus", "querier"] {
             graph.add_node(id.to_string(), Attrs::new());
         }
-        graph.add_edge("fractions".to_string(), "decimals".to_string(), None, Attrs::new());
-        graph.add_edge("fractions".to_string(), "calculus".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "fractions".to_string(),
+            "decimals".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "fractions".to_string(),
+            "calculus".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -10089,7 +10281,8 @@ mod tests {
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             register_followon_f_callbacks(
-                &mut e, iso,
+                &mut e,
+                iso,
                 Box::new(move |args| {
                     if let Some(HostValue::String(s)) = args.first() {
                         observations_for_cb.lock().push(s.clone());
@@ -10118,28 +10311,56 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_f = engine_rc.borrow_mut().eval_component(iso, "F", fractions_body).unwrap();
-        let fn_d = engine_rc.borrow_mut().eval_component(iso, "D", decimals_body).unwrap();
-        let fn_c = engine_rc.borrow_mut().eval_component(iso, "C", calculus_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Q", querier_body).unwrap();
+        let fn_f = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "F", fractions_body)
+            .unwrap();
+        let fn_d = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "D", decimals_body)
+            .unwrap();
+        let fn_c = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "C", calculus_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Q", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("F".into(), Rc::clone(&engine_rc), iso, fn_f),
-            "fractions".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("D".into(), Rc::clone(&engine_rc), iso, fn_d),
-            "decimals".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("C".into(), Rc::clone(&engine_rc), iso, fn_c),
-            "calculus".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("F".into(), Rc::clone(&engine_rc), iso, fn_f),
+                "fractions".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("D".into(), Rc::clone(&engine_rc), iso, fn_d),
+                "decimals".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("C".into(), Rc::clone(&engine_rc), iso, fn_c),
+                "calculus".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -10148,8 +10369,10 @@ mod tests {
         ));
         {
             let _g = EngineGuard::with_directory(
-                Rc::clone(&engine_rc), iso,
-                Rc::clone(&scheduler.directory), snapshot,
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
             );
             scheduler.process_batch().expect("batch");
         }
@@ -10176,15 +10399,36 @@ mod tests {
         reset_global_state();
 
         let mut graph = CommunicationGraph::new();
-        for id in ["invader", "open-region", "peace-region", "frontier", "querier"] {
+        for id in [
+            "invader",
+            "open-region",
+            "peace-region",
+            "frontier",
+            "querier",
+        ] {
             graph.add_node(id.to_string(), Attrs::new());
         }
         // Tier 1: invader→open-region→frontier; invader→peace-region.
         // Without the treaty, war message would BFS to all 4 regions.
         // Peace-region's predicate vetoes incoming war from invader.
-        graph.add_edge("invader".to_string(), "open-region".to_string(), None, Attrs::new());
-        graph.add_edge("invader".to_string(), "peace-region".to_string(), None, Attrs::new());
-        graph.add_edge("open-region".to_string(), "frontier".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "invader".to_string(),
+            "open-region".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "invader".to_string(),
+            "peace-region".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "open-region".to_string(),
+            "frontier".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -10196,7 +10440,8 @@ mod tests {
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             register_followon_f_callbacks(
-                &mut e, iso,
+                &mut e,
+                iso,
                 Box::new(move |args| {
                     if let Some(HostValue::String(s)) = args.first() {
                         observations_for_cb.lock().push(s.clone());
@@ -10226,33 +10471,68 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_i = engine_rc.borrow_mut().eval_component(iso, "I", invader_body).unwrap();
-        let fn_o = engine_rc.borrow_mut().eval_component(iso, "O", open_body).unwrap();
-        let fn_p = engine_rc.borrow_mut().eval_component(iso, "P", peace_body).unwrap();
-        let fn_fr = engine_rc.borrow_mut().eval_component(iso, "F", frontier_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Q", querier_body).unwrap();
+        let fn_i = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "I", invader_body)
+            .unwrap();
+        let fn_o = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "O", open_body)
+            .unwrap();
+        let fn_p = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "P", peace_body)
+            .unwrap();
+        let fn_fr = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "F", frontier_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Q", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("I".into(), Rc::clone(&engine_rc), iso, fn_i),
-            "invader".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("O".into(), Rc::clone(&engine_rc), iso, fn_o),
-            "open-region".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("P".into(), Rc::clone(&engine_rc), iso, fn_p),
-            "peace-region".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("F".into(), Rc::clone(&engine_rc), iso, fn_fr),
-            "frontier".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("I".into(), Rc::clone(&engine_rc), iso, fn_i),
+                "invader".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("O".into(), Rc::clone(&engine_rc), iso, fn_o),
+                "open-region".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("P".into(), Rc::clone(&engine_rc), iso, fn_p),
+                "peace-region".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("F".into(), Rc::clone(&engine_rc), iso, fn_fr),
+                "frontier".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -10261,8 +10541,10 @@ mod tests {
         ));
         {
             let _g = EngineGuard::with_directory(
-                Rc::clone(&engine_rc), iso,
-                Rc::clone(&scheduler.directory), snapshot,
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
             );
             scheduler.process_batch().expect("batch");
         }
@@ -10272,15 +10554,21 @@ mod tests {
         // is excluded (predicate vetoed). Expected order is
         // discovery-order — invader,open-region,frontier — but to
         // tolerate sort-order variation we just check membership.
-        let bfs_line = observed.iter()
+        let bfs_line = observed
+            .iter()
             .find(|s| s.starts_with("reachable="))
             .expect("reachable observation present");
-        let visited: Vec<&str> = bfs_line.trim_start_matches("reachable=").split(',').collect();
+        let visited: Vec<&str> = bfs_line
+            .trim_start_matches("reachable=")
+            .split(',')
+            .collect();
         assert!(visited.contains(&"invader"), "{bfs_line:?}");
         assert!(visited.contains(&"open-region"), "{bfs_line:?}");
         assert!(visited.contains(&"frontier"), "{bfs_line:?}");
-        assert!(!visited.contains(&"peace-region"),
-            "peace-region must be vetoed by predicate; got {bfs_line:?}");
+        assert!(
+            !visited.contains(&"peace-region"),
+            "peace-region must be vetoed by predicate; got {bfs_line:?}"
+        );
         drop(observed);
 
         let mut e = engine_rc.borrow_mut();
@@ -10299,17 +10587,43 @@ mod tests {
         reset_global_state();
 
         let mut graph = CommunicationGraph::new();
-        for id in ["drug", "on-target-receptor", "off-target-receptor", "kinase", "querier"] {
+        for id in [
+            "drug",
+            "on-target-receptor",
+            "off-target-receptor",
+            "kinase",
+            "querier",
+        ] {
             graph.add_node(id.to_string(), Attrs::new());
         }
         // Both receptors are Tier 1-adjacent to drug AND to kinase.
         // Tier 2 finds two paths: drug→on-target→kinase AND
         // drug→off-target→kinase. Tier 3 with off-target's
         // veto leaves only the on-target chain.
-        graph.add_edge("drug".to_string(), "on-target-receptor".to_string(), None, Attrs::new());
-        graph.add_edge("drug".to_string(), "off-target-receptor".to_string(), None, Attrs::new());
-        graph.add_edge("on-target-receptor".to_string(), "kinase".to_string(), None, Attrs::new());
-        graph.add_edge("off-target-receptor".to_string(), "kinase".to_string(), None, Attrs::new());
+        graph.add_edge(
+            "drug".to_string(),
+            "on-target-receptor".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "drug".to_string(),
+            "off-target-receptor".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "on-target-receptor".to_string(),
+            "kinase".to_string(),
+            None,
+            Attrs::new(),
+        );
+        graph.add_edge(
+            "off-target-receptor".to_string(),
+            "kinase".to_string(),
+            None,
+            Attrs::new(),
+        );
 
         let observations: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -10321,7 +10635,8 @@ mod tests {
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             register_followon_f_callbacks(
-                &mut e, iso,
+                &mut e,
+                iso,
                 Box::new(move |args| {
                     if let Some(HostValue::String(s)) = args.first() {
                         observations_for_cb.lock().push(s.clone());
@@ -10356,33 +10671,68 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_d = engine_rc.borrow_mut().eval_component(iso, "D", drug_body).unwrap();
-        let fn_on = engine_rc.borrow_mut().eval_component(iso, "On", on_target_body).unwrap();
-        let fn_off = engine_rc.borrow_mut().eval_component(iso, "Off", off_target_body).unwrap();
-        let fn_k = engine_rc.borrow_mut().eval_component(iso, "K", kinase_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Q", querier_body).unwrap();
+        let fn_d = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "D", drug_body)
+            .unwrap();
+        let fn_on = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "On", on_target_body)
+            .unwrap();
+        let fn_off = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Off", off_target_body)
+            .unwrap();
+        let fn_k = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "K", kinase_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Q", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("D".into(), Rc::clone(&engine_rc), iso, fn_d),
-            "drug".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("On".into(), Rc::clone(&engine_rc), iso, fn_on),
-            "on-target-receptor".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Off".into(), Rc::clone(&engine_rc), iso, fn_off),
-            "off-target-receptor".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("K".into(), Rc::clone(&engine_rc), iso, fn_k),
-            "kinase".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("D".into(), Rc::clone(&engine_rc), iso, fn_d),
+                "drug".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("On".into(), Rc::clone(&engine_rc), iso, fn_on),
+                "on-target-receptor".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Off".into(), Rc::clone(&engine_rc), iso, fn_off),
+                "off-target-receptor".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("K".into(), Rc::clone(&engine_rc), iso, fn_k),
+                "kinase".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -10391,8 +10741,10 @@ mod tests {
         ));
         {
             let _g = EngineGuard::with_directory(
-                Rc::clone(&engine_rc), iso,
-                Rc::clone(&scheduler.directory), snapshot,
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
             );
             scheduler.process_batch().expect("batch");
         }
@@ -10403,7 +10755,9 @@ mod tests {
             "exactly 1 Tier 3 path drug→kinase (off-target chain vetoed); observations: {observed:?}"
         );
         assert!(
-            observed.iter().any(|s| s == "path:drug>on-target-receptor>kinase"),
+            observed
+                .iter()
+                .any(|s| s == "path:drug>on-target-receptor>kinase"),
             "the surviving path is via on-target-receptor; observations: {observed:?}"
         );
         drop(observed);
@@ -10424,7 +10778,13 @@ mod tests {
         reset_global_state();
 
         let mut graph = CommunicationGraph::new();
-        for id in ["alice", "high-trust-mutual", "low-trust-mutual", "bob", "querier"] {
+        for id in [
+            "alice",
+            "high-trust-mutual",
+            "low-trust-mutual",
+            "bob",
+            "querier",
+        ] {
             graph.add_node(id.to_string(), Attrs::new());
         }
         // Two parallel vouch chains alice→mutual→bob. Tier 1 backs
@@ -10435,10 +10795,30 @@ mod tests {
         high_edge.insert("trust".to_string(), serde_json::json!(1.0));
         let mut low_edge = Attrs::new();
         low_edge.insert("trust".to_string(), serde_json::json!(0.1));
-        graph.add_edge("alice".to_string(), "high-trust-mutual".to_string(), None, high_edge.clone());
-        graph.add_edge("alice".to_string(), "low-trust-mutual".to_string(), None, low_edge.clone());
-        graph.add_edge("high-trust-mutual".to_string(), "bob".to_string(), None, high_edge);
-        graph.add_edge("low-trust-mutual".to_string(), "bob".to_string(), None, low_edge);
+        graph.add_edge(
+            "alice".to_string(),
+            "high-trust-mutual".to_string(),
+            None,
+            high_edge.clone(),
+        );
+        graph.add_edge(
+            "alice".to_string(),
+            "low-trust-mutual".to_string(),
+            None,
+            low_edge.clone(),
+        );
+        graph.add_edge(
+            "high-trust-mutual".to_string(),
+            "bob".to_string(),
+            None,
+            high_edge,
+        );
+        graph.add_edge(
+            "low-trust-mutual".to_string(),
+            "bob".to_string(),
+            None,
+            low_edge,
+        );
 
         let observations: std::sync::Arc<parking_lot::Mutex<Vec<String>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -10450,7 +10830,8 @@ mod tests {
             e.initialize().expect("init");
             let iso = e.create_isolate(IsolateOptions::default()).expect("create");
             register_followon_f_callbacks(
-                &mut e, iso,
+                &mut e,
+                iso,
                 Box::new(move |args| {
                     if let Some(HostValue::String(s)) = args.first() {
                         observations_for_cb.lock().push(s.clone());
@@ -10483,33 +10864,68 @@ mod tests {
             return { accepts: [], emits: [] };\n\
         ";
 
-        let fn_a = engine_rc.borrow_mut().eval_component(iso, "A", alice_body).unwrap();
-        let fn_h = engine_rc.borrow_mut().eval_component(iso, "H", high_mutual_body).unwrap();
-        let fn_l = engine_rc.borrow_mut().eval_component(iso, "L", low_mutual_body).unwrap();
-        let fn_b = engine_rc.borrow_mut().eval_component(iso, "B", bob_body).unwrap();
-        let fn_q = engine_rc.borrow_mut().eval_component(iso, "Q", querier_body).unwrap();
+        let fn_a = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "A", alice_body)
+            .unwrap();
+        let fn_h = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "H", high_mutual_body)
+            .unwrap();
+        let fn_l = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "L", low_mutual_body)
+            .unwrap();
+        let fn_b = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "B", bob_body)
+            .unwrap();
+        let fn_q = engine_rc
+            .borrow_mut()
+            .eval_component(iso, "Q", querier_body)
+            .unwrap();
 
         let mut scheduler = Scheduler::new(graph);
-        scheduler.register_node(
-            build_js_node_definition("A".into(), Rc::clone(&engine_rc), iso, fn_a),
-            "alice".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("H".into(), Rc::clone(&engine_rc), iso, fn_h),
-            "high-trust-mutual".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("L".into(), Rc::clone(&engine_rc), iso, fn_l),
-            "low-trust-mutual".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("B".into(), Rc::clone(&engine_rc), iso, fn_b),
-            "bob".to_string(), Attrs::new(), 0_u32,
-        ).unwrap();
-        scheduler.register_node(
-            build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
-            "querier".to_string(), Attrs::new(), 1_u32,
-        ).unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("A".into(), Rc::clone(&engine_rc), iso, fn_a),
+                "alice".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("H".into(), Rc::clone(&engine_rc), iso, fn_h),
+                "high-trust-mutual".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("L".into(), Rc::clone(&engine_rc), iso, fn_l),
+                "low-trust-mutual".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("B".into(), Rc::clone(&engine_rc), iso, fn_b),
+                "bob".to_string(),
+                Attrs::new(),
+                0_u32,
+            )
+            .unwrap();
+        scheduler
+            .register_node(
+                build_js_node_definition("Q".into(), Rc::clone(&engine_rc), iso, fn_q),
+                "querier".to_string(),
+                Attrs::new(),
+                1_u32,
+            )
+            .unwrap();
 
         let snapshot = Rc::new(GraphSnapshot::from_live(
             Rc::clone(&scheduler.graph),
@@ -10518,8 +10934,10 @@ mod tests {
         ));
         {
             let _g = EngineGuard::with_directory(
-                Rc::clone(&engine_rc), iso,
-                Rc::clone(&scheduler.directory), snapshot,
+                Rc::clone(&engine_rc),
+                iso,
+                Rc::clone(&scheduler.directory),
+                snapshot,
             );
             scheduler.process_batch().expect("batch");
         }
@@ -10561,12 +10979,8 @@ mod tests {
             .expect("host_state_set");
         e.register_callback(iso, "host_effect", build_host_effect_callback())
             .expect("host_effect");
-        e.register_callback(
-            iso,
-            "host_effect_async",
-            build_host_effect_async_callback(),
-        )
-        .expect("host_effect_async");
+        e.register_callback(iso, "host_effect_async", build_host_effect_async_callback())
+            .expect("host_effect_async");
         e.register_callback(
             iso,
             "host_effect_async_complete",

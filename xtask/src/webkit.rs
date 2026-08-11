@@ -171,10 +171,7 @@ pub fn cmake_flags(target: Target, mode: Mode) -> Vec<(String, String)> {
         ("ENABLE_MEDIA_STREAM".into(), "OFF".into()),
         ("ENABLE_WEB_RTC".into(), "OFF".into()),
         ("CMAKE_EXPORT_COMPILE_COMMANDS".into(), "ON".into()),
-        (
-            "CMAKE_BUILD_TYPE".into(),
-            mode.cmake_build_type().into(),
-        ),
+        ("CMAKE_BUILD_TYPE".into(), mode.cmake_build_type().into()),
     ];
 
     // Cross-compile / target-shape hints. Native builds skip
@@ -428,7 +425,11 @@ pub fn webkit_clone(workspace_root: &Path, opts: CloneOptions) -> Result<(), Str
     if opts.dry_run {
         eprintln!(
             "xtask webkit-clone (dry-run): would {} WebKit at ref `{}` into {}",
-            if already_cloned { "fetch + checkout" } else { "clone" },
+            if already_cloned {
+                "fetch + checkout"
+            } else {
+                "clone"
+            },
             resolved,
             dest.display()
         );
@@ -450,7 +451,11 @@ pub fn webkit_clone(workspace_root: &Path, opts: CloneOptions) -> Result<(), Str
     }
 
     for argv in &argvs {
-        let cwd = if already_cloned { dest.as_path() } else { workspace_root };
+        let cwd = if already_cloned {
+            dest.as_path()
+        } else {
+            workspace_root
+        };
         run_command(argv, cwd)?;
     }
 
@@ -570,8 +575,7 @@ fn write_stamp(dest: &Path, resolved_ref: &str) -> Result<(), String> {
          repo={WEBKIT_REPO}\n\
          ref={resolved_ref}\n"
     );
-    std::fs::write(&stamp, body)
-        .map_err(|e| format!("write stamp {}: {e}", stamp.display()))?;
+    std::fs::write(&stamp, body).map_err(|e| format!("write stamp {}: {e}", stamp.display()))?;
     Ok(())
 }
 
@@ -624,13 +628,28 @@ mod tests {
         let flags = cmake_flags(Target::LinuxX86_64, Mode::Release);
         let by_key: std::collections::HashMap<String, String> = flags.into_iter().collect();
         assert_eq!(by_key.get("PORT").map(String::as_str), Some("JSCOnly"));
-        assert_eq!(by_key.get("ENABLE_STATIC_JSC").map(String::as_str), Some("ON"));
-        assert_eq!(by_key.get("USE_THIN_ARCHIVES").map(String::as_str), Some("OFF"));
+        assert_eq!(
+            by_key.get("ENABLE_STATIC_JSC").map(String::as_str),
+            Some("ON")
+        );
+        assert_eq!(
+            by_key.get("USE_THIN_ARCHIVES").map(String::as_str),
+            Some("OFF")
+        );
         assert_eq!(by_key.get("ENABLE_FTL_JIT").map(String::as_str), Some("ON"));
-        assert_eq!(by_key.get("CMAKE_BUILD_TYPE").map(String::as_str), Some("Release"));
+        assert_eq!(
+            by_key.get("CMAKE_BUILD_TYPE").map(String::as_str),
+            Some("Release")
+        );
         // Media subsystems off — we don't need them.
-        assert_eq!(by_key.get("ENABLE_MEDIA_SOURCE").map(String::as_str), Some("OFF"));
-        assert_eq!(by_key.get("ENABLE_WEB_RTC").map(String::as_str), Some("OFF"));
+        assert_eq!(
+            by_key.get("ENABLE_MEDIA_SOURCE").map(String::as_str),
+            Some("OFF")
+        );
+        assert_eq!(
+            by_key.get("ENABLE_WEB_RTC").map(String::as_str),
+            Some("OFF")
+        );
     }
 
     #[test]
@@ -672,7 +691,10 @@ mod tests {
     fn debug_mode_emits_debug_build_type() {
         let flags = cmake_flags(Target::LinuxX86_64, Mode::Debug);
         let by_key: std::collections::HashMap<String, String> = flags.into_iter().collect();
-        assert_eq!(by_key.get("CMAKE_BUILD_TYPE").map(String::as_str), Some("Debug"));
+        assert_eq!(
+            by_key.get("CMAKE_BUILD_TYPE").map(String::as_str),
+            Some("Debug")
+        );
     }
 
     #[test]
@@ -711,7 +733,10 @@ mod tests {
 
     #[test]
     fn resolve_ref_uses_env_when_no_cli() {
-        assert_eq!(resolve_ref_with_env(None, Some("env-ref-abc")), "env-ref-abc");
+        assert_eq!(
+            resolve_ref_with_env(None, Some("env-ref-abc")),
+            "env-ref-abc"
+        );
     }
 
     #[test]
@@ -759,10 +784,7 @@ mod tests {
     fn fetch_and_checkout_round_trip_use_detached_head() {
         let (fetch, checkout) = fetch_and_checkout_argvs("ref-xyz");
         assert_eq!(fetch, vec!["git", "fetch", "origin", "ref-xyz"]);
-        assert_eq!(
-            checkout,
-            vec!["git", "checkout", "--detach", "ref-xyz"]
-        );
+        assert_eq!(checkout, vec!["git", "checkout", "--detach", "ref-xyz"]);
     }
 
     #[test]

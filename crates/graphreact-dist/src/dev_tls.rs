@@ -56,14 +56,13 @@ pub fn issue(ca: &DevCa, name: &str, require_mtls: bool) -> Result<DevIdentity, 
             .try_into()
             .map_err(|e: rcgen::Error| DistError::Tls(format!("san dns name: {e}")))?,
     ));
-    let leaf_key = rcgen::KeyPair::generate()
-        .map_err(|e| DistError::Tls(format!("leaf keygen: {e}")))?;
+    let leaf_key =
+        rcgen::KeyPair::generate().map_err(|e| DistError::Tls(format!("leaf keygen: {e}")))?;
     let leaf_cert = leaf_params
         .signed_by(&leaf_key, &ca.cert, &ca.keypair)
         .map_err(|e| DistError::Tls(format!("leaf sign: {e}")))?;
     let cert_der: CertificateDer<'static> = leaf_cert.der().clone();
-    let key_der: PrivateKeyDer<'static> =
-        PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into();
+    let key_der: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into();
 
     let cfg = TlsConfig::from_pem_bytes(
         vec![cert_der],

@@ -96,7 +96,8 @@ impl EchoEngine {
             return Err(map_status(rc));
         }
         buf.truncate(written);
-        String::from_utf8(buf).map_err(|_| EngineError::Internal("non-utf8 string from engine".into()))
+        String::from_utf8(buf)
+            .map_err(|_| EngineError::Internal("non-utf8 string from engine".into()))
     }
 }
 
@@ -393,23 +394,17 @@ where
 fn map_status(rc: i32) -> EngineError {
     match rc {
         ffi::GR_OK => EngineError::Internal("expected non-OK status".into()),
-        ffi::GR_ERR_NOT_INITIALIZED => {
-            EngineError::Internal("engine not initialized".into())
-        }
+        ffi::GR_ERR_NOT_INITIALIZED => EngineError::Internal("engine not initialized".into()),
         ffi::GR_ERR_INVALID_ISOLATE => EngineError::InvalidIsolate,
         ffi::GR_ERR_INVALID_MODULE => EngineError::InvalidModule,
-        ffi::GR_ERR_INVALID_FUNCTION => {
-            EngineError::Internal("invalid function handle".into())
-        }
+        ffi::GR_ERR_INVALID_FUNCTION => EngineError::Internal("invalid function handle".into()),
         ffi::GR_ERR_CALLBACK_DUPLICATE => EngineError::CallbackAlreadyRegistered {
             name: "<unknown>".into(),
         },
         ffi::GR_ERR_CALLBACK_NOT_FOUND => EngineError::CallbackNotFound {
             name: "<unknown>".into(),
         },
-        ffi::GR_ERR_BUFFER_TOO_SMALL => {
-            EngineError::Internal("buffer too small".into())
-        }
+        ffi::GR_ERR_BUFFER_TOO_SMALL => EngineError::Internal("buffer too small".into()),
         other => EngineError::Internal(format!("engine returned status {other}")),
     }
 }

@@ -451,7 +451,12 @@ mod tests {
         let upper: f64 = (0..8)
             .map(|i| (0..8).map(|j| a[(i, j)] * a[(i, j)]).sum::<f64>())
             .sum();
-        assert!((m.objective - upper).abs() < 1e-6, "{} vs {}", m.objective, upper);
+        assert!(
+            (m.objective - upper).abs() < 1e-6,
+            "{} vs {}",
+            m.objective,
+            upper
+        );
     }
 
     #[test]
@@ -530,5 +535,4 @@ mod tests {
             .sum();
         assert!((m.objective - upper).abs() < 1e-6);
     }
-
 }

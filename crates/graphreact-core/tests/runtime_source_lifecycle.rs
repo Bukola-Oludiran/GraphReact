@@ -78,7 +78,11 @@ fn source_stop_fires_when_owning_node_unmounts() {
         .expect("register");
 
     scheduler.process_batch().expect("first batch");
-    assert_eq!(starts.load(Ordering::SeqCst), 1, "source.start fired once on initial mount");
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "source.start fired once on initial mount"
+    );
     assert_eq!(stops.load(Ordering::SeqCst), 0, "no stop yet");
 
     scheduler.unmount(key);

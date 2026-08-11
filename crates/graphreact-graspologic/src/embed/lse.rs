@@ -178,8 +178,7 @@ mod tests {
         let a = adjacency_matrix(&g, "weight");
         let l = to_laplacian(a.as_ref(), LaplacianForm::Dad, None).expect("ok");
         let from_matrix =
-            laplacian_spectral_embed_matrix(l.as_ref(), Some(2), 1, Some(false))
-                .expect("ok");
+            laplacian_spectral_embed_matrix(l.as_ref(), Some(2), 1, Some(false)).expect("ok");
         for (a, b) in from_graph
             .singular_values
             .iter()

@@ -95,15 +95,12 @@ fn write_cluster_pem(dir: &std::path::Path) -> ClusterPemPaths {
     let ca_path = dir.join("cluster-ca.pem");
     std::fs::write(&ca_path, ca_pem).expect("write ca pem");
 
-    let mut params =
-        rcgen::CertificateParams::new(vec!["alice".into()]).expect("leaf params");
+    let mut params = rcgen::CertificateParams::new(vec!["alice".into()]).expect("leaf params");
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         "alice".to_string().try_into().expect("san"),
     ));
     let kp = rcgen::KeyPair::generate().expect("leaf keygen");
-    let cert = params
-        .signed_by(&kp, &ca_cert, &ca_kp)
-        .expect("leaf sign");
+    let cert = params.signed_by(&kp, &ca_cert, &ca_kp).expect("leaf sign");
     let cert_pem = cert.pem();
     let key_pem = kp.serialize_pem();
     let alice_cert = dir.join("alice-cert.pem");
@@ -147,8 +144,8 @@ fn dial_observer_capture_cert(
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(client_cfg));
         let tcp = TcpStream::connect(addr).await.expect("tcp connect");
-        let dns_name = rustls::pki_types::ServerName::try_from(sni.to_string())
-            .expect("sni parses");
+        let dns_name =
+            rustls::pki_types::ServerName::try_from(sni.to_string()).expect("sni parses");
         let tls = connector
             .connect(dns_name, tcp)
             .await
@@ -175,10 +172,7 @@ fn dial_observer_capture_cert(
 /// the prior 200ms-sleep race window). Returns the observer's
 /// bound socket addr once all three are seen. Each line passes
 /// through to stderr for test-driver triage.
-fn wait_for_observer_ready(
-    child: &mut std::process::Child,
-    deadline: Duration,
-) -> SocketAddr {
+fn wait_for_observer_ready(child: &mut std::process::Child, deadline: Duration) -> SocketAddr {
     let stdout = child.stdout.take().expect("daemon stdout");
     let reader = BufReader::new(stdout);
     let start = Instant::now();
@@ -326,17 +320,12 @@ fn grx_daemon_sighup_swaps_observer_cert_subprocess() {
     // assertion below proves the negative: dialing with CA A
     // post-rotation panics inside `dial_observer_capture_cert`
     // because the server now serves cert B signed by CA B.
-    let _observed_a = dial_observer_capture_cert(
-        observer_addr,
-        &observer_pair_a.sni,
-        &observer_pair_a.ca_der,
-    );
+    let _observed_a =
+        dial_observer_capture_cert(observer_addr, &observer_pair_a.sni, &observer_pair_a.ca_der);
 
     // Overwrite cert + key files with cert B material.
-    std::fs::copy(&observer_pair_b.cert_path, &observer_cert_path)
-        .expect("overwrite cert B");
-    std::fs::copy(&observer_pair_b.key_path, &observer_key_path)
-        .expect("overwrite key B");
+    std::fs::copy(&observer_pair_b.cert_path, &observer_cert_path).expect("overwrite cert B");
+    std::fs::copy(&observer_pair_b.key_path, &observer_key_path).expect("overwrite key B");
 
     // Fire the signal.
     let pid = child.id();
@@ -354,11 +343,7 @@ fn grx_daemon_sighup_swaps_observer_cert_subprocess() {
         // we wrap it in catch_unwind. The helper is panic-only;
         // any handshake error panics through the `.expect()`.
         let attempt = std::panic::catch_unwind(|| {
-            dial_observer_capture_cert(
-                observer_addr,
-                &observer_pair_b.sni,
-                &observer_pair_b.ca_der,
-            )
+            dial_observer_capture_cert(observer_addr, &observer_pair_b.sni, &observer_pair_b.ca_der)
         });
         if attempt.is_ok() {
             break true;
@@ -379,11 +364,7 @@ fn grx_daemon_sighup_swaps_observer_cert_subprocess() {
     // B; the client trusts only CA A, so webpki rejects the
     // chain). Catch the panic so the test reports cleanly.
     let neg = std::panic::catch_unwind(|| {
-        dial_observer_capture_cert(
-            observer_addr,
-            &observer_pair_a.sni,
-            &observer_pair_a.ca_der,
-        )
+        dial_observer_capture_cert(observer_addr, &observer_pair_a.sni, &observer_pair_a.ca_der)
     });
     assert!(
         neg.is_err(),

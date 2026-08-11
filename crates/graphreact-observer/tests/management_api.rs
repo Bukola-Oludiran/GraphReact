@@ -16,8 +16,7 @@ use std::sync::Arc;
 
 use graphreact_core::telemetry::{NodeIntrospection, SupervisorIntrospection};
 use graphreact_observer::{
-    spawn_management_api, ApiServerHandle, BearerToken, BindConfig, MetricsInner,
-    SnapshotRequest,
+    spawn_management_api, ApiServerHandle, BearerToken, BindConfig, MetricsInner, SnapshotRequest,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -26,16 +25,16 @@ use tokio::task::JoinHandle;
 /// Spawn the management API + a test drain loop that replies with
 /// fixed fixture data. Returns the server handle (caller awaits
 /// `.shutdown()`) + the drain task handle (for graceful teardown).
-async fn spawn_with_fixture(
-    token: Option<&[u8]>,
-) -> (ApiServerHandle, JoinHandle<()>) {
+async fn spawn_with_fixture(token: Option<&[u8]>) -> (ApiServerHandle, JoinHandle<()>) {
     let metrics = Arc::new(MetricsInner::new());
     let bind = BindConfig {
         addr: "127.0.0.1:0".parse().unwrap(),
         token: token.map(|t| BearerToken::from_bytes(t.to_vec()).unwrap()),
         tls: None,
     };
-    let mut server = spawn_management_api(bind, metrics, 1234).await.expect("spawn");
+    let mut server = spawn_management_api(bind, metrics, 1234)
+        .await
+        .expect("spawn");
     // Move the receiver out of `server` for the drain loop. We
     // rebuild the handle without the receiver so `server.shutdown()`
     // still joins the accept-loop task at end of test.
@@ -117,11 +116,8 @@ async fn healthz_bypasses_auth_and_returns_ok() {
 #[tokio::test]
 async fn readyz_503_before_first_batch_tick() {
     let (server, _drain) = spawn_with_fixture(Some(b"top-secret")).await;
-    let (status, body) = http_get_with_headers(
-        &format!("http://{}/v1/readyz", server.local_addr),
-        None,
-    )
-    .await;
+    let (status, body) =
+        http_get_with_headers(&format!("http://{}/v1/readyz", server.local_addr), None).await;
     assert_eq!(status.code, 503);
     assert!(
         body.contains("scheduler_first_batch_pending"),
@@ -156,26 +152,19 @@ async fn readyz_200_after_first_batch_tick() {
     // drainer so the bridge channel doesn't fill up under any
     // accidental upstream request.
     let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
-    let _drain: JoinHandle<()> = tokio::spawn(async move {
-        while snapshot_rx.recv().await.is_some() {}
-    });
+    let _drain: JoinHandle<()> =
+        tokio::spawn(async move { while snapshot_rx.recv().await.is_some() {} });
 
     // 503 before any tick.
-    let (status, _) = http_get_with_headers(
-        &format!("http://{}/v1/readyz", server.local_addr),
-        None,
-    )
-    .await;
+    let (status, _) =
+        http_get_with_headers(&format!("http://{}/v1/readyz", server.local_addr), None).await;
     assert_eq!(status.code, 503);
 
     // Simulate the first scheduler tick_end (any duration > 0 works).
     metrics.process_batch_duration.observe(100_000);
 
-    let (status, body) = http_get_with_headers(
-        &format!("http://{}/v1/readyz", server.local_addr),
-        None,
-    )
-    .await;
+    let (status, body) =
+        http_get_with_headers(&format!("http://{}/v1/readyz", server.local_addr), None).await;
     assert_eq!(status.code, 200);
     assert!(body.contains("ready"));
     server.shutdown().await;
@@ -193,17 +182,13 @@ async fn readyz_503_after_audit_sink_write_failure() {
         .await
         .expect("spawn");
     let mut snapshot_rx = std::mem::replace(&mut server.snapshot_rx, mpsc::channel(1).1);
-    let _drain: JoinHandle<()> = tokio::spawn(async move {
-        while snapshot_rx.recv().await.is_some() {}
-    });
+    let _drain: JoinHandle<()> =
+        tokio::spawn(async move { while snapshot_rx.recv().await.is_some() {} });
     metrics.process_batch_duration.observe(100_000);
 
     metrics.audit_sink_write_failures_inc("write");
-    let (status, body) = http_get_with_headers(
-        &format!("http://{}/v1/readyz", server.local_addr),
-        None,
-    )
-    .await;
+    let (status, body) =
+        http_get_with_headers(&format!("http://{}/v1/readyz", server.local_addr), None).await;
     assert_eq!(status.code, 503);
     assert_eq!(status.retry_after.as_deref(), Some("1"));
     assert_eq!(body, "audit_sink_failed");
@@ -220,11 +205,8 @@ async fn readyz_bypasses_auth_when_token_required() {
     // (verified by `protected_routes_return_401_when_token_missing`);
     // /readyz must still return a probe response (503 because no
     // tick has fired in this fixture).
-    let (status, _body) = http_get_with_headers(
-        &format!("http://{}/v1/readyz", server.local_addr),
-        None,
-    )
-    .await;
+    let (status, _body) =
+        http_get_with_headers(&format!("http://{}/v1/readyz", server.local_addr), None).await;
     assert_eq!(status.code, 503, "expected 503-not-401: auth must bypass");
     server.shutdown().await;
 }
@@ -232,8 +214,7 @@ async fn readyz_bypasses_auth_when_token_required() {
 #[tokio::test]
 async fn identity_returns_process_start_id_and_version() {
     let (server, _drain) = spawn_with_fixture(None).await;
-    let (status, body) =
-        http_get(&format!("http://{}/v1/identity", server.local_addr), None).await;
+    let (status, body) = http_get(&format!("http://{}/v1/identity", server.local_addr), None).await;
     assert_eq!(status, 200);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["process_start_id"], 1234);
@@ -245,8 +226,7 @@ async fn identity_returns_process_start_id_and_version() {
 #[tokio::test]
 async fn nodes_list_returns_array_of_introspections() {
     let (server, _drain) = spawn_with_fixture(None).await;
-    let (status, body) =
-        http_get(&format!("http://{}/v1/nodes", server.local_addr), None).await;
+    let (status, body) = http_get(&format!("http://{}/v1/nodes", server.local_addr), None).await;
     assert_eq!(status, 200);
     let v: Value = serde_json::from_str(&body).unwrap();
     let arr = v.as_array().unwrap();
@@ -259,8 +239,11 @@ async fn nodes_list_returns_array_of_introspections() {
 #[tokio::test]
 async fn node_detail_with_known_id_returns_object() {
     let (server, _drain) = spawn_with_fixture(None).await;
-    let (status, body) =
-        http_get(&format!("http://{}/v1/nodes/alpha", server.local_addr), None).await;
+    let (status, body) = http_get(
+        &format!("http://{}/v1/nodes/alpha", server.local_addr),
+        None,
+    )
+    .await;
     assert_eq!(status, 200);
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["id"], "alpha");
@@ -271,8 +254,11 @@ async fn node_detail_with_known_id_returns_object() {
 #[tokio::test]
 async fn node_detail_with_unknown_id_returns_404() {
     let (server, _drain) = spawn_with_fixture(None).await;
-    let (status, _body) =
-        http_get(&format!("http://{}/v1/nodes/nonexistent", server.local_addr), None).await;
+    let (status, _body) = http_get(
+        &format!("http://{}/v1/nodes/nonexistent", server.local_addr),
+        None,
+    )
+    .await;
     assert_eq!(status, 404);
     server.shutdown().await;
 }
@@ -297,8 +283,7 @@ async fn supervisor_tree_returns_array_with_strategy() {
 #[tokio::test]
 async fn metrics_route_returns_prometheus_text() {
     let (server, _drain) = spawn_with_fixture(None).await;
-    let (status, body) =
-        http_get(&format!("http://{}/v1/metrics", server.local_addr), None).await;
+    let (status, body) = http_get(&format!("http://{}/v1/metrics", server.local_addr), None).await;
     assert_eq!(status, 200);
     assert!(body.contains("# TYPE grx_node_mount_total counter"));
     server.shutdown().await;
@@ -307,7 +292,12 @@ async fn metrics_route_returns_prometheus_text() {
 #[tokio::test]
 async fn protected_routes_return_401_when_token_missing() {
     let (server, _drain) = spawn_with_fixture(Some(b"the-token")).await;
-    for path in ["/v1/identity", "/v1/metrics", "/v1/nodes", "/v1/supervisor/tree"] {
+    for path in [
+        "/v1/identity",
+        "/v1/metrics",
+        "/v1/nodes",
+        "/v1/supervisor/tree",
+    ] {
         let (status, _body) =
             http_get(&format!("http://{}{}", server.local_addr, path), None).await;
         assert_eq!(status, 401, "{path} expected 401 without token");
@@ -387,9 +377,8 @@ async fn http_get_with_headers(
         Some(a) => format!("Authorization: {a}\r\n"),
         None => String::new(),
     };
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{auth_line}\r\n"
-    );
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{auth_line}\r\n");
     stream.write_all(req.as_bytes()).await.expect("send req");
 
     let mut response = Vec::new();
@@ -436,9 +425,8 @@ async fn http_get(url: &str, authorization: Option<&str>) -> (u16, String) {
         Some(a) => format!("Authorization: {a}\r\n"),
         None => String::new(),
     };
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{auth_line}\r\n"
-    );
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n{auth_line}\r\n");
     stream.write_all(req.as_bytes()).await.expect("send req");
 
     let mut response = Vec::new();

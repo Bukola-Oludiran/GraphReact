@@ -206,10 +206,8 @@ mod tests {
 
     #[test]
     fn from_env_rejects_unset() {
-        let err = BearerToken::from_env(
-            "GRX_OBSERVER_TEST_TOKEN_DEFINITELY_UNSET_ZNXBVKQR",
-        )
-        .unwrap_err();
+        let err =
+            BearerToken::from_env("GRX_OBSERVER_TEST_TOKEN_DEFINITELY_UNSET_ZNXBVKQR").unwrap_err();
         assert!(matches!(err, AuthError::Env { .. }));
     }
 

@@ -3,7 +3,9 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use graphreact_grx_parser::parser::Parser;
-use graphreact_lsp::completion::{build_completions, classify_completion_context, CompletionContext};
+use graphreact_lsp::completion::{
+    build_completions, classify_completion_context, CompletionContext,
+};
 use tower_lsp_server::ls_types::Position;
 
 #[test]
@@ -16,7 +18,10 @@ fn tag_completion_pulls_open_vocab_tags_from_ir() {
     let pos = Position::new(1, 1);
     let items = build_completions(&file, &probe, pos);
     let names: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
-    assert!(names.iter().any(|n| n == "Counter"), "expected Counter; got {names:?}");
+    assert!(
+        names.iter().any(|n| n == "Counter"),
+        "expected Counter; got {names:?}"
+    );
     assert!(names.iter().any(|n| n == "Logger"), "expected Logger");
     // Built-ins from the static catalog also appear.
     assert!(names.iter().any(|n| n == "Graph"));
@@ -32,7 +37,10 @@ fn attribute_completion_returns_per_tag_attrs() {
     assert!(matches!(ctx, CompletionContext::AttributeName { ref tag } if tag == "Graph"));
     let items = build_completions(&file, src, pos);
     let names: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
-    assert!(names.iter().any(|n| n == "id"), "expected id; got {names:?}");
+    assert!(
+        names.iter().any(|n| n == "id"),
+        "expected id; got {names:?}"
+    );
 }
 
 #[test]

@@ -120,8 +120,10 @@ fn stress_100_isolates_1k_messages() {
     // register_callback) under the contention from no other thread
     // — a serial baseline that tells us those paths complete cleanly
     // at 100x repetition before the hot loop starts.
-    let mut isos_funcs: Vec<(graphreact_engine_zig::IsolateHandle, graphreact_engine_zig::FunctionHandle)> =
-        Vec::with_capacity(N_ISOLATES);
+    let mut isos_funcs: Vec<(
+        graphreact_engine_zig::IsolateHandle,
+        graphreact_engine_zig::FunctionHandle,
+    )> = Vec::with_capacity(N_ISOLATES);
     for _ in 0..N_ISOLATES {
         let iso = engine
             .create_isolate(IsolateOptions::default())

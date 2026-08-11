@@ -146,8 +146,7 @@ mod tests {
         // Compile-test: must be able to store any Discovery impl
         // behind `Arc<dyn Discovery>`. Higher layers (M14.4+) need
         // this for the cluster config.
-        let _: std::sync::Arc<dyn Discovery> =
-            std::sync::Arc::new(StaticDiscovery::default());
+        let _: std::sync::Arc<dyn Discovery> = std::sync::Arc::new(StaticDiscovery::default());
         let _: std::sync::Arc<dyn Discovery> = std::sync::Arc::new(DnsDiscovery::new(9700));
     }
 }

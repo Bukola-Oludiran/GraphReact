@@ -102,7 +102,9 @@ impl std::fmt::Debug for SecretCookie {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print cookie contents — even Debug-derived logs go
         // to stderr / panics / crashdumps.
-        f.debug_struct("SecretCookie").field("bytes", &"<redacted>").finish()
+        f.debug_struct("SecretCookie")
+            .field("bytes", &"<redacted>")
+            .finish()
     }
 }
 

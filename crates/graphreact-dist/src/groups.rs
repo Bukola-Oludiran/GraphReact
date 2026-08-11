@@ -216,7 +216,11 @@ pub struct DistGroups {
 }
 
 impl DistGroups {
-    pub fn new(scheduler_handle: SchedulerHandle, registry: NodeRegistry, our_name: String) -> Self {
+    pub fn new(
+        scheduler_handle: SchedulerHandle,
+        registry: NodeRegistry,
+        our_name: String,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(FxHashMap::default()),
@@ -251,14 +255,7 @@ impl DistGroups {
     /// Apply an inbound state record. Returns `true` if the
     /// record was newer than what we had and the map mutated;
     /// `false` if it was an out-of-order duplicate.
-    fn upsert(
-        &self,
-        group: &str,
-        member: &str,
-        present: bool,
-        lamport: u64,
-        origin: &str,
-    ) -> bool {
+    fn upsert(&self, group: &str, member: &str, present: bool, lamport: u64, origin: &str) -> bool {
         let mut state = self.inner.state.lock();
         let key = (group.to_string(), member.to_string());
         match state.get(&key) {
@@ -503,8 +500,7 @@ impl DistGroups {
         // sender just told us via `pkt.vc`). Falling back to the
         // sender's own Lamport when the vc doesn't carry the
         // origin (e.g. self-relay) is acceptable.
-        let pkt_vc: FxHashMap<String, u64> =
-            pkt.vc.iter().cloned().collect();
+        let pkt_vc: FxHashMap<String, u64> = pkt.vc.iter().cloned().collect();
         let mut snapshot_set: FxHashSet<(String, String)> = FxHashSet::default();
         for (group, members) in &pkt.groups {
             for member in members {
@@ -617,8 +613,7 @@ impl DistGroups {
         // we know who delivered this packet to us). Append
         // our_name to `visited_peers` and ship the updated
         // PgBroadcast to each downstream peer.
-        let mut visited: FxHashSet<&str> =
-            pkt.visited_peers.iter().map(String::as_str).collect();
+        let mut visited: FxHashSet<&str> = pkt.visited_peers.iter().map(String::as_str).collect();
         visited.insert(peer_name);
         let our_name = self.inner.our_name.as_str();
         let peers_with_members = self.peers_with_members(&pkt.group);
@@ -776,15 +771,11 @@ fn best_effort_send(
     match tx.try_send(packet) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
-            tracing::warn!(
-                "dist groups: outbound channel full to `{peer_name}`; dropping {ty:?}"
-            );
+            tracing::warn!("dist groups: outbound channel full to `{peer_name}`; dropping {ty:?}");
             false
         }
         Err(TrySendError::Closed(_)) => {
-            tracing::debug!(
-                "dist groups: peer `{peer_name}` channel closed; dropping {ty:?}"
-            );
+            tracing::debug!("dist groups: peer `{peer_name}` channel closed; dropping {ty:?}");
             false
         }
     }
@@ -796,20 +787,16 @@ fn _unused_message_type_assertion(_m: Message) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node_id::Creation;
     use crate::node_id::NodeId;
     use crate::registry::PeerHandle;
-    use crate::node_id::Creation;
     use graphreact_core::Scheduler;
     use tokio::sync::mpsc;
 
     fn fresh() -> (DistGroups, NodeRegistry) {
         let scheduler = Scheduler::default();
         let registry = NodeRegistry::new();
-        let groups = DistGroups::new(
-            scheduler.handle(),
-            registry.clone(),
-            "alice".to_string(),
-        );
+        let groups = DistGroups::new(scheduler.handle(), registry.clone(), "alice".to_string());
         (groups, registry)
     }
 
@@ -864,7 +851,11 @@ mod tests {
                 vc: vec![("bob".to_string(), 3)],
             },
         );
-        assert_eq!(groups.member_count("workers"), 1, "stale Leave should be rejected");
+        assert_eq!(
+            groups.member_count("workers"),
+            1,
+            "stale Leave should be rejected"
+        );
         // Newer Leave — wins.
         groups.handle_pg_leave(
             "bob",
@@ -1022,7 +1013,10 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert_eq!(received, 5, "all 5 buffered PgJoin packets should ship after debounce");
+        assert_eq!(
+            received, 5,
+            "all 5 buffered PgJoin packets should ship after debounce"
+        );
 
         // Buffer is now empty.
         assert_eq!(groups.pending_ops_count(), 0);

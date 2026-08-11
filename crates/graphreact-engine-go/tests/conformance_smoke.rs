@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use graphreact_engine_go::{GoEngine, __test_callback_registry_contains};
+use graphreact_engine_go::{__test_callback_registry_contains, GoEngine};
 use graphreact_engine_zig::{
     BoxCallback, Engine, EngineError, EngineResult, FunctionHandle, HostValue, IsolateHandle,
     IsolateOptions, ModuleHandle,
@@ -61,7 +61,8 @@ fn run_all() -> Result<(), String> {
 fn scenario_loads_and_reports_abi_version() -> Result<(), String> {
     eprintln!("[1/12] loads_artifact_and_reports_abi_version");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     e.shutdown().map_err(|err| format!("shutdown: {err:?}"))?;
     Ok(())
 }
@@ -69,7 +70,8 @@ fn scenario_loads_and_reports_abi_version() -> Result<(), String> {
 fn scenario_create_and_dispose_isolate() -> Result<(), String> {
     eprintln!("[2/12] create_and_dispose_isolate");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let iso = e
         .create_isolate(IsolateOptions::default())
         .map_err(|err| format!("create_isolate: {err:?}"))?;
@@ -82,7 +84,8 @@ fn scenario_create_and_dispose_isolate() -> Result<(), String> {
 fn scenario_eval_module_resolve_and_call_add() -> Result<(), String> {
     eprintln!("[3/12] eval_module_resolve_and_call_add");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let iso = e
         .create_isolate(IsolateOptions::default())
         .map_err(|err| format!("create_isolate: {err:?}"))?;
@@ -93,11 +96,7 @@ fn scenario_eval_module_resolve_and_call_add() -> Result<(), String> {
         .resolve_function(iso, module, "Add")
         .map_err(|err| format!("resolve Add: {err:?}"))?;
     let result = e
-        .call_function(
-            iso,
-            func,
-            &[HostValue::Number(2.0), HostValue::Number(3.0)],
-        )
+        .call_function(iso, func, &[HostValue::Number(2.0), HostValue::Number(3.0)])
         .map_err(|err| format!("call Add(2,3): {err:?}"))?;
     let HostValue::Number(n) = result else {
         return Err(format!("expected Number, got {result:?}"));
@@ -114,7 +113,8 @@ fn scenario_eval_module_resolve_and_call_add() -> Result<(), String> {
 fn scenario_register_callback_round_trips() -> Result<(), String> {
     eprintln!("[4/12] register_callback_round_trips");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let iso = e
         .create_isolate(IsolateOptions::default())
         .map_err(|err| format!("create_isolate: {err:?}"))?;
@@ -160,7 +160,8 @@ fn scenario_register_callback_round_trips() -> Result<(), String> {
 fn scenario_initialize_and_shutdown_idempotent() -> Result<(), String> {
     eprintln!("[1b/12] initialize_and_shutdown_idempotent");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize 1: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize 1: {err:?}"))?;
     e.initialize()
         .map_err(|err| format!("initialize 2 (idempotent): {err:?}"))?;
     e.shutdown().map_err(|err| format!("shutdown 1: {err:?}"))?;
@@ -172,7 +173,8 @@ fn scenario_initialize_and_shutdown_idempotent() -> Result<(), String> {
 fn scenario_bad_isolate_handle_rejected() -> Result<(), String> {
     eprintln!("[2b/12] bad_isolate_handle_rejected");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let bad = IsolateHandle(999_999);
     let module_result = e.eval_module(bad, "calculator", "calculator");
     if !matches!(module_result, Err(EngineError::InvalidIsolate)) {
@@ -218,7 +220,8 @@ fn scenario_bad_isolate_handle_rejected() -> Result<(), String> {
 fn scenario_register_duplicate_callback_rejected() -> Result<(), String> {
     eprintln!("[4b/12] register_duplicate_callback_rejected");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let iso = e
         .create_isolate(IsolateOptions::default())
         .map_err(|err| format!("create_isolate: {err:?}"))?;
@@ -237,7 +240,8 @@ fn scenario_register_duplicate_callback_rejected() -> Result<(), String> {
         ));
     }
 
-    e.dispose_isolate(iso).map_err(|err| format!("dispose: {err:?}"))?;
+    e.dispose_isolate(iso)
+        .map_err(|err| format!("dispose: {err:?}"))?;
     e.shutdown().map_err(|err| format!("shutdown: {err:?}"))?;
     Ok(())
 }
@@ -245,7 +249,8 @@ fn scenario_register_duplicate_callback_rejected() -> Result<(), String> {
 fn scenario_dispose_drains_callback_registry() -> Result<(), String> {
     eprintln!("[4c/12] dispose_drains_callback_registry");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let iso = e
         .create_isolate(IsolateOptions::default())
         .map_err(|err| format!("create_isolate: {err:?}"))?;
@@ -255,7 +260,10 @@ fn scenario_dispose_drains_callback_registry() -> Result<(), String> {
         .register_callback(iso, "drain_me", cb)
         .map_err(|err| format!("register: {err:?}"))?;
     if !__test_callback_registry_contains(id.0) {
-        return Err(format!("callback id {} not in registry post-register", id.0));
+        return Err(format!(
+            "callback id {} not in registry post-register",
+            id.0
+        ));
     }
 
     e.dispose_isolate(iso)
@@ -274,7 +282,8 @@ fn scenario_dispose_drains_callback_registry() -> Result<(), String> {
 fn scenario_large_payload_grows_buffer() -> Result<(), String> {
     eprintln!("[5b/12] large_payload_grows_buffer");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let iso = e
         .create_isolate(IsolateOptions::default())
         .map_err(|err| format!("create_isolate: {err:?}"))?;
@@ -306,7 +315,8 @@ fn scenario_large_payload_grows_buffer() -> Result<(), String> {
 fn scenario_large_payload_cap_exceeded_errors() -> Result<(), String> {
     eprintln!("[5c/12] large_payload_cap_exceeded_errors");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let iso = e
         .create_isolate(IsolateOptions::default())
         .map_err(|err| format!("create_isolate: {err:?}"))?;
@@ -327,9 +337,7 @@ fn scenario_large_payload_cap_exceeded_errors() -> Result<(), String> {
         ));
     };
     if !msg.contains("1 MiB") {
-        return Err(format!(
-            "expected '1 MiB' in error message, got: {msg}"
-        ));
+        return Err(format!("expected '1 MiB' in error message, got: {msg}"));
     }
 
     e.dispose_isolate(iso)
@@ -341,7 +349,8 @@ fn scenario_large_payload_cap_exceeded_errors() -> Result<(), String> {
 fn scenario_large_callback_grows_trampoline_buffer() -> Result<(), String> {
     eprintln!("[5d/12] large_callback_grows_trampoline_buffer");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let iso = e
         .create_isolate(IsolateOptions::default())
         .map_err(|err| format!("create_isolate: {err:?}"))?;
@@ -373,10 +382,7 @@ fn scenario_large_callback_grows_trampoline_buffer() -> Result<(), String> {
         return Err(format!("expected String, got {result:?}"));
     };
     if s.len() != 6 * 1024 {
-        return Err(format!(
-            "expected 6 KiB echo, got {} bytes",
-            s.len()
-        ));
+        return Err(format!("expected 6 KiB echo, got {} bytes", s.len()));
     }
 
     e.dispose_isolate(iso)
@@ -388,7 +394,8 @@ fn scenario_large_callback_grows_trampoline_buffer() -> Result<(), String> {
 fn scenario_drain_microtasks_is_soft_no_op() -> Result<(), String> {
     eprintln!("[12/12] drain_microtasks_is_soft_no_op");
     let mut e = fresh_engine();
-    e.initialize().map_err(|err| format!("initialize: {err:?}"))?;
+    e.initialize()
+        .map_err(|err| format!("initialize: {err:?}"))?;
     let iso = e
         .create_isolate(IsolateOptions::default())
         .map_err(|err| format!("create_isolate: {err:?}"))?;

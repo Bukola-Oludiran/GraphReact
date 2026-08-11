@@ -20,7 +20,11 @@ async fn did_open_did_change_did_close_round_trip() {
 
     // didOpen
     store
-        .upsert(&uri, include_str!("fixtures/well-formed.grx").to_string(), 1)
+        .upsert(
+            &uri,
+            include_str!("fixtures/well-formed.grx").to_string(),
+            1,
+        )
         .await;
     let opened = store.get(&uri).await.expect("present after open");
     assert_eq!(opened.version, 1);

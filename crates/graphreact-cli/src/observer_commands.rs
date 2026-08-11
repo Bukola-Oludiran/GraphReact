@@ -135,7 +135,11 @@ pub async fn run_top(target: ObserverTarget, interval: u64) -> Result<(), Comman
             .map_err(map_err)?;
         let nodes: Vec<NodeRow> = serde_json::from_str(&nodes_body).map_err(map_serde)?;
 
-        println!("grx observer — target {} — interval {}s", tgt.host_port_display(), interval);
+        println!(
+            "grx observer — target {} — interval {}s",
+            tgt.host_port_display(),
+            interval
+        );
         println!("identity: {}", identity.trim());
         println!();
         println!("nodes ({}):", nodes.len());

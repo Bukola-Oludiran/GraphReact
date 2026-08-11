@@ -25,10 +25,10 @@ pub fn render(frame: &mut Frame<'_>, state: &ObserverState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // status bar
-            Constraint::Length(1),  // pane tabs
-            Constraint::Min(0),     // main pane area
-            Constraint::Length(1),  // hint bar
+            Constraint::Length(1), // status bar
+            Constraint::Length(1), // pane tabs
+            Constraint::Min(0),    // main pane area
+            Constraint::Length(1), // hint bar
         ])
         .split(frame.area());
 
@@ -48,7 +48,10 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &ObserverState) {
     let conn = match &state.connection {
         Connection::Connecting => "connecting…".to_string(),
         Connection::Connected => "connected".to_string(),
-        Connection::Disconnected { reason, retry_in_ms } => {
+        Connection::Disconnected {
+            reason,
+            retry_in_ms,
+        } => {
             format!("disconnected ({reason}; retry {retry_in_ms}ms)")
         }
     };
@@ -102,8 +105,7 @@ fn render_pane_tabs(frame: &mut Frame<'_>, area: Rect, pane: &Pane) {
 
 fn render_hint_bar(frame: &mut Frame<'_>, area: Rect, pane: &Pane) {
     frame.render_widget(
-        Paragraph::new(pane.keybind_hint())
-            .style(Style::default().add_modifier(Modifier::DIM)),
+        Paragraph::new(pane.keybind_hint()).style(Style::default().add_modifier(Modifier::DIM)),
         area,
     );
 }
@@ -131,15 +133,14 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, state: &ObserverState) {
 }
 
 fn render_tree(frame: &mut Frame<'_>, area: Rect, state: &ObserverState) {
-    let block = Block::default().title("Supervisor tree").borders(Borders::ALL);
+    let block = Block::default()
+        .title("Supervisor tree")
+        .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if state.supervisors.is_empty() {
-        frame.render_widget(
-            Paragraph::new("(no supervisors registered)"),
-            inner,
-        );
+        frame.render_widget(Paragraph::new("(no supervisors registered)"), inner);
         return;
     }
     let mut items: Vec<ListItem> = Vec::new();
@@ -206,12 +207,7 @@ fn render_nodes(frame: &mut Frame<'_>, area: Rect, state: &ObserverState) {
     frame.render_widget(Table::new(rows, widths).header(header), inner);
 }
 
-fn render_node_detail(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &ObserverState,
-    node_id: &str,
-) {
+fn render_node_detail(frame: &mut Frame<'_>, area: Rect, state: &ObserverState, node_id: &str) {
     let block = Block::default()
         .title(format!("Node {node_id}"))
         .borders(Borders::ALL);
@@ -226,10 +222,7 @@ fn render_node_detail(
         return;
     };
     let supervisor = node.supervisor.as_deref().unwrap_or("-");
-    let recent_count = state
-        .recent_messages
-        .get(node_id)
-        .map_or(0, Vec::len);
+    let recent_count = state.recent_messages.get(node_id).map_or(0, Vec::len);
     let lines = vec![
         Line::from(format!("id:         {}", node.id)),
         Line::from(format!("role:       {}", node.role)),
@@ -245,12 +238,7 @@ fn render_node_detail(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_trace(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &ObserverState,
-    node_id: Option<&str>,
-) {
+fn render_trace(frame: &mut Frame<'_>, area: Rect, state: &ObserverState, node_id: Option<&str>) {
     let title = match node_id {
         Some(id) => format!("Trace ({id})"),
         None => "Trace (drill into a node and press `t` to tail)".to_string(),

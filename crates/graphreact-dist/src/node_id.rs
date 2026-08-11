@@ -90,7 +90,10 @@ impl std::str::FromStr for NodeId {
                 if idx == s.len() - 1 {
                     return Err(NodeIdParseError::EmptyHost(s.to_string()));
                 }
-                Ok(Self { full: s.to_string(), at_offset: idx })
+                Ok(Self {
+                    full: s.to_string(),
+                    at_offset: idx,
+                })
             }
             _ => Err(NodeIdParseError::BadSeparator(s.to_string())),
         }
