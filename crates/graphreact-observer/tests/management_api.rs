@@ -91,7 +91,10 @@ async fn spawn_with_fixture(token: Option<&[u8]>) -> (ApiServerHandle, JoinHandl
                 SnapshotRequest::InjectMessage { .. }
                 | SnapshotRequest::InjectMessageWithReply { .. }
                 | SnapshotRequest::InjectMessageBulkLine { .. }
-                | SnapshotRequest::DelegatedRestart { .. } => {}
+                | SnapshotRequest::DelegatedRestart { .. }
+                | SnapshotRequest::StartDurableRun { .. }
+                | SnapshotRequest::GetDurableRun { .. }
+                | SnapshotRequest::CancelDurableRun { .. } => {}
             }
         }
     });

@@ -151,6 +151,51 @@ pub enum SnapshotRequest {
         token_id: String,
         oneshot_tx: oneshot::Sender<DelegatedRestartDispatchResult>,
     },
+    StartDurableRun {
+        entrypoint: String,
+        payload: Value,
+        idempotency_key: String,
+        oneshot_tx: oneshot::Sender<DurableRunBridgeResult>,
+    },
+    GetDurableRun {
+        run_id: String,
+        oneshot_tx: oneshot::Sender<DurableRunBridgeResult>,
+    },
+    CancelDurableRun {
+        run_id: String,
+        oneshot_tx: oneshot::Sender<DurableRunBridgeResult>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DurableRunView {
+    pub run_id: String,
+    pub entrypoint: String,
+    pub status: String,
+    pub created_at_ms: u64,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum DurableRunBridgeResult {
+    Ready {
+        run: DurableRunView,
+        created: Option<bool>,
+    },
+    NotFound,
+    IdempotencyConflict,
+    UnknownEntrypoint,
+    Terminal,
+    DurabilityDisabled,
+    Failed(String),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StartDurableRunBody {
+    pub entrypoint: String,
+    #[serde(default)]
+    pub payload: Value,
 }
 
 /// Immediate originator-side disposition for the delegated-restart
@@ -696,16 +741,19 @@ pub const DEFAULT_RATE_LIMIT_PER_TOKEN_BURST: u32 = 40;
 /// route match happens), so `MatchedPath` is NOT in extensions on
 /// the request path. Instead, the middleware uses
 /// [`classify_protected_path`] which performs a small fixed-shape
-/// match against the 12 known patterns + an `unknown` sentinel for
+/// match against the 15 known patterns + an `unknown` sentinel for
 /// anything outside the table (e.g. an operator typoing `/v1/foo`).
 ///
-/// Cardinality bound is exactly `12 + 1 = 13` for the rate-limit
+/// Cardinality bound is exactly `15 + 1 = 16` for the rate-limit
 /// metric family — well under the conventional Prometheus
 /// per-family soft cap of ~10k.
 pub const PROTECTED_ROUTE_LABELS: &[&str] = &[
     "/v1/admin/cluster/delegated-restart",
     "/v1/identity",
     "/v1/metrics",
+    "/v1/runs",
+    "/v1/runs/:run_id",
+    "/v1/runs/:run_id/cancel",
     "/v1/nodes",
     "/v1/nodes/:id",
     "/v1/nodes/:id/messages",
@@ -735,6 +783,7 @@ pub fn classify_protected_path(path: &str) -> &'static str {
         "/v1/admin/cluster/delegated-restart" => "/v1/admin/cluster/delegated-restart",
         "/v1/identity" => "/v1/identity",
         "/v1/metrics" => "/v1/metrics",
+        "/v1/runs" => "/v1/runs",
         "/v1/nodes" => "/v1/nodes",
         "/v1/supervisor/tree" => "/v1/supervisor/tree",
         "/v1/observer/events" => "/v1/observer/events",
@@ -759,6 +808,19 @@ pub fn classify_protected_path(path: &str) -> &'static str {
                 "unknown"
             } else {
                 "/v1/nodes/:id"
+            }
+        }
+        p if p.starts_with("/v1/runs/") => {
+            let tail = &p["/v1/runs/".len()..];
+            if !tail.is_empty() && !tail.contains('/') {
+                "/v1/runs/:run_id"
+            } else if tail
+                .strip_suffix("/cancel")
+                .is_some_and(|run_id| !run_id.is_empty() && !run_id.contains('/'))
+            {
+                "/v1/runs/:run_id/cancel"
+            } else {
+                "unknown"
             }
         }
         _ => "unknown",
@@ -1297,6 +1359,9 @@ pub fn build_router_with_rate_limit_and_proxies(
         )
         .route("/v1/identity", get(identity))
         .route("/v1/metrics", get(metrics))
+        .route("/v1/runs", post(start_durable_run_handler))
+        .route("/v1/runs/:run_id", get(get_durable_run_handler))
+        .route("/v1/runs/:run_id/cancel", post(cancel_durable_run_handler))
         .route("/v1/nodes", get(nodes_list))
         .route("/v1/nodes/:id", get(node_detail))
         .route("/v1/nodes/:id/messages/recent", get(node_messages_recent))
@@ -2364,6 +2429,179 @@ async fn metrics(State(state): State<ApiState>) -> Response {
             "text/plain; version=0.0.4; charset=utf-8",
         )],
         body,
+    )
+        .into_response()
+}
+
+async fn start_durable_run_handler(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<StartDurableRunBody>,
+) -> Response {
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
+        return drain_in_progress_response();
+    }
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return durable_run_error(
+            StatusCode::BAD_REQUEST,
+            "missing_idempotency_key",
+            "Idempotency-Key is required",
+        );
+    };
+    if body.entrypoint.trim().is_empty() {
+        return durable_run_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_entrypoint",
+            "entrypoint must not be empty",
+        );
+    }
+
+    let _inflight = state.ingress_in_flight.enter();
+    let (tx, rx) = oneshot::channel();
+    let request = SnapshotRequest::StartDurableRun {
+        entrypoint: body.entrypoint,
+        payload: body.payload,
+        idempotency_key: idempotency_key.to_owned(),
+        oneshot_tx: tx,
+    };
+    match state.snapshot_tx.try_send(request) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => return bridge_saturated_response(),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return service_unavailable("scheduler bridge closed");
+        }
+    }
+    match rx.await {
+        Ok(DurableRunBridgeResult::Ready {
+            run,
+            created: Some(created),
+        }) => {
+            let status = if created {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(run)).into_response()
+        }
+        Ok(DurableRunBridgeResult::IdempotencyConflict) => durable_run_error(
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+            "Idempotency-Key was already used for different request content",
+        ),
+        Ok(DurableRunBridgeResult::UnknownEntrypoint) => durable_run_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_entrypoint",
+            "entrypoint does not exist in this deployment",
+        ),
+        Ok(DurableRunBridgeResult::DurabilityDisabled) => durable_run_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durability_disabled",
+            "durable run service is not enabled",
+        ),
+        Ok(DurableRunBridgeResult::Failed(message)) => durable_run_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persistence_error",
+            &message,
+        ),
+        Ok(_) => durable_run_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_bridge_response",
+            "scheduler returned an invalid run response",
+        ),
+        Err(_) => service_unavailable("scheduler bridge dropped response"),
+    }
+}
+
+async fn get_durable_run_handler(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> Response {
+    durable_run_lookup(&state, run_id, false).await
+}
+
+async fn cancel_durable_run_handler(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> Response {
+    if state.draining.as_ref().is_some_and(DrainFlag::is_draining) {
+        return drain_in_progress_response();
+    }
+    let _inflight = state.ingress_in_flight.enter();
+    durable_run_lookup(&state, run_id, true).await
+}
+
+async fn durable_run_lookup(state: &ApiState, run_id: String, cancel: bool) -> Response {
+    let (tx, rx) = oneshot::channel();
+    let request = if cancel {
+        SnapshotRequest::CancelDurableRun {
+            run_id,
+            oneshot_tx: tx,
+        }
+    } else {
+        SnapshotRequest::GetDurableRun {
+            run_id,
+            oneshot_tx: tx,
+        }
+    };
+    let sent = if cancel {
+        state
+            .snapshot_tx
+            .try_send(request)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => bridge_saturated_response(),
+                mpsc::error::TrySendError::Closed(_) => {
+                    service_unavailable("scheduler bridge closed")
+                }
+            })
+    } else {
+        state
+            .snapshot_tx
+            .send(request)
+            .await
+            .map_err(|_| service_unavailable("scheduler bridge closed"))
+    };
+    if let Err(response) = sent {
+        return response;
+    }
+    match rx.await {
+        Ok(DurableRunBridgeResult::Ready { run, .. }) => Json(run).into_response(),
+        Ok(DurableRunBridgeResult::NotFound) => {
+            durable_run_error(StatusCode::NOT_FOUND, "run_not_found", "run was not found")
+        }
+        Ok(DurableRunBridgeResult::Terminal) => durable_run_error(
+            StatusCode::CONFLICT,
+            "run_terminal",
+            "terminal runs cannot be cancelled",
+        ),
+        Ok(DurableRunBridgeResult::DurabilityDisabled) => durable_run_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durability_disabled",
+            "durable run service is not enabled",
+        ),
+        Ok(DurableRunBridgeResult::Failed(message)) => durable_run_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persistence_error",
+            &message,
+        ),
+        Ok(_) => durable_run_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_bridge_response",
+            "scheduler returned an invalid run response",
+        ),
+        Err(_) => service_unavailable("scheduler bridge dropped response"),
+    }
+}
+
+fn durable_run_error(status: StatusCode, code: &'static str, message: &str) -> Response {
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "error": code, "message": message }).to_string(),
     )
         .into_response()
 }
@@ -4014,6 +4252,96 @@ mod tests {
         request
     }
 
+    fn durable_run_http_request(
+        method: Method,
+        uri: &str,
+        body: &'static str,
+        idempotency_key: Option<&'static str>,
+    ) -> axum::http::Request<axum::body::Body> {
+        use axum::extract::ConnectInfo;
+        let peer: SocketAddr = "127.0.0.1:34568".parse().unwrap();
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(
+                axum::http::header::AUTHORIZATION,
+                "Bearer delegated-restart-token",
+            )
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        if let Some(key) = idempotency_key {
+            builder = builder.header("idempotency-key", key);
+        }
+        let mut request = builder.body(axum::body::Body::from(body)).unwrap();
+        request.extensions_mut().insert(peer);
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
+    }
+
+    #[tokio::test]
+    async fn durable_run_creation_requires_idempotency_key() {
+        use tower::ServiceExt;
+        let (state, _snapshot_rx) = delegated_restart_test_state(crate::rbac::Role::Admin);
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
+        let response = app
+            .oneshot(durable_run_http_request(
+                Method::POST,
+                "/v1/runs",
+                r#"{"entrypoint":"summarize","payload":{}}"#,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn durable_run_creation_dispatches_and_returns_run() {
+        use tower::ServiceExt;
+        let (state, mut snapshot_rx) = delegated_restart_test_state(crate::rbac::Role::Admin);
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
+        let responder = tokio::spawn(async move {
+            match snapshot_rx.recv().await.expect("durable run request") {
+                SnapshotRequest::StartDurableRun {
+                    entrypoint,
+                    idempotency_key,
+                    oneshot_tx,
+                    ..
+                } => {
+                    assert_eq!(entrypoint, "summarize");
+                    assert_eq!(idempotency_key, "request-1");
+                    let _ = oneshot_tx.send(DurableRunBridgeResult::Ready {
+                        run: DurableRunView {
+                            run_id: "01900000-0000-7000-8000-000000000001".into(),
+                            entrypoint,
+                            status: "queued".into(),
+                            created_at_ms: 1,
+                            result: None,
+                            error: None,
+                        },
+                        created: Some(true),
+                    });
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        });
+        let response = app
+            .oneshot(durable_run_http_request(
+                Method::POST,
+                "/v1/runs",
+                r#"{"entrypoint":"summarize","payload":{"prompt":"hello"}}"#,
+                Some("request-1"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "queued");
+        responder.await.unwrap();
+    }
+
     #[tokio::test]
     async fn delegated_restart_admin_dispatches_token_id_and_returns_correlation() {
         use tower::ServiceExt;
@@ -4341,7 +4669,7 @@ mod rate_limit_tests {
 
     #[test]
     fn protected_route_labels_table_matches_registered_routes() {
-        // `PROTECTED_ROUTE_LABELS` must list exactly the 12
+        // `PROTECTED_ROUTE_LABELS` must list exactly the 15
         // protected paths the router registers. If a new
         // protected route lands without updating the table, the
         // classifier collapses it to `"unknown"` and operators
@@ -4351,6 +4679,9 @@ mod rate_limit_tests {
             "/v1/admin/cluster/delegated-restart",
             "/v1/identity",
             "/v1/metrics",
+            "/v1/runs",
+            "/v1/runs/:run_id",
+            "/v1/runs/:run_id/cancel",
             "/v1/nodes",
             "/v1/nodes/:id",
             "/v1/nodes/:id/messages",

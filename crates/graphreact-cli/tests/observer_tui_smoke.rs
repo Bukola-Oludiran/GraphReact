@@ -87,7 +87,10 @@ async fn spawn_fixture(process_start_id: u64) -> (ApiServerHandle, JoinHandle<()
                 SnapshotRequest::InjectMessage { .. }
                 | SnapshotRequest::InjectMessageWithReply { .. }
                 | SnapshotRequest::InjectMessageBulkLine { .. }
-                | SnapshotRequest::DelegatedRestart { .. } => {}
+                | SnapshotRequest::DelegatedRestart { .. }
+                | SnapshotRequest::StartDurableRun { .. }
+                | SnapshotRequest::GetDurableRun { .. }
+                | SnapshotRequest::CancelDurableRun { .. } => {}
             }
         }
     });

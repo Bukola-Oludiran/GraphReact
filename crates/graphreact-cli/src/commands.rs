@@ -1743,6 +1743,7 @@ pub struct DaemonHandle {
     cluster: Cluster,
     host: SchedulerHost,
     durable_checkpoint: Option<DurableCheckpointState>,
+    deployment_ir: Option<graphreact_grx_parser::GrxIr>,
     /// **M16-Backend P2+P4.** Observer management-API handle when
     /// `--observer-bind` was passed. `None` means no observer port
     /// bound. [`Self::shutdown`] joins the server's task before
@@ -3146,6 +3147,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         cluster,
         host,
         durable_checkpoint,
+        deployment_ir,
         observer,
         metrics: metrics_for_engine_counts,
         #[cfg(feature = "otel")]
@@ -3448,6 +3450,7 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         cluster,
         host,
         durable_checkpoint: None,
+        deployment_ir: None,
         observer: None,
         // `grx connect` is a one-shot dial; no metrics surface is
         // wired so per-tick `grx_engine_eval_count` recording is a
@@ -3727,6 +3730,8 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
     let DaemonHandle {
         cluster,
         host,
+        durable_checkpoint,
+        deployment_ir,
         observer,
         ..
     } = handle;
@@ -3909,8 +3914,116 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
                 };
                 let _ = oneshot_tx.send(result);
             }
+            SnapshotRequest::StartDurableRun {
+                entrypoint,
+                payload,
+                idempotency_key,
+                oneshot_tx,
+            } => {
+                let result = match (durable_checkpoint.as_ref(), deployment_ir.as_ref()) {
+                    (Some(durable), Some(ir)) => futures::executor::block_on(async {
+                        match graphreact_durable_runtime::start_run(
+                            scheduler,
+                            durable.engine.as_ref(),
+                            durable.fencing_token,
+                            ir,
+                            &entrypoint,
+                            payload,
+                            &idempotency_key,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => graphreact_durable_runtime::get_run(
+                                durable.engine.as_ref(),
+                                &outcome.run_id,
+                            )
+                            .await
+                            .map(|run| durable_run_ready(run, Some(outcome.created)))
+                            .unwrap_or_else(durable_run_error),
+                            Err(error) => durable_run_error(error),
+                        }
+                    }),
+                    _ => graphreact_observer::DurableRunBridgeResult::DurabilityDisabled,
+                };
+                let _ = oneshot_tx.send(result);
+            }
+            SnapshotRequest::GetDurableRun { run_id, oneshot_tx } => {
+                let result = match durable_checkpoint.as_ref() {
+                    Some(durable) => match graphreact_persistence::RunId::parse(run_id) {
+                        Ok(run_id) => futures::executor::block_on(async {
+                            graphreact_durable_runtime::get_run(durable.engine.as_ref(), &run_id)
+                                .await
+                                .map(|run| durable_run_ready(run, None))
+                                .unwrap_or_else(durable_run_error)
+                        }),
+                        Err(_) => graphreact_observer::DurableRunBridgeResult::NotFound,
+                    },
+                    None => graphreact_observer::DurableRunBridgeResult::DurabilityDisabled,
+                };
+                let _ = oneshot_tx.send(result);
+            }
+            SnapshotRequest::CancelDurableRun { run_id, oneshot_tx } => {
+                let result = match durable_checkpoint.as_ref() {
+                    Some(durable) => match graphreact_persistence::RunId::parse(run_id) {
+                        Ok(run_id) => futures::executor::block_on(async {
+                            graphreact_durable_runtime::cancel_run(
+                                scheduler,
+                                durable.engine.as_ref(),
+                                durable.fencing_token,
+                                &run_id,
+                            )
+                            .await
+                            .map(|run| durable_run_ready(run, None))
+                            .unwrap_or_else(durable_run_error)
+                        }),
+                        Err(_) => graphreact_observer::DurableRunBridgeResult::NotFound,
+                    },
+                    None => graphreact_observer::DurableRunBridgeResult::DurabilityDisabled,
+                };
+                let _ = oneshot_tx.send(result);
+            }
         }
     });
+}
+
+fn durable_run_ready(
+    run: graphreact_durable_runtime::RunInfo,
+    created: Option<bool>,
+) -> graphreact_observer::DurableRunBridgeResult {
+    let status = serde_json::to_value(run.status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "indeterminate".to_owned());
+    graphreact_observer::DurableRunBridgeResult::Ready {
+        run: graphreact_observer::DurableRunView {
+            run_id: run.run_id.to_string(),
+            entrypoint: run.entrypoint,
+            status,
+            created_at_ms: run.created_at_ms,
+            result: run.result,
+            error: run.error,
+        },
+        created,
+    }
+}
+
+fn durable_run_error(
+    error: graphreact_durable_runtime::RunServiceError,
+) -> graphreact_observer::DurableRunBridgeResult {
+    use graphreact_durable_runtime::RunServiceError;
+    match error {
+        RunServiceError::UnknownEntrypoint(_) => {
+            graphreact_observer::DurableRunBridgeResult::UnknownEntrypoint
+        }
+        RunServiceError::IdempotencyConflict => {
+            graphreact_observer::DurableRunBridgeResult::IdempotencyConflict
+        }
+        RunServiceError::RunNotFound(_) => graphreact_observer::DurableRunBridgeResult::NotFound,
+        RunServiceError::RunTerminal { .. } => {
+            graphreact_observer::DurableRunBridgeResult::Terminal
+        }
+        other => graphreact_observer::DurableRunBridgeResult::Failed(other.to_string()),
+    }
 }
 
 /// Process-monotonic creation epoch. Increments per

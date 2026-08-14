@@ -160,6 +160,7 @@ pub const READ_ONLY_ROUTES: &[&str] = &[
     "/v1/nodes",
     "/v1/nodes/:id",
     "/v1/nodes/:id/messages/recent",
+    "/v1/runs/:run_id",
     "/v1/supervisor/tree",
     "/v1/observer/events",
     "/v1/observer/events.sse",
