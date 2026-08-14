@@ -194,7 +194,7 @@ high-throughput execution/event plane.
 Deliver persistence, stable run identifiers, durable timers, cancellation, and
 an artifact store.
 
-Implementation tracker (updated 2026-08-13):
+Implementation tracker (updated 2026-08-14):
 
 - Shipped: versioned persistence records, UUIDv7 identities, verified local
   append-only storage, snapshots, immutable deployment bundles, durable
@@ -208,9 +208,13 @@ Implementation tracker (updated 2026-08-13):
   standby, acquires with a 15-second lease and 2-second polling, renews every 5
   seconds before scheduler work, and closes readiness/admission plus halts on
   lease loss.
-- Remaining before Phase A closes: Postgres/MinIO service-level conformance and
-  repeated failover tests, language parity surfaces, durability metrics/audit
-  events, decoder fuzzing, and the final crash/failover soak gates.
+- Shipped: an opt-in real-service conformance suite runs against disposable
+  Postgres and MinIO in CI. It covers immutable bundles, commits and replay,
+  expired-writer orphan safety, fenced takeover, snapshots, idempotent artifact
+  metadata, integrity verification, lease release, and deployment mismatch.
+- Remaining before Phase A closes: repeated daemon-level failover tests,
+  language parity surfaces, durability metrics/audit events, decoder fuzzing,
+  and the final crash/failover soak gates.
 
 Acceptance: kill the daemon at every boundary of a tool-call workflow and prove
 that restart produces exactly one externally visible outcome.

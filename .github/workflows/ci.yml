@@ -78,6 +78,61 @@ jobs:
           echo "GRAPHREACT_PYTHON_VERSION=${MATRIX_PYTHON}" >> "$GITHUB_ENV"
       - run: cargo test --workspace --all-features
 
+  cluster-persistence:
+    name: cluster-persistence (Postgres / MinIO)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: graphreact
+          POSTGRES_USER: graphreact
+          POSTGRES_PASSWORD: graphreact-test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U graphreact -d graphreact"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      GRX_CLUSTER_TEST_DATABASE_URL: postgres://graphreact:graphreact-test@127.0.0.1:5432/graphreact?sslmode=disable
+      GRX_CLUSTER_TEST_S3_BUCKET: graphreact-persistence
+      GRX_CLUSTER_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      GRX_CLUSTER_TEST_S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: graphreact
+      AWS_SECRET_ACCESS_KEY: graphreact-test-secret
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cluster-persistence
+      - name: Start MinIO
+        run: |
+          docker run --detach --name grx-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
+            --env MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs grx-minio
+          exit 1
+      - name: Create test bucket
+        run: |
+          docker run --rm --network host --entrypoint /bin/sh \
+            minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
+            'mc alias set local http://127.0.0.1:9000 graphreact graphreact-test-secret && mc mb --ignore-existing local/graphreact-persistence'
+      - name: Postgres and MinIO conformance
+        run: cargo test -p graphreact-persistence --test cluster_services -- --ignored --nocapture
+
   test-go:
     name: test-go (${{ matrix.os }} / go${{ matrix.go }})
     runs-on: ${{ matrix.os }}

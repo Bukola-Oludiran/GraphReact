@@ -38,5 +38,6 @@ indexes, and idempotency decisions require strongly consistent transactions.
   becoming ready.
 - The daemon polls for ownership before mounting, renews before scheduler work,
   and stops admission, effect dispatch, and scheduler progress on lease loss.
-- Service-level conformance still requires Postgres and MinIO fixtures in CI;
-  deterministic in-memory tests cover fencing and orphan safety on every build.
+- A dedicated CI lane runs the public backend contract against disposable
+  Postgres and MinIO, while deterministic in-memory tests keep fencing and
+  orphan-safety coverage in every ordinary workspace build.

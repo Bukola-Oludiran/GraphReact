@@ -454,8 +454,8 @@ pub enum ClusterOp {
         #[arg(long)]
         path: Option<PathBuf>,
         /// Durable execution backend. Off preserves the existing ephemeral
-        /// scheduler behavior. Cluster storage is validated but remains
-        /// unavailable until the Phase A Postgres/S3 backend lands.
+        /// scheduler behavior. Cluster mode uses Postgres fencing and
+        /// S3-compatible immutable storage.
         #[arg(long, value_enum, default_value_t = DurabilityArg::Off)]
         durability: DurabilityArg,
         /// Stable UUID identifying this immutable durable deployment.
