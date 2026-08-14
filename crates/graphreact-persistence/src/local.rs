@@ -160,6 +160,7 @@ impl LocalPersistence {
             fencing_token: self.cfg.fencing_token,
             head_sequence: state.next_sequence.checked_sub(1),
             snapshot_sequence: state.snapshot_sequence,
+            durable_bytes: state.durable_bytes,
             artifact_count: state.artifact_count,
             lease_owner: state.lease.as_ref().map(|g| g.replica_id.clone()),
         }

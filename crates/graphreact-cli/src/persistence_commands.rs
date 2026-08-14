@@ -45,6 +45,7 @@ fn print_status(label: &str, status: &PersistenceStatus) -> CommandResult<()> {
         "  snapshot_sequence: {}",
         optional_number(status.snapshot_sequence)
     )?;
+    writeln!(stdout, "  durable_bytes: {}", status.durable_bytes)?;
     writeln!(stdout, "  artifact_count: {}", status.artifact_count)?;
     writeln!(
         stdout,

@@ -1647,9 +1647,102 @@ fn observe_engine_batch_duration(
 /// Live daemon. Exposed so tests can introspect [`Cluster::registry`]
 /// without going through subprocess. Owns the [`SchedulerHost`] (boxed
 /// — `!Send` + held across `await`s by the binary's blocking driver).
+struct DurableCheckpointState {
+    engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine>,
+    fencing_token: u64,
+    last_scanned_sequence: Option<u64>,
+    activations_since_snapshot: u64,
+    bytes_at_snapshot: u64,
+}
+
+fn durable_checkpoint_due(activations: u64, new_bytes: u64) -> bool {
+    activations >= graphreact_persistence::SNAPSHOT_ACTIVATION_INTERVAL
+        || new_bytes >= graphreact_persistence::SEGMENT_TARGET_BYTES
+}
+
+impl DurableCheckpointState {
+    async fn new(
+        engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine>,
+        fencing_token: u64,
+    ) -> Result<Self, graphreact_persistence::PersistenceError> {
+        let status = engine.status().await?;
+        let replay_from = status
+            .snapshot_sequence
+            .map_or(0, |sequence| sequence.saturating_add(1));
+        let activations_since_snapshot = engine
+            .replay(replay_from)
+            .await?
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record,
+                    graphreact_persistence::RuntimeRecordV1::ActivationCommitted(_)
+                )
+            })
+            .count() as u64;
+        let bytes_at_snapshot = if status.snapshot_sequence == status.head_sequence {
+            status.durable_bytes
+        } else {
+            0
+        };
+        Ok(Self {
+            engine,
+            fencing_token,
+            last_scanned_sequence: status.head_sequence,
+            activations_since_snapshot,
+            bytes_at_snapshot,
+        })
+    }
+
+    async fn checkpoint(
+        &mut self,
+        scheduler: &Scheduler,
+        force: bool,
+    ) -> Result<bool, graphreact_durable_runtime::DurableRuntimeError> {
+        let status = self.engine.status().await?;
+        let replay_from = self
+            .last_scanned_sequence
+            .map_or(0, |sequence| sequence.saturating_add(1));
+        if status.head_sequence.is_some_and(|head| head >= replay_from) {
+            self.activations_since_snapshot = self.activations_since_snapshot.saturating_add(
+                self.engine
+                    .replay(replay_from)
+                    .await?
+                    .iter()
+                    .filter(|record| {
+                        matches!(
+                            record,
+                            graphreact_persistence::RuntimeRecordV1::ActivationCommitted(_)
+                        )
+                    })
+                    .count() as u64,
+            );
+        }
+        self.last_scanned_sequence = status.head_sequence;
+        let new_bytes = status.durable_bytes.saturating_sub(self.bytes_at_snapshot);
+        let due = durable_checkpoint_due(self.activations_since_snapshot, new_bytes);
+        if status.head_sequence.is_none() || (!force && !due) {
+            return Ok(false);
+        }
+
+        graphreact_durable_runtime::write_runtime_snapshot(
+            scheduler,
+            self.engine.as_ref(),
+            self.fencing_token,
+        )
+        .await?;
+        let installed = self.engine.status().await?;
+        self.last_scanned_sequence = installed.head_sequence;
+        self.activations_since_snapshot = 0;
+        self.bytes_at_snapshot = installed.durable_bytes;
+        Ok(true)
+    }
+}
+
 pub struct DaemonHandle {
     cluster: Cluster,
     host: SchedulerHost,
+    durable_checkpoint: Option<DurableCheckpointState>,
     /// **M16-Backend P2+P4.** Observer management-API handle when
     /// `--observer-bind` was passed. `None` means no observer port
     /// bound. [`Self::shutdown`] joins the server's task before
@@ -1782,6 +1875,21 @@ impl DaemonHandle {
     fn process_batch_observed(&mut self) -> Result<(), graphreact_core::RuntimeError> {
         self.host
             .process_batch_with_metrics(self.metrics.as_deref())
+    }
+
+    async fn checkpoint_durable_state(
+        &mut self,
+        force: bool,
+    ) -> Result<bool, graphreact_durable_runtime::DurableRuntimeError> {
+        let Self {
+            host,
+            durable_checkpoint,
+            ..
+        } = self;
+        let Some(checkpoint) = durable_checkpoint.as_mut() else {
+            return Ok(false);
+        };
+        checkpoint.checkpoint(host.scheduler_mut(), force).await
     }
 
     /// **M22 verify fix.** Read the shared `MetricsInner` Arc, if any
@@ -2245,7 +2353,14 @@ impl DaemonHandle {
     /// shutdown — k8s SIGKILLs at `terminationGracePeriodSeconds`
     /// anyway, and we want to surface the timeout in the audit
     /// log rather than be murdered silently.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
+        if let Err(error) = self.checkpoint_durable_state(true).await {
+            tracing::warn!(
+                target: "graphreact::persistence",
+                error = %error,
+                "graceful-shutdown durable snapshot failed"
+            );
+        }
         // **M16-Backend P10 + M-Prod #5.** Flush the OTel span
         // batch processor FIRST so any buffered spans hit the
         // collector before the scheduler/cluster teardown drops
@@ -2509,6 +2624,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         runtime_secrets.clone(),
         &opts.go_build,
     )?;
+    let mut durable_checkpoint = None;
     if let Some((config, bundle)) = local_durability {
         let engine = graphreact_durable_runtime::install_local(host.scheduler_mut(), config)
             .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
@@ -2521,6 +2637,13 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         graphreact_durable_runtime::recover(host.scheduler_mut(), engine.as_ref())
             .await
             .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+        let checkpoint_engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine> =
+            engine;
+        durable_checkpoint = Some(
+            DurableCheckpointState::new(checkpoint_engine, 1)
+                .await
+                .map_err(|error| CommandError::ClusterArg(error.to_string()))?,
+        );
     }
     // **M16-Backend P8.** Install debugpy on the freshly-mounted
     // CPython isolate (if `--debug=cpython:<port>` was passed).
@@ -3022,6 +3145,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     Ok(DaemonHandle {
         cluster,
         host,
+        durable_checkpoint,
         observer,
         metrics: metrics_for_engine_counts,
         #[cfg(feature = "otel")]
@@ -3323,6 +3447,7 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
     let mut handle = DaemonHandle {
         cluster,
         host,
+        durable_checkpoint: None,
         observer: None,
         // `grx connect` is a one-shot dial; no metrics surface is
         // wired so per-tick `grx_engine_eval_count` recording is a
@@ -3469,7 +3594,7 @@ pub async fn drive_handle_until(
         #[cfg(unix)]
         tokio::select! {
             _ = tick.tick() => {
-                drive_one_tick(handle)?;
+                drive_one_tick(handle).await?;
             }
             _ = sigint, if duration.is_none() => {
                 return Ok(LoopExit::Sigint);
@@ -3544,7 +3669,7 @@ pub async fn drive_handle_until(
         #[cfg(not(unix))]
         tokio::select! {
             _ = tick.tick() => {
-                drive_one_tick(handle)?;
+                drive_one_tick(handle).await?;
             }
             _ = sigint, if duration.is_none() => {
                 return Ok(LoopExit::Sigint);
@@ -3556,7 +3681,7 @@ pub async fn drive_handle_until(
 /// **M-Prod sub-track #4 Phase α.** One tick of the drive loop —
 /// pulled out so the select! macro stays small enough to read
 /// across the unix / non-unix cfg-gated branches.
-fn drive_one_tick(handle: &mut DaemonHandle) -> Result<(), CommandError> {
+async fn drive_one_tick(handle: &mut DaemonHandle) -> Result<(), CommandError> {
     // **M22 verify fix.** Route the tick through
     // `handle.process_batch()` (which dispatches via
     // `SchedulerHost::process_batch`) instead of the raw
@@ -3586,6 +3711,10 @@ fn drive_one_tick(handle: &mut DaemonHandle) -> Result<(), CommandError> {
     // an API request: one process_batch round (~50ms tick
     // cadence + the drain that follows).
     drain_management_api_snapshots(handle);
+    handle
+        .checkpoint_durable_state(false)
+        .await
+        .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
     Ok(())
 }
 
@@ -3873,6 +4002,13 @@ fn _arc_kept_alive() -> Arc<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_checkpoint_thresholds_are_inclusive() {
+        assert!(!durable_checkpoint_due(9_999, 64 * 1024 * 1024 - 1));
+        assert!(durable_checkpoint_due(10_000, 0));
+        assert!(durable_checkpoint_due(0, 64 * 1024 * 1024));
+    }
 
     /// **M-Prod sub-track #5 safest slice.** Verify the
     /// `OBSERVER_SHUTDOWN_DEADLINE` env var contract: unset / empty

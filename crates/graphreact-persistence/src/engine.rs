@@ -31,6 +31,7 @@ pub struct PersistenceStatus {
     pub fencing_token: u64,
     pub head_sequence: Option<u64>,
     pub snapshot_sequence: Option<u64>,
+    pub durable_bytes: u64,
     pub artifact_count: u64,
     pub lease_owner: Option<String>,
 }
