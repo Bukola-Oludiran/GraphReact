@@ -1471,7 +1471,9 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "graphreact-core",
+ "graphreact-grx-parser",
  "graphreact-persistence",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

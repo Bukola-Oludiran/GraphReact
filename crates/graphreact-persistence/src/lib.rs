@@ -17,8 +17,8 @@ pub use ids::{
 };
 pub use local::{LocalConfig, LocalPersistence};
 pub use records::{
-    ActivationCommit, ArtifactMetadata, DeploymentBundle, DeploymentDigest, DurableMessage,
-    DurableStateWrite, EffectIntent, EffectOutcome, ReplayPolicy, RunStatus, RuntimeRecordV1,
-    RuntimeSnapshotV1, TimerIntent, FORMAT_VERSION, MAX_ARTIFACT_BYTES, MAX_RECORD_BYTES,
-    SEGMENT_TARGET_BYTES, SNAPSHOT_ACTIVATION_INTERVAL,
+    canonical_json_bytes, ActivationCommit, ArtifactMetadata, DeploymentBundle, DeploymentDigest,
+    DurableMessage, DurableStateWrite, EffectIntent, EffectOutcome, ReplayPolicy, RunStatus,
+    RuntimeRecordV1, RuntimeSnapshotV1, TimerIntent, FORMAT_VERSION, MAX_ARTIFACT_BYTES,
+    MAX_RECORD_BYTES, SEGMENT_TARGET_BYTES, SNAPSHOT_ACTIVATION_INTERVAL,
 };

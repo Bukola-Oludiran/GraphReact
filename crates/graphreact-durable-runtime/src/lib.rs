@@ -1,9 +1,13 @@
 //! Bridge between the storage-agnostic core activation boundary
 //! and the versioned persistence records.
 
+mod deployment;
 mod effects;
 mod timers;
 
+pub use deployment::{
+    build_deployment_bundle, install_deployment_bundle, require_deployment_bundle, BundleInputs,
+};
 pub use effects::{
     dispatch_pending_effects, AdapterFuture, DeterministicIdempotentAdapter, DurableEffectAdapter,
     EffectAdapterError, EffectAdapterRegistry, EffectDispatchSummary,
@@ -33,6 +37,10 @@ pub enum DurableRuntimeError {
     Effect(#[from] EffectAdapterError),
     #[error("invalid persisted durable message: {0}")]
     InvalidMessage(String),
+    #[error("immutable deployment bundle is missing")]
+    DeploymentBundleMissing,
+    #[error("immutable deployment bundle does not match the configured deployment digest")]
+    DeploymentBundleMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -93,7 +93,7 @@ pub struct DeploymentBundle {
 impl DeploymentBundle {
     #[must_use]
     pub fn new(deployment_id: DeploymentId, manifest: serde_json::Value, payload: Vec<u8>) -> Self {
-        let mut canonical = serde_json::to_vec(&manifest).unwrap_or_default();
+        let mut canonical = canonical_json_bytes(&manifest);
         canonical.extend_from_slice(&payload);
         Self {
             deployment_id,
@@ -101,6 +101,56 @@ impl DeploymentBundle {
             manifest,
             payload,
         }
+    }
+
+    #[must_use]
+    pub fn verify_digest(&self) -> bool {
+        let mut canonical = canonical_json_bytes(&self.manifest);
+        canonical.extend_from_slice(&self.payload);
+        self.digest == DeploymentDigest::of(&canonical)
+    }
+}
+
+/// Deterministic JSON encoding with recursively sorted object keys.
+#[must_use]
+pub fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    fn canonicalize(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(object) => {
+                let sorted: std::collections::BTreeMap<_, _> = object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), canonicalize(value)))
+                    .collect();
+                serde_json::Value::Object(sorted.into_iter().collect())
+            }
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(canonicalize).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    serde_json::to_vec(&canonicalize(value)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    #[test]
+    fn bundle_digest_is_independent_of_manifest_key_order() {
+        let deployment_id = DeploymentId::new();
+        let left = DeploymentBundle::new(
+            deployment_id.clone(),
+            serde_json::json!({"b": 2, "nested": {"z": 1, "a": 2}, "a": 1}),
+            b"payload".to_vec(),
+        );
+        let right = DeploymentBundle::new(
+            deployment_id,
+            serde_json::json!({"a": 1, "nested": {"a": 2, "z": 1}, "b": 2}),
+            b"payload".to_vec(),
+        );
+        assert_eq!(left.digest, right.digest);
+        assert!(left.verify_digest());
     }
 }
 
