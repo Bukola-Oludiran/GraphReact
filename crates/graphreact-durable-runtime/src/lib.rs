@@ -37,6 +37,7 @@ pub struct RecoverySummary {
     pub replayed_records: usize,
     pub pending_messages: usize,
     pub postponed_messages: usize,
+    pub cancelled_runs: usize,
 }
 
 /// Open a locked local backend and install its fsync-before-ack activation
@@ -102,6 +103,25 @@ pub fn enqueue_durable_message(
     Ok(message_id)
 }
 
+/// Persist a monotonic cancellation request before closing scheduler
+/// admission for the run.
+pub fn request_cancellation(
+    scheduler: &Scheduler,
+    engine: &dyn PersistenceEngine,
+    fencing_token: u64,
+    run_id: RunId,
+) -> Result<(), DurableRuntimeError> {
+    futures::executor::block_on(engine.commit(
+        fencing_token,
+        &[RuntimeRecordV1::CancellationRequested {
+            run_id: run_id.clone(),
+            requested_at_ms: unix_time_ms(),
+        }],
+    ))?;
+    scheduler.cancel_durable_run(run_id.to_string());
+    Ok(())
+}
+
 /// Rebuild named state and pending work from a verified snapshot plus log.
 /// Inputs consumed by a later activation commit are removed, while committed
 /// outputs not yet consumed are re-enqueued without rerunning their producer.
@@ -115,6 +135,7 @@ pub async fn recover(
     let mut state = BTreeMap::<String, BTreeMap<String, serde_json::Value>>::new();
     let mut inbox = Vec::<DurableMessage>::new();
     let mut postponed = Vec::<DurableMessage>::new();
+    let mut cancelled_runs = std::collections::BTreeSet::<RunId>::new();
     if let Some(snapshot) = snapshot {
         apply_state_writes(&mut state, &snapshot.durable_state);
         inbox = snapshot.inbox;
@@ -139,6 +160,9 @@ pub async fn recover(
                 result_message: Some(message),
                 ..
             } => upsert_message(&mut inbox, message.clone()),
+            RuntimeRecordV1::CancellationRequested { run_id, .. } => {
+                cancelled_runs.insert(run_id.clone());
+            }
             _ => {}
         }
     }
@@ -150,12 +174,23 @@ pub async fn recover(
     }
     let postponed_messages = postponed.len();
     scheduler.restore_postponed_messages(postponed.into_iter().map(core_message))?;
+    for run_id in &cancelled_runs {
+        scheduler.cancel_durable_run(run_id.to_string());
+    }
     Ok(RecoverySummary {
         snapshot_sequence,
         replayed_records: records.len(),
         pending_messages,
         postponed_messages,
+        cancelled_runs: cancelled_runs.len(),
     })
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 fn apply_state_writes(
@@ -521,6 +556,52 @@ mod tests {
         assert_eq!(
             commit.effect_intents[0].replay_policy,
             ReplayPolicy::Idempotent
+        );
+    }
+
+    #[test]
+    fn cancellation_is_persisted_before_admission_closes_and_restores() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = LocalConfig::new(
+            directory.path(),
+            graphreact_persistence::DeploymentId::new(),
+            graphreact_persistence::DeploymentDigest::of(b"cancel-deployment"),
+        );
+        let run_id = RunId::new();
+        let mut first = counter_scheduler();
+        let first_engine = install_local(&mut first, config.clone()).unwrap();
+        first.start().unwrap();
+        enqueue_durable_message(
+            &first,
+            first_engine.as_ref(),
+            1,
+            "counter",
+            "increment",
+            serde_json::Value::Null,
+            run_id.clone(),
+            AttemptId::new(),
+            CorrelationId::new(),
+        )
+        .unwrap();
+        request_cancellation(&first, first_engine.as_ref(), 1, run_id.clone()).unwrap();
+        first.process_batch().unwrap();
+        assert_eq!(
+            first.snapshot_durable_state().nodes["counter"]["count"],
+            serde_json::json!(0)
+        );
+        drop(first);
+        drop(first_engine);
+
+        let mut recovered = counter_scheduler();
+        let recovered_engine = install_local(&mut recovered, config).unwrap();
+        let summary =
+            futures::executor::block_on(recover(&recovered, recovered_engine.as_ref())).unwrap();
+        assert_eq!(summary.cancelled_runs, 1);
+        assert!(recovered.is_durable_run_cancelled(run_id.as_str()));
+        recovered.start().unwrap();
+        assert_eq!(
+            recovered.snapshot_durable_state().nodes["counter"]["count"],
+            serde_json::json!(0)
         );
     }
 }

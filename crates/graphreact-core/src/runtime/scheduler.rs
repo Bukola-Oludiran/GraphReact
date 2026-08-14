@@ -162,6 +162,7 @@ pub struct Scheduler {
     /// Local output messages produced by the active durable handler. `None`
     /// means the compatibility path should enqueue directly.
     durable_output_buffer: Rc<RefCell<Option<DurableActivationBuffer>>>,
+    cancelled_durable_runs: Rc<RefCell<std::collections::BTreeSet<String>>>,
 
     /// Active monitors. Drained per-target on `unmount` to deliver
     /// `__DOWN__` system messages.
@@ -620,6 +621,7 @@ impl Scheduler {
             current_durable_run_context: Rc::new(RefCell::new(None)),
             durable_activation_committer: None,
             durable_output_buffer: Rc::new(RefCell::new(None)),
+            cancelled_durable_runs: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
             monitors: Rc::new(RefCell::new(MonitorRegistry::new())),
             links: Rc::new(RefCell::new(LinkRegistry::new())),
             groups: Rc::new(RefCell::new(GroupRegistry::new())),
@@ -675,6 +677,19 @@ impl Scheduler {
     /// both run and attempt identifiers take the buffered path.
     pub fn install_durable_activation_committer(&mut self, committer: DurableActivationCommitter) {
         self.durable_activation_committer = Some(committer);
+    }
+
+    /// Close admission for a durable run. Cancellation is monotonic for the
+    /// lifetime of this scheduler and is restored from persistence.
+    pub fn cancel_durable_run(&self, run_id: impl Into<String>) {
+        self.cancelled_durable_runs
+            .borrow_mut()
+            .insert(run_id.into());
+    }
+
+    #[must_use]
+    pub fn is_durable_run_cancelled(&self, run_id: &str) -> bool {
+        self.cancelled_durable_runs.borrow().contains(run_id)
     }
 
     /// Read the cluster-unique node name set via `set_node_name`.
@@ -2381,6 +2396,13 @@ impl Scheduler {
 
     fn deliver(&self, mut msg: Message) -> Result<(), RuntimeError> {
         let retry_message = msg.clone();
+        if msg
+            .run_id
+            .as_deref()
+            .is_some_and(|run_id| self.is_durable_run_cancelled(run_id))
+        {
+            return Ok(());
+        }
         if !decrement_ttl(&mut msg) {
             return Ok(());
         }
