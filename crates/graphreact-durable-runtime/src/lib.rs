@@ -16,10 +16,12 @@ use std::sync::Arc;
 
 use graphreact_core::{DurableActivation, RuntimeError, Scheduler};
 use graphreact_persistence::{
-    ActivationCommit, AttemptId, CorrelationId, DurableMessage, DurableStateWrite, EffectId,
-    EffectIntent, LocalConfig, LocalPersistence, MessageId, PersistenceEngine, ReplayPolicy, RunId,
-    RunStatus, RuntimeRecordV1, RuntimeSnapshotV1, TimerId, TimerIntent,
+    ActivationCommit, ArtifactId, ArtifactMetadata, AttemptId, CorrelationId, DurableMessage,
+    DurableStateWrite, EffectId, EffectIntent, LocalConfig, LocalPersistence, MessageId,
+    PersistenceEngine, ReplayPolicy, RunId, RunStatus, RuntimeRecordV1, RuntimeSnapshotV1, TimerId,
+    TimerIntent,
 };
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DurableRuntimeError {
@@ -130,6 +132,58 @@ pub fn request_cancellation(
     ))?;
     scheduler.cancel_durable_run(run_id.to_string());
     Ok(())
+}
+
+/// Store immutable content first, then durably publish its run-scoped
+/// metadata. Unreferenced content after a crash is safe for later GC.
+pub async fn store_artifact(
+    engine: &dyn PersistenceEngine,
+    fencing_token: u64,
+    run_id: RunId,
+    logical_name: impl Into<String>,
+    media_type: impl Into<String>,
+    bytes: &[u8],
+) -> Result<ArtifactMetadata, DurableRuntimeError> {
+    let metadata = ArtifactMetadata {
+        id: ArtifactId::new(),
+        run_id,
+        logical_name: logical_name.into(),
+        media_type: media_type.into(),
+        size: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(),
+        created_at_ms: unix_time_ms(),
+    };
+    engine.put_artifact(&metadata, bytes).await?;
+    engine
+        .commit(
+            fencing_token,
+            &[RuntimeRecordV1::ArtifactCommitted(metadata.clone())],
+        )
+        .await?;
+    Ok(metadata)
+}
+
+/// List artifact metadata for one run from the durable record stream.
+pub async fn list_run_artifacts(
+    engine: &dyn PersistenceEngine,
+    run_id: &RunId,
+) -> Result<Vec<ArtifactMetadata>, DurableRuntimeError> {
+    let mut artifacts = BTreeMap::<ArtifactId, ArtifactMetadata>::new();
+    if let Some(snapshot) = engine.read_snapshot().await? {
+        for metadata in snapshot.artifacts {
+            if &metadata.run_id == run_id {
+                artifacts.insert(metadata.id.clone(), metadata);
+            }
+        }
+    }
+    for record in engine.replay(0).await? {
+        if let RuntimeRecordV1::ArtifactCommitted(metadata) = record {
+            if &metadata.run_id == run_id {
+                artifacts.insert(metadata.id.clone(), metadata);
+            }
+        }
+    }
+    Ok(artifacts.into_values().collect())
 }
 
 /// Write a verified runtime snapshot at the current committed log head.
@@ -839,5 +893,34 @@ mod tests {
             futures::executor::block_on(fire_due_timers(&scheduler, engine.as_ref(), 1, 1_000))
                 .unwrap();
         assert_eq!(repeated.fired, 0);
+    }
+
+    #[test]
+    fn artifact_bytes_are_stored_before_run_metadata_is_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalPersistence::open(LocalConfig::new(
+            directory.path(),
+            graphreact_persistence::DeploymentId::new(),
+            graphreact_persistence::DeploymentDigest::of(b"artifact-deployment"),
+        ))
+        .unwrap();
+        let run_id = RunId::new();
+        let bytes = b"durable evidence";
+        let metadata = futures::executor::block_on(store_artifact(
+            &store,
+            1,
+            run_id.clone(),
+            "evidence.txt",
+            "text/plain",
+            bytes,
+        ))
+        .unwrap();
+
+        let restored = futures::executor::block_on(store.read_artifact(&metadata.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored, bytes);
+        let listed = futures::executor::block_on(list_run_artifacts(&store, &run_id)).unwrap();
+        assert_eq!(listed, vec![metadata]);
     }
 }

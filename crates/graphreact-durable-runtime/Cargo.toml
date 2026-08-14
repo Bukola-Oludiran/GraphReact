@@ -13,6 +13,7 @@ graphreact-core = { path = "../graphreact-core" }
 graphreact-persistence = { path = "../graphreact-persistence" }
 futures.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
