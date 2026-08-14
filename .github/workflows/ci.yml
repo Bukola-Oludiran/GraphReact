@@ -107,9 +107,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
           key: cluster-persistence
+      - name: Resolve Python pkg-config name
+        run: |
+          echo "GRAPHREACT_PYTHON_PKGCONFIG=python-3.12-embed" >> "$GITHUB_ENV"
+          echo "GRAPHREACT_PYTHON_VERSION=3.12" >> "$GITHUB_ENV"
       - name: Start MinIO
         run: |
           docker run --detach --name grx-minio \
@@ -132,6 +142,8 @@ jobs:
             'mc alias set local http://127.0.0.1:9000 graphreact graphreact-test-secret && mc mb --ignore-existing local/graphreact-persistence'
       - name: Postgres and MinIO conformance
         run: cargo test -p graphreact-persistence --test cluster_services -- --ignored --nocapture
+      - name: Repeated daemon failover
+        run: cargo test -p graphreact-cli --test cluster_failover_services -- --ignored --nocapture
 
   test-go:
     name: test-go (${{ matrix.os }} / go${{ matrix.go }})

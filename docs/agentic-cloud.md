@@ -212,9 +212,11 @@ Implementation tracker (updated 2026-08-14):
   Postgres and MinIO in CI. It covers immutable bundles, commits and replay,
   expired-writer orphan safety, fenced takeover, snapshots, idempotent artifact
   metadata, integrity verification, lease release, and deployment mismatch.
-- Remaining before Phase A closes: repeated daemon-level failover tests,
-  language parity surfaces, durability metrics/audit events, decoder fuzzing,
-  and the final crash/failover soak gates.
+- Shipped: a three-cycle real-daemon failover gate suspends each active replica,
+  requires its standby to become ready within 30 seconds, resumes the former
+  owner, and proves renewal fencing halts it before further scheduler work.
+- Remaining before Phase A closes: language parity surfaces, durability
+  metrics/audit events, decoder fuzzing, and the final crash/failover soak gates.
 
 Acceptance: kill the daemon at every boundary of a tool-call workflow and prove
 that restart produces exactly one externally visible outcome.

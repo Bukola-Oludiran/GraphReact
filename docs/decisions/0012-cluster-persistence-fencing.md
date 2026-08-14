@@ -41,3 +41,6 @@ indexes, and idempotency decisions require strongly consistent transactions.
 - A dedicated CI lane runs the public backend contract against disposable
   Postgres and MinIO, while deterministic in-memory tests keep fencing and
   orphan-safety coverage in every ordinary workspace build.
+- The same lane repeatedly suspends a live active daemon through lease expiry,
+  requires takeover within 30 seconds, then resumes the former owner and
+  requires it to halt on failed renewal.
