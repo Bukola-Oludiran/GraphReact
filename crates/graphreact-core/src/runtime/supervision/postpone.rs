@@ -63,6 +63,11 @@ impl PostponeQueue {
         std::mem::take(&mut self.pending)
     }
 
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<Message> {
+        self.pending.clone()
+    }
+
     /// Whether there are any pending messages.
     #[must_use]
     pub fn is_empty(&self) -> bool {

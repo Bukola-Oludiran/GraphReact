@@ -31,6 +31,12 @@ pub struct DurableStateSnapshot {
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DurableQueueSnapshot {
+    pub inbox: Vec<Message>,
+    pub postponed: Vec<Message>,
+}
+
 /// One durable message-handler activation presented to the host commit
 /// boundary. Core owns evaluation and buffering; the host translates this
 /// storage-agnostic value into persistence records and acknowledges only

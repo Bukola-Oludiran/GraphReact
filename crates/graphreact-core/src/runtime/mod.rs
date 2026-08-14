@@ -44,8 +44,8 @@ pub use supervision::{
 pub use transforms::{get_transform, list_transforms, register_transform};
 pub use types::{
     ChannelPolicy, ChildRef, ComposeChildSpec, DurabilityMode, DurableActivation,
-    DurableEffectIntent, DurableEffectRequest, DurableReplayPolicy, DurableStateSnapshot,
-    DurableTimerCommand, DurableTimerIntent, DurableTimerRequest, EmitOptions, ExternalCall,
-    IncomingMessage, Message, MessageHandler, NodeContext, PermissionManifest, TopologyEventKind,
-    TopologyFilterOptions, TopologyHandler, TransformFn,
+    DurableEffectIntent, DurableEffectRequest, DurableQueueSnapshot, DurableReplayPolicy,
+    DurableStateSnapshot, DurableTimerCommand, DurableTimerIntent, DurableTimerRequest,
+    EmitOptions, ExternalCall, IncomingMessage, Message, MessageHandler, NodeContext,
+    PermissionManifest, TopologyEventKind, TopologyFilterOptions, TopologyHandler, TransformFn,
 };

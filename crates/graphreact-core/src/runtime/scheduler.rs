@@ -43,8 +43,8 @@ use crate::runtime::supervision::{
 };
 use crate::runtime::types::{
     ComposeChildSpec, DurableActivation, DurableEffectIntent, DurableEffectRequest,
-    DurableStateSnapshot, DurableTimerCommand, DurableTimerIntent, EmitOptions, IncomingMessage,
-    Message, NodeContext, PermissionManifest, TopologyEventKind,
+    DurableQueueSnapshot, DurableStateSnapshot, DurableTimerCommand, DurableTimerIntent,
+    EmitOptions, IncomingMessage, Message, NodeContext, PermissionManifest, TopologyEventKind,
 };
 
 new_key_type! {
@@ -997,6 +997,33 @@ impl Scheduler {
             .filter(|(_, values)| !values.is_empty())
             .collect();
         DurableStateSnapshot { nodes }
+    }
+
+    /// Snapshot only messages carrying durable run/attempt context.
+    #[must_use]
+    pub fn snapshot_durable_queues(&self) -> DurableQueueSnapshot {
+        let mut inbox: Vec<_> = self
+            .messages
+            .borrow()
+            .iter()
+            .filter(|message| message.run_id.is_some() && message.attempt_id.is_some())
+            .cloned()
+            .collect();
+        inbox.extend(
+            self.external_inbox
+                .lock()
+                .iter()
+                .filter(|message| message.run_id.is_some() && message.attempt_id.is_some())
+                .cloned(),
+        );
+        let postponed = self
+            .postponed
+            .borrow()
+            .values()
+            .flat_map(PostponeQueue::snapshot)
+            .filter(|message| message.run_id.is_some() && message.attempt_id.is_some())
+            .collect();
+        DurableQueueSnapshot { inbox, postponed }
     }
 
     /// Restore named durable values after node definitions are rebuilt.

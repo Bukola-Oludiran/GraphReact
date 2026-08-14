@@ -18,7 +18,7 @@ use graphreact_core::{DurableActivation, RuntimeError, Scheduler};
 use graphreact_persistence::{
     ActivationCommit, AttemptId, CorrelationId, DurableMessage, DurableStateWrite, EffectId,
     EffectIntent, LocalConfig, LocalPersistence, MessageId, PersistenceEngine, ReplayPolicy, RunId,
-    RunStatus, RuntimeRecordV1, TimerId, TimerIntent,
+    RunStatus, RuntimeRecordV1, RuntimeSnapshotV1, TimerId, TimerIntent,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +40,14 @@ pub struct RecoverySummary {
     pub pending_messages: usize,
     pub postponed_messages: usize,
     pub cancelled_runs: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotSummary {
+    pub through_sequence: u64,
+    pub durable_state_values: usize,
+    pub inbox_messages: usize,
+    pub postponed_messages: usize,
 }
 
 /// Open a locked local backend and install its fsync-before-ack activation
@@ -122,6 +130,126 @@ pub fn request_cancellation(
     ))?;
     scheduler.cancel_durable_run(run_id.to_string());
     Ok(())
+}
+
+/// Write a verified runtime snapshot at the current committed log head.
+pub async fn write_runtime_snapshot(
+    scheduler: &Scheduler,
+    engine: &dyn PersistenceEngine,
+    fencing_token: u64,
+) -> Result<SnapshotSummary, DurableRuntimeError> {
+    let status = engine.status().await?;
+    let through_sequence = status.head_sequence.unwrap_or_default();
+    let state = scheduler.snapshot_durable_state();
+    let durable_state: Vec<_> = state
+        .nodes
+        .into_iter()
+        .flat_map(|(node_id, values)| {
+            values
+                .into_iter()
+                .map(move |(key, value)| DurableStateWrite {
+                    node_id: node_id.clone(),
+                    key,
+                    value,
+                })
+        })
+        .collect();
+    let queues = scheduler.snapshot_durable_queues();
+    let inbox = queues
+        .inbox
+        .iter()
+        .map(durable_message)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DurableRuntimeError::InvalidMessage)?;
+    let postponed = queues
+        .postponed
+        .iter()
+        .map(durable_message)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DurableRuntimeError::InvalidMessage)?;
+    let previous = engine.read_snapshot().await?;
+    let replay_from = previous
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.through_sequence.saturating_add(1));
+    let mut effects: BTreeMap<EffectId, EffectIntent> = previous
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .effects
+                .iter()
+                .cloned()
+                .map(|intent| (intent.id.clone(), intent))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut timers: BTreeMap<TimerId, TimerIntent> = previous
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .timers
+                .iter()
+                .cloned()
+                .map(|intent| (intent.id.clone(), intent))
+                .collect()
+        })
+        .unwrap_or_default();
+    for record in engine.replay(replay_from).await? {
+        match record {
+            RuntimeRecordV1::ActivationCommitted(commit) => {
+                for intent in commit.effect_intents {
+                    effects.insert(intent.id.clone(), intent);
+                }
+                for id in commit.timers_cancelled {
+                    timers.remove(&id);
+                }
+                for intent in commit.timers_scheduled {
+                    timers.insert(intent.id.clone(), intent);
+                }
+            }
+            RuntimeRecordV1::EffectCompleted { effect_id, .. } => {
+                effects.remove(&effect_id);
+            }
+            RuntimeRecordV1::TimerFired { timer_id, .. }
+            | RuntimeRecordV1::TimerCancelled { timer_id, .. } => {
+                timers.remove(&timer_id);
+            }
+            _ => {}
+        }
+    }
+    let graph = serde_json::to_value(graphreact_core::to_json(&scheduler.graph.borrow()))
+        .map_err(|error| DurableRuntimeError::InvalidMessage(error.to_string()))?;
+    let snapshot = RuntimeSnapshotV1 {
+        deployment_id: engine.deployment_id().clone(),
+        deployment_digest: engine.deployment_digest(),
+        through_sequence,
+        graph,
+        manifests: serde_json::json!({}),
+        durable_state,
+        inbox,
+        postponed,
+        supervision: serde_json::json!({}),
+        timers: timers.into_values().collect(),
+        effects: effects.into_values().collect(),
+        artifacts: Vec::new(),
+        runs: serde_json::json!({}),
+    };
+    let summary = SnapshotSummary {
+        through_sequence,
+        durable_state_values: snapshot.durable_state.len(),
+        inbox_messages: snapshot.inbox.len(),
+        postponed_messages: snapshot.postponed.len(),
+    };
+    let digest = engine.write_snapshot(fencing_token, &snapshot).await?;
+    engine
+        .commit(
+            fencing_token,
+            &[RuntimeRecordV1::SnapshotInstalled {
+                sequence: through_sequence,
+                digest,
+            }],
+        )
+        .await?;
+    Ok(summary)
 }
 
 /// Rebuild named state and pending work from a verified snapshot plus log.
@@ -515,6 +643,10 @@ mod tests {
         )
         .unwrap();
         first.process_batch().unwrap();
+        let snapshot =
+            futures::executor::block_on(write_runtime_snapshot(&first, first_engine.as_ref(), 1))
+                .unwrap();
+        assert_eq!(snapshot.durable_state_values, 1);
         drop(first);
         drop(first_engine);
 
@@ -522,6 +654,7 @@ mod tests {
         let recovered_engine = install_local(&mut recovered, config).unwrap();
         let summary =
             futures::executor::block_on(recover(&recovered, recovered_engine.as_ref())).unwrap();
+        assert_eq!(summary.snapshot_sequence, Some(snapshot.through_sequence));
         assert_eq!(summary.pending_messages, 0);
         recovered.start().unwrap();
         assert_eq!(
