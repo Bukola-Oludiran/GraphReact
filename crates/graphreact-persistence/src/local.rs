@@ -41,6 +41,46 @@ impl LocalConfig {
             artifact_limit_bytes: MAX_ARTIFACT_BYTES,
         }
     }
+
+    /// Discover deployment identity from the immutable bundle in an existing
+    /// local persistence directory. Offline tooling uses this so operators do
+    /// not need to copy digests out of log headers by hand.
+    pub fn discover(root: impl Into<PathBuf>) -> crate::Result<Self> {
+        let root = root.into();
+        let bundles_dir = root.join("bundles");
+        let entries = std::fs::read_dir(&bundles_dir)
+            .map_err(|error| PersistenceError::io(&bundles_dir, error))?;
+        let mut bundle_paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| PersistenceError::io(&bundles_dir, error))?;
+            let path = entry.path();
+            if path.extension().is_some_and(|value| value == "grxbundle") {
+                bundle_paths.push(path);
+            }
+        }
+        let path = bundle_paths.first().ok_or_else(|| {
+            PersistenceError::Configuration(format!(
+                "no immutable deployment bundle found in {}",
+                bundles_dir.display()
+            ))
+        })?;
+        if bundle_paths.len() != 1 {
+            return Err(PersistenceError::Configuration(format!(
+                "multiple immutable deployment bundles found in {}",
+                bundles_dir.display()
+            )));
+        }
+        let bytes = std::fs::read(path).map_err(|error| PersistenceError::io(path, error))?;
+        let bundle: DeploymentBundle = postcard::from_bytes(&bytes)
+            .map_err(|error| PersistenceError::Codec(error.to_string()))?;
+        if !bundle.verify_digest()
+            || path.file_stem().and_then(std::ffi::OsStr::to_str)
+                != Some(bundle.digest.hex().as_str())
+        {
+            return Err(PersistenceError::DeploymentDigestMismatch);
+        }
+        Ok(Self::new(root, bundle.deployment_id, bundle.digest))
+    }
 }
 
 pub struct LocalPersistence {
@@ -640,6 +680,26 @@ mod tests {
         let store = LocalPersistence::open(cfg).unwrap();
         assert_eq!(store.replay(0).await.unwrap().len(), 2);
         assert_eq!(store.status().await.unwrap().head_sequence, Some(1));
+    }
+
+    #[tokio::test]
+    async fn config_discovers_identity_from_verified_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let deployment_id = DeploymentId::new();
+        let bundle = DeploymentBundle::new(
+            deployment_id.clone(),
+            serde_json::json!({"format_version": 1}),
+            b"deployment".to_vec(),
+        );
+        let cfg = LocalConfig::new(dir.path(), deployment_id.clone(), bundle.digest);
+        {
+            let store = LocalPersistence::open(cfg).unwrap();
+            store.put_bundle(&bundle).await.unwrap();
+        }
+
+        let discovered = LocalConfig::discover(dir.path()).unwrap();
+        assert_eq!(discovered.deployment_id, deployment_id);
+        assert_eq!(discovered.deployment_digest, bundle.digest);
     }
 
     #[tokio::test]

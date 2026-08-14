@@ -55,6 +55,8 @@ pub enum CommandError {
     /// CommandError to ExitCode::FAILURE).
     #[error("audit verify failure: {0}")]
     AuditVerify(#[from] graphreact_observer::AuditChainError),
+    #[error("persistence error: {0}")]
+    Persistence(#[from] graphreact_persistence::PersistenceError),
 }
 
 pub type CommandResult<T> = Result<T, CommandError>;

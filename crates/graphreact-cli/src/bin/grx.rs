@@ -143,6 +143,9 @@ fn dispatch(runtime: &tokio::runtime::Runtime, command: Command) -> Result<(), C
         Command::Audit { op } => {
             graphreact_cli::audit_commands::run_audit(op)?;
         }
+        Command::Persistence { op } => {
+            runtime.block_on(graphreact_cli::persistence_commands::run_persistence(op))?;
+        }
         Command::Admin { op } => {
             graphreact_cli::admin_commands::run_admin(op)?;
         }
@@ -434,6 +437,7 @@ fn associated_path(command: &Command) -> Option<&Path> {
         | Command::Observer { .. }
         | Command::Secrets { .. }
         | Command::Audit { .. }
+        | Command::Persistence { .. }
         | Command::Admin { .. } => None,
     }
 }

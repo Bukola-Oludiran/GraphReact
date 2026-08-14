@@ -54,6 +54,8 @@ pub mod mixedruntime;
 pub mod observer_client;
 pub mod observer_commands;
 pub mod observer_tui;
+/// Offline integrity verification and diagnostics for durable stores.
+pub mod persistence_commands;
 #[cfg(target_os = "macos")]
 pub mod pyruntime;
 pub mod runtime;

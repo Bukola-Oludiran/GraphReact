@@ -246,6 +246,12 @@ pub enum Command {
         #[command(subcommand)]
         op: AuditOp,
     },
+    /// Inspect or verify an offline local durable store. The command takes an
+    /// exclusive deployment lock so it cannot race a running daemon.
+    Persistence {
+        #[command(subcommand)]
+        op: PersistenceOp,
+    },
     /// **M-Prod sub-track #1 Phase B Part 2 (Group 1ab).** Operator
     /// admin surface for a running daemon. Today's surface:
     /// - `grx admin reload-tokens` — fire SIGHUP at a target daemon
@@ -296,6 +302,20 @@ pub enum AuditOp {
     Verify {
         /// Path to the NDJSON audit log to verify.
         path: PathBuf,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum PersistenceOp {
+    /// Verify log, snapshot, and immutable bundle integrity.
+    Verify {
+        /// Local durability directory previously passed to the daemon.
+        directory: PathBuf,
+    },
+    /// Print the current durable head and recovery metadata.
+    Status {
+        /// Local durability directory previously passed to the daemon.
+        directory: PathBuf,
     },
 }
 
