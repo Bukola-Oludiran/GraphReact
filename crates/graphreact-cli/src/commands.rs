@@ -3982,6 +3982,80 @@ fn drain_management_api_snapshots(handle: &mut DaemonHandle) {
                 };
                 let _ = oneshot_tx.send(result);
             }
+            SnapshotRequest::ListRunArtifacts { run_id, oneshot_tx } => {
+                let result = match durable_checkpoint.as_ref() {
+                    Some(durable) => match graphreact_persistence::RunId::parse(run_id) {
+                        Ok(run_id) => futures::executor::block_on(async {
+                            match graphreact_durable_runtime::get_run(
+                                durable.engine.as_ref(),
+                                &run_id,
+                            )
+                            .await
+                            {
+                                Ok(_) => graphreact_durable_runtime::list_run_artifacts(
+                                    durable.engine.as_ref(),
+                                    &run_id,
+                                )
+                                .await
+                                .map(|artifacts| {
+                                    graphreact_observer::DurableArtifactBridgeResult::List(
+                                        artifacts.into_iter().map(durable_artifact_view).collect(),
+                                    )
+                                })
+                                .unwrap_or_else(|error| {
+                                    graphreact_observer::DurableArtifactBridgeResult::Failed(
+                                        error.to_string(),
+                                    )
+                                }),
+                                Err(graphreact_durable_runtime::RunServiceError::RunNotFound(
+                                    _,
+                                )) => graphreact_observer::DurableArtifactBridgeResult::NotFound,
+                                Err(error) => {
+                                    graphreact_observer::DurableArtifactBridgeResult::Failed(
+                                        error.to_string(),
+                                    )
+                                }
+                            }
+                        }),
+                        Err(_) => graphreact_observer::DurableArtifactBridgeResult::NotFound,
+                    },
+                    None => graphreact_observer::DurableArtifactBridgeResult::DurabilityDisabled,
+                };
+                let _ = oneshot_tx.send(result);
+            }
+            SnapshotRequest::GetArtifact {
+                artifact_id,
+                oneshot_tx,
+            } => {
+                let result = match durable_checkpoint.as_ref() {
+                    Some(durable) => match graphreact_persistence::ArtifactId::parse(artifact_id) {
+                        Ok(artifact_id) => futures::executor::block_on(async {
+                            graphreact_durable_runtime::read_artifact(
+                                durable.engine.as_ref(),
+                                &artifact_id,
+                            )
+                            .await
+                            .map(|artifact| match artifact {
+                                Some((metadata, bytes)) => {
+                                    graphreact_observer::DurableArtifactBridgeResult::Content {
+                                        artifact: durable_artifact_view(metadata),
+                                        bytes,
+                                    }
+                                }
+                                None => graphreact_observer::DurableArtifactBridgeResult::NotFound,
+                            })
+                            .unwrap_or_else(|error| {
+                                graphreact_observer::DurableArtifactBridgeResult::Failed(
+                                    error.to_string(),
+                                )
+                            })
+                        }),
+                        Err(_) => graphreact_observer::DurableArtifactBridgeResult::NotFound,
+                    },
+                    None => graphreact_observer::DurableArtifactBridgeResult::DurabilityDisabled,
+                };
+                let _ = oneshot_tx.send(result);
+            }
         }
     });
 }
@@ -4023,6 +4097,25 @@ fn durable_run_error(
             graphreact_observer::DurableRunBridgeResult::Terminal
         }
         other => graphreact_observer::DurableRunBridgeResult::Failed(other.to_string()),
+    }
+}
+
+fn durable_artifact_view(
+    artifact: graphreact_persistence::ArtifactMetadata,
+) -> graphreact_observer::DurableArtifactView {
+    use std::fmt::Write as _;
+    let mut sha256 = String::with_capacity(64);
+    for byte in artifact.sha256 {
+        let _ = write!(sha256, "{byte:02x}");
+    }
+    graphreact_observer::DurableArtifactView {
+        artifact_id: artifact.id.to_string(),
+        run_id: artifact.run_id.to_string(),
+        logical_name: artifact.logical_name,
+        media_type: artifact.media_type,
+        size: artifact.size,
+        created_at_ms: artifact.created_at_ms,
+        sha256,
     }
 }
 

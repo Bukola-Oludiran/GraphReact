@@ -202,6 +202,35 @@ pub async fn list_run_artifacts(
     Ok(artifacts.into_values().collect())
 }
 
+/// Resolve artifact metadata from the verified durable record stream and read
+/// its content-addressed bytes. Metadata without a corresponding blob fails as
+/// not found instead of returning an unverifiable partial result.
+pub async fn read_artifact(
+    engine: &dyn PersistenceEngine,
+    artifact_id: &ArtifactId,
+) -> Result<Option<(ArtifactMetadata, Vec<u8>)>, DurableRuntimeError> {
+    let mut metadata = engine.read_snapshot().await?.and_then(|snapshot| {
+        snapshot
+            .artifacts
+            .into_iter()
+            .find(|metadata| &metadata.id == artifact_id)
+    });
+    for record in engine.replay(0).await? {
+        if let RuntimeRecordV1::ArtifactCommitted(candidate) = record {
+            if &candidate.id == artifact_id {
+                metadata = Some(candidate);
+            }
+        }
+    }
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let Some(bytes) = engine.read_artifact(artifact_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some((metadata, bytes)))
+}
+
 /// Write a verified runtime snapshot at the current committed log head.
 pub async fn write_runtime_snapshot(
     scheduler: &Scheduler,
@@ -937,6 +966,12 @@ mod tests {
             .unwrap();
         assert_eq!(restored, bytes);
         let listed = futures::executor::block_on(list_run_artifacts(&store, &run_id)).unwrap();
-        assert_eq!(listed, vec![metadata]);
+        assert_eq!(listed, vec![metadata.clone()]);
+        let (read_metadata, read_bytes) =
+            futures::executor::block_on(read_artifact(&store, &metadata.id))
+                .unwrap()
+                .unwrap();
+        assert_eq!(read_metadata, metadata);
+        assert_eq!(read_bytes, bytes);
     }
 }

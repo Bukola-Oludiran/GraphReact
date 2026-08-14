@@ -165,6 +165,14 @@ pub enum SnapshotRequest {
         run_id: String,
         oneshot_tx: oneshot::Sender<DurableRunBridgeResult>,
     },
+    ListRunArtifacts {
+        run_id: String,
+        oneshot_tx: oneshot::Sender<DurableArtifactBridgeResult>,
+    },
+    GetArtifact {
+        artifact_id: String,
+        oneshot_tx: oneshot::Sender<DurableArtifactBridgeResult>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,6 +204,29 @@ pub struct StartDurableRunBody {
     pub entrypoint: String,
     #[serde(default)]
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DurableArtifactView {
+    pub artifact_id: String,
+    pub run_id: String,
+    pub logical_name: String,
+    pub media_type: String,
+    pub size: u64,
+    pub created_at_ms: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug)]
+pub enum DurableArtifactBridgeResult {
+    List(Vec<DurableArtifactView>),
+    Content {
+        artifact: DurableArtifactView,
+        bytes: Vec<u8>,
+    },
+    NotFound,
+    DurabilityDisabled,
+    Failed(String),
 }
 
 /// Immediate originator-side disposition for the delegated-restart
@@ -741,10 +772,10 @@ pub const DEFAULT_RATE_LIMIT_PER_TOKEN_BURST: u32 = 40;
 /// route match happens), so `MatchedPath` is NOT in extensions on
 /// the request path. Instead, the middleware uses
 /// [`classify_protected_path`] which performs a small fixed-shape
-/// match against the 15 known patterns + an `unknown` sentinel for
+/// match against the 17 known patterns + an `unknown` sentinel for
 /// anything outside the table (e.g. an operator typoing `/v1/foo`).
 ///
-/// Cardinality bound is exactly `15 + 1 = 16` for the rate-limit
+/// Cardinality bound is exactly `17 + 1 = 18` for the rate-limit
 /// metric family — well under the conventional Prometheus
 /// per-family soft cap of ~10k.
 pub const PROTECTED_ROUTE_LABELS: &[&str] = &[
@@ -754,6 +785,8 @@ pub const PROTECTED_ROUTE_LABELS: &[&str] = &[
     "/v1/runs",
     "/v1/runs/:run_id",
     "/v1/runs/:run_id/cancel",
+    "/v1/runs/:run_id/artifacts",
+    "/v1/artifacts/:artifact_id",
     "/v1/nodes",
     "/v1/nodes/:id",
     "/v1/nodes/:id/messages",
@@ -819,6 +852,19 @@ pub fn classify_protected_path(path: &str) -> &'static str {
                 .is_some_and(|run_id| !run_id.is_empty() && !run_id.contains('/'))
             {
                 "/v1/runs/:run_id/cancel"
+            } else if tail
+                .strip_suffix("/artifacts")
+                .is_some_and(|run_id| !run_id.is_empty() && !run_id.contains('/'))
+            {
+                "/v1/runs/:run_id/artifacts"
+            } else {
+                "unknown"
+            }
+        }
+        p if p.starts_with("/v1/artifacts/") => {
+            let artifact_id = &p["/v1/artifacts/".len()..];
+            if !artifact_id.is_empty() && !artifact_id.contains('/') {
+                "/v1/artifacts/:artifact_id"
             } else {
                 "unknown"
             }
@@ -1362,6 +1408,11 @@ pub fn build_router_with_rate_limit_and_proxies(
         .route("/v1/runs", post(start_durable_run_handler))
         .route("/v1/runs/:run_id", get(get_durable_run_handler))
         .route("/v1/runs/:run_id/cancel", post(cancel_durable_run_handler))
+        .route(
+            "/v1/runs/:run_id/artifacts",
+            get(list_run_artifacts_handler),
+        )
+        .route("/v1/artifacts/:artifact_id", get(get_artifact_handler))
         .route("/v1/nodes", get(nodes_list))
         .route("/v1/nodes/:id", get(node_detail))
         .route("/v1/nodes/:id/messages/recent", get(node_messages_recent))
@@ -2604,6 +2655,106 @@ fn durable_run_error(status: StatusCode, code: &'static str, message: &str) -> R
         serde_json::json!({ "error": code, "message": message }).to_string(),
     )
         .into_response()
+}
+
+async fn list_run_artifacts_handler(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> Response {
+    let (tx, rx) = oneshot::channel();
+    if state
+        .snapshot_tx
+        .send(SnapshotRequest::ListRunArtifacts {
+            run_id,
+            oneshot_tx: tx,
+        })
+        .await
+        .is_err()
+    {
+        return service_unavailable("scheduler bridge closed");
+    }
+    match rx.await {
+        Ok(DurableArtifactBridgeResult::List(artifacts)) => Json(artifacts).into_response(),
+        Ok(DurableArtifactBridgeResult::NotFound) => {
+            durable_run_error(StatusCode::NOT_FOUND, "run_not_found", "run was not found")
+        }
+        Ok(DurableArtifactBridgeResult::DurabilityDisabled) => durable_run_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durability_disabled",
+            "durable artifact service is not enabled",
+        ),
+        Ok(DurableArtifactBridgeResult::Failed(message)) => durable_run_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persistence_error",
+            &message,
+        ),
+        Ok(_) => durable_run_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_bridge_response",
+            "scheduler returned an invalid artifact response",
+        ),
+        Err(_) => service_unavailable("scheduler bridge dropped response"),
+    }
+}
+
+async fn get_artifact_handler(
+    State(state): State<ApiState>,
+    Path(artifact_id): Path<String>,
+) -> Response {
+    let (tx, rx) = oneshot::channel();
+    if state
+        .snapshot_tx
+        .send(SnapshotRequest::GetArtifact {
+            artifact_id,
+            oneshot_tx: tx,
+        })
+        .await
+        .is_err()
+    {
+        return service_unavailable("scheduler bridge closed");
+    }
+    match rx.await {
+        Ok(DurableArtifactBridgeResult::Content { artifact, bytes }) => {
+            let content_type = HeaderValue::from_str(&artifact.media_type)
+                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+            let mut response = bytes.into_response();
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_TYPE, content_type);
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_LENGTH,
+                HeaderValue::from_str(&artifact.size.to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("0")),
+            );
+            response.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-graphreact-artifact-id"),
+                HeaderValue::from_str(&artifact.artifact_id)
+                    .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+            );
+            response
+        }
+        Ok(DurableArtifactBridgeResult::NotFound) => durable_run_error(
+            StatusCode::NOT_FOUND,
+            "artifact_not_found",
+            "artifact was not found",
+        ),
+        Ok(DurableArtifactBridgeResult::DurabilityDisabled) => durable_run_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durability_disabled",
+            "durable artifact service is not enabled",
+        ),
+        Ok(DurableArtifactBridgeResult::Failed(message)) => durable_run_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persistence_error",
+            &message,
+        ),
+        Ok(_) => durable_run_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_bridge_response",
+            "scheduler returned an invalid artifact response",
+        ),
+        Err(_) => service_unavailable("scheduler bridge dropped response"),
+    }
 }
 
 async fn nodes_list(
@@ -4343,6 +4494,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_artifact_download_streams_stored_media_type() {
+        use tower::ServiceExt;
+        let (state, mut snapshot_rx) = delegated_restart_test_state(crate::rbac::Role::Admin);
+        let app = build_router_with_rate_limit(state, RateLimitConfig::for_tests(1_000, 1_000));
+        let responder = tokio::spawn(async move {
+            match snapshot_rx.recv().await.expect("artifact request") {
+                SnapshotRequest::GetArtifact {
+                    artifact_id,
+                    oneshot_tx,
+                } => {
+                    let _ = oneshot_tx.send(DurableArtifactBridgeResult::Content {
+                        artifact: DurableArtifactView {
+                            artifact_id,
+                            run_id: "01900000-0000-7000-8000-000000000001".into(),
+                            logical_name: "evidence.txt".into(),
+                            media_type: "text/plain".into(),
+                            size: 7,
+                            created_at_ms: 1,
+                            sha256: "00".repeat(32),
+                        },
+                        bytes: b"durable".to_vec(),
+                    });
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        });
+        let response = app
+            .oneshot(durable_run_http_request(
+                Method::GET,
+                "/v1/artifacts/01900000-0000-7000-8000-000000000002",
+                "",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain"
+        );
+        assert_eq!(response.headers()[axum::http::header::CONTENT_LENGTH], "7");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"durable");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn delegated_restart_admin_dispatches_token_id_and_returns_correlation() {
         use tower::ServiceExt;
         let (state, mut snapshot_rx) = delegated_restart_test_state(crate::rbac::Role::Admin);
@@ -4669,7 +4869,7 @@ mod rate_limit_tests {
 
     #[test]
     fn protected_route_labels_table_matches_registered_routes() {
-        // `PROTECTED_ROUTE_LABELS` must list exactly the 15
+        // `PROTECTED_ROUTE_LABELS` must list exactly the 17
         // protected paths the router registers. If a new
         // protected route lands without updating the table, the
         // classifier collapses it to `"unknown"` and operators
@@ -4682,6 +4882,8 @@ mod rate_limit_tests {
             "/v1/runs",
             "/v1/runs/:run_id",
             "/v1/runs/:run_id/cancel",
+            "/v1/runs/:run_id/artifacts",
+            "/v1/artifacts/:artifact_id",
             "/v1/nodes",
             "/v1/nodes/:id",
             "/v1/nodes/:id/messages",
