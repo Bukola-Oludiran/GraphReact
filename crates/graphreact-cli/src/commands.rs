@@ -1660,6 +1660,21 @@ const CLUSTER_LEASE_DURATION: Duration = Duration::from_secs(15);
 const CLUSTER_LEASE_RENEWAL_INTERVAL: Duration = Duration::from_secs(5);
 const CLUSTER_STANDBY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+struct ObserverDurableRuntimeMetrics(std::sync::Arc<graphreact_observer::MetricsInner>);
+
+impl graphreact_durable_runtime::DurableRuntimeObserver for ObserverDurableRuntimeMetrics {
+    fn activation_commit(&self, duration_ns: u64, success: bool) {
+        self.0.durability_commit_observe(duration_ns, success);
+    }
+
+    fn effect_dispatch(&self, retried: u64, indeterminate: u64) {
+        self.0.durability_effect_retries_total.add(retried);
+        self.0
+            .durability_indeterminate_effects_total
+            .add(indeterminate);
+    }
+}
+
 struct ClusterLeaseState {
     engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine>,
     grant: graphreact_persistence::LeaseGrant,
@@ -1691,16 +1706,16 @@ impl ClusterLeaseState {
         }
     }
 
-    async fn renew_if_due(&mut self) -> Result<(), graphreact_persistence::PersistenceError> {
+    async fn renew_if_due(&mut self) -> Result<bool, graphreact_persistence::PersistenceError> {
         if tokio::time::Instant::now() < self.next_renewal {
-            return Ok(());
+            return Ok(false);
         }
         self.grant = self
             .engine
             .renew_lease(&self.grant, CLUSTER_LEASE_DURATION)
             .await?;
         self.next_renewal = tokio::time::Instant::now() + CLUSTER_LEASE_RENEWAL_INTERVAL;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1747,8 +1762,12 @@ impl DurableCheckpointState {
         &mut self,
         scheduler: &Scheduler,
         force: bool,
+        metrics: Option<&graphreact_observer::MetricsInner>,
     ) -> Result<bool, graphreact_durable_runtime::DurableRuntimeError> {
         let status = self.engine.status().await?;
+        if let Some(metrics) = metrics {
+            metrics.durability_log_bytes.set(status.durable_bytes);
+        }
         let replay_from = self
             .last_scanned_sequence
             .map_or(0, |sequence| sequence.saturating_add(1));
@@ -1784,6 +1803,10 @@ impl DurableCheckpointState {
         self.last_scanned_sequence = installed.head_sequence;
         self.activations_since_snapshot = 0;
         self.bytes_at_snapshot = installed.durable_bytes;
+        if let Some(metrics) = metrics {
+            metrics.durability_log_bytes.set(installed.durable_bytes);
+            metrics.durability_snapshot_bytes.set(new_bytes);
+        }
         Ok(true)
     }
 }
@@ -1940,28 +1963,43 @@ impl DaemonHandle {
         let Some(checkpoint) = durable_checkpoint.as_mut() else {
             return Ok(false);
         };
-        checkpoint.checkpoint(host.scheduler_mut(), force).await
+        checkpoint
+            .checkpoint(host.scheduler_mut(), force, self.metrics.as_deref())
+            .await
     }
 
     async fn renew_cluster_lease(&mut self) -> bool {
         let Some(lease) = self.cluster_lease.as_mut() else {
             return true;
         };
-        if let Err(error) = lease.renew_if_due().await {
-            tracing::error!(
-                target: "graphreact::persistence",
-                replica_id = lease.grant.replica_id,
-                fencing_token = lease.grant.fencing_token,
-                error = %error,
-                "cluster durability lease lost; halting scheduler"
-            );
-            if let Some(drain) = &self.drain {
-                drain.start(0);
+        match lease.renew_if_due().await {
+            Ok(true) => {
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.durability_lease_renewals_total.inc();
+                    metrics.durability_active.set(1);
+                }
             }
-            self.cluster.begin_drain();
-            self.cluster_lease = None;
-            self.durable_checkpoint = None;
-            return false;
+            Ok(false) => return true,
+            Err(error) => {
+                tracing::error!(
+                    target: "graphreact::persistence",
+                    replica_id = lease.grant.replica_id,
+                    fencing_token = lease.grant.fencing_token,
+                    error = %error,
+                    "cluster durability lease lost; halting scheduler"
+                );
+                if let Some(drain) = &self.drain {
+                    drain.start(0);
+                }
+                self.cluster.begin_drain();
+                self.cluster_lease = None;
+                self.durable_checkpoint = None;
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.durability_lease_losses_total.inc();
+                    metrics.durability_active.set(0);
+                }
+                return false;
+            }
         }
         true
     }
@@ -2664,6 +2702,14 @@ fn validate_tls_paths_absolute(paths: Option<&TlsPaths>) {
 /// [`DaemonHandle`]. Async because `Cluster::start` + `Cluster::connect`
 /// are async.
 pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandError> {
+    let durability_metrics = opts
+        .observer_bind
+        .as_ref()
+        .map(|_| std::sync::Arc::new(graphreact_observer::MetricsInner::new()));
+    let durable_runtime_observer = durability_metrics.as_ref().map(|metrics| {
+        std::sync::Arc::new(ObserverDurableRuntimeMetrics(metrics.clone()))
+            as std::sync::Arc<dyn graphreact_durable_runtime::DurableRuntimeObserver>
+    });
     let durability = opts
         .durability
         .clone()
@@ -2773,17 +2819,32 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     match durable_startup {
         DurableStartup::Off => {}
         DurableStartup::Local { config, bundle } => {
-            let engine = graphreact_durable_runtime::install_local(host.scheduler_mut(), config)
-                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            let engine = graphreact_durable_runtime::install_local_observed(
+                host.scheduler_mut(),
+                config,
+                durable_runtime_observer.clone(),
+            )
+            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
             graphreact_durable_runtime::install_deployment_bundle(engine.as_ref(), &bundle)
                 .await
                 .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
             graphreact_durable_runtime::require_deployment_bundle(engine.as_ref())
                 .await
                 .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
-            graphreact_durable_runtime::recover(host.scheduler_mut(), engine.as_ref())
-                .await
-                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            let recovery_started = std::time::Instant::now();
+            let recovery =
+                graphreact_durable_runtime::recover(host.scheduler_mut(), engine.as_ref())
+                    .await
+                    .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            if let Some(metrics) = durability_metrics.as_ref() {
+                metrics.durability_recovery_observe(
+                    u64::try_from(recovery_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    u64::try_from(recovery.replayed_records).unwrap_or(u64::MAX),
+                );
+                metrics
+                    .durability_log_bytes
+                    .set(engine.status().await?.durable_bytes);
+            }
             let checkpoint_engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine> =
                 engine;
             durable_checkpoint = Some(
@@ -2798,10 +2859,11 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
             grant,
         } => {
             let engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine> = engine;
-            graphreact_durable_runtime::install_engine(
+            graphreact_durable_runtime::install_engine_observed(
                 host.scheduler_mut(),
                 engine.clone(),
                 grant.fencing_token,
+                durable_runtime_observer.clone(),
             );
             graphreact_durable_runtime::install_deployment_bundle(engine.as_ref(), &bundle)
                 .await
@@ -2809,9 +2871,21 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
             graphreact_durable_runtime::require_deployment_bundle(engine.as_ref())
                 .await
                 .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
-            graphreact_durable_runtime::recover(host.scheduler_mut(), engine.as_ref())
-                .await
-                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            let recovery_started = std::time::Instant::now();
+            let recovery =
+                graphreact_durable_runtime::recover(host.scheduler_mut(), engine.as_ref())
+                    .await
+                    .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            if let Some(metrics) = durability_metrics.as_ref() {
+                metrics.durability_recovery_observe(
+                    u64::try_from(recovery_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    u64::try_from(recovery.replayed_records).unwrap_or(u64::MAX),
+                );
+                metrics
+                    .durability_log_bytes
+                    .set(engine.status().await?.durable_bytes);
+                metrics.durability_active.set(1);
+            }
             durable_checkpoint = Some(
                 DurableCheckpointState::new(engine.clone(), grant.fencing_token)
                     .await
@@ -2933,9 +3007,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     // observer is wired. `None` when no observer is configured
     // (zero-overhead default).
     #[allow(unused_assignments)]
-    let mut metrics_for_engine_counts: Option<
-        std::sync::Arc<graphreact_observer::MetricsInner>,
-    > = None;
+    let mut metrics_for_engine_counts = durability_metrics.clone();
     // **M-Prod sub-track #5.** Cluster-readiness counter shared
     // between the `/v1/readyz` handler and the per-peer dial loop
     // below. The handler returns 200 once `configured_peers == 0`
@@ -2966,7 +3038,9 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         // validator is tracing-only (no AuditSink fan) per the
         // drain_budget_misconfig precedent below.
         validate_tls_paths_absolute(opts.observer_tls_paths.as_ref());
-        let metrics = std::sync::Arc::new(graphreact_observer::MetricsInner::new());
+        let metrics = durability_metrics
+            .clone()
+            .expect("observer bind creates durability metrics before recovery");
         if let Some(context) = runtime_secrets.as_ref() {
             context.set_metrics(Some(metrics.clone()));
         }

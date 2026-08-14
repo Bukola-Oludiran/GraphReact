@@ -218,8 +218,11 @@ Implementation tracker (updated 2026-08-14):
 - Shipped: JavaScript, Python, and Go expose equivalent named durable-state,
   durable-effect, durable-timer, immutable-artifact, and monotonic-cancellation
   activation APIs over one versioned JSON wire contract.
-- Remaining before Phase A closes: durability metrics/audit events, decoder
-  fuzzing, and the final crash/failover soak gates.
+- Shipped: bounded durability metrics cover commit latency/failures, current
+  log and snapshot bytes, recovery duration/replay count, effect retries and
+  indeterminate outcomes, lease renewals/losses, and active-replica role.
+- Remaining before Phase A closes: hash-chained durability audit events,
+  decoder fuzzing, and the final crash/failover soak gates.
 
 Acceptance: kill the daemon at every boundary of a tool-call workflow and prove
 that restart produces exactly one externally visible outcome.

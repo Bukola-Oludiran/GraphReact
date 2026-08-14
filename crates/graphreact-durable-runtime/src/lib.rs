@@ -15,8 +15,9 @@ pub use deployment::{
     build_deployment_bundle, install_deployment_bundle, require_deployment_bundle, BundleInputs,
 };
 pub use effects::{
-    dispatch_pending_effects, AdapterFuture, DeterministicIdempotentAdapter, DurableEffectAdapter,
-    EffectAdapterError, EffectAdapterRegistry, EffectDispatchSummary,
+    dispatch_pending_effects, dispatch_pending_effects_observed, AdapterFuture,
+    DeterministicIdempotentAdapter, DurableEffectAdapter, EffectAdapterError,
+    EffectAdapterRegistry, EffectDispatchSummary,
 };
 pub use entrypoints::{validate_entrypoint_manifests, EntrypointValidationError};
 pub use runs::{cancel_run, get_run, start_run, RunInfo, RunServiceError, StartRunOutcome};
@@ -34,6 +35,13 @@ use graphreact_persistence::{
     TimerIntent,
 };
 use sha2::{Digest, Sha256};
+
+/// Low-cardinality host observer for the activation commit boundary.
+pub trait DurableRuntimeObserver: Send + Sync {
+    fn activation_commit(&self, duration_ns: u64, success: bool);
+
+    fn effect_dispatch(&self, _retried: u64, _indeterminate: u64) {}
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DurableRuntimeError {
@@ -75,12 +83,21 @@ pub fn install_local(
     scheduler: &mut Scheduler,
     config: LocalConfig,
 ) -> graphreact_persistence::Result<Arc<LocalPersistence>> {
+    install_local_observed(scheduler, config, None)
+}
+
+pub fn install_local_observed(
+    scheduler: &mut Scheduler,
+    config: LocalConfig,
+    observer: Option<Arc<dyn DurableRuntimeObserver>>,
+) -> graphreact_persistence::Result<Arc<LocalPersistence>> {
     let fencing_token = config.fencing_token;
     let engine = Arc::new(LocalPersistence::open(config)?);
-    install_engine(
+    install_engine_observed(
         scheduler,
         Arc::clone(&engine) as Arc<dyn PersistenceEngine>,
         fencing_token,
+        observer,
     );
     Ok(engine)
 }
@@ -91,11 +108,32 @@ pub fn install_engine(
     engine: Arc<dyn PersistenceEngine>,
     fencing_token: u64,
 ) {
+    install_engine_observed(scheduler, engine, fencing_token, None);
+}
+
+pub fn install_engine_observed(
+    scheduler: &mut Scheduler,
+    engine: Arc<dyn PersistenceEngine>,
+    fencing_token: u64,
+    observer: Option<Arc<dyn DurableRuntimeObserver>>,
+) {
     scheduler.install_durable_activation_committer(Rc::new(move |activation| {
-        let artifacts = activation_artifacts(activation)
-            .map_err(|message| RuntimeError::DurableCommit { message })?;
+        let started = std::time::Instant::now();
+        let finish = |success| {
+            if let Some(observer) = observer.as_ref() {
+                observer.activation_commit(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    success,
+                );
+            }
+        };
+        let artifacts = activation_artifacts(activation).map_err(|message| {
+            finish(false);
+            RuntimeError::DurableCommit { message }
+        })?;
         for (metadata, bytes) in &artifacts {
             futures::executor::block_on(engine.put_artifact(metadata, bytes)).map_err(|error| {
+                finish(false);
                 RuntimeError::DurableCommit {
                     message: error.to_string(),
                 }
@@ -108,12 +146,17 @@ pub fn install_engine(
                 .map(|(metadata, _)| metadata)
                 .collect(),
         )
-        .map_err(|message| RuntimeError::DurableCommit { message })?;
-        futures::executor::block_on(engine.commit(fencing_token, &records))
+        .map_err(|message| {
+            finish(false);
+            RuntimeError::DurableCommit { message }
+        })?;
+        let result = futures::executor::block_on(engine.commit(fencing_token, &records))
             .map(|_| ())
             .map_err(|error| RuntimeError::DurableCommit {
                 message: error.to_string(),
-            })
+            });
+        finish(result.is_ok());
+        result
     }));
 }
 
@@ -719,6 +762,20 @@ mod tests {
         use_durable_state, use_message, Attrs, CommunicationGraph, NodeContext, NodeDefinition,
         PermissionManifest,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct TestDurableObserver {
+        successful_commits: AtomicU64,
+    }
+
+    impl DurableRuntimeObserver for TestDurableObserver {
+        fn activation_commit(&self, _duration_ns: u64, success: bool) {
+            if success {
+                self.successful_commits.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 
     fn counter_scheduler() -> Scheduler {
         let definition = NodeDefinition::new("Counter", |_ctx: &NodeContext| {
@@ -745,7 +802,13 @@ mod tests {
         let config = LocalConfig::new(directory.path(), deployment_id, digest);
 
         let mut scheduler = counter_scheduler();
-        let engine = install_local(&mut scheduler, config).unwrap();
+        let observer = Arc::new(TestDurableObserver::default());
+        let engine = install_local_observed(
+            &mut scheduler,
+            config,
+            Some(observer.clone() as Arc<dyn DurableRuntimeObserver>),
+        )
+        .unwrap();
         scheduler.start().unwrap();
         enqueue_durable_message(
             &scheduler,
@@ -772,6 +835,7 @@ mod tests {
         assert_eq!(commit.state_writes.len(), 1);
         assert_eq!(commit.state_writes[0].key, "count");
         assert_eq!(commit.state_writes[0].value, serde_json::json!(1));
+        assert_eq!(observer.successful_commits.load(Ordering::Relaxed), 1);
     }
 
     #[test]

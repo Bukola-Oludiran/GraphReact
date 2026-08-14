@@ -320,6 +320,23 @@ impl LabeledGauge {
 /// Held behind `Arc` so the HTTP handler and the sink see the same
 /// counters.
 pub struct MetricsInner {
+    /// Phase A durability metrics are deliberately unlabeled. A process owns
+    /// at most one active deployment, so deployment/run identifiers would add
+    /// cardinality without improving operator decisions.
+    pub durability_commit_duration: Histogram,
+    pub durability_commits_total: Counter,
+    pub durability_commit_failures_total: Counter,
+    pub durability_log_bytes: Gauge,
+    pub durability_snapshot_bytes: Gauge,
+    pub durability_recovery_duration: Histogram,
+    pub durability_replay_records_total: Counter,
+    pub durability_effect_retries_total: Counter,
+    pub durability_indeterminate_effects_total: Counter,
+    pub durability_lease_renewals_total: Counter,
+    pub durability_lease_losses_total: Counter,
+    /// 1 for the active lease holder, 0 for standby/off/local mode.
+    pub durability_active: Gauge,
+
     /// `grx_messages_delivered_total{from,to,type}` — high-cardinality.
     /// See module-level cardinality risk note.
     pub messages_delivered: DashMap<u64, Arc<LabeledCounter>>,
@@ -462,6 +479,18 @@ impl MetricsInner {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            durability_commit_duration: Histogram::new(),
+            durability_commits_total: Counter::new(),
+            durability_commit_failures_total: Counter::new(),
+            durability_log_bytes: Gauge::new(),
+            durability_snapshot_bytes: Gauge::new(),
+            durability_recovery_duration: Histogram::new(),
+            durability_replay_records_total: Counter::new(),
+            durability_effect_retries_total: Counter::new(),
+            durability_indeterminate_effects_total: Counter::new(),
+            durability_lease_renewals_total: Counter::new(),
+            durability_lease_losses_total: Counter::new(),
+            durability_active: Gauge::new(),
             messages_delivered: DashMap::new(),
             messages_dropped: DashMap::new(),
             node_renders: DashMap::new(),
@@ -487,6 +516,22 @@ impl MetricsInner {
             audit_forwarder_queue_depth: DashMap::new(),
             audit_forwarder_drain_timeouts: DashMap::new(),
         }
+    }
+
+    #[inline]
+    pub fn durability_commit_observe(&self, duration_ns: u64, success: bool) {
+        self.durability_commit_duration.observe(duration_ns);
+        if success {
+            self.durability_commits_total.inc();
+        } else {
+            self.durability_commit_failures_total.inc();
+        }
+    }
+
+    #[inline]
+    pub fn durability_recovery_observe(&self, duration_ns: u64, replayed_records: u64) {
+        self.durability_recovery_duration.observe(duration_ns);
+        self.durability_replay_records_total.add(replayed_records);
     }
 
     /// **M-Prod sub-track #1 Phase B Part 2 (Group 1d).** Increment

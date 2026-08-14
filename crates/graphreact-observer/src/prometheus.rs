@@ -48,6 +48,79 @@ use crate::metrics::{
 pub fn encode_text(inner: &MetricsInner) -> String {
     let mut s = String::with_capacity(8 * 1024);
 
+    encode_histogram(
+        &mut s,
+        "grx_durability_commit_duration_seconds",
+        "Wall-clock duration of durable activation commits, in seconds.",
+        &inner.durability_commit_duration.snapshot(),
+    );
+    encode_unlabeled_counter(
+        &mut s,
+        "grx_durability_commits_total",
+        "Durable activation commits acknowledged by persistence.",
+        inner.durability_commits_total.get(),
+    );
+    encode_unlabeled_counter(
+        &mut s,
+        "grx_durability_commit_failures_total",
+        "Durable activation commits rejected by persistence.",
+        inner.durability_commit_failures_total.get(),
+    );
+    encode_gauge(
+        &mut s,
+        "grx_durability_log_bytes",
+        "Current durable log bytes reported by the persistence head.",
+        inner.durability_log_bytes.get(),
+    );
+    encode_gauge(
+        &mut s,
+        "grx_durability_snapshot_bytes",
+        "Bytes covered by the latest installed snapshot.",
+        inner.durability_snapshot_bytes.get(),
+    );
+    encode_histogram(
+        &mut s,
+        "grx_durability_recovery_duration_seconds",
+        "Wall-clock duration of verified snapshot restore and log replay.",
+        &inner.durability_recovery_duration.snapshot(),
+    );
+    encode_unlabeled_counter(
+        &mut s,
+        "grx_durability_replay_records_total",
+        "Verified persistence records replayed during recovery.",
+        inner.durability_replay_records_total.get(),
+    );
+    encode_unlabeled_counter(
+        &mut s,
+        "grx_durability_effect_retries_total",
+        "Ambiguous idempotent effects retried with their stable EffectId.",
+        inner.durability_effect_retries_total.get(),
+    );
+    encode_unlabeled_counter(
+        &mut s,
+        "grx_durability_indeterminate_effects_total",
+        "Ambiguous non-replayable effects marked indeterminate.",
+        inner.durability_indeterminate_effects_total.get(),
+    );
+    encode_unlabeled_counter(
+        &mut s,
+        "grx_durability_lease_renewals_total",
+        "Successful active-replica lease renewals.",
+        inner.durability_lease_renewals_total.get(),
+    );
+    encode_unlabeled_counter(
+        &mut s,
+        "grx_durability_lease_losses_total",
+        "Lease renewal failures that fenced and halted the scheduler.",
+        inner.durability_lease_losses_total.get(),
+    );
+    encode_gauge(
+        &mut s,
+        "grx_durability_active",
+        "Whether this replica currently owns the durability lease (1 active, 0 standby/off/local).",
+        inner.durability_active.get(),
+    );
+
     encode_labeled_counter(
         &mut s,
         "grx_messages_delivered_total",
@@ -539,6 +612,29 @@ mod tests {
         assert!(out.contains("grx_queue_depth_messages 0"));
         // Labeled families are suppressed when empty.
         assert!(!out.contains("grx_messages_delivered_total{"));
+    }
+
+    #[test]
+    fn durability_families_are_unlabeled_and_bounded() {
+        let inner = MetricsInner::new();
+        inner.durability_commit_observe(8_000, true);
+        inner.durability_commit_observe(16_000, false);
+        inner.durability_recovery_observe(32_000, 7);
+        inner.durability_log_bytes.set(4096);
+        inner.durability_snapshot_bytes.set(2048);
+        inner.durability_lease_renewals_total.inc();
+        inner.durability_active.set(1);
+
+        let out = encode_text(&inner);
+        assert!(out.contains("grx_durability_commits_total 1"));
+        assert!(out.contains("grx_durability_commit_failures_total 1"));
+        assert!(out.contains("grx_durability_replay_records_total 7"));
+        assert!(out.contains("grx_durability_log_bytes 4096"));
+        assert!(out.contains("grx_durability_snapshot_bytes 2048"));
+        assert!(out.contains("grx_durability_lease_renewals_total 1"));
+        assert!(out.contains("grx_durability_active 1"));
+        assert!(!out.contains("deployment_id="));
+        assert!(!out.contains("run_id="));
     }
 
     #[test]

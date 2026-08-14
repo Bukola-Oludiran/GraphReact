@@ -8,7 +8,7 @@ use graphreact_persistence::{
     PersistenceEngine, ReplayPolicy, RunStatus, RuntimeRecordV1,
 };
 
-use crate::DurableRuntimeError;
+use crate::{DurableRuntimeError, DurableRuntimeObserver};
 
 pub type AdapterFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, EffectAdapterError>> + Send + 'a>>;
@@ -66,6 +66,16 @@ pub async fn dispatch_pending_effects(
     engine: &dyn PersistenceEngine,
     fencing_token: u64,
     registry: &EffectAdapterRegistry,
+) -> Result<EffectDispatchSummary, DurableRuntimeError> {
+    dispatch_pending_effects_observed(scheduler, engine, fencing_token, registry, None).await
+}
+
+pub async fn dispatch_pending_effects_observed(
+    scheduler: &Scheduler,
+    engine: &dyn PersistenceEngine,
+    fencing_token: u64,
+    registry: &EffectAdapterRegistry,
+    observer: Option<&dyn DurableRuntimeObserver>,
 ) -> Result<EffectDispatchSummary, DurableRuntimeError> {
     let snapshot = engine.read_snapshot().await?;
     let replay_from = snapshot
@@ -195,6 +205,12 @@ pub async fn dispatch_pending_effects(
         scheduler.enqueue_recovered_message(super::core_message(result_message));
         summary.dispatched += 1;
         summary.result_messages += 1;
+    }
+    if let Some(observer) = observer {
+        observer.effect_dispatch(
+            u64::try_from(summary.retried).unwrap_or(u64::MAX),
+            u64::try_from(summary.indeterminate).unwrap_or(u64::MAX),
+        );
     }
     Ok(summary)
 }
