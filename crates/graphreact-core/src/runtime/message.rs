@@ -47,6 +47,8 @@ pub fn create_message(
         // (`SchedulerHandle::send_ingress_with_correlation`) set
         // it directly on construction.
         correlation_id: None,
+        run_id: None,
+        attempt_id: None,
     }
 }
 

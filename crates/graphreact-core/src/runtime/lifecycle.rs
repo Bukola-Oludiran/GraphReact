@@ -32,9 +32,9 @@ use crate::runtime::types::NodeContext;
 /// They're cleared once the entire evaluation pass completes.
 pub fn evaluate_node(node_rc: &Rc<RefCell<NodeInstance>>, ctx: NodeContext, hook_ctx: HookCtx) {
     install_ctx(node_rc, hook_ctx);
+    let _context_guard = HookContextGuard;
     run_component_body(node_rc, ctx);
     flush_effects(node_rc);
-    clear_ctx();
 }
 
 /// Evaluate a node and await its async effects. Async slots that resolved
@@ -45,9 +45,9 @@ pub async fn evaluate_node_async(
     hook_ctx: HookCtx,
 ) {
     install_ctx(node_rc, hook_ctx);
+    let _context_guard = HookContextGuard;
     run_component_body(node_rc, ctx);
     flush_effects_async(node_rc).await;
-    clear_ctx();
 }
 
 fn install_ctx(node_rc: &Rc<RefCell<NodeInstance>>, hook_ctx: HookCtx) {
@@ -58,6 +58,16 @@ fn install_ctx(node_rc: &Rc<RefCell<NodeInstance>>, hook_ctx: HookCtx) {
 fn clear_ctx() {
     set_hook_ctx(None);
     set_current_node(None);
+}
+
+/// Ensures validation errors or component panics cannot leak one node's hook
+/// context into a later activation on the same scheduler thread.
+struct HookContextGuard;
+
+impl Drop for HookContextGuard {
+    fn drop(&mut self) {
+        clear_ctx();
+    }
 }
 
 fn run_component_body(node_rc: &Rc<RefCell<NodeInstance>>, ctx: NodeContext) {

@@ -1743,6 +1743,8 @@ fn wire_to_local(
         // capability-gating happens at the sender's `route_outbound`
         // (peers without `INGRESS_CALL_V1_CAPABILITY` send `None`).
         correlation_id: wire.correlation_id,
+        run_id: None,
+        attempt_id: None,
     })
 }
 

@@ -115,6 +115,8 @@ fn map_payload_value(msg: &IncomingMessage, f: impl FnOnce(f64) -> f64) -> Incom
         r#type: msg.r#type.clone(),
         payload,
         ttl: msg.ttl,
+        run_id: msg.run_id.clone(),
+        attempt_id: msg.attempt_id.clone(),
     }
 }
 

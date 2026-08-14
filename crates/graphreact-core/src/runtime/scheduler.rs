@@ -42,8 +42,8 @@ use crate::runtime::supervision::{
     RestartPolicy, Supervisor, SupervisorError, SYSTEM_DOWN, SYSTEM_EXIT,
 };
 use crate::runtime::types::{
-    ComposeChildSpec, EmitOptions, IncomingMessage, Message, NodeContext, PermissionManifest,
-    TopologyEventKind,
+    ComposeChildSpec, DurableStateSnapshot, EmitOptions, IncomingMessage, Message, NodeContext,
+    PermissionManifest, TopologyEventKind,
 };
 
 new_key_type! {
@@ -71,6 +71,12 @@ struct CallContext {
     correlation_id: String,
     reply_type: String,
     tagged: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DurableRunContext {
+    run_id: String,
+    attempt_id: String,
 }
 
 /// Reactive scheduler. Owns nodes, the message queue, and the dirty queue.
@@ -138,6 +144,9 @@ pub struct Scheduler {
     /// multi-emit handlers don't accidentally tag downstream
     /// messages as replies.
     current_call_context: Rc<RefCell<Option<CallContext>>>,
+    /// Run identity active while a durable message handler executes. Local
+    /// emits inherit it; remote emits are suppressed during Phase A.
+    current_durable_run_context: Rc<RefCell<Option<DurableRunContext>>>,
 
     /// Active monitors. Drained per-target on `unmount` to deliver
     /// `__DOWN__` system messages.
@@ -593,6 +602,7 @@ impl Scheduler {
             current_delivery_ttl: Rc::new(std::cell::Cell::new(None)),
             last_received_ttl: Rc::new(RefCell::new(FxHashMap::default())),
             current_call_context: Rc::new(RefCell::new(None)),
+            current_durable_run_context: Rc::new(RefCell::new(None)),
             monitors: Rc::new(RefCell::new(MonitorRegistry::new())),
             links: Rc::new(RefCell::new(LinkRegistry::new())),
             groups: Rc::new(RefCell::new(GroupRegistry::new())),
@@ -929,6 +939,48 @@ impl Scheduler {
         map
     }
 
+    /// Capture the JSON-compatible values owned by explicitly durable hooks.
+    /// Ephemeral positional hook state and executable callbacks never enter
+    /// this recovery payload.
+    #[must_use]
+    pub fn snapshot_durable_state(&self) -> DurableStateSnapshot {
+        let nodes = self
+            .id_to_key
+            .iter()
+            .filter_map(|(id, key)| {
+                self.nodes
+                    .get(*key)
+                    .map(|node| (id.clone(), node.borrow().durable_state_snapshot()))
+            })
+            .filter(|(_, values)| !values.is_empty())
+            .collect();
+        DurableStateSnapshot { nodes }
+    }
+
+    /// Restore named durable values after node definitions are rebuilt.
+    /// This may be called before initial evaluation; values are staged until
+    /// the matching hook key is installed by the component body.
+    pub fn restore_durable_state(
+        &self,
+        snapshot: DurableStateSnapshot,
+    ) -> Result<(), RuntimeError> {
+        for (node_id, values) in snapshot.nodes {
+            let key = self.id_to_key.get(&node_id).copied().ok_or_else(|| {
+                RuntimeError::NodeNotRegistered {
+                    id: node_id.clone(),
+                }
+            })?;
+            let node = self
+                .nodes
+                .get(key)
+                .ok_or_else(|| RuntimeError::NodeNotRegistered {
+                    id: node_id.clone(),
+                })?;
+            node.borrow_mut().restore_durable_state(values);
+        }
+        Ok(())
+    }
+
     /// Whether a node is registered with the scheduler.
     #[must_use]
     pub fn has_node(&self, id: &str) -> bool {
@@ -1054,6 +1106,23 @@ impl Scheduler {
     /// Inject a message into the runtime from outside.
     pub fn send(&self, target_id: impl Into<String>, r#type: impl Into<String>, payload: Value) {
         let msg = create_message(r#type, "__external__", target_id, payload, None);
+        self.messages.borrow_mut().push_back(msg);
+        self.notify.notify_one();
+    }
+
+    /// Inject a message belonging to a durable run. Downstream local emits
+    /// inherit the same run and attempt identifiers.
+    pub fn send_durable(
+        &self,
+        target_id: impl Into<String>,
+        r#type: impl Into<String>,
+        payload: Value,
+        run_id: impl Into<String>,
+        attempt_id: impl Into<String>,
+    ) {
+        let mut msg = create_message(r#type, "__external__", target_id, payload, None);
+        msg.run_id = Some(run_id.into());
+        msg.attempt_id = Some(attempt_id.into());
         self.messages.borrow_mut().push_back(msg);
         self.notify.notify_one();
     }
@@ -2421,6 +2490,15 @@ impl Scheduler {
         // match so subsequent matching emits in the same
         // invocation are NOT tagged.
         let prev_call_context = self.current_call_context.borrow_mut().take();
+        let prev_run_context = self.current_durable_run_context.borrow_mut().take();
+        *self.current_durable_run_context.borrow_mut() = msg
+            .run_id
+            .as_ref()
+            .zip(msg.attempt_id.as_ref())
+            .map(|(run_id, attempt_id)| DurableRunContext {
+                run_id: run_id.clone(),
+                attempt_id: attempt_id.clone(),
+            });
         let new_call_context = msg.correlation_id.as_ref().and_then(|cid| {
             target_rc.borrow().manifest.as_ref().and_then(|m| {
                 m.accepts_external_call
@@ -2442,6 +2520,7 @@ impl Scheduler {
 
         // Restore the prior call context (supports nested deliveries).
         *self.current_call_context.borrow_mut() = prev_call_context;
+        *self.current_durable_run_context.borrow_mut() = prev_run_context;
 
         // If any handler called `postpone()`, defer this message into the
         // target's postpone queue. It re-enters the main queue at the
@@ -2499,6 +2578,7 @@ impl Scheduler {
         let current_ttl = Rc::clone(&self.current_delivery_ttl);
         let last_received_ttl = Rc::clone(&self.last_received_ttl);
         let call_context = Rc::clone(&self.current_call_context);
+        let durable_run_context = Rc::clone(&self.current_durable_run_context);
         // **M-Ingress phase 2.** Snapshot the telemetry sink at
         // make_emit time so the auto-propagation `on_call_reply`
         // path can fire without re-acquiring the ArcSwap on every
@@ -2600,6 +2680,7 @@ impl Scheduler {
                     _ => None,
                 }
             };
+            let run_context = durable_run_context.borrow().clone();
 
             // **M-Ingress phase 2.** When auto-tagging fires, surface
             // the reply payload to any installed `TelemetrySink` so the
@@ -2649,8 +2730,17 @@ impl Scheduler {
                     );
                     msg.direct = is_direct;
                     msg.correlation_id.clone_from(&auto_correlation_id);
+                    if let Some(context) = &run_context {
+                        msg.run_id = Some(context.run_id.clone());
+                        msg.attempt_id = Some(context.attempt_id.clone());
+                    }
                     q.push_back(msg);
                 } else if is_remote_addr {
+                    // Phase A durable runs are single-deployment and may not
+                    // cross simultaneously active GraphReact peers.
+                    if run_context.is_some() {
+                        continue;
+                    }
                     // Cross-node target. Build the message with the
                     // ORIGINAL (unstripped) target + a qualified
                     // `from` ("local@<our_name>") so the remote
@@ -3395,6 +3485,23 @@ impl SchedulerHandle {
     /// it up at the start of its next batch.
     pub fn send(&self, target_id: impl Into<String>, r#type: impl Into<String>, payload: Value) {
         let msg = create_message(r#type, "__external__", target_id, payload, None);
+        self.inbox.lock().push(msg);
+        self.notify.notify_one();
+    }
+
+    /// Thread-safe durable-run injection counterpart to
+    /// [`Scheduler::send_durable`].
+    pub fn send_durable(
+        &self,
+        target_id: impl Into<String>,
+        r#type: impl Into<String>,
+        payload: Value,
+        run_id: impl Into<String>,
+        attempt_id: impl Into<String>,
+    ) {
+        let mut msg = create_message(r#type, "__external__", target_id, payload, None);
+        msg.run_id = Some(run_id.into());
+        msg.attempt_id = Some(attempt_id.into());
         self.inbox.lock().push(msg);
         self.notify.notify_one();
     }

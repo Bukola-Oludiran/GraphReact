@@ -6,7 +6,7 @@
 //! handles become safely-stale rather than dangling.
 
 use generational_box::{AnyStorage, GenerationalBox, Owner, UnsyncStorage};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::graph::Attrs;
 use crate::runtime::constants::flags;
@@ -59,6 +59,14 @@ impl NodeDefinition {
 /// State hook slot — wraps the generational-box cell holding the value.
 pub struct StateHookState {
     pub(crate) value: GenerationalBox<StateCellInner, UnsyncStorage>,
+}
+
+/// JSON-compatible state cell used by the explicitly named durable-state
+/// hook. Durable cells live outside the positional hook list: their stable
+/// key, rather than render order, is their recovery identity.
+pub struct DurableStateCellInner {
+    pub(crate) value: serde_json::Value,
+    pub(crate) enqueue: std::rc::Rc<dyn Fn()>,
 }
 
 /// What kind of effect callback is held in this slot. Sync effects are
@@ -153,6 +161,13 @@ pub struct NodeInstance {
     pub props: Attrs,
     pub bits: u32,
     pub(crate) hooks: Vec<HookSlot>,
+    pub(crate) durable_state:
+        FxHashMap<String, GenerationalBox<DurableStateCellInner, UnsyncStorage>>,
+    /// Values restored before component bodies are rebuilt. The first
+    /// matching `use_durable_state` call moves the value into a live cell.
+    pub(crate) restored_durable_state: FxHashMap<String, serde_json::Value>,
+    /// Keys used in the current evaluation, reset with the handler maps.
+    pub(crate) durable_keys_seen: FxHashSet<String>,
     pub(crate) pending_effects: Vec<usize>,
     pub(crate) message_handlers: FxHashMap<String, Vec<MessageHandler>>,
     pub(crate) topology_handlers: Vec<(TopologyHandler, Option<TopologyFilterOptions>)>,
@@ -194,6 +209,9 @@ impl NodeInstance {
             props,
             bits: 0,
             hooks: Vec::new(),
+            durable_state: FxHashMap::default(),
+            restored_durable_state: FxHashMap::default(),
+            durable_keys_seen: FxHashSet::default(),
             pending_effects: Vec::new(),
             message_handlers: FxHashMap::default(),
             topology_handlers: Vec::new(),
@@ -229,6 +247,7 @@ impl NodeInstance {
     pub fn reset_handlers(&mut self) {
         self.message_handlers.clear();
         self.topology_handlers.clear();
+        self.durable_keys_seen.clear();
         // M12.3a-followon-F: drop any predicate installed in a prior
         // render so a body that conditionally stops calling
         // `use_edge_accept_handler` reverts to default-accept.
@@ -238,5 +257,37 @@ impl NodeInstance {
     #[must_use]
     pub fn hook_count(&self) -> usize {
         self.hooks.len()
+    }
+
+    /// Snapshot only explicitly durable JSON state. Positional hooks and
+    /// callbacks are deliberately excluded from recovery data.
+    #[must_use]
+    pub fn durable_state_snapshot(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        let mut values: std::collections::BTreeMap<_, _> = self
+            .restored_durable_state
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        values.extend(
+            self.durable_state
+                .iter()
+                .map(|(key, cell)| (key.clone(), cell.read().value.clone())),
+        );
+        values
+    }
+
+    /// Install recovered durable values. Existing live cells are updated;
+    /// values whose hooks have not been rebuilt yet remain staged by key.
+    pub fn restore_durable_state(
+        &mut self,
+        values: impl IntoIterator<Item = (String, serde_json::Value)>,
+    ) {
+        for (key, value) in values {
+            if let Some(cell) = self.durable_state.get(&key) {
+                cell.write().value = value;
+            } else {
+                self.restored_durable_state.insert(key, value);
+            }
+        }
     }
 }

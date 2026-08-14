@@ -11,6 +11,26 @@ use std::sync::Arc;
 
 use crate::graph::Attrs;
 
+/// Scheduler durability policy. `Off` is the compatibility default and does
+/// not alter the existing ephemeral processing path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityMode {
+    #[default]
+    Off,
+    Local,
+    Cluster,
+}
+
+/// Recovery payload containing only explicitly named durable hook values.
+/// Callback state, positional hooks, engine objects, and arbitrary Rust
+/// values are intentionally absent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DurableStateSnapshot {
+    pub nodes:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
 /// Wire-level message — what flows through the scheduler's queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -64,6 +84,13 @@ pub struct Message {
     /// field outbound and ignore it inbound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    /// Phase A durable-run identity. These fields propagate only through
+    /// local scheduler emissions; the existing distribution wire remains
+    /// unchanged and durable emissions to remote peers are rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
 }
 
 /// Trimmed view of a [`Message`] handed to user `useMessage` handlers.
@@ -73,6 +100,8 @@ pub struct IncomingMessage {
     pub r#type: String,
     pub payload: Value,
     pub ttl: u32,
+    pub run_id: Option<String>,
+    pub attempt_id: Option<String>,
 }
 
 impl IncomingMessage {
@@ -83,6 +112,8 @@ impl IncomingMessage {
             r#type: msg.r#type.clone(),
             payload: msg.payload.clone(),
             ttl: msg.ttl,
+            run_id: msg.run_id.clone(),
+            attempt_id: msg.attempt_id.clone(),
         }
     }
 }

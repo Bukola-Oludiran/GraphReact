@@ -19,8 +19,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::runtime::node_instance::{
-    AsyncEffectCleanup, EffectCallback, EffectCleanup, EffectHookState, HookSlot, MemoHookState,
-    MessageHookState, NodeInstance, SourceHookState, StateHookState, TopologyHookState,
+    AsyncEffectCleanup, DurableStateCellInner, EffectCallback, EffectCleanup, EffectHookState,
+    HookSlot, MemoHookState, MessageHookState, NodeInstance, SourceHookState, StateHookState,
+    TopologyHookState,
 };
 use crate::runtime::sources::EventSource;
 use crate::runtime::types::{
@@ -210,6 +211,42 @@ impl<T: 'static> Clone for Signal<T> {
 
 impl<T: 'static> Copy for Signal<T> {}
 
+/// Handle to explicitly durable, named JSON state.
+///
+/// Unlike [`Signal<T>`], this state is keyed independently of hook order and
+/// can be included in a scheduler recovery snapshot. Keeping the value as
+/// `serde_json::Value` makes the serialization contract identical across the
+/// JavaScript, Python, and Go hosts.
+#[derive(Clone, Copy)]
+pub struct DurableSignal {
+    cell: GenerationalBox<DurableStateCellInner, UnsyncStorage>,
+}
+
+impl DurableSignal {
+    /// Read the current durable JSON value.
+    #[must_use]
+    pub fn get(&self) -> Value {
+        self.cell.read().value.clone()
+    }
+
+    /// Replace the durable JSON value and schedule re-evaluation on change.
+    pub fn set(&self, value: Value) {
+        let mut cell = self.cell.write();
+        if cell.value == value {
+            return;
+        }
+        cell.value = value;
+        let enqueue = std::rc::Rc::clone(&cell.enqueue);
+        drop(cell);
+        enqueue();
+    }
+
+    /// Transform the durable value in place.
+    pub fn update(&self, f: impl FnOnce(&Value) -> Value) {
+        self.set(f(&self.get()));
+    }
+}
+
 // --- Hooks ---
 
 /// Node-local state. Returns a [`Signal<T>`] handle.
@@ -241,6 +278,39 @@ where
         cell,
         _marker: std::marker::PhantomData,
     }
+}
+
+/// Node-local JSON state with a stable recovery key.
+///
+/// Keys must be non-empty and may appear only once in a component
+/// evaluation. Violations panic before the scheduler can commit the
+/// activation, matching the existing hook misuse failure model.
+pub fn use_durable_state(key: impl Into<String>, initial: Value) -> DurableSignal {
+    let key = key.into();
+    assert!(
+        !key.trim().is_empty(),
+        "durable state key must be non-empty"
+    );
+
+    let node_rc = current_node_rc();
+    let enqueue = with_ctx(|ctx| std::rc::Rc::clone(&ctx.enqueue_self));
+    let cell = {
+        let mut node = node_rc.borrow_mut();
+        assert!(
+            node.durable_keys_seen.insert(key.clone()),
+            "duplicate durable state key `{key}` in node `{}`",
+            node.id
+        );
+        if let Some(cell) = node.durable_state.get(&key) {
+            *cell
+        } else {
+            let value = node.restored_durable_state.remove(&key).unwrap_or(initial);
+            let cell = node.owner.insert(DurableStateCellInner { value, enqueue });
+            node.durable_state.insert(key, cell);
+            cell
+        }
+    };
+    DurableSignal { cell }
 }
 
 /// Reducer-style state. The reducer maps `(state, action)` to a new state.
