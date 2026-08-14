@@ -194,6 +194,21 @@ high-throughput execution/event plane.
 Deliver persistence, stable run identifiers, durable timers, cancellation, and
 an artifact store.
 
+Implementation tracker (updated 2026-08-13):
+
+- Shipped: versioned persistence records, UUIDv7 identities, verified local
+  append-only storage, snapshots, immutable deployment bundles, durable
+  scheduler activations, state, timers, effects, cancellation, and artifacts.
+- Shipped: named entrypoints plus protected run creation, status, cancellation,
+  artifact-listing, and artifact-download routes.
+- In progress: the cluster `PersistenceEngine` now has a Postgres control plane,
+  S3-compatible immutable objects, lease acquisition/renewal/release, monotonic
+  fencing, fenced head/snapshot updates, and deterministic conformance tests.
+- Remaining before Phase A closes: daemon active/passive lease orchestration and
+  readiness gating, Postgres/MinIO service-level conformance and repeated
+  failover tests, language parity surfaces, durability metrics/audit events,
+  decoder fuzzing, and the final crash/failover soak gates.
+
 Acceptance: kill the daemon at every boundary of a tool-call workflow and prove
 that restart produces exactly one externally visible outcome.
 

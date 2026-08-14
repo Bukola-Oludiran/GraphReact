@@ -4,12 +4,14 @@
 //! does not depend on `graphreact-core`. Core integrates through the stable
 //! types and [`PersistenceEngine`] trait exported here.
 
+mod cluster;
 mod engine;
 mod error;
 mod ids;
 mod local;
 mod records;
 
+pub use cluster::{ClusterConfig, ClusterPersistence};
 pub use engine::{BoxFuture, CommitReceipt, LeaseGrant, PersistenceEngine, PersistenceStatus};
 pub use error::{PersistenceError, Result};
 pub use ids::{

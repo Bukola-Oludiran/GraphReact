@@ -36,6 +36,10 @@ pub enum PersistenceError {
     LeaseNotOwned(String),
     #[error("invalid persistence configuration: {0}")]
     Configuration(String),
+    #[error("Postgres persistence operation failed: {0}")]
+    Database(String),
+    #[error("object-store persistence operation failed: {0}")]
+    ObjectStore(String),
 }
 
 impl PersistenceError {
