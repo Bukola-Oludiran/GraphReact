@@ -5,6 +5,7 @@ mod config;
 mod deployment;
 mod effects;
 mod entrypoints;
+mod runs;
 mod timers;
 
 pub use config::{
@@ -18,6 +19,7 @@ pub use effects::{
     EffectAdapterError, EffectAdapterRegistry, EffectDispatchSummary,
 };
 pub use entrypoints::{validate_entrypoint_manifests, EntrypointValidationError};
+pub use runs::{cancel_run, get_run, start_run, RunInfo, RunServiceError, StartRunOutcome};
 pub use timers::{fire_due_timers, TimerDispatchSummary};
 
 use std::collections::BTreeMap;
