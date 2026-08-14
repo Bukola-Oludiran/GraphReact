@@ -243,6 +243,9 @@ pub enum RuntimeRecordV1 {
     EffectCompleted {
         effect_id: EffectId,
         outcome: EffectOutcome,
+        /// Result/error delivery persisted in the same record. The scheduler
+        /// makes it visible only after this record is durable.
+        result_message: Option<DurableMessage>,
         completed_at_ms: u64,
     },
     TimerFired {

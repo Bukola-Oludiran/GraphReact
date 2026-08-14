@@ -4,8 +4,8 @@
 mod effects;
 
 pub use effects::{
-    AdapterFuture, DeterministicIdempotentAdapter, DurableEffectAdapter, EffectAdapterError,
-    EffectAdapterRegistry,
+    dispatch_pending_effects, AdapterFuture, DeterministicIdempotentAdapter, DurableEffectAdapter,
+    EffectAdapterError, EffectAdapterRegistry, EffectDispatchSummary,
 };
 
 use std::collections::BTreeMap;
@@ -25,6 +25,8 @@ pub enum DurableRuntimeError {
     Persistence(#[from] graphreact_persistence::PersistenceError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    Effect(#[from] EffectAdapterError),
     #[error("invalid persisted durable message: {0}")]
     InvalidMessage(String),
 }
@@ -133,6 +135,10 @@ pub async fn recover(
                     upsert_message(&mut inbox, message.clone());
                 }
             }
+            RuntimeRecordV1::EffectCompleted {
+                result_message: Some(message),
+                ..
+            } => upsert_message(&mut inbox, message.clone()),
             _ => {}
         }
     }
