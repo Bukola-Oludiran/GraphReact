@@ -5,6 +5,7 @@
 //! types and [`PersistenceEngine`] trait exported here.
 
 mod cluster;
+mod codec;
 mod engine;
 mod error;
 mod ids;
@@ -12,12 +13,15 @@ mod local;
 mod records;
 
 pub use cluster::{ClusterConfig, ClusterPersistence};
+pub use codec::{decode_runtime_record, decode_runtime_snapshot};
 pub use engine::{BoxFuture, CommitReceipt, LeaseGrant, PersistenceEngine, PersistenceStatus};
 pub use error::{PersistenceError, Result};
 pub use ids::{
     ArtifactId, AttemptId, CorrelationId, DeploymentId, EffectId, MessageId, RunId, TimerId,
 };
-pub use local::{LocalConfig, LocalPersistence};
+pub use local::{
+    decode_local_frame, encode_local_frame, DecodedLocalFrame, LocalConfig, LocalPersistence,
+};
 pub use records::{
     canonical_json_bytes, ActivationCommit, ArtifactMetadata, DeploymentBundle, DeploymentDigest,
     DurableMessage, DurableStateWrite, EffectIntent, EffectOutcome, ReplayPolicy, RunStatus,

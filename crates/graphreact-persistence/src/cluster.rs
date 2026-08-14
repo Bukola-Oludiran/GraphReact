@@ -809,8 +809,7 @@ impl PersistenceEngine for ClusterPersistence {
                 .get_object(&key)
                 .await?
                 .ok_or_else(|| PersistenceError::ObjectStore("snapshot object missing".into()))?;
-            let snapshot: RuntimeSnapshotV1 = postcard::from_bytes(&bytes)
-                .map_err(|error| PersistenceError::Codec(error.to_string()))?;
+            let snapshot = crate::decode_runtime_snapshot(&bytes)?;
             if snapshot.deployment_digest != self.config.deployment_digest
                 || Some(snapshot.through_sequence) != head.snapshot_sequence
             {

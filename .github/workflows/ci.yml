@@ -296,21 +296,25 @@ jobs:
 
   fuzz:
     # **M-Prod sub-track #9 (chaos + fuzz) safest slice.** Runs the
-    # `fuzz_management_api_bodies` libFuzzer target against the three
-    # ingress JSON body shapes (`InjectMessageBody`, `CallMessageBody`,
-    # `BulkLineBody`). Kill-gate: any panic / ASan trap / libFuzzer-
-    # detected timeout fails the job — successful deserialisations
-    # (and well-formed serde_json::Err) pass silently.
+    # management-API and persistence-decoder libFuzzer targets.
+    # Kill-gate: any panic / ASan trap / libFuzzer-detected timeout
+    # fails the matrix cell; ordinary decoder errors pass silently.
     #
     # Push-to-main + release tags only (NOT PRs): a 10-min libFuzzer
     # run + ~2-3 min cargo-fuzz cold-build is too heavy for PR
     # turnaround. The `if` guard at the job level scopes it without
     # touching the workflow-level `on:` block (which would gate fmt /
     # clippy / test / deny / sbom too).
-    name: fuzz-management-api-bodies
+    name: fuzz-${{ matrix.target }}
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_management_api_bodies
+          - fuzz_persistence_decoders
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly toolchain
@@ -346,7 +350,7 @@ jobs:
         # Failure here surfaces as a clear "fuzz substrate broken"
         # signal rather than a vague libFuzzer error.
         working-directory: fuzz
-        run: cargo +nightly-2026-06-01 fuzz build fuzz_management_api_bodies
+        run: cargo +nightly-2026-06-01 fuzz build ${{ matrix.target }}
       - name: Run fuzz target (10 min)
         # `-max_total_time=600` is libFuzzer's wall-clock cap in
         # seconds. The flag is a soft cap: in-flight inputs finish,
@@ -357,7 +361,7 @@ jobs:
         working-directory: fuzz
         run: |
           set -euo pipefail
-          cargo +nightly-2026-06-01 fuzz run fuzz_management_api_bodies -- \
+          cargo +nightly-2026-06-01 fuzz run ${{ matrix.target }} -- \
             -max_total_time=600 \
             -rss_limit_mb=2048 \
             -print_final_stats=1
@@ -371,7 +375,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-management-api-bodies-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+          name: fuzz-${{ matrix.target }}-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
           path: |
             fuzz/artifacts/
             fuzz/corpus/

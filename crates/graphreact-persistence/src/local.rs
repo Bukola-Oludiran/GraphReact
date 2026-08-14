@@ -17,6 +17,125 @@ use crate::{
 const MAGIC: [u8; 8] = *b"GRXLOG01";
 const HEADER_BYTES: usize = 8 + 2 + 32 + 8 + 8 + 4 + 32;
 
+/// A verified frame decoded from a local durable log segment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedLocalFrame {
+    pub fencing_token: u64,
+    pub sequence: u64,
+    pub record: RuntimeRecordV1,
+    pub consumed_bytes: usize,
+}
+
+struct DecodedFrameHeader {
+    fencing_token: u64,
+    sequence: u64,
+    payload_len: usize,
+    checksum: [u8; 32],
+}
+
+/// Decode and verify the first framed record in `bytes`.
+///
+/// Trailing bytes are left unconsumed so fuzzers and offline tooling can walk
+/// concatenated segment data using [`DecodedLocalFrame::consumed_bytes`].
+pub fn decode_local_frame(
+    bytes: &[u8],
+    expected_digest: DeploymentDigest,
+    expected_fencing_token: u64,
+    expected_sequence: u64,
+) -> crate::Result<DecodedLocalFrame> {
+    if bytes.len() < HEADER_BYTES {
+        return Err(PersistenceError::Codec("torn durable frame header".into()));
+    }
+    let header = decode_frame_header(
+        &bytes[..HEADER_BYTES],
+        expected_digest,
+        expected_fencing_token,
+        expected_sequence,
+    )?;
+    let frame_len =
+        HEADER_BYTES
+            .checked_add(header.payload_len)
+            .ok_or(PersistenceError::RecordTooLarge {
+                actual: usize::MAX,
+                cap: MAX_RECORD_BYTES,
+            })?;
+    if bytes.len() < frame_len {
+        return Err(PersistenceError::Codec("torn durable frame payload".into()));
+    }
+    let record = decode_frame_payload(&header, &bytes[HEADER_BYTES..frame_len])?;
+    Ok(DecodedLocalFrame {
+        fencing_token: header.fencing_token,
+        sequence: header.sequence,
+        record,
+        consumed_bytes: frame_len,
+    })
+}
+
+fn decode_frame_header(
+    header: &[u8],
+    expected_digest: DeploymentDigest,
+    expected_fencing_token: u64,
+    expected_sequence: u64,
+) -> crate::Result<DecodedFrameHeader> {
+    if header[..8] != MAGIC {
+        return Err(PersistenceError::InvalidMagic {
+            sequence: expected_sequence,
+        });
+    }
+    let version = u16::from_be_bytes([header[8], header[9]]);
+    if version != crate::FORMAT_VERSION {
+        return Err(PersistenceError::UnsupportedVersion {
+            found: version,
+            supported: crate::FORMAT_VERSION,
+        });
+    }
+    let digest = DeploymentDigest(header[10..42].try_into().expect("digest width"));
+    if digest != expected_digest {
+        return Err(PersistenceError::DeploymentDigestMismatch);
+    }
+    let fencing_token = u64::from_be_bytes(header[42..50].try_into().expect("fence width"));
+    if fencing_token != expected_fencing_token {
+        return Err(PersistenceError::StaleFence {
+            expected: expected_fencing_token,
+            found: fencing_token,
+        });
+    }
+    let sequence = u64::from_be_bytes(header[50..58].try_into().expect("sequence width"));
+    if sequence != expected_sequence {
+        return Err(PersistenceError::SequenceMismatch {
+            expected: expected_sequence,
+            found: sequence,
+        });
+    }
+    let payload_len =
+        u32::from_be_bytes(header[58..62].try_into().expect("payload width")) as usize;
+    if payload_len > MAX_RECORD_BYTES {
+        return Err(PersistenceError::RecordTooLarge {
+            actual: payload_len,
+            cap: MAX_RECORD_BYTES,
+        });
+    }
+    Ok(DecodedFrameHeader {
+        fencing_token,
+        sequence,
+        payload_len,
+        checksum: header[62..94].try_into().expect("checksum width"),
+    })
+}
+
+fn decode_frame_payload(
+    header: &DecodedFrameHeader,
+    payload: &[u8],
+) -> crate::Result<RuntimeRecordV1> {
+    let actual: [u8; 32] = Sha256::digest(payload).into();
+    if header.checksum != actual {
+        return Err(PersistenceError::ChecksumMismatch {
+            sequence: header.sequence,
+        });
+    }
+    crate::decode_runtime_record(payload)
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalConfig {
     pub root: PathBuf,
@@ -134,7 +253,13 @@ impl LocalPersistence {
             .append(true)
             .open(&log_path)
             .map_err(|e| PersistenceError::io(&log_path, e))?;
-        let scan = scan_log(&mut log, cfg.deployment_digest, true, &log_path)?;
+        let scan = scan_log(
+            &mut log,
+            cfg.deployment_digest,
+            cfg.fencing_token,
+            true,
+            &log_path,
+        )?;
         let snapshot_sequence = read_snapshot_pointer(&cfg.root)?.map(|(seq, _)| seq);
         let artifact_count = std::fs::read_dir(cfg.root.join("artifacts"))
             .map(|it| it.filter_map(std::result::Result::ok).count() as u64)
@@ -201,12 +326,12 @@ impl PersistenceEngine for LocalPersistence {
                     });
                 }
                 let sequence = state.next_sequence;
-                let frame = encode_frame(
+                let frame = encode_local_frame(
                     self.cfg.deployment_digest,
                     fencing_token,
                     sequence,
                     &payload,
-                );
+                )?;
                 state
                     .log
                     .write_all(&frame)
@@ -235,7 +360,13 @@ impl PersistenceEngine for LocalPersistence {
                 .read(true)
                 .open(&path)
                 .map_err(|e| PersistenceError::io(&path, e))?;
-            let scan = scan_log(&mut file, self.cfg.deployment_digest, false, &path)?;
+            let scan = scan_log(
+                &mut file,
+                self.cfg.deployment_digest,
+                self.cfg.fencing_token,
+                false,
+                &path,
+            )?;
             Ok(scan
                 .records
                 .into_iter()
@@ -280,8 +411,7 @@ impl PersistenceEngine for LocalPersistence {
             };
             let path = self.cfg.root.join("snapshots").join(name);
             let bytes = std::fs::read(&path).map_err(|e| PersistenceError::io(&path, e))?;
-            let snapshot: RuntimeSnapshotV1 =
-                postcard::from_bytes(&bytes).map_err(|e| PersistenceError::Codec(e.to_string()))?;
+            let snapshot = crate::decode_runtime_snapshot(&bytes)?;
             if snapshot.deployment_digest != self.cfg.deployment_digest {
                 return Err(PersistenceError::DeploymentDigestMismatch);
             }
@@ -459,7 +589,13 @@ impl PersistenceEngine for LocalPersistence {
                 .read(true)
                 .open(&path)
                 .map_err(|e| PersistenceError::io(&path, e))?;
-            let _ = scan_log(&mut file, self.cfg.deployment_digest, false, &path)?;
+            let _ = scan_log(
+                &mut file,
+                self.cfg.deployment_digest,
+                self.cfg.fencing_token,
+                false,
+                &path,
+            )?;
             if let Some(snapshot) = self.read_snapshot().await? {
                 if snapshot.deployment_digest != self.cfg.deployment_digest {
                     return Err(PersistenceError::DeploymentDigestMismatch);
@@ -480,6 +616,7 @@ struct ScanResult {
 fn scan_log(
     file: &mut File,
     expected_digest: DeploymentDigest,
+    expected_fencing_token: u64,
     repair_tail: bool,
     path: &Path,
 ) -> crate::Result<ScanResult> {
@@ -507,37 +644,13 @@ fn scan_log(
         let mut header = [0_u8; HEADER_BYTES];
         file.read_exact(&mut header)
             .map_err(|e| PersistenceError::io(path, e))?;
-        if header[..8] != MAGIC {
-            return Err(PersistenceError::InvalidMagic {
-                sequence: expected_sequence,
-            });
-        }
-        let version = u16::from_be_bytes([header[8], header[9]]);
-        if version != crate::FORMAT_VERSION {
-            return Err(PersistenceError::UnsupportedVersion {
-                found: version,
-                supported: crate::FORMAT_VERSION,
-            });
-        }
-        let digest = DeploymentDigest(header[10..42].try_into().expect("digest width"));
-        if digest != expected_digest {
-            return Err(PersistenceError::DeploymentDigestMismatch);
-        }
-        let sequence = u64::from_be_bytes(header[50..58].try_into().expect("sequence width"));
-        if sequence != expected_sequence {
-            return Err(PersistenceError::SequenceMismatch {
-                expected: expected_sequence,
-                found: sequence,
-            });
-        }
-        let payload_len =
-            u32::from_be_bytes(header[58..62].try_into().expect("payload width")) as usize;
-        if payload_len > MAX_RECORD_BYTES {
-            return Err(PersistenceError::RecordTooLarge {
-                actual: payload_len,
-                cap: MAX_RECORD_BYTES,
-            });
-        }
+        let decoded_header = decode_frame_header(
+            &header,
+            expected_digest,
+            expected_fencing_token,
+            expected_sequence,
+        )?;
+        let payload_len = decoded_header.payload_len;
         let frame_end = offset + HEADER_BYTES as u64 + payload_len as u64;
         if frame_end > total_len {
             if repair_tail {
@@ -552,14 +665,8 @@ fn scan_log(
         let mut payload = vec![0_u8; payload_len];
         file.read_exact(&mut payload)
             .map_err(|e| PersistenceError::io(path, e))?;
-        let checksum: [u8; 32] = header[62..94].try_into().expect("checksum width");
-        let actual: [u8; 32] = Sha256::digest(&payload).into();
-        if checksum != actual {
-            return Err(PersistenceError::ChecksumMismatch { sequence });
-        }
-        let record =
-            postcard::from_bytes(&payload).map_err(|e| PersistenceError::Codec(e.to_string()))?;
-        records.push((sequence, record));
+        let record = decode_frame_payload(&decoded_header, &payload)?;
+        records.push((decoded_header.sequence, record));
         expected_sequence += 1;
         offset = frame_end;
     }
@@ -572,7 +679,20 @@ fn scan_log(
     })
 }
 
-fn encode_frame(digest: DeploymentDigest, fence: u64, sequence: u64, payload: &[u8]) -> Vec<u8> {
+/// Encode one local durable-log frame using the production checksum and size
+/// rules. Exposed for offline tooling and decoder fuzz corpus construction.
+pub fn encode_local_frame(
+    digest: DeploymentDigest,
+    fence: u64,
+    sequence: u64,
+    payload: &[u8],
+) -> crate::Result<Vec<u8>> {
+    if payload.len() > MAX_RECORD_BYTES {
+        return Err(PersistenceError::RecordTooLarge {
+            actual: payload.len(),
+            cap: MAX_RECORD_BYTES,
+        });
+    }
     let checksum: [u8; 32] = Sha256::digest(payload).into();
     let mut out = Vec::with_capacity(HEADER_BYTES + payload.len());
     out.extend_from_slice(&MAGIC);
@@ -580,11 +700,11 @@ fn encode_frame(digest: DeploymentDigest, fence: u64, sequence: u64, payload: &[
     out.extend_from_slice(&digest.0);
     out.extend_from_slice(&fence.to_be_bytes());
     out.extend_from_slice(&sequence.to_be_bytes());
-    let payload_len = u32::try_from(payload.len()).expect("payload length validated against cap");
+    let payload_len = u32::try_from(payload.len()).expect("record cap fits u32");
     out.extend_from_slice(&payload_len.to_be_bytes());
     out.extend_from_slice(&checksum);
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> crate::Result<()> {
@@ -737,6 +857,27 @@ mod tests {
         assert!(matches!(
             LocalPersistence::open(cfg),
             Err(PersistenceError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fencing_token_corruption_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        {
+            let store = LocalPersistence::open(cfg.clone()).unwrap();
+            store.commit(1, &[record()]).await.unwrap();
+        }
+        let path = dir.path().join("runtime.grxlog");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[49] = 2;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            LocalPersistence::open(cfg),
+            Err(PersistenceError::StaleFence {
+                expected: 1,
+                found: 2,
+            })
         ));
     }
 

@@ -1,6 +1,8 @@
 # `fuzz/` — GraphReact fuzz substrate (M-Prod sub-track #9)
 
-**Status:** safe-slice — first target only (`fuzz_management_api_bodies`); chaos arms + 24h corpus / 7-day soak / cert+cookie rotation soak deferred to CI-infra (see [`../docs/backend/m-prod-chaos-fuzz.md`](../docs/backend/m-prod-chaos-fuzz.md)).
+**Status:** management-API and Phase A persistence-decoder targets shipped;
+chaos arms + 24h corpus / 7-day soak / cert+cookie rotation soak deferred to
+CI-infra (see [`../docs/backend/m-prod-chaos-fuzz.md`](../docs/backend/m-prod-chaos-fuzz.md)).
 
 ## What's in here
 
@@ -11,6 +13,7 @@ fuzz/
   Cargo.toml                        # standalone workspace; deps libfuzzer-sys + path-dep on graphreact-observer
   fuzz_targets/
     fuzz_management_api_bodies.rs   # InjectMessageBody + CallMessageBody + BulkLineBody
+    fuzz_persistence_decoders.rs    # framed logs + record/snapshot postcard decoders
   corpus/
     fuzz_management_api_bodies/
       seed_*.json                   # hand-written seed inputs (committed; libFuzzer mutator output ignored)
@@ -28,6 +31,9 @@ cargo install cargo-fuzz
 # the CI lane budget at .github/workflows/ci.yml :: fuzz).
 cd fuzz
 cargo +nightly fuzz run fuzz_management_api_bodies -- -max_total_time=600
+
+# Exercise framed-log integrity and record/snapshot decoding.
+cargo +nightly fuzz run fuzz_persistence_decoders -- -max_total_time=600
 
 # Or run forever until a crash / SIGINT.
 cargo +nightly fuzz run fuzz_management_api_bodies
@@ -67,6 +73,12 @@ The target drives `serde_json::from_slice::<T>(data)` for each — the same call
 - a libFuzzer-reported timeout (default 1200s per input).
 
 Successful `Ok(_)` parses are accepted silently. This target is a panic / OOM hunter, not a property test. Round-trip / equivalence variants are tracked under `m-prod-chaos-fuzz.md`.
+
+`fuzz_persistence_decoders` drives arbitrary bytes through the production
+framed-log decoder and the shared Postcard record/snapshot decoders. It also
+wraps each arbitrary payload in a valid production frame, ensuring mutations
+reach checksum-verified payload parsing instead of stalling at the magic-byte
+gate.
 
 ## Seed corpus
 

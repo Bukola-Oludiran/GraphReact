@@ -56,10 +56,18 @@ serde_json = "1"
 # `graphreact_observer::management_api`; the fuzz target imports
 # them from the crate root.
 graphreact-observer = { path = "../crates/graphreact-observer" }
+graphreact-persistence = { path = "../crates/graphreact-persistence" }
 
 [[bin]]
 name = "fuzz_management_api_bodies"
 path = "fuzz_targets/fuzz_management_api_bodies.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_persistence_decoders"
+path = "fuzz_targets/fuzz_persistence_decoders.rs"
 test = false
 doc = false
 bench = false

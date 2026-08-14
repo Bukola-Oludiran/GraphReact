@@ -225,8 +225,11 @@ Implementation tracker (updated 2026-08-14):
   indeterminate outcomes, plus lease/role transitions emit bounded lifecycle
   events into the existing hash-chained audit ledger. Early lease and recovery
   events are buffered until the configured file sink attaches.
-- Remaining before Phase A closes: decoder fuzzing and the final
-  crash/failover soak gates.
+- Shipped: a dedicated libFuzzer target exercises the production framed-log
+  header, length, checksum and record decoder plus the shared snapshot decoder;
+  checksum-valid arbitrary payload frames ensure deep decoder coverage. CI runs
+  it in parallel with the management-API fuzz target.
+- Remaining before Phase A closes: the final crash/failover soak gates.
 
 Acceptance: kill the daemon at every boundary of a tool-call workflow and prove
 that restart produces exactly one externally visible outcome.
