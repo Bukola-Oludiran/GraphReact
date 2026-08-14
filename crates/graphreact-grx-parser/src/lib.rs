@@ -38,11 +38,11 @@ pub mod style;
 pub mod treesitter;
 
 pub use ast::{
-    AttrMap, EdgeDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl, NodeDefinitionBlock,
-    SubgraphDecl, WalkedNode,
+    AttrMap, EdgeDecl, EntrypointDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl,
+    NodeDefinitionBlock, SubgraphDecl, WalkedNode,
 };
 pub use error::{GrxParseError, GrxResult, SourceLoc};
-pub use ir::{GrxIr, IrEdge, IrNode};
+pub use ir::{GrxIr, IrEdge, IrEntrypoint, IrNode};
 pub use lexer::{Lexer, Token, TokenType};
 pub use multi_file::{
     resolve_multi_file, resolve_multi_file_cached, resolve_multi_file_cached_treesitter,

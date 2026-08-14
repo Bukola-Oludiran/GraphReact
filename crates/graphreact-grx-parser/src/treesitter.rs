@@ -34,8 +34,8 @@ use serde_json::Value as JsonValue;
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::ast::{
-    AttrMap, ComponentLang, EdgeDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl,
-    NodeDefinitionBlock, SubgraphDecl,
+    AttrMap, ComponentLang, EdgeDecl, EntrypointDecl, GraphDecl, GrxFile, GrxNode, ImportDirective,
+    NodeDecl, NodeDefinitionBlock, SubgraphDecl,
 };
 use crate::error::{GrxParseError, GrxResult, SourceLoc};
 use crate::ir::GrxIr;
@@ -258,7 +258,47 @@ fn build_import_decl(node: Node<'_>, source: &str) -> GrxResult<ImportDirective>
 fn build_graph_decl(graph_node: Node<'_>, source: &str) -> GrxResult<GraphDecl> {
     let (id, loc) = extract_graph_id(graph_node, source)?;
     let children = walk_block_children_to_ast(graph_node, source)?;
-    Ok(GraphDecl { id, children, loc })
+    let mut entrypoints = Vec::new();
+    let mut cursor = graph_node.walk();
+    for child in graph_node.named_children(&mut cursor) {
+        if child.kind() == "entrypoint_decl" {
+            let mut attrs = std::collections::HashMap::new();
+            let mut attr_cursor = child.walk();
+            for attr in child.named_children(&mut attr_cursor) {
+                if attr.kind() == "attribute" {
+                    let (name, value) = parse_attribute(attr, source)?;
+                    if let Some(serde_json::Value::String(value)) = value {
+                        attrs.insert(name, value);
+                    }
+                }
+            }
+            let required = |name: &str| {
+                attrs
+                    .get(name)
+                    .filter(|v| !v.is_empty())
+                    .cloned()
+                    .ok_or_else(|| {
+                        GrxParseError::parse(
+                            format!("entrypoint requires non-empty `{name}`"),
+                            node_loc(child).into_inner(),
+                        )
+                    })
+            };
+            entrypoints.push(EntrypointDecl {
+                name: required("name")?,
+                target: required("target")?,
+                request: required("request")?,
+                reply: required("reply")?,
+                loc: node_loc(child).into_inner(),
+            });
+        }
+    }
+    Ok(GraphDecl {
+        id,
+        children,
+        entrypoints,
+        loc,
+    })
 }
 
 fn build_subgraph_decl(subgraph_node: Node<'_>, source: &str) -> GrxResult<SubgraphDecl> {

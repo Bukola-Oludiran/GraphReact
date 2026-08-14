@@ -17,6 +17,7 @@ members = [
     "crates/graphreact-hotreload",
     "crates/graphreact-observer",
     "crates/graphreact-secrets",
+    "crates/graphreact-persistence",
     "crates/graphreact-cli",
     "crates/graphreact-napi",
     "crates/graphreact-wasm",
@@ -66,7 +67,7 @@ cc = "1"
 # M-Ingress phase 2 — server-side correlation_id mint for
 # `POST /v1/nodes/:id/call`. UUIDv4 keeps the space wide enough that
 # accidental reuse is ~impossible.
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 
 # M15 Phase 1B — tree-sitter incremental reparse for `.grx` parser.
 tree-sitter = "0.25"

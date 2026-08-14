@@ -130,6 +130,10 @@
         {
           "type": "SYMBOL",
           "name": "edge_decl"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "entrypoint_decl"
         }
       ]
     },
@@ -306,6 +310,30 @@
         {
           "type": "STRING",
           "value": "edge"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "attribute"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "/>"
+        }
+      ]
+    },
+    "entrypoint_decl": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "<"
+        },
+        {
+          "type": "STRING",
+          "value": "entrypoint"
         },
         {
           "type": "REPEAT",

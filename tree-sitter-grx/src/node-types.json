@@ -82,6 +82,21 @@
     }
   },
   {
+    "type": "entrypoint_decl",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "attribute",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "expr_literal",
     "named": true,
     "fields": {}
@@ -103,6 +118,10 @@
           "named": true
         },
         {
+          "type": "entrypoint_decl",
+          "named": true
+        },
+        {
           "type": "graph_node",
           "named": true
         }
@@ -119,6 +138,10 @@
       "types": [
         {
           "type": "edge_decl",
+          "named": true
+        },
+        {
+          "type": "entrypoint_decl",
           "named": true
         },
         {
@@ -253,6 +276,10 @@
           "named": true
         },
         {
+          "type": "entrypoint_decl",
+          "named": true
+        },
+        {
           "type": "graph_node",
           "named": true
         }
@@ -316,6 +343,10 @@
   },
   {
     "type": "edge",
+    "named": false
+  },
+  {
+    "type": "entrypoint",
     "named": false
   },
   {

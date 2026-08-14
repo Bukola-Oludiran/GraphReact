@@ -64,11 +64,22 @@ pub struct GrxIr {
     pub graph_loc: SourceLoc,
     pub nodes: Vec<IrNode>,
     pub edges: Vec<IrEdge>,
+    #[serde(default)]
+    pub entrypoints: Vec<IrEntrypoint>,
     /// Component-body code blocks (Phase-7 `<ComponentName>...code...</ComponentName>`).
     pub definitions: Vec<IrDefinition>,
     /// Imported file paths in declaration order (already resolved by
     /// the multi-file resolver, if any).
     pub imports: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrEntrypoint {
+    pub name: String,
+    pub target: String,
+    pub request: String,
+    pub reply: String,
+    pub source_loc: SourceLoc,
 }
 
 /// One node in the IR. Hierarchy info (`depth`, `parent_path`) and
@@ -168,12 +179,46 @@ pub fn build_ir(file: &GrxFile) -> GrxResult<GrxIr> {
         .collect();
 
     let imports = file.imports.iter().map(|i| i.src.clone()).collect();
+    let entrypoints: Vec<IrEntrypoint> = graph
+        .map(|g| {
+            g.entrypoints
+                .iter()
+                .map(|entry| IrEntrypoint {
+                    name: entry.name.clone(),
+                    target: entry.target.clone(),
+                    request: entry.request.clone(),
+                    reply: entry.reply.clone(),
+                    source_loc: entry.loc,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut names = std::collections::BTreeSet::new();
+    for entry in &entrypoints {
+        if !names.insert(entry.name.clone()) {
+            return Err(GrxParseError::parse(
+                format!("duplicate entrypoint `{}`", entry.name),
+                entry.source_loc,
+            ));
+        }
+        if !nodes.iter().any(|node| node.id == entry.target) {
+            return Err(GrxParseError::parse(
+                format!(
+                    "entrypoint `{}` targets unknown node `{}`",
+                    entry.name, entry.target
+                ),
+                entry.source_loc,
+            ));
+        }
+    }
 
     Ok(GrxIr {
         graph_id,
         graph_loc,
         nodes,
         edges,
+        entrypoints,
         definitions,
         imports,
     })
@@ -649,6 +694,31 @@ fn loc_to_json(loc: SourceLoc) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_entrypoint_is_captured_and_validated() {
+        let ir = parse_to_ir(
+            r#"<Graph id="agents">
+                <Agent id="agent" />
+                <entrypoint name="summarize" target="agent" request="prompt" reply="completion" />
+            </Graph>"#,
+        )
+        .unwrap();
+        assert_eq!(ir.entrypoints.len(), 1);
+        assert_eq!(ir.entrypoints[0].name, "summarize");
+        assert_eq!(ir.entrypoints[0].target, "agent");
+    }
+
+    #[test]
+    fn durable_entrypoint_rejects_unknown_target() {
+        let error = parse_to_ir(
+            r#"<Graph id="agents">
+                <entrypoint name="summarize" target="missing" request="prompt" reply="completion" />
+            </Graph>"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown node `missing`"));
+    }
     use crate::parser::Parser;
 
     #[test]

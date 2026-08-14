@@ -7,7 +7,8 @@
 use serde_json::Value as JsonValue;
 
 use crate::ast::{
-    AttrMap, EdgeDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl, NodeDefinitionBlock,
+    AttrMap, EdgeDecl, EntrypointDecl, GraphDecl, GrxFile, GrxNode, ImportDirective, NodeDecl,
+    NodeDefinitionBlock,
 };
 use crate::error::{GrxParseError, GrxResult, SourceLoc};
 use crate::lexer::{Lexer, Token, TokenType};
@@ -109,7 +110,28 @@ impl Parser {
             }
         };
         self.expect(TokenType::TagEnd, "Graph")?;
-        let children = self.parse_children("Graph")?;
+        let mut children = Vec::new();
+        let mut entrypoints = Vec::new();
+        loop {
+            self.skip_comments();
+            let token = self.peek().clone();
+            match token.kind {
+                TokenType::CloseTag | TokenType::Eof => break,
+                TokenType::OpenTag if token.value == "edge" => {
+                    children.push(GrxNode::Edge(self.parse_edge()?));
+                }
+                TokenType::OpenTag if token.value == "entrypoint" => {
+                    entrypoints.push(self.parse_entrypoint()?);
+                }
+                TokenType::OpenTag => children.push(GrxNode::Node(self.parse_node()?)),
+                _ => {
+                    return Err(GrxParseError::parse(
+                        "unexpected token inside `<Graph>`",
+                        token.loc,
+                    ))
+                }
+            }
+        }
         let close = self.expect(TokenType::CloseTag, "Graph")?;
         if close.value != "Graph" {
             return Err(GrxParseError::MismatchedClose {
@@ -121,6 +143,27 @@ impl Parser {
         Ok(GraphDecl {
             id,
             children,
+            entrypoints,
+            loc: open.loc,
+        })
+    }
+
+    fn parse_entrypoint(&mut self) -> GrxResult<EntrypointDecl> {
+        let open = self.expect(TokenType::OpenTag, "entrypoint")?;
+        let attrs = self.parse_attributes()?;
+        self.expect(TokenType::SelfClose, "entrypoint")?;
+        let required = |name: &str| match attrs.get(name) {
+            Some(JsonValue::String(value)) if !value.trim().is_empty() => Ok(value.clone()),
+            _ => Err(GrxParseError::parse(
+                format!("entrypoint requires non-empty `{name}`"),
+                open.loc,
+            )),
+        };
+        Ok(EntrypointDecl {
+            name: required("name")?,
+            target: required("target")?,
+            request: required("request")?,
+            reply: required("reply")?,
             loc: open.loc,
         })
     }

@@ -78,7 +78,7 @@ module.exports = grammar({
 
     _graph_close: ($) => seq('<', '/', 'Graph', '>'),
 
-    _graph_child: ($) => choice($.graph_node, $.edge_decl),
+    _graph_child: ($) => choice($.graph_node, $.edge_decl, $.entrypoint_decl),
 
     // ----------------------------------------------------------------
     // Subgraph — PCBPnR Phase 5-D §2.2. Same child shape as Graph
@@ -111,6 +111,8 @@ module.exports = grammar({
     _graph_node_close: ($) => seq('<', '/', $.tag_name, '>'),
 
     edge_decl: ($) => seq('<', 'edge', repeat($.attribute), '/>'),
+
+    entrypoint_decl: ($) => seq('<', 'entrypoint', repeat($.attribute), '/>'),
 
     // ----------------------------------------------------------------
     // Definition blocks (top-level, raw body)

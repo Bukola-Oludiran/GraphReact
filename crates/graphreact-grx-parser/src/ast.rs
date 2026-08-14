@@ -47,6 +47,16 @@ pub struct SubgraphDecl {
 pub struct GraphDecl {
     pub id: String,
     pub children: Vec<GrxNode>,
+    pub entrypoints: Vec<EntrypointDecl>,
+    pub loc: SourceLoc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntrypointDecl {
+    pub name: String,
+    pub target: String,
+    pub request: String,
+    pub reply: String,
     pub loc: SourceLoc,
 }
 
