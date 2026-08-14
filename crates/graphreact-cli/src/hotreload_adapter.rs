@@ -681,6 +681,7 @@ mod tests {
                     source_loc: graphreact_grx_parser::SourceLoc::default(),
                 }],
                 edges: Vec::<IrEdge>::new(),
+                entrypoints: Vec::new(),
                 definitions: vec![IrDefinition {
                     component: "Counter".to_string(),
                     code: code.to_string(),

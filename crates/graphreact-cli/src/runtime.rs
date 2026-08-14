@@ -102,6 +102,7 @@ pub fn assemble_resolved_ir(resolved: &MultiFileResolved) -> RuntimeResult<GrxIr
         graph_loc: graph.loc,
         nodes: nodes_edges_ir.nodes,
         edges: nodes_edges_ir.edges,
+        entrypoints: nodes_edges_ir.entrypoints,
         definitions,
         imports: resolved
             .imports
@@ -199,6 +200,7 @@ pub fn dry_mount(path: &std::path::Path, engine: &mut dyn Engine) -> RuntimeResu
         graph_loc: graph.loc,
         nodes: built.nodes,
         edges: built.edges,
+        entrypoints: built.entrypoints,
         definitions: definitions
             .iter()
             .map(
@@ -342,6 +344,7 @@ pub fn dry_mount_jsc(
         graph_loc: graph.loc,
         nodes: built.nodes,
         edges: built.edges,
+        entrypoints: built.entrypoints,
         definitions: definitions
             .iter()
             .map(

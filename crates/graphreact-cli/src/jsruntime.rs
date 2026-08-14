@@ -40,7 +40,6 @@
 //! getter to graphreact-core just for the JSC layer's bookkeeping —
 //! cheaper as a layer-local mirror.
 
-#![cfg(target_os = "macos")]
 // Signal ids are minted by an in-process counter — bounded well under
 // 2^53 in any realistic run, so the round-trip through JS Number
 // (f64 mantissa = 53 bits) is lossless. Node depths come from the IR
@@ -4633,6 +4632,7 @@ pub fn mount_with_scheduler_and_secrets(
         graph_loc: graph_block.loc,
         nodes: built.nodes,
         edges: built.edges,
+        entrypoints: built.entrypoints,
         definitions: definitions
             .iter()
             .map(

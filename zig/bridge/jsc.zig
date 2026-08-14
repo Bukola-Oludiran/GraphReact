@@ -77,7 +77,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const c = @cImport({
-    @cInclude("JavaScriptCore/JavaScriptCore.h");
+    @cInclude("jsc_import.h");
 });
 
 // Status codes — must match `crates/graphreact-engine-jsc/src/ffi.rs`.

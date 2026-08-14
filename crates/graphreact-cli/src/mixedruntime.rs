@@ -38,8 +38,6 @@
 //!   three. Engines whose lang is absent from the IR are not
 //!   initialized.
 
-#![cfg(target_os = "macos")]
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

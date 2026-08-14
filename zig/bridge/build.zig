@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
     // JSC's C API headers live behind the `JavaScriptCore` framework
     // on macOS. Link libC and the framework so `@cImport` resolves.
     jsc_module.link_libc = true;
+    jsc_module.addIncludePath(b.path("."));
     jsc_module.linkFramework("JavaScriptCore", .{});
 
     const jsc_lib = b.addLibrary(.{

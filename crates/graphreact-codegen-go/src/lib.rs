@@ -405,6 +405,7 @@ mod tests {
             graph_loc: SourceLoc::new(1, 1),
             nodes: Vec::new(),
             edges: Vec::new(),
+            entrypoints: Vec::new(),
             definitions: Vec::new(),
             imports: Vec::new(),
         }
