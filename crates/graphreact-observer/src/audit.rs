@@ -58,6 +58,27 @@ fn fan_to_sink(sink: Option<&Arc<dyn AuditSink>>, input: AuditRecordInput) {
     }
 }
 
+/// Emit a durability lifecycle event to both the structured tracing stream and
+/// the optional hash-chained audit sink.
+///
+/// Callers must use a closed, low-cardinality `kind` vocabulary and bounded
+/// fields. Durable payloads, credentials, paths, and adapter inputs do not
+/// belong in this record.
+#[inline]
+pub fn log_durability_event(
+    kind: &'static str,
+    fields: serde_json::Value,
+    sink: Option<&Arc<dyn AuditSink>>,
+) {
+    tracing::info!(
+        target: "graphreact::observer::audit",
+        event = kind,
+        fields = %fields,
+        "durability lifecycle event"
+    );
+    fan_to_sink(sink, AuditRecordInput { kind, fields });
+}
+
 /// Log a successful per-connection accept.
 #[inline]
 pub fn log_accept(peer: SocketAddr, path: &str, sink: Option<&Arc<dyn AuditSink>>) {

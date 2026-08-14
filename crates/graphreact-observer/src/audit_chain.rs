@@ -24,7 +24,8 @@
 //! - `prev_hash`: hex SHA-256 of the previous record (genesis = 64×`0`)
 //! - `kind`: one of `bind`, `accept`, `auth_fail`, `response`,
 //!   `tls_reload_attempt`, `tls_reload_success`, `tls_reload_failure`,
-//!   `otel_shutdown_timeout`, `audit_sink_write_failed`
+//!   `otel_shutdown_timeout`, `audit_sink_write_failed`, or a closed
+//!   `durability_*` lifecycle event emitted by the durable runtime
 //! - `fields`: opaque `serde_json::Value` carrying the structured
 //!   fields the existing tracing line emits (`peer`, `path`, `status`,
 //!   `bytes`, `reason`, `addr`, `tls`, `auth`,
