@@ -31,6 +31,18 @@ pub struct DurableStateSnapshot {
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
+/// One durable message-handler activation presented to the host commit
+/// boundary. Core owns evaluation and buffering; the host translates this
+/// storage-agnostic value into persistence records and acknowledges only
+/// after its backend has made them durable.
+#[derive(Debug, Clone)]
+pub struct DurableActivation {
+    pub input: Message,
+    pub state_before: DurableStateSnapshot,
+    pub state_after: DurableStateSnapshot,
+    pub emitted_messages: Vec<Message>,
+}
+
 /// Wire-level message — what flows through the scheduler's queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {

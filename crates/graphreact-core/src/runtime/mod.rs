@@ -29,9 +29,10 @@ pub use node_instance::{
 };
 pub use permissions::{node_accepts, node_can_emit, resolve_channel_policy, ResolvedPolicy};
 pub use scheduler::{
-    DelegatedRestartOutcome, DelegatedRestartRequest, GroupOp, NodeKey, RemoteBroadcastSink,
-    RemoteGroupSink, RemoteLinkSink, RemoteMonitorSink, RemoteSink, RemoteUnlinkSink, Scheduler,
-    SchedulerHandle, SuperviseDecision, SuperviseDecisionHook, SupervisorKey, UnmountHook,
+    DelegatedRestartOutcome, DelegatedRestartRequest, DurableActivationCommitter, GroupOp, NodeKey,
+    RemoteBroadcastSink, RemoteGroupSink, RemoteLinkSink, RemoteMonitorSink, RemoteSink,
+    RemoteUnlinkSink, Scheduler, SchedulerHandle, SuperviseDecision, SuperviseDecisionHook,
+    SupervisorKey, UnmountHook,
 };
 pub use sources::{delay_source, timer_source, EventSource, EventSourceFactory};
 pub use supervision::{
@@ -41,7 +42,8 @@ pub use supervision::{
 };
 pub use transforms::{get_transform, list_transforms, register_transform};
 pub use types::{
-    ChannelPolicy, ChildRef, ComposeChildSpec, DurabilityMode, DurableStateSnapshot, EmitOptions,
-    ExternalCall, IncomingMessage, Message, MessageHandler, NodeContext, PermissionManifest,
-    TopologyEventKind, TopologyFilterOptions, TopologyHandler, TransformFn,
+    ChannelPolicy, ChildRef, ComposeChildSpec, DurabilityMode, DurableActivation,
+    DurableStateSnapshot, EmitOptions, ExternalCall, IncomingMessage, Message, MessageHandler,
+    NodeContext, PermissionManifest, TopologyEventKind, TopologyFilterOptions, TopologyHandler,
+    TransformFn,
 };

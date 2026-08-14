@@ -2,7 +2,7 @@ use graphreact_core::{
     use_durable_state, use_emit, use_message, Attrs, CommunicationGraph, EmitOptions, NodeContext,
     NodeDefinition, PermissionManifest, Scheduler,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -198,4 +198,143 @@ fn durable_run_emit_does_not_cross_a_remote_peer() {
     scheduler.send("sender", "start", serde_json::Value::Null);
     scheduler.process_batch().unwrap();
     assert_eq!(routed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn durable_outputs_become_live_only_after_commit() {
+    let delivered = Rc::new(Cell::new(0));
+    let sender = NodeDefinition::new("Sender", |_ctx: &NodeContext| {
+        let count = use_durable_state("count", serde_json::json!(0));
+        let emit = use_emit();
+        use_message("start", move |_| {
+            count.update(|value| serde_json::json!(value.as_u64().unwrap_or_default() + 1));
+            emit(
+                "work",
+                serde_json::Value::Null,
+                EmitOptions {
+                    direct: Some("receiver".into()),
+                    ..EmitOptions::default()
+                },
+            );
+        });
+        PermissionManifest::new(vec!["start"], vec!["work"])
+    });
+    let receiver_delivered = Rc::clone(&delivered);
+    let receiver = NodeDefinition::new("Receiver", move |_ctx: &NodeContext| {
+        let receiver_delivered = Rc::clone(&receiver_delivered);
+        use_message("work", move |_| {
+            receiver_delivered.set(receiver_delivered.get() + 1);
+        });
+        PermissionManifest::new(vec!["work"], Vec::<String>::new())
+    });
+    let mut graph = CommunicationGraph::new();
+    graph.add_node("sender", Attrs::new());
+    graph.add_node("receiver", Attrs::new());
+    let mut scheduler = Scheduler::new(graph);
+    scheduler
+        .register_node(sender, "sender", Attrs::new(), 0)
+        .unwrap();
+    scheduler
+        .register_node(receiver, "receiver", Attrs::new(), 0)
+        .unwrap();
+    let delivered_at_commit = Rc::clone(&delivered);
+    scheduler.install_durable_activation_committer(Rc::new(move |activation| {
+        if activation.input.r#type == "start" {
+            assert_eq!(delivered_at_commit.get(), 0, "output leaked before commit");
+            assert_eq!(activation.emitted_messages.len(), 1);
+            assert_eq!(
+                activation.state_after.nodes["sender"]["count"],
+                serde_json::json!(1)
+            );
+        }
+        Ok(())
+    }));
+    scheduler.start().unwrap();
+    scheduler.send_durable(
+        "sender",
+        "start",
+        serde_json::Value::Null,
+        "run-1",
+        "attempt-1",
+    );
+    scheduler.process_batch().unwrap();
+    assert_eq!(delivered.get(), 1);
+}
+
+#[test]
+fn failed_commit_rolls_back_state_and_retries_input() {
+    let delivered = Rc::new(Cell::new(0));
+    let attempts = Rc::new(Cell::new(0));
+    let sender = NodeDefinition::new("Sender", |_ctx: &NodeContext| {
+        let count = use_durable_state("count", serde_json::json!(0));
+        let emit = use_emit();
+        use_message("start", move |_| {
+            count.update(|value| serde_json::json!(value.as_u64().unwrap_or_default() + 1));
+            emit(
+                "work",
+                serde_json::Value::Null,
+                EmitOptions {
+                    direct: Some("receiver".into()),
+                    ..EmitOptions::default()
+                },
+            );
+        });
+        PermissionManifest::new(vec!["start"], vec!["work"])
+    });
+    let receiver_delivered = Rc::clone(&delivered);
+    let receiver = NodeDefinition::new("Receiver", move |_ctx: &NodeContext| {
+        let receiver_delivered = Rc::clone(&receiver_delivered);
+        use_message("work", move |_| {
+            receiver_delivered.set(receiver_delivered.get() + 1);
+        });
+        PermissionManifest::new(vec!["work"], Vec::<String>::new())
+    });
+    let mut graph = CommunicationGraph::new();
+    graph.add_node("sender", Attrs::new());
+    graph.add_node("receiver", Attrs::new());
+    let mut scheduler = Scheduler::new(graph);
+    scheduler
+        .register_node(sender, "sender", Attrs::new(), 0)
+        .unwrap();
+    scheduler
+        .register_node(receiver, "receiver", Attrs::new(), 0)
+        .unwrap();
+    let commit_attempts = Rc::clone(&attempts);
+    scheduler.install_durable_activation_committer(Rc::new(move |activation| {
+        if activation.input.r#type != "start" {
+            return Ok(());
+        }
+        commit_attempts.set(commit_attempts.get() + 1);
+        if commit_attempts.get() == 1 {
+            Err(graphreact_core::RuntimeError::DurableCommit {
+                message: "injected fsync failure".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }));
+    scheduler.start().unwrap();
+    scheduler.send_durable(
+        "sender",
+        "start",
+        serde_json::Value::Null,
+        "run-1",
+        "attempt-1",
+    );
+
+    let error = scheduler.process_batch().unwrap_err();
+    assert!(error.to_string().contains("injected fsync failure"));
+    assert_eq!(delivered.get(), 0);
+    assert_eq!(
+        scheduler.snapshot_durable_state().nodes["sender"]["count"],
+        serde_json::json!(0)
+    );
+
+    scheduler.process_batch().unwrap();
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(delivered.get(), 1);
+    assert_eq!(
+        scheduler.snapshot_durable_state().nodes["sender"]["count"],
+        serde_json::json!(1)
+    );
 }

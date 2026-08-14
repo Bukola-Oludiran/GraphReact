@@ -1,0 +1,21 @@
+[package]
+name = "graphreact-durable-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Durable scheduler integration for GraphReact core and persistence backends"
+
+[dependencies]
+graphreact-core = { path = "../graphreact-core" }
+graphreact-persistence = { path = "../graphreact-persistence" }
+futures.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -18,6 +18,7 @@ members = [
     "crates/graphreact-observer",
     "crates/graphreact-secrets",
     "crates/graphreact-persistence",
+    "crates/graphreact-durable-runtime",
     "crates/graphreact-cli",
     "crates/graphreact-napi",
     "crates/graphreact-wasm",

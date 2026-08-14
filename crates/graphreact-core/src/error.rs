@@ -58,6 +58,12 @@ pub enum RuntimeError {
     #[error("node '{id}' not registered with scheduler")]
     NodeNotRegistered { id: String },
 
+    /// The configured durable activation commit boundary refused or failed
+    /// to persist an activation. The scheduler restores state and retries
+    /// the original input on a later batch.
+    #[error("durable activation commit failed: {message}")]
+    DurableCommit { message: String },
+
     /// Wrapper around a graph-layer error.
     #[error(transparent)]
     Graph(#[from] GraphError),

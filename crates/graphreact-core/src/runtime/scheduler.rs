@@ -42,8 +42,8 @@ use crate::runtime::supervision::{
     RestartPolicy, Supervisor, SupervisorError, SYSTEM_DOWN, SYSTEM_EXIT,
 };
 use crate::runtime::types::{
-    ComposeChildSpec, DurableStateSnapshot, EmitOptions, IncomingMessage, Message, NodeContext,
-    PermissionManifest, TopologyEventKind,
+    ComposeChildSpec, DurableActivation, DurableStateSnapshot, EmitOptions, IncomingMessage,
+    Message, NodeContext, PermissionManifest, TopologyEventKind,
 };
 
 new_key_type! {
@@ -55,6 +55,9 @@ new_key_type! {
 
 /// Height of a node in the hierarchy — used for dirty-queue ordering.
 pub type Height = u32;
+
+/// Storage-agnostic host callback invoked at the durable activation boundary.
+pub type DurableActivationCommitter = Rc<dyn Fn(&DurableActivation) -> Result<(), RuntimeError>>;
 
 /// **M-Ingress phase 2.** Per-handler-invocation context capturing
 /// the inbound HTTP-call shape so `make_emit` can auto-tag the
@@ -147,6 +150,10 @@ pub struct Scheduler {
     /// Run identity active while a durable message handler executes. Local
     /// emits inherit it; remote emits are suppressed during Phase A.
     current_durable_run_context: Rc<RefCell<Option<DurableRunContext>>>,
+    durable_activation_committer: Option<DurableActivationCommitter>,
+    /// Local output messages produced by the active durable handler. `None`
+    /// means the compatibility path should enqueue directly.
+    durable_output_buffer: Rc<RefCell<Option<Vec<Message>>>>,
 
     /// Active monitors. Drained per-target on `unmount` to deliver
     /// `__DOWN__` system messages.
@@ -603,6 +610,8 @@ impl Scheduler {
             last_received_ttl: Rc::new(RefCell::new(FxHashMap::default())),
             current_call_context: Rc::new(RefCell::new(None)),
             current_durable_run_context: Rc::new(RefCell::new(None)),
+            durable_activation_committer: None,
+            durable_output_buffer: Rc::new(RefCell::new(None)),
             monitors: Rc::new(RefCell::new(MonitorRegistry::new())),
             links: Rc::new(RefCell::new(LinkRegistry::new())),
             groups: Rc::new(RefCell::new(GroupRegistry::new())),
@@ -651,6 +660,13 @@ impl Scheduler {
     /// `target@<other>` as remote (consults `remote_sink`).
     pub fn set_node_name(&self, name: String) {
         *self.node_name.write() = Some(name);
+    }
+
+    /// Install the host's durable activation commit boundary. Merely
+    /// installing it does not affect ephemeral messages; only messages with
+    /// both run and attempt identifiers take the buffered path.
+    pub fn install_durable_activation_committer(&mut self, committer: DurableActivationCommitter) {
+        self.durable_activation_committer = Some(committer);
     }
 
     /// Read the cluster-unique node name set via `set_node_name`.
@@ -1121,6 +1137,7 @@ impl Scheduler {
         attempt_id: impl Into<String>,
     ) {
         let mut msg = create_message(r#type, "__external__", target_id, payload, None);
+        msg.id = uuid::Uuid::now_v7().to_string();
         msg.run_id = Some(run_id.into());
         msg.attempt_id = Some(attempt_id.into());
         self.messages.borrow_mut().push_back(msg);
@@ -1309,7 +1326,10 @@ impl Scheduler {
                 break;
             }
             for msg in next_batch {
-                self.deliver(msg);
+                if let Err(error) = self.deliver(msg) {
+                    *self.running.borrow_mut() = false;
+                    return Err(error);
+                }
             }
         }
         *self.running.borrow_mut() = false;
@@ -1443,7 +1463,10 @@ impl Scheduler {
                 break;
             }
             for msg in next_batch {
-                self.deliver(msg);
+                if let Err(error) = self.deliver(msg) {
+                    *self.running.borrow_mut() = false;
+                    return Err(error);
+                }
             }
         }
         *self.running.borrow_mut() = false;
@@ -2321,18 +2344,19 @@ impl Scheduler {
         }
     }
 
-    fn deliver(&self, mut msg: Message) {
+    fn deliver(&self, mut msg: Message) -> Result<(), RuntimeError> {
+        let retry_message = msg.clone();
         if !decrement_ttl(&mut msg) {
-            return;
+            return Ok(());
         }
         let Some(&target_key) = self.id_to_key.get(&msg.to) else {
-            return;
+            return Ok(());
         };
         let Some(target_rc) = self.nodes.get(target_key) else {
-            return;
+            return Ok(());
         };
         if target_rc.borrow().is_unmounted() {
-            return;
+            return Ok(());
         }
 
         // Track the active TTL so `emit` calls inside message handlers
@@ -2453,7 +2477,15 @@ impl Scheduler {
 
         if !accepted {
             self.current_delivery_ttl.set(prev_ttl);
-            return;
+            return Ok(());
+        }
+
+        let is_durable_activation = msg.run_id.is_some()
+            && msg.attempt_id.is_some()
+            && self.durable_activation_committer.is_some();
+        let state_before = is_durable_activation.then(|| self.snapshot_durable_state());
+        if is_durable_activation {
+            *self.durable_output_buffer.borrow_mut() = Some(Vec::new());
         }
 
         let handlers: Vec<crate::runtime::types::MessageHandler> = target_rc
@@ -2522,6 +2554,34 @@ impl Scheduler {
         *self.current_call_context.borrow_mut() = prev_call_context;
         *self.current_durable_run_context.borrow_mut() = prev_run_context;
 
+        if let Some(state_before) = state_before {
+            let emitted_messages = self
+                .durable_output_buffer
+                .borrow_mut()
+                .take()
+                .unwrap_or_default();
+            let activation = DurableActivation {
+                input: msg.clone(),
+                state_before: state_before.clone(),
+                state_after: self.snapshot_durable_state(),
+                emitted_messages,
+            };
+            let commit_result = self
+                .durable_activation_committer
+                .as_ref()
+                .expect("durable committer checked above")
+                .as_ref()(&activation);
+            if let Err(error) = commit_result {
+                self.restore_durable_state(state_before)?;
+                self.messages.borrow_mut().push_front(retry_message);
+                self.current_delivery_ttl.set(prev_ttl);
+                return Err(error);
+            }
+            self.messages
+                .borrow_mut()
+                .extend(activation.emitted_messages);
+        }
+
         // If any handler called `postpone()`, defer this message into the
         // target's postpone queue. It re-enters the main queue at the
         // next re-evaluation of this node.
@@ -2535,6 +2595,7 @@ impl Scheduler {
 
         // Restore previous TTL context (supports nested deliveries).
         self.current_delivery_ttl.set(prev_ttl);
+        Ok(())
     }
 
     /// Build the per-node `HookCtx` used by `evaluate_node`,
@@ -2579,6 +2640,7 @@ impl Scheduler {
         let last_received_ttl = Rc::clone(&self.last_received_ttl);
         let call_context = Rc::clone(&self.current_call_context);
         let durable_run_context = Rc::clone(&self.current_durable_run_context);
+        let durable_output_buffer = Rc::clone(&self.durable_output_buffer);
         // **M-Ingress phase 2.** Snapshot the telemetry sink at
         // make_emit time so the auto-propagation `on_call_reply`
         // path can fire without re-acquiring the ArcSwap on every
@@ -2704,7 +2766,6 @@ impl Scheduler {
                 }
             }
 
-            let mut q = messages.borrow_mut();
             for target in targets {
                 // M14 distribution: classify the target into Local /
                 // LocalStripped (target@<our_name>) / Remote (@<other>).
@@ -2731,10 +2792,15 @@ impl Scheduler {
                     msg.direct = is_direct;
                     msg.correlation_id.clone_from(&auto_correlation_id);
                     if let Some(context) = &run_context {
+                        msg.id = uuid::Uuid::now_v7().to_string();
                         msg.run_id = Some(context.run_id.clone());
                         msg.attempt_id = Some(context.attempt_id.clone());
                     }
-                    q.push_back(msg);
+                    if let Some(buffer) = durable_output_buffer.borrow_mut().as_mut() {
+                        buffer.push(msg);
+                    } else {
+                        messages.borrow_mut().push_back(msg);
+                    }
                 } else if is_remote_addr {
                     // Phase A durable runs are single-deployment and may not
                     // cross simultaneously active GraphReact peers.
@@ -3500,6 +3566,7 @@ impl SchedulerHandle {
         attempt_id: impl Into<String>,
     ) {
         let mut msg = create_message(r#type, "__external__", target_id, payload, None);
+        msg.id = uuid::Uuid::now_v7().to_string();
         msg.run_id = Some(run_id.into());
         msg.attempt_id = Some(attempt_id.into());
         self.inbox.lock().push(msg);
