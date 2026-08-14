@@ -22,7 +22,7 @@
 //! The classifier is pure — no scheduler interaction, no I/O. Easy to
 //! golden-test against fixture pairs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use graphreact_grx_parser::{
     ast::{AttrMap, ComponentLang},
@@ -109,6 +109,9 @@ pub enum NodeDeltaKind {
         old: ComponentLang,
         new: ComponentLang,
     },
+    /// A named external entrypoint targeting this node changed. The
+    /// deployment contract must be revalidated before traffic resumes.
+    EntrypointsChanged,
 }
 
 /// Per-edge change record.
@@ -296,6 +299,33 @@ pub fn classify(before: &GrxIr, after: &GrxIr, cache: &mut DiffCache) -> ReloadD
 
     // 3) Edge diff. Match by (source, target, kind).
     let topology = diff_edges(&before.edges, &after.edges);
+
+    // Entrypoints are deployment contract, not executable body text. Treat a
+    // change as incompatible so it cannot disappear into a NoChange result or
+    // bypass manifest validation during a live reload.
+    if before.entrypoints != after.entrypoints {
+        let targets: BTreeSet<_> = before
+            .entrypoints
+            .iter()
+            .chain(&after.entrypoints)
+            .map(|entrypoint| entrypoint.target.clone())
+            .collect();
+        compat.retain(|delta| !targets.contains(&delta.node_id));
+        for target in targets {
+            if incompat.iter().any(|delta| delta.node_id == target) {
+                continue;
+            }
+            let component = after_nodes
+                .get(target.as_str())
+                .or_else(|| before_nodes.get(target.as_str()))
+                .map_or_else(String::new, |node| node.component.clone());
+            incompat.push(NodeDelta {
+                node_id: target,
+                component,
+                kind: NodeDeltaKind::EntrypointsChanged,
+            });
+        }
+    }
 
     // 4) Combine into the top-level shape.
     match (compat.is_empty(), incompat.is_empty(), topology.is_empty()) {
@@ -508,6 +538,23 @@ mod tests {
         match classify(&a, &b, &mut cache) {
             ReloadDelta::NoChange => {}
             other => panic!("expected NoChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entrypoint_contract_change_is_incompatible() {
+        let before = parse(
+            r#"<Graph id="g"><Agent id="agent" /><entrypoint name="run" target="agent" request="prompt" reply="completion" /></Graph>"#,
+        );
+        let after = parse(
+            r#"<Graph id="g"><Agent id="agent" /><entrypoint name="run" target="agent" request="prompt.v2" reply="completion" /></Graph>"#,
+        );
+        let mut cache = DiffCache::new();
+        match classify(&before, &after, &mut cache) {
+            ReloadDelta::Incompatible(deltas) => assert!(deltas.iter().any(|delta| {
+                delta.node_id == "agent" && matches!(delta.kind, NodeDeltaKind::EntrypointsChanged)
+            })),
+            other => panic!("expected Incompatible, got {other:?}"),
         }
     }
 

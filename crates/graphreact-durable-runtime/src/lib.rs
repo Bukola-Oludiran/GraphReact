@@ -4,6 +4,7 @@
 mod config;
 mod deployment;
 mod effects;
+mod entrypoints;
 mod timers;
 
 pub use config::{
@@ -16,6 +17,7 @@ pub use effects::{
     dispatch_pending_effects, AdapterFuture, DeterministicIdempotentAdapter, DurableEffectAdapter,
     EffectAdapterError, EffectAdapterRegistry, EffectDispatchSummary,
 };
+pub use entrypoints::{validate_entrypoint_manifests, EntrypointValidationError};
 pub use timers::{fire_due_timers, TimerDispatchSummary};
 
 use std::collections::BTreeMap;

@@ -531,6 +531,15 @@ impl<A: EngineAdapter> ReloadOrchestrator<A> {
                     detail: "ComponentRenamed unmounted; remount of the new component requires caller-supplied body source.".into(),
                 });
             }
+            NodeDeltaKind::EntrypointsChanged => {
+                outcome.nodes.push((
+                    delta.node_id.clone(),
+                    NodeApplyOutcome::Skipped {
+                        reason: "entrypoint contract changed; deployment restart and manifest revalidation required"
+                            .into(),
+                    },
+                ));
+            }
             NodeDeltaKind::BodyChangedCompatible { .. } => {
                 // Should not be in the Incompatible bucket. Defensive
                 // coverage.

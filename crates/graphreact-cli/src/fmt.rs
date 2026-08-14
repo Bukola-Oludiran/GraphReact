@@ -56,11 +56,18 @@ pub fn format_file(file: &GrxFile) -> String {
 
 fn format_graph(out: &mut String, graph: &GraphDecl, indent: usize) {
     let pad = "  ".repeat(indent);
-    if graph.children.is_empty() {
+    if graph.children.is_empty() && graph.entrypoints.is_empty() {
         let _ = writeln!(out, "{pad}<Graph id=\"{}\"></Graph>", graph.id);
         return;
     }
     let _ = writeln!(out, "{pad}<Graph id=\"{}\">", graph.id);
+    for entrypoint in &graph.entrypoints {
+        let _ = writeln!(
+            out,
+            "{pad}  <entrypoint name=\"{}\" target=\"{}\" request=\"{}\" reply=\"{}\" />",
+            entrypoint.name, entrypoint.target, entrypoint.request, entrypoint.reply
+        );
+    }
     for child in &graph.children {
         format_node_child(out, child, indent + 1);
     }
@@ -172,5 +179,16 @@ const x = 1;
         assert!(formatted.contains("<Foo>"));
         assert!(formatted.contains("const x = 1"));
         assert!(formatted.contains("<Graph id=\"g\""));
+    }
+
+    #[test]
+    fn fmt_preserves_entrypoints_and_is_idempotent() {
+        let input = r#"<Graph id="g"><Agent id="agent" /><entrypoint reply="completion" request="prompt" target="agent" name="summarize" /></Graph>"#;
+        let once = round_trip(input);
+        assert!(once.contains(
+            "<entrypoint name=\"summarize\" target=\"agent\" request=\"prompt\" reply=\"completion\" />"
+        ));
+        let file = Parser::parse_file(&once).expect("re-parse formatted entrypoint");
+        assert_eq!(format_file(&file), once);
     }
 }

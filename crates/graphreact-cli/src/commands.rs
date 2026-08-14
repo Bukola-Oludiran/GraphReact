@@ -17,7 +17,7 @@ use graphreact_engine_zig::Engine;
 use crate::cli::{Cli, InitTemplate, RuntimeArg};
 use crate::engine_select::{select, EngineKind};
 use crate::fmt::format_file;
-use crate::runtime::{dry_mount, RuntimeError};
+use crate::runtime::{dry_mount, resolve_and_assemble_ir, RuntimeError};
 
 #[derive(Debug, Error)]
 pub enum CommandError {
@@ -2464,21 +2464,26 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         .with_environment()
         .validate(false)
         .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+    let deployment_ir = opts
+        .path
+        .as_deref()
+        .map(|path| resolve_and_assemble_ir(path).map(|(_, ir)| ir))
+        .transpose()?;
     let local_durability = match durability {
         graphreact_durable_runtime::ValidatedDurabilityConfig::Off => None,
         graphreact_durable_runtime::ValidatedDurabilityConfig::Local {
             deployment_id,
             directory,
         } => {
-            let path = opts.path.as_deref().ok_or_else(|| {
+            opts.path.as_deref().ok_or_else(|| {
                 CommandError::ClusterArg(
                     "--durability local requires --path for an immutable deployment bundle".into(),
                 )
             })?;
-            let ir = build_ir_for_path(path)?;
+            let ir = deployment_ir.as_ref().expect("path checked above");
             let bundle = graphreact_durable_runtime::build_deployment_bundle(
                 deployment_id.clone(),
-                &ir,
+                ir,
                 &graphreact_durable_runtime::BundleInputs::default(),
             )
             .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
@@ -2948,6 +2953,11 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
     // → process_batch settles immediately).
     host.process_batch_with_metrics(metrics_for_engine_counts.as_deref())
         .map_err(|e| CommandError::Runtime(crate::runtime::RuntimeError::from(e)))?;
+    if let Some(ir) = &deployment_ir {
+        let manifests = host.scheduler_mut().snapshot_manifests();
+        graphreact_durable_runtime::validate_entrypoint_manifests(ir, &manifests)
+            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+    }
 
     // **M22 phase 4.** Record the first batch's body-evaluation
     // counts. Subsequent `process_batch` rounds (driven by

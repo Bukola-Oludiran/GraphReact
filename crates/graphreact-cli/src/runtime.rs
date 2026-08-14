@@ -93,7 +93,7 @@ pub fn assemble_resolved_ir(resolved: &MultiFileResolved) -> RuntimeResult<GrxIr
     let nodes_edges_ir = graphreact_grx_parser::ir::build_ir(&GrxFile {
         imports: resolved.root.imports.clone(),
         graph: Some(graph.clone()),
-        subgraphs: resolved.root.subgraphs.clone(),
+        subgraphs: resolved.collect_root_subgraphs()?,
         definitions: resolved.root.definitions.clone(),
     })?;
 
