@@ -146,8 +146,13 @@ fn spawn_daemon(
         }
         let mut line = String::new();
         if reader.read_line(&mut line).expect("read daemon stdout") == 0 {
+            let stderr = child
+                .stderr
+                .take()
+                .map(|stderr| std::io::read_to_string(stderr).unwrap_or_default())
+                .unwrap_or_default();
             let _ = child.kill();
-            panic!("daemon stdout closed before ready signal");
+            panic!("daemon stdout closed before ready signal; stderr: {stderr}");
         }
         if let Some(rest) = line.trim().strip_prefix("grx-daemon-ready ") {
             // Sanity: the bound addr matches what we asked for.

@@ -201,13 +201,16 @@ Implementation tracker (updated 2026-08-13):
   scheduler activations, state, timers, effects, cancellation, and artifacts.
 - Shipped: named entrypoints plus protected run creation, status, cancellation,
   artifact-listing, and artifact-download routes.
-- In progress: the cluster `PersistenceEngine` now has a Postgres control plane,
+- Shipped: the cluster `PersistenceEngine` has a Postgres control plane,
   S3-compatible immutable objects, lease acquisition/renewal/release, monotonic
   fencing, fenced head/snapshot updates, and deterministic conformance tests.
-- Remaining before Phase A closes: daemon active/passive lease orchestration and
-  readiness gating, Postgres/MinIO service-level conformance and repeated
-  failover tests, language parity surfaces, durability metrics/audit events,
-  decoder fuzzing, and the final crash/failover soak gates.
+- Shipped: active/passive daemon orchestration waits without mounting on the
+  standby, acquires with a 15-second lease and 2-second polling, renews every 5
+  seconds before scheduler work, and closes readiness/admission plus halts on
+  lease loss.
+- Remaining before Phase A closes: Postgres/MinIO service-level conformance and
+  repeated failover tests, language parity surfaces, durability metrics/audit
+  events, decoder fuzzing, and the final crash/failover soak gates.
 
 Acceptance: kill the daemon at every boundary of a tool-call workflow and prove
 that restart produces exactly one externally visible outcome.

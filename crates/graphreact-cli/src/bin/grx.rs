@@ -361,7 +361,13 @@ fn dispatch_cluster(runtime: &tokio::runtime::Runtime, op: ClusterOp) -> Result<
                     // of `ps aux`.
                     println!("grx-observer-ready {addr}");
                 }
-                let exit = drive_handle_until(&mut handle, duration_secs).await?;
+                let exit = match drive_handle_until(&mut handle, duration_secs).await {
+                    Ok(exit) => exit,
+                    Err(error) => {
+                        handle.shutdown().await;
+                        return Err(error);
+                    }
+                };
                 // **M-Prod sub-track #4 Phase α.** SIGTERM
                 // routes through `start_drain` before shutdown;
                 // SIGINT + duration go straight to shutdown.
@@ -369,6 +375,11 @@ fn dispatch_cluster(runtime: &tokio::runtime::Runtime, op: ClusterOp) -> Result<
                     let _ = handle.start_drain(drain_deadline_for_run).await;
                 }
                 handle.shutdown().await;
+                if matches!(exit, graphreact_cli::commands::LoopExit::LeaseLost) {
+                    return Err(CommandError::ClusterArg(
+                        "cluster durability lease lost; scheduler halted".into(),
+                    ));
+                }
                 println!(
                     "grx-daemon-exited{}",
                     match (duration_secs, exit) {

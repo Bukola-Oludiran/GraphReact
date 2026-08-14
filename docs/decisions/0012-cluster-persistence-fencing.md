@@ -36,7 +36,7 @@ indexes, and idempotency decisions require strongly consistent transactions.
   ownership.
 - Takeover does not need to find or delete uploads from a former owner before
   becoming ready.
-- The daemon must stop admission and effect dispatch immediately on lease loss.
-  That orchestration is a separate slice built on this persistence contract.
+- The daemon polls for ownership before mounting, renews before scheduler work,
+  and stops admission, effect dispatch, and scheduler progress on lease loss.
 - Service-level conformance still requires Postgres and MinIO fixtures in CI;
   deterministic in-memory tests cover fencing and orphan safety on every build.

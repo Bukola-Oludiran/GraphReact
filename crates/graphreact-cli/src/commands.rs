@@ -11,6 +11,7 @@ use graphreact_grx_parser::{
     multi_file::resolve_multi_file,
     Parser,
 };
+use graphreact_persistence::PersistenceEngine as _;
 
 use graphreact_engine_zig::Engine;
 
@@ -1655,6 +1656,54 @@ struct DurableCheckpointState {
     bytes_at_snapshot: u64,
 }
 
+const CLUSTER_LEASE_DURATION: Duration = Duration::from_secs(15);
+const CLUSTER_LEASE_RENEWAL_INTERVAL: Duration = Duration::from_secs(5);
+const CLUSTER_STANDBY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+struct ClusterLeaseState {
+    engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine>,
+    grant: graphreact_persistence::LeaseGrant,
+    next_renewal: tokio::time::Instant,
+}
+
+enum DurableStartup {
+    Off,
+    Local {
+        config: graphreact_persistence::LocalConfig,
+        bundle: graphreact_persistence::DeploymentBundle,
+    },
+    Cluster {
+        engine: std::sync::Arc<graphreact_persistence::ClusterPersistence>,
+        bundle: graphreact_persistence::DeploymentBundle,
+        grant: graphreact_persistence::LeaseGrant,
+    },
+}
+
+impl ClusterLeaseState {
+    fn new(
+        engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine>,
+        grant: graphreact_persistence::LeaseGrant,
+    ) -> Self {
+        Self {
+            engine,
+            grant,
+            next_renewal: tokio::time::Instant::now() + CLUSTER_LEASE_RENEWAL_INTERVAL,
+        }
+    }
+
+    async fn renew_if_due(&mut self) -> Result<(), graphreact_persistence::PersistenceError> {
+        if tokio::time::Instant::now() < self.next_renewal {
+            return Ok(());
+        }
+        self.grant = self
+            .engine
+            .renew_lease(&self.grant, CLUSTER_LEASE_DURATION)
+            .await?;
+        self.next_renewal = tokio::time::Instant::now() + CLUSTER_LEASE_RENEWAL_INTERVAL;
+        Ok(())
+    }
+}
+
 fn durable_checkpoint_due(activations: u64, new_bytes: u64) -> bool {
     activations >= graphreact_persistence::SNAPSHOT_ACTIVATION_INTERVAL
         || new_bytes >= graphreact_persistence::SEGMENT_TARGET_BYTES
@@ -1743,6 +1792,7 @@ pub struct DaemonHandle {
     cluster: Cluster,
     host: SchedulerHost,
     durable_checkpoint: Option<DurableCheckpointState>,
+    cluster_lease: Option<ClusterLeaseState>,
     deployment_ir: Option<graphreact_grx_parser::GrxIr>,
     /// **M16-Backend P2+P4.** Observer management-API handle when
     /// `--observer-bind` was passed. `None` means no observer port
@@ -1891,6 +1941,29 @@ impl DaemonHandle {
             return Ok(false);
         };
         checkpoint.checkpoint(host.scheduler_mut(), force).await
+    }
+
+    async fn renew_cluster_lease(&mut self) -> bool {
+        let Some(lease) = self.cluster_lease.as_mut() else {
+            return true;
+        };
+        if let Err(error) = lease.renew_if_due().await {
+            tracing::error!(
+                target: "graphreact::persistence",
+                replica_id = lease.grant.replica_id,
+                fencing_token = lease.grant.fencing_token,
+                error = %error,
+                "cluster durability lease lost; halting scheduler"
+            );
+            if let Some(drain) = &self.drain {
+                drain.start(0);
+            }
+            self.cluster.begin_drain();
+            self.cluster_lease = None;
+            self.durable_checkpoint = None;
+            return false;
+        }
+        true
     }
 
     /// **M22 verify fix.** Read the shared `MetricsInner` Arc, if any
@@ -2355,12 +2428,29 @@ impl DaemonHandle {
     /// anyway, and we want to surface the timeout in the audit
     /// log rather than be murdered silently.
     pub async fn shutdown(mut self) {
+        if self.cluster_lease.is_some() {
+            if let Some(drain) = &self.drain {
+                drain.start(0);
+            }
+            self.cluster.begin_drain();
+        }
         if let Err(error) = self.checkpoint_durable_state(true).await {
             tracing::warn!(
                 target: "graphreact::persistence",
                 error = %error,
                 "graceful-shutdown durable snapshot failed"
             );
+        }
+        if let Some(lease) = self.cluster_lease.take() {
+            if let Err(error) = lease.engine.release_lease(&lease.grant).await {
+                tracing::warn!(
+                    target: "graphreact::persistence",
+                    replica_id = lease.grant.replica_id,
+                    fencing_token = lease.grant.fencing_token,
+                    error = %error,
+                    "cluster durability lease release failed"
+                );
+            }
         }
         // **M16-Backend P10 + M-Prod #5.** Flush the OTel span
         // batch processor FIRST so any buffered spans hit the
@@ -2585,8 +2675,8 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         .as_deref()
         .map(|path| resolve_and_assemble_ir(path).map(|(_, ir)| ir))
         .transpose()?;
-    let local_durability = match durability {
-        graphreact_durable_runtime::ValidatedDurabilityConfig::Off => None,
+    let durable_startup = match durability {
+        graphreact_durable_runtime::ValidatedDurabilityConfig::Off => DurableStartup::Off,
         graphreact_durable_runtime::ValidatedDurabilityConfig::Local {
             deployment_id,
             directory,
@@ -2605,13 +2695,66 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
             .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
             let config =
                 graphreact_persistence::LocalConfig::new(directory, deployment_id, bundle.digest);
-            Some((config, bundle))
+            DurableStartup::Local { config, bundle }
         }
-        graphreact_durable_runtime::ValidatedDurabilityConfig::Cluster { .. } => {
-            return Err(CommandError::ClusterArg(
-                "cluster durability is not available until the Phase A Postgres/S3 backend lands"
-                    .into(),
-            ));
+        graphreact_durable_runtime::ValidatedDurabilityConfig::Cluster {
+            deployment_id,
+            replica_id,
+            database_url,
+            object_store,
+        } => {
+            opts.path.as_deref().ok_or_else(|| {
+                CommandError::ClusterArg(
+                    "--durability cluster requires --path for an immutable deployment bundle"
+                        .into(),
+                )
+            })?;
+            let ir = deployment_ir.as_ref().expect("path checked above");
+            let bundle = graphreact_durable_runtime::build_deployment_bundle(
+                deployment_id.clone(),
+                ir,
+                &graphreact_durable_runtime::BundleInputs::default(),
+            )
+            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            let mut config = graphreact_persistence::ClusterConfig::new(
+                deployment_id,
+                bundle.digest,
+                database_url,
+                object_store.bucket,
+            );
+            config.endpoint = object_store.endpoint;
+            config.region = object_store.region;
+            config.prefix = object_store.prefix;
+            let engine = graphreact_persistence::ClusterPersistence::connect(config).await?;
+            let grant = loop {
+                match engine
+                    .acquire_lease(&replica_id, CLUSTER_LEASE_DURATION)
+                    .await
+                {
+                    Ok(grant) => break grant,
+                    Err(graphreact_persistence::PersistenceError::LeaseNotOwned(_)) => {
+                        tracing::info!(
+                            target: "graphreact::persistence",
+                            replica_id,
+                            poll_interval_secs = CLUSTER_STANDBY_POLL_INTERVAL.as_secs(),
+                            "cluster durability replica is standby; waiting for deployment lease"
+                        );
+                        tokio::time::sleep(CLUSTER_STANDBY_POLL_INTERVAL).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            tracing::info!(
+                target: "graphreact::persistence",
+                replica_id,
+                fencing_token = grant.fencing_token,
+                "cluster durability lease acquired"
+            );
+            DurableStartup::Cluster {
+                engine,
+                bundle,
+                grant,
+            }
         }
     };
     let runtime_secrets = opts
@@ -2626,25 +2769,56 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         &opts.go_build,
     )?;
     let mut durable_checkpoint = None;
-    if let Some((config, bundle)) = local_durability {
-        let engine = graphreact_durable_runtime::install_local(host.scheduler_mut(), config)
-            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
-        graphreact_durable_runtime::install_deployment_bundle(engine.as_ref(), &bundle)
-            .await
-            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
-        graphreact_durable_runtime::require_deployment_bundle(engine.as_ref())
-            .await
-            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
-        graphreact_durable_runtime::recover(host.scheduler_mut(), engine.as_ref())
-            .await
-            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
-        let checkpoint_engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine> =
-            engine;
-        durable_checkpoint = Some(
-            DurableCheckpointState::new(checkpoint_engine, 1)
+    let mut cluster_lease = None;
+    match durable_startup {
+        DurableStartup::Off => {}
+        DurableStartup::Local { config, bundle } => {
+            let engine = graphreact_durable_runtime::install_local(host.scheduler_mut(), config)
+                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            graphreact_durable_runtime::install_deployment_bundle(engine.as_ref(), &bundle)
                 .await
-                .map_err(|error| CommandError::ClusterArg(error.to_string()))?,
-        );
+                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            graphreact_durable_runtime::require_deployment_bundle(engine.as_ref())
+                .await
+                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            graphreact_durable_runtime::recover(host.scheduler_mut(), engine.as_ref())
+                .await
+                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            let checkpoint_engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine> =
+                engine;
+            durable_checkpoint = Some(
+                DurableCheckpointState::new(checkpoint_engine, 1)
+                    .await
+                    .map_err(|error| CommandError::ClusterArg(error.to_string()))?,
+            );
+        }
+        DurableStartup::Cluster {
+            engine,
+            bundle,
+            grant,
+        } => {
+            let engine: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine> = engine;
+            graphreact_durable_runtime::install_engine(
+                host.scheduler_mut(),
+                engine.clone(),
+                grant.fencing_token,
+            );
+            graphreact_durable_runtime::install_deployment_bundle(engine.as_ref(), &bundle)
+                .await
+                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            graphreact_durable_runtime::require_deployment_bundle(engine.as_ref())
+                .await
+                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            graphreact_durable_runtime::recover(host.scheduler_mut(), engine.as_ref())
+                .await
+                .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            durable_checkpoint = Some(
+                DurableCheckpointState::new(engine.clone(), grant.fencing_token)
+                    .await
+                    .map_err(|error| CommandError::ClusterArg(error.to_string()))?,
+            );
+            cluster_lease = Some(ClusterLeaseState::new(engine, grant));
+        }
     }
     // **M16-Backend P8.** Install debugpy on the freshly-mounted
     // CPython isolate (if `--debug=cpython:<port>` was passed).
@@ -3147,6 +3321,7 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         cluster,
         host,
         durable_checkpoint,
+        cluster_lease,
         deployment_ir,
         observer,
         metrics: metrics_for_engine_counts,
@@ -3371,7 +3546,13 @@ pub async fn run_daemon_blocking(opts: DaemonOptions) -> Result<String, CommandE
     let duration = opts.duration_secs;
     let drain_deadline = resolve_drain_deadline(opts.drain_deadline_secs);
     let mut handle = start_daemon(opts).await?;
-    let exit = drive_handle_until(&mut handle, duration).await?;
+    let exit = match drive_handle_until(&mut handle, duration).await {
+        Ok(exit) => exit,
+        Err(error) => {
+            handle.shutdown().await;
+            return Err(error);
+        }
+    };
     if matches!(exit, LoopExit::Sigterm) {
         // **M-Prod sub-track #4 Phase α.** Drain BEFORE shutdown
         // so the LB sees /v1/readyz=503 and ingress sees 503
@@ -3384,6 +3565,11 @@ pub async fn run_daemon_blocking(opts: DaemonOptions) -> Result<String, CommandE
         let _ = handle.start_drain(drain_deadline).await;
     }
     handle.shutdown().await;
+    if matches!(exit, LoopExit::LeaseLost) {
+        return Err(CommandError::ClusterArg(
+            "cluster durability lease lost; scheduler halted".into(),
+        ));
+    }
     Ok(match (duration, exit) {
         (Some(secs), _) => format!("daemon exited after {secs}s"),
         (None, LoopExit::Sigterm) => "daemon exited (SIGTERM, drained)".to_string(),
@@ -3419,6 +3605,9 @@ pub enum LoopExit {
     /// SIGTERM (unix). Kubelet-driven; trigger graceful drain
     /// before shutdown.
     Sigterm,
+    /// Cluster persistence ownership could not be renewed. The
+    /// daemon has already closed admission and halted scheduling.
+    LeaseLost,
 }
 
 /// One-shot dial. Spins up an empty cluster, opens a TLS
@@ -3450,6 +3639,7 @@ pub async fn run_connect_blocking(opts: ConnectOptions) -> Result<String, Comman
         cluster,
         host,
         durable_checkpoint: None,
+        cluster_lease: None,
         deployment_ir: None,
         observer: None,
         // `grx connect` is a one-shot dial; no metrics surface is
@@ -3597,7 +3787,9 @@ pub async fn drive_handle_until(
         #[cfg(unix)]
         tokio::select! {
             _ = tick.tick() => {
-                drive_one_tick(handle).await?;
+                if !drive_one_tick(handle).await? {
+                    return Ok(LoopExit::LeaseLost);
+                }
             }
             _ = sigint, if duration.is_none() => {
                 return Ok(LoopExit::Sigint);
@@ -3672,7 +3864,9 @@ pub async fn drive_handle_until(
         #[cfg(not(unix))]
         tokio::select! {
             _ = tick.tick() => {
-                drive_one_tick(handle).await?;
+                if !drive_one_tick(handle).await? {
+                    return Ok(LoopExit::LeaseLost);
+                }
             }
             _ = sigint, if duration.is_none() => {
                 return Ok(LoopExit::Sigint);
@@ -3684,7 +3878,10 @@ pub async fn drive_handle_until(
 /// **M-Prod sub-track #4 Phase α.** One tick of the drive loop —
 /// pulled out so the select! macro stays small enough to read
 /// across the unix / non-unix cfg-gated branches.
-async fn drive_one_tick(handle: &mut DaemonHandle) -> Result<(), CommandError> {
+async fn drive_one_tick(handle: &mut DaemonHandle) -> Result<bool, CommandError> {
+    if !handle.renew_cluster_lease().await {
+        return Ok(false);
+    }
     // **M22 verify fix.** Route the tick through
     // `handle.process_batch()` (which dispatches via
     // `SchedulerHost::process_batch`) instead of the raw
@@ -3718,7 +3915,7 @@ async fn drive_one_tick(handle: &mut DaemonHandle) -> Result<(), CommandError> {
         .checkpoint_durable_state(false)
         .await
         .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
-    Ok(())
+    Ok(true)
 }
 
 /// Drain any pending management-API snapshot requests from the
@@ -4214,6 +4411,43 @@ mod tests {
         assert!(!durable_checkpoint_due(9_999, 64 * 1024 * 1024 - 1));
         assert!(durable_checkpoint_due(10_000, 0));
         assert!(durable_checkpoint_due(0, 64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn cluster_failover_cadence_matches_phase_a_contract() {
+        assert_eq!(CLUSTER_LEASE_DURATION, Duration::from_secs(15));
+        assert_eq!(CLUSTER_LEASE_RENEWAL_INTERVAL, Duration::from_secs(5));
+        assert_eq!(CLUSTER_STANDBY_POLL_INTERVAL, Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn cluster_lease_state_refuses_to_renew_released_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(
+            graphreact_persistence::LocalPersistence::open(
+                graphreact_persistence::LocalConfig::new(
+                    directory.path(),
+                    graphreact_persistence::DeploymentId::new(),
+                    graphreact_persistence::DeploymentDigest::of(b"lease-lifecycle-test"),
+                ),
+            )
+            .unwrap(),
+        );
+        let grant = engine
+            .acquire_lease("replica-a", CLUSTER_LEASE_DURATION)
+            .await
+            .unwrap();
+        let engine_dyn: std::sync::Arc<dyn graphreact_persistence::PersistenceEngine> =
+            engine.clone();
+        let mut state = ClusterLeaseState::new(engine_dyn, grant.clone());
+        engine.release_lease(&grant).await.unwrap();
+        state.next_renewal = tokio::time::Instant::now();
+
+        assert!(matches!(
+            state.renew_if_due().await,
+            Err(graphreact_persistence::PersistenceError::LeaseNotOwned(owner))
+                if owner == "replica-a"
+        ));
     }
 
     /// **M-Prod sub-track #5 safest slice.** Verify the
