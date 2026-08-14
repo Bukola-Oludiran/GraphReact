@@ -42,9 +42,10 @@ use crate::runtime::supervision::{
     RestartPolicy, Supervisor, SupervisorError, SYSTEM_DOWN, SYSTEM_EXIT,
 };
 use crate::runtime::types::{
-    ComposeChildSpec, DurableActivation, DurableEffectIntent, DurableEffectRequest,
-    DurableQueueSnapshot, DurableStateSnapshot, DurableTimerCommand, DurableTimerIntent,
-    EmitOptions, IncomingMessage, Message, NodeContext, PermissionManifest, TopologyEventKind,
+    ComposeChildSpec, DurableActivation, DurableArtifactIntent, DurableArtifactRequest,
+    DurableEffectIntent, DurableEffectRequest, DurableQueueSnapshot, DurableStateSnapshot,
+    DurableTimerCommand, DurableTimerIntent, EmitOptions, IncomingMessage, Message, NodeContext,
+    PermissionManifest, TopologyEventKind,
 };
 
 new_key_type! {
@@ -91,6 +92,8 @@ struct DurableActivationBuffer {
     timers_scheduled: Vec<DurableTimerIntent>,
     timers_cancelled: Vec<String>,
     timer_keys: std::collections::BTreeSet<String>,
+    artifacts: Vec<DurableArtifactIntent>,
+    cancellation_requested: bool,
 }
 
 /// Reactive scheduler. Owns nodes, the message queue, and the dirty queue.
@@ -2655,6 +2658,8 @@ impl Scheduler {
                 effect_intents: buffer.effect_intents,
                 timers_scheduled: buffer.timers_scheduled,
                 timers_cancelled: buffer.timers_cancelled,
+                artifacts: buffer.artifacts,
+                cancellation_requested: buffer.cancellation_requested,
             };
             let commit_result = self
                 .durable_activation_committer
@@ -2666,6 +2671,11 @@ impl Scheduler {
                 self.messages.borrow_mut().push_front(retry_message);
                 self.current_delivery_ttl.set(prev_ttl);
                 return Err(error);
+            }
+            if activation.cancellation_requested {
+                if let Some(run_id) = &activation.input.run_id {
+                    self.cancel_durable_run(run_id.clone());
+                }
             }
             self.messages
                 .borrow_mut()
@@ -2699,6 +2709,8 @@ impl Scheduler {
             emit: self.make_emit(node_id.clone()),
             enqueue_durable_effect: self.make_enqueue_durable_effect(node_id.clone()),
             durable_timer: self.make_durable_timer(node_id.clone()),
+            store_durable_artifact: self.make_store_durable_artifact(),
+            request_durable_cancellation: self.make_request_durable_cancellation(),
             register_source: self.make_register_source(key, node_id.clone()),
             unregister_source: self.make_unregister_source(),
             register_monitor: self.make_register_monitor(key, node_id.clone()),
@@ -2835,6 +2847,14 @@ impl Scheduler {
                 }
             };
             let run_context = durable_run_context.borrow().clone();
+            if run_context.is_some()
+                && durable_output_buffer
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|buffer| buffer.cancellation_requested)
+            {
+                return;
+            }
 
             // **M-Ingress phase 2.** When auto-tagging fires, surface
             // the reply payload to any installed `TelemetrySink` so the
@@ -2950,6 +2970,9 @@ impl Scheduler {
                 .ok_or(RuntimeError::DurableEffectOutsideRun)?;
             let mut slot = activation_buffer.borrow_mut();
             let buffer = slot.as_mut().ok_or(RuntimeError::DurableEffectOutsideRun)?;
+            if buffer.cancellation_requested {
+                return Err(RuntimeError::DurableRunCancelling);
+            }
             if !buffer.effect_keys.insert(request.key.clone()) {
                 return Err(RuntimeError::DuplicateDurableEffectKey { key: request.key });
             }
@@ -2984,6 +3007,9 @@ impl Scheduler {
                 .ok_or(RuntimeError::DurableTimerOutsideRun)?;
             let mut slot = activation_buffer.borrow_mut();
             let buffer = slot.as_mut().ok_or(RuntimeError::DurableTimerOutsideRun)?;
+            if buffer.cancellation_requested {
+                return Err(RuntimeError::DurableRunCancelling);
+            }
             match command {
                 DurableTimerCommand::Schedule(request) => {
                     if request.key.trim().is_empty() {
@@ -3013,6 +3039,59 @@ impl Scheduler {
                     Ok(None)
                 }
             }
+        })
+    }
+
+    fn make_store_durable_artifact(
+        &self,
+    ) -> Rc<dyn Fn(DurableArtifactRequest) -> Result<String, RuntimeError>> {
+        let run_context = Rc::clone(&self.current_durable_run_context);
+        let activation_buffer = Rc::clone(&self.durable_output_buffer);
+        Rc::new(move |request| {
+            if request.logical_name.trim().is_empty() {
+                return Err(RuntimeError::EmptyDurableArtifactLogicalName);
+            }
+            if request.media_type.trim().is_empty() {
+                return Err(RuntimeError::EmptyDurableArtifactMediaType);
+            }
+            let context = run_context
+                .borrow()
+                .clone()
+                .ok_or(RuntimeError::DurableArtifactOutsideRun)?;
+            let mut slot = activation_buffer.borrow_mut();
+            let buffer = slot
+                .as_mut()
+                .ok_or(RuntimeError::DurableArtifactOutsideRun)?;
+            if buffer.cancellation_requested {
+                return Err(RuntimeError::DurableRunCancelling);
+            }
+            let id = uuid::Uuid::now_v7().to_string();
+            buffer.artifacts.push(DurableArtifactIntent {
+                id: id.clone(),
+                run_id: context.run_id,
+                logical_name: request.logical_name,
+                media_type: request.media_type,
+                bytes: request.bytes,
+                created_at_ms: crate::runtime::message::unix_time_ms(),
+            });
+            Ok(id)
+        })
+    }
+
+    fn make_request_durable_cancellation(&self) -> Rc<dyn Fn() -> Result<(), RuntimeError>> {
+        let run_context = Rc::clone(&self.current_durable_run_context);
+        let activation_buffer = Rc::clone(&self.durable_output_buffer);
+        Rc::new(move || {
+            run_context
+                .borrow()
+                .as_ref()
+                .ok_or(RuntimeError::DurableCancellationOutsideRun)?;
+            let mut slot = activation_buffer.borrow_mut();
+            let buffer = slot
+                .as_mut()
+                .ok_or(RuntimeError::DurableCancellationOutsideRun)?;
+            buffer.cancellation_requested = true;
+            Ok(())
         })
     }
 

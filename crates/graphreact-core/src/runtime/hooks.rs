@@ -25,8 +25,8 @@ use crate::runtime::node_instance::{
 };
 use crate::runtime::sources::EventSource;
 use crate::runtime::types::{
-    DurableEffectRequest, DurableTimerCommand, EmitOptions, IncomingMessage, MessageHandler,
-    TopologyFilterOptions, TopologyHandler,
+    DurableArtifactRequest, DurableEffectRequest, DurableTimerCommand, EmitOptions,
+    IncomingMessage, MessageHandler, TopologyFilterOptions, TopologyHandler,
 };
 
 // --- Thread-local context populated by the lifecycle ---
@@ -50,6 +50,10 @@ pub struct HookCtx {
         std::rc::Rc<dyn Fn(DurableEffectRequest) -> Result<String, crate::RuntimeError>>,
     pub(crate) durable_timer:
         std::rc::Rc<dyn Fn(DurableTimerCommand) -> Result<Option<String>, crate::RuntimeError>>,
+    pub(crate) store_durable_artifact:
+        std::rc::Rc<dyn Fn(DurableArtifactRequest) -> Result<String, crate::RuntimeError>>,
+    pub(crate) request_durable_cancellation:
+        std::rc::Rc<dyn Fn() -> Result<(), crate::RuntimeError>>,
     /// Register a new event source under the active node.
     pub(crate) register_source: std::rc::Rc<dyn Fn(std::sync::Arc<dyn EventSource>)>,
     /// Unregister an event source by ID.
@@ -297,6 +301,17 @@ pub fn use_durable_effect(
 pub fn use_durable_timer(
 ) -> std::rc::Rc<dyn Fn(DurableTimerCommand) -> Result<Option<String>, crate::RuntimeError>> {
     with_ctx(|ctx| std::rc::Rc::clone(&ctx.durable_timer))
+}
+
+/// Return the activation-scoped immutable artifact writer.
+pub fn use_durable_artifact(
+) -> std::rc::Rc<dyn Fn(DurableArtifactRequest) -> Result<String, crate::RuntimeError>> {
+    with_ctx(|ctx| std::rc::Rc::clone(&ctx.store_durable_artifact))
+}
+
+/// Return a callback that monotonically cancels the active durable run.
+pub fn use_durable_cancellation() -> std::rc::Rc<dyn Fn() -> Result<(), crate::RuntimeError>> {
+    with_ctx(|ctx| std::rc::Rc::clone(&ctx.request_durable_cancellation))
 }
 
 /// Node-local JSON state with a stable recovery key.

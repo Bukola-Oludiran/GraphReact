@@ -50,6 +50,28 @@ pub struct DurableActivation {
     pub effect_intents: Vec<DurableEffectIntent>,
     pub timers_scheduled: Vec<DurableTimerIntent>,
     pub timers_cancelled: Vec<String>,
+    pub artifacts: Vec<DurableArtifactIntent>,
+    pub cancellation_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableArtifactRequest {
+    #[serde(alias = "logical_name")]
+    pub logical_name: String,
+    #[serde(alias = "media_type")]
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DurableArtifactIntent {
+    pub id: String,
+    pub run_id: String,
+    pub logical_name: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+    pub created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,7 +143,9 @@ pub struct DurableTimerIntent {
 
 #[cfg(test)]
 mod durable_wire_tests {
-    use super::{DurableEffectRequest, DurableReplayPolicy, DurableTimerRequest};
+    use super::{
+        DurableArtifactRequest, DurableEffectRequest, DurableReplayPolicy, DurableTimerRequest,
+    };
     use serde_json::json;
 
     #[test]
@@ -169,6 +193,14 @@ mod durable_wire_tests {
             python_effect.replay_policy,
             DurableReplayPolicy::NonReplayable
         );
+
+        let artifact: DurableArtifactRequest = serde_json::from_value(json!({
+            "logical_name": "answer.bin",
+            "media_type": "application/octet-stream",
+            "bytes": [0, 127, 255]
+        }))
+        .expect("artifact request");
+        assert_eq!(artifact.bytes, vec![0, 127, 255]);
     }
 }
 

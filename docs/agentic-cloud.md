@@ -216,11 +216,10 @@ Implementation tracker (updated 2026-08-14):
   requires its standby to become ready within 30 seconds, resumes the former
   owner, and proves renewal fencing halts it before further scheduler work.
 - Shipped: JavaScript, Python, and Go expose equivalent named durable-state,
-  durable-effect, and durable-timer activation APIs over one versioned JSON wire
-  contract.
-- Remaining before Phase A closes: guest artifact/cancellation parity,
-  durability metrics/audit events, decoder fuzzing, and the final
-  crash/failover soak gates.
+  durable-effect, durable-timer, immutable-artifact, and monotonic-cancellation
+  activation APIs over one versioned JSON wire contract.
+- Remaining before Phase A closes: durability metrics/audit events, decoder
+  fuzzing, and the final crash/failover soak gates.
 
 Acceptance: kill the daemon at every boundary of a tool-call workflow and prove
 that restart produces exactly one externally visible outcome.

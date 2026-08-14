@@ -1098,6 +1098,20 @@ class _DurableTimer:
 def use_durable_timer():
     return _DurableTimer()
 
+def use_durable_artifact():
+    def store(logical_name, media_type, data):
+        return host_durable_artifact({
+            'logical_name': logical_name,
+            'media_type': media_type,
+            'bytes': list(data),
+        })
+    return store
+
+def use_durable_cancellation():
+    def request():
+        host_durable_cancellation()
+    return request
+
 def use_effect(fn, deps=None):
     if deps is None:
         deps = []
@@ -1577,6 +1591,8 @@ _builtins.use_state = use_state
 _builtins.use_durable_state = use_durable_state
 _builtins.use_durable_effect = use_durable_effect
 _builtins.use_durable_timer = use_durable_timer
+_builtins.use_durable_artifact = use_durable_artifact
+_builtins.use_durable_cancellation = use_durable_cancellation
 _builtins.use_effect = use_effect
 _builtins.use_effect_async = use_effect_async
 _builtins.use_emit = use_emit
@@ -5019,6 +5035,16 @@ fn install_hook_prelude(
         "host_durable_timer_cancel",
         crate::durable_host::build_timer_cancel_callback(),
     )?;
+    engine.register_callback(
+        iso,
+        "host_durable_artifact",
+        crate::durable_host::build_artifact_callback(),
+    )?;
+    engine.register_callback(
+        iso,
+        "host_durable_cancellation",
+        crate::durable_host::build_cancellation_callback(),
+    )?;
     engine.register_callback(iso, "host_effect", build_host_effect_callback())?;
     // Phase 3g — useEffectAsync via asyncio bridge. host_effect_async
     // parks a oneshot Sender + invokes the Python invoker (which
@@ -6947,7 +6973,7 @@ def body(ctx):
                 "probe",
                 "def probe():\n    \
                      import builtins\n    \
-                     names = ('use_state', 'use_durable_state', 'use_durable_effect', 'use_durable_timer', 'use_effect', 'use_effect_async', 'use_emit', 'use_message', 'use_memo', 'use_callback', 'use_reducer', 'use_neighbors', 'use_topology', 'use_accept_edge', 'use_edge_accept_handler', 'use_graph_query', 'use_spawn_child', 'use_unmount_self', 'use_compose', 'use_monitor', 'use_demonitor', 'use_link', 'use_unlink', 'use_group_join', 'use_group_leave', 'use_source', 'timer_source', 'delay_source', 'http_source', 'watch_source', '__register_callback', '__invoke_callback', '__augment_ctx')\n    \
+                     names = ('use_state', 'use_durable_state', 'use_durable_effect', 'use_durable_timer', 'use_durable_artifact', 'use_durable_cancellation', 'use_effect', 'use_effect_async', 'use_emit', 'use_message', 'use_memo', 'use_callback', 'use_reducer', 'use_neighbors', 'use_topology', 'use_accept_edge', 'use_edge_accept_handler', 'use_graph_query', 'use_spawn_child', 'use_unmount_self', 'use_compose', 'use_monitor', 'use_demonitor', 'use_link', 'use_unlink', 'use_group_join', 'use_group_leave', 'use_source', 'timer_source', 'delay_source', 'http_source', 'watch_source', '__register_callback', '__invoke_callback', '__augment_ctx')\n    \
                      return [n for n in names if hasattr(builtins, n)]\n",
             )
             .expect("eval");
@@ -6970,6 +6996,8 @@ def body(ctx):
                     "use_durable_state",
                     "use_durable_effect",
                     "use_durable_timer",
+                    "use_durable_artifact",
+                    "use_durable_cancellation",
                     "use_effect",
                     "use_effect_async",
                     "use_emit",

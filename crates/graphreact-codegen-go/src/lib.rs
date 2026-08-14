@@ -515,6 +515,8 @@ mod tests {
             "func UseDurableEffect(",
             "func ScheduleDurableTimer(",
             "func CancelDurableTimer(",
+            "func UseDurableArtifact(",
+            "func UseDurableCancellation(",
             "type DurableEffectRequest",
             "type DurableTimerRequest",
             "func UseEffect(",

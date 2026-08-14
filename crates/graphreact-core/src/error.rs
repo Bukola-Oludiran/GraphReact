@@ -85,6 +85,21 @@ pub enum RuntimeError {
     #[error("invalid durable timer id `{id}`")]
     InvalidDurableTimerId { id: String },
 
+    #[error("durable artifact requires an active durable run")]
+    DurableArtifactOutsideRun,
+
+    #[error("durable artifact logical name must be non-empty")]
+    EmptyDurableArtifactLogicalName,
+
+    #[error("durable artifact media type must be non-empty")]
+    EmptyDurableArtifactMediaType,
+
+    #[error("durable cancellation requires an active durable run")]
+    DurableCancellationOutsideRun,
+
+    #[error("durable run is cancelling and rejects new durable work")]
+    DurableRunCancelling,
+
     /// Wrapper around a graph-layer error.
     #[error(transparent)]
     Graph(#[from] GraphError),

@@ -4810,6 +4810,16 @@ pub fn mount_with_scheduler_and_secrets(
             "host_durable_timer_cancel",
             crate::durable_host::build_timer_cancel_callback(),
         )?;
+        e.register_callback(
+            iso,
+            "host_durable_artifact",
+            crate::durable_host::build_artifact_callback(),
+        )?;
+        e.register_callback(
+            iso,
+            "host_durable_cancellation",
+            crate::durable_host::build_cancellation_callback(),
+        )?;
         e.register_callback(iso, "host_effect", build_host_effect_callback())?;
         // M12.3b-phase1: useEffectAsync — real impl via JS Promise →
         // Rust Future bridge (oneshot channel keyed by completion id).
@@ -5195,6 +5205,8 @@ mod tests {
                    if (typeof useDurableState !== 'function') throw new Error('state');\n\
                    if (typeof useDurableEffect !== 'function') throw new Error('effect');\n\
                    if (typeof useDurableTimer !== 'function') throw new Error('timer');\n\
+                   if (typeof useDurableArtifact !== 'function') throw new Error('artifact');\n\
+                   if (typeof useDurableCancellation !== 'function') throw new Error('cancellation');\n\
                    return { accepts: [], emits: [] };\n\
                  }",
             )

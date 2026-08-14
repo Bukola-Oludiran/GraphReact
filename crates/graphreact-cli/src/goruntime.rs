@@ -3547,6 +3547,18 @@ pub fn mount_with_scheduler_and_options(
             crate::durable_host::build_timer_cancel_callback(),
         )
         .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_durable_artifact",
+            crate::durable_host::build_artifact_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_durable_cancellation",
+            crate::durable_host::build_cancellation_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
         e.register_callback(iso, "host_effect", build_host_effect_callback())
             .map_err(RuntimeError::Engine)?;
         // M17 phase 3d-α: memo + callback split-cache substrate.

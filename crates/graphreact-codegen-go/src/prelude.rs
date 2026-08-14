@@ -633,6 +633,37 @@ func CancelDurableTimer(timerID string) error {{
     return nil
 }}
 
+func UseDurableArtifact(logicalName string, mediaType string, bytes []byte) (string, error) {{
+    wireBytes := make([]int, len(bytes))
+    for i, value := range bytes {{
+        wireBytes[i] = int(value)
+    }}
+    request := map[string]interface{{}}{{
+        "logicalName": logicalName,
+        "mediaType": mediaType,
+        "bytes": wireBytes,
+    }}
+    raw, status := Invoke("host_durable_artifact", request)
+    if status != GR_OK {{
+        return "", fmt.Errorf("durable artifact store failed with status %d", status)
+    }}
+    var artifactID string
+    if err := json.Unmarshal(raw, &artifactID); err != nil {{
+        return "", err
+    }}
+    return artifactID, nil
+}}
+
+func UseDurableCancellation() func() error {{
+    return func() error {{
+        _, status := Invoke("host_durable_cancellation")
+        if status != GR_OK {{
+            return fmt.Errorf("durable cancellation failed with status %d", status)
+        }}
+        return nil
+    }}
+}}
+
 // MemoCheckResult is the JSON shape host_memo_check returns. Mirrors
 // pyruntime's envelope: `cached` (deps-unchanged hit), optional
 // `value` (the cached value, present only on hit), optional

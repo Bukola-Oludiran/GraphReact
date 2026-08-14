@@ -1,8 +1,8 @@
 //! Shared language-runtime bridge for activation-scoped durable operations.
 
 use graphreact_core::{
-    use_durable_effect, use_durable_timer, DurableEffectRequest, DurableTimerCommand,
-    DurableTimerRequest,
+    use_durable_artifact, use_durable_cancellation, use_durable_effect, use_durable_timer,
+    DurableArtifactRequest, DurableEffectRequest, DurableTimerCommand, DurableTimerRequest,
 };
 use graphreact_engine_zig::{BoxCallback, EngineError, HostValue};
 
@@ -51,6 +51,23 @@ pub(crate) fn build_timer_cancel_callback() -> BoxCallback {
         };
         use_durable_timer()(DurableTimerCommand::Cancel { timer_id })
             .map(|_| HostValue::Null)
+            .map_err(|error| EngineError::Internal(error.to_string()))
+    })
+}
+
+pub(crate) fn build_artifact_callback() -> BoxCallback {
+    Box::new(|args| {
+        let request: DurableArtifactRequest = decode("host_durable_artifact", args.first())?;
+        use_durable_artifact()(request)
+            .map(HostValue::String)
+            .map_err(|error| EngineError::Internal(error.to_string()))
+    })
+}
+
+pub(crate) fn build_cancellation_callback() -> BoxCallback {
+    Box::new(|_| {
+        use_durable_cancellation()()
+            .map(|()| HostValue::Null)
             .map_err(|error| EngineError::Internal(error.to_string()))
     })
 }

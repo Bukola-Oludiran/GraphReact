@@ -92,9 +92,24 @@ pub fn install_engine(
     fencing_token: u64,
 ) {
     scheduler.install_durable_activation_committer(Rc::new(move |activation| {
-        let record = activation_record(activation)
+        let artifacts = activation_artifacts(activation)
             .map_err(|message| RuntimeError::DurableCommit { message })?;
-        futures::executor::block_on(engine.commit(fencing_token, &[record]))
+        for (metadata, bytes) in &artifacts {
+            futures::executor::block_on(engine.put_artifact(metadata, bytes)).map_err(|error| {
+                RuntimeError::DurableCommit {
+                    message: error.to_string(),
+                }
+            })?;
+        }
+        let records = activation_records(
+            activation,
+            artifacts
+                .into_iter()
+                .map(|(metadata, _)| metadata)
+                .collect(),
+        )
+        .map_err(|message| RuntimeError::DurableCommit { message })?;
+        futures::executor::block_on(engine.commit(fencing_token, &records))
             .map(|_| ())
             .map_err(|error| RuntimeError::DurableCommit {
                 message: error.to_string(),
@@ -193,10 +208,20 @@ pub async fn list_run_artifacts(
         }
     }
     for record in engine.replay(0).await? {
-        if let RuntimeRecordV1::ArtifactCommitted(metadata) = record {
-            if &metadata.run_id == run_id {
-                artifacts.insert(metadata.id.clone(), metadata);
+        match record {
+            RuntimeRecordV1::ArtifactCommitted(metadata) => {
+                if &metadata.run_id == run_id {
+                    artifacts.insert(metadata.id.clone(), metadata);
+                }
             }
+            RuntimeRecordV1::ActivationCommitted(commit) => {
+                for metadata in commit.artifacts {
+                    if &metadata.run_id == run_id {
+                        artifacts.insert(metadata.id.clone(), metadata);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(artifacts.into_values().collect())
@@ -216,10 +241,20 @@ pub async fn read_artifact(
             .find(|metadata| &metadata.id == artifact_id)
     });
     for record in engine.replay(0).await? {
-        if let RuntimeRecordV1::ArtifactCommitted(candidate) = record {
-            if &candidate.id == artifact_id {
+        match record {
+            RuntimeRecordV1::ArtifactCommitted(candidate) if &candidate.id == artifact_id => {
                 metadata = Some(candidate);
             }
+            RuntimeRecordV1::ActivationCommitted(commit) => {
+                if let Some(candidate) = commit
+                    .artifacts
+                    .into_iter()
+                    .find(|candidate| &candidate.id == artifact_id)
+                {
+                    metadata = Some(candidate);
+                }
+            }
+            _ => {}
         }
     }
     let Some(metadata) = metadata else {
@@ -292,6 +327,17 @@ pub async fn write_runtime_snapshot(
                 .collect()
         })
         .unwrap_or_default();
+    let mut artifacts: BTreeMap<ArtifactId, ArtifactMetadata> = previous
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .artifacts
+                .iter()
+                .cloned()
+                .map(|metadata| (metadata.id.clone(), metadata))
+                .collect()
+        })
+        .unwrap_or_default();
     for record in engine.replay(replay_from).await? {
         match record {
             RuntimeRecordV1::ActivationCommitted(commit) => {
@@ -304,6 +350,12 @@ pub async fn write_runtime_snapshot(
                 for intent in commit.timers_scheduled {
                     timers.insert(intent.id.clone(), intent);
                 }
+                for metadata in commit.artifacts {
+                    artifacts.insert(metadata.id.clone(), metadata);
+                }
+            }
+            RuntimeRecordV1::ArtifactCommitted(metadata) => {
+                artifacts.insert(metadata.id.clone(), metadata);
             }
             RuntimeRecordV1::EffectCompleted { effect_id, .. } => {
                 effects.remove(&effect_id);
@@ -329,7 +381,7 @@ pub async fn write_runtime_snapshot(
         supervision: serde_json::json!({}),
         timers: timers.into_values().collect(),
         effects: effects.into_values().collect(),
-        artifacts: Vec::new(),
+        artifacts: artifacts.into_values().collect(),
         runs: serde_json::json!({}),
     };
     let summary = SnapshotSummary {
@@ -462,7 +514,10 @@ fn core_message(message: DurableMessage) -> graphreact_core::Message {
     }
 }
 
-fn activation_record(activation: &DurableActivation) -> Result<RuntimeRecordV1, String> {
+fn activation_records(
+    activation: &DurableActivation,
+    artifacts: Vec<ArtifactMetadata>,
+) -> Result<Vec<RuntimeRecordV1>, String> {
     let run_id = required_id(activation.input.run_id.as_deref(), "run id", RunId::parse)?;
     let attempt_id = required_id(
         activation.input.attempt_id.as_deref(),
@@ -496,7 +551,18 @@ fn activation_record(activation: &DurableActivation) -> Result<RuntimeRecordV1, 
         .map(|id| TimerId::parse(id.clone()).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(RuntimeRecordV1::ActivationCommitted(ActivationCommit {
+    let mut records = Vec::with_capacity(if activation.cancellation_requested {
+        2
+    } else {
+        1
+    });
+    if activation.cancellation_requested {
+        records.push(RuntimeRecordV1::CancellationRequested {
+            run_id: run_id.clone(),
+            requested_at_ms: unix_time_ms(),
+        });
+    }
+    records.push(RuntimeRecordV1::ActivationCommitted(ActivationCommit {
         run_id,
         attempt_id,
         input_message_id,
@@ -505,9 +571,37 @@ fn activation_record(activation: &DurableActivation) -> Result<RuntimeRecordV1, 
         timers_scheduled,
         timers_cancelled,
         effect_intents,
-        artifacts: Vec::new(),
-        resulting_status: RunStatus::Running,
-    }))
+        artifacts,
+        resulting_status: if activation.cancellation_requested {
+            RunStatus::Cancelling
+        } else {
+            RunStatus::Running
+        },
+    }));
+    Ok(records)
+}
+
+fn activation_artifacts(
+    activation: &DurableActivation,
+) -> Result<Vec<(ArtifactMetadata, Vec<u8>)>, String> {
+    activation
+        .artifacts
+        .iter()
+        .map(|intent| {
+            let metadata = ArtifactMetadata {
+                id: ArtifactId::parse(intent.id.clone())
+                    .map_err(|error| format!("invalid durable artifact id: {error}"))?,
+                run_id: RunId::parse(intent.run_id.clone())
+                    .map_err(|error| format!("invalid durable artifact run id: {error}"))?,
+                logical_name: intent.logical_name.clone(),
+                media_type: intent.media_type.clone(),
+                size: intent.bytes.len() as u64,
+                sha256: Sha256::digest(&intent.bytes).into(),
+                created_at_ms: intent.created_at_ms,
+            };
+            Ok((metadata, intent.bytes.clone()))
+        })
+        .collect()
 }
 
 fn durable_timer_intent(
@@ -973,5 +1067,101 @@ mod tests {
                 .unwrap();
         assert_eq!(read_metadata, metadata);
         assert_eq!(read_bytes, bytes);
+    }
+
+    #[test]
+    fn activation_artifact_and_guest_cancellation_commit_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = LocalConfig::new(
+            directory.path(),
+            graphreact_persistence::DeploymentId::new(),
+            graphreact_persistence::DeploymentDigest::of(b"guest-artifact-cancel"),
+        );
+        let definition = NodeDefinition::new("Agent", |_ctx: &NodeContext| {
+            let artifact = graphreact_core::use_durable_artifact();
+            let cancel = graphreact_core::use_durable_cancellation();
+            let effect = graphreact_core::use_durable_effect();
+            use_message("start", move |_| {
+                artifact(graphreact_core::DurableArtifactRequest {
+                    logical_name: "answer.txt".into(),
+                    media_type: "text/plain".into(),
+                    bytes: b"durable answer".to_vec(),
+                })
+                .unwrap();
+                cancel().unwrap();
+                let rejected = effect(graphreact_core::DurableEffectRequest {
+                    key: "too-late".into(),
+                    adapter: "deterministic".into(),
+                    operation: "record".into(),
+                    input: serde_json::Value::Null,
+                    result_type: "ok".into(),
+                    error_type: "error".into(),
+                    replay_policy: graphreact_core::DurableReplayPolicy::Idempotent,
+                });
+                assert_eq!(rejected, Err(RuntimeError::DurableRunCancelling));
+            });
+            PermissionManifest::new(vec!["start"], Vec::<String>::new())
+        });
+        let mut graph = CommunicationGraph::new();
+        graph.add_node("agent", Attrs::new());
+        let mut scheduler = Scheduler::new(graph);
+        scheduler
+            .register_node(definition, "agent", Attrs::new(), 0)
+            .unwrap();
+        let engine = install_local(&mut scheduler, config).unwrap();
+        scheduler.start().unwrap();
+        let run_id = RunId::new();
+        enqueue_durable_message(
+            &scheduler,
+            engine.as_ref(),
+            1,
+            "agent",
+            "start",
+            serde_json::Value::Null,
+            run_id.clone(),
+            AttemptId::new(),
+            CorrelationId::new(),
+        )
+        .unwrap();
+
+        scheduler.process_batch().unwrap();
+
+        assert!(scheduler.is_durable_run_cancelled(run_id.as_str()));
+        let artifacts =
+            futures::executor::block_on(list_run_artifacts(engine.as_ref(), &run_id)).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        let (_, bytes) =
+            futures::executor::block_on(read_artifact(engine.as_ref(), &artifacts[0].id))
+                .unwrap()
+                .unwrap();
+        assert_eq!(bytes, b"durable answer");
+        let records = futures::executor::block_on(engine.replay(0)).unwrap();
+        let cancellation_position = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record,
+                    RuntimeRecordV1::CancellationRequested { run_id: id, .. } if id == &run_id
+                )
+            })
+            .unwrap();
+        let activation_position = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record,
+                    RuntimeRecordV1::ActivationCommitted(commit) if commit.artifacts.len() == 1
+                )
+            })
+            .unwrap();
+        assert!(cancellation_position < activation_position);
+        assert!(records.iter().any(|record| matches!(
+            record,
+            RuntimeRecordV1::CancellationRequested { run_id: id, .. } if id == &run_id
+        )));
+        assert!(records.iter().any(|record| matches!(
+            record,
+            RuntimeRecordV1::ActivationCommitted(commit) if commit.artifacts.len() == 1
+        )));
     }
 }

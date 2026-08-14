@@ -490,6 +490,22 @@ const HOOK_PRELUDE: []const u8 =
     \\    }
     \\  };
     \\};
+    \\globalThis.useDurableArtifact = function() {
+    \\  return function(logicalName, mediaType, bytes) {
+    \\    if (typeof host_durable_artifact === 'undefined') return null;
+    \\    return host_durable_artifact({
+    \\      logicalName: logicalName,
+    \\      mediaType: mediaType,
+    \\      bytes: Array.from(bytes || [])
+    \\    });
+    \\  };
+    \\};
+    \\globalThis.useDurableCancellation = function() {
+    \\  return function() {
+    \\    if (typeof host_durable_cancellation === 'undefined') return;
+    \\    host_durable_cancellation();
+    \\  };
+    \\};
     \\globalThis.useEmit = function() {
     \\  return function(type, payload, opts) {
     \\    if (typeof host_emit === 'undefined') return;

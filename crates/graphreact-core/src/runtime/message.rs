@@ -9,6 +9,13 @@ use super::types::Message;
 
 static MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// Build a [`Message`] with monotonically-increasing ID and current timestamp.
 pub fn create_message(
     r#type: impl Into<String>,
@@ -18,13 +25,7 @@ pub fn create_message(
     ttl: Option<u32>,
 ) -> Message {
     let counter = MESSAGE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| {
-            let millis: u128 = d.as_millis();
-            u64::try_from(millis).unwrap_or(u64::MAX)
-        })
-        .unwrap_or(0);
+    let timestamp = unix_time_ms();
     Message {
         id: format!("msg_{counter}"),
         r#type: r#type.into(),
