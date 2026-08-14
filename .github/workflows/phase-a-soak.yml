@@ -1,0 +1,94 @@
+name: Phase A durability soak
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  crash-recovery:
+    name: activation crash recovery (100 cycles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GRX_CRASH_SOAK_CYCLES: "100"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: phase-a-crash-soak
+      - name: Abort before and after commit, then recover
+        run: cargo test -p graphreact-durable-runtime --test crash_recovery_subprocess -- --nocapture
+
+  clustered-failover:
+    name: clustered failover (20 cycles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: graphreact
+          POSTGRES_USER: graphreact
+          POSTGRES_PASSWORD: graphreact-test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U graphreact -d graphreact"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      GRX_FAILOVER_SOAK_CYCLES: "20"
+      GRX_CLUSTER_TEST_DATABASE_URL: postgres://graphreact:graphreact-test@127.0.0.1:5432/graphreact?sslmode=disable
+      GRX_CLUSTER_TEST_S3_BUCKET: graphreact-persistence
+      GRX_CLUSTER_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      GRX_CLUSTER_TEST_S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: graphreact
+      AWS_SECRET_ACCESS_KEY: graphreact-test-secret
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: phase-a-failover-soak
+      - name: Resolve Python pkg-config name
+        run: |
+          echo "GRAPHREACT_PYTHON_PKGCONFIG=python-3.12-embed" >> "$GITHUB_ENV"
+          echo "GRAPHREACT_PYTHON_VERSION=3.12" >> "$GITHUB_ENV"
+      - name: Start MinIO
+        run: |
+          docker run --detach --name grx-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
+            --env MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs grx-minio
+          exit 1
+      - name: Create test bucket
+        run: |
+          docker run --rm --network host --entrypoint /bin/sh \
+            minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
+            'mc alias set local http://127.0.0.1:9000 graphreact graphreact-test-secret && mc mb --ignore-existing local/graphreact-persistence'
+      - name: Repeated active/passive takeover and former-owner fencing
+        run: cargo test -p graphreact-cli --test cluster_failover_services -- --ignored --nocapture

@@ -229,7 +229,15 @@ Implementation tracker (updated 2026-08-14):
   header, length, checksum and record decoder plus the shared snapshot decoder;
   checksum-valid arbitrary payload frames ensure deep decoder coverage. CI runs
   it in parallel with the management-API fuzz target.
-- Remaining before Phase A closes: the final crash/failover soak gates.
+- Shipped: a subprocess crash gate aborts before/after activation commit, after
+  effect-intent commit, and after an external side effect but before completion
+  persistence. Fresh processes prove retry/non-rerun behavior and one external
+  record plus one durable result using the same `EffectId`. A nightly soak
+  repeats this for 100 cycles and runs 20 real Postgres/MinIO active-passive
+  takeovers, each enforcing the 30-second target and former-owner fencing.
+- Phase A implementation and automated acceptance gates are complete. Extended
+  production observation remains an operational release criterion rather than
+  an implementation gap.
 
 Acceptance: kill the daemon at every boundary of a tool-call workflow and prove
 that restart produces exactly one externally visible outcome.

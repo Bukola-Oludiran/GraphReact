@@ -20,7 +20,15 @@ use graphreact_persistence::DeploymentId;
 
 const TAKEOVER_DEADLINE: Duration = Duration::from_secs(30);
 const FORMER_OWNER_EXIT_DEADLINE: Duration = Duration::from_secs(10);
-const REPEATED_FAILOVER_CYCLES: usize = 3;
+const DEFAULT_REPEATED_FAILOVER_CYCLES: usize = 3;
+
+fn repeated_failover_cycles() -> usize {
+    std::env::var("GRX_FAILOVER_SOAK_CYCLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|cycles| *cycles != 0)
+        .unwrap_or(DEFAULT_REPEATED_FAILOVER_CYCLES)
+}
 
 const GO_GRAPH: &str = r#"
 <Counter lang="go">
@@ -251,7 +259,7 @@ fn suspended_active_is_fenced_after_repeated_takeovers() {
     let pem = write_pem_artifacts();
     let graphs = tempfile::tempdir().expect("graph tempdir");
 
-    for cycle in 0..REPEATED_FAILOVER_CYCLES {
+    for cycle in 0..repeated_failover_cycles() {
         let deployment_id = DeploymentId::new();
         let active_graph = graph_copy(graphs.path(), &format!("cycle-{cycle}-active"));
         let standby_graph = graph_copy(graphs.path(), &format!("cycle-{cycle}-standby"));
