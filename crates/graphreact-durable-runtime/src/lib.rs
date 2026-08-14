@@ -1,14 +1,22 @@
 //! Bridge between the storage-agnostic core activation boundary
 //! and the versioned persistence records.
 
+mod effects;
+
+pub use effects::{
+    AdapterFuture, DeterministicIdempotentAdapter, DurableEffectAdapter, EffectAdapterError,
+    EffectAdapterRegistry,
+};
+
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use graphreact_core::{DurableActivation, RuntimeError, Scheduler};
 use graphreact_persistence::{
-    ActivationCommit, AttemptId, CorrelationId, DurableMessage, DurableStateWrite, LocalConfig,
-    LocalPersistence, MessageId, PersistenceEngine, RunId, RunStatus, RuntimeRecordV1,
+    ActivationCommit, AttemptId, CorrelationId, DurableMessage, DurableStateWrite, EffectId,
+    EffectIntent, LocalConfig, LocalPersistence, MessageId, PersistenceEngine, ReplayPolicy, RunId,
+    RunStatus, RuntimeRecordV1,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -199,6 +207,11 @@ fn activation_record(activation: &DurableActivation) -> Result<RuntimeRecordV1, 
         .iter()
         .map(durable_message)
         .collect::<Result<Vec<_>, _>>()?;
+    let effect_intents = activation
+        .effect_intents
+        .iter()
+        .map(durable_effect_intent)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(RuntimeRecordV1::ActivationCommitted(ActivationCommit {
         run_id,
@@ -208,10 +221,34 @@ fn activation_record(activation: &DurableActivation) -> Result<RuntimeRecordV1, 
         emitted_messages,
         timers_scheduled: Vec::new(),
         timers_cancelled: Vec::new(),
-        effect_intents: Vec::new(),
+        effect_intents,
         artifacts: Vec::new(),
         resulting_status: RunStatus::Running,
     }))
+}
+
+fn durable_effect_intent(
+    intent: &graphreact_core::DurableEffectIntent,
+) -> Result<EffectIntent, String> {
+    Ok(EffectIntent {
+        id: EffectId::parse(intent.id.clone())
+            .map_err(|error| format!("invalid durable effect id: {error}"))?,
+        key: intent.key.clone(),
+        run_id: RunId::parse(intent.run_id.clone())
+            .map_err(|error| format!("invalid durable effect run id: {error}"))?,
+        attempt_id: AttemptId::parse(intent.attempt_id.clone())
+            .map_err(|error| format!("invalid durable effect attempt id: {error}"))?,
+        node_id: intent.node_id.clone(),
+        adapter: intent.adapter.clone(),
+        operation: intent.operation.clone(),
+        input: intent.input.clone(),
+        result_type: intent.result_type.clone(),
+        error_type: intent.error_type.clone(),
+        replay_policy: match intent.replay_policy {
+            graphreact_core::DurableReplayPolicy::Idempotent => ReplayPolicy::Idempotent,
+            graphreact_core::DurableReplayPolicy::NonReplayable => ReplayPolicy::NonReplayable,
+        },
+    })
 }
 
 fn required_id<T, E>(
@@ -416,6 +453,68 @@ mod tests {
         assert_eq!(
             recovered.snapshot_durable_state().nodes["counter"]["count"],
             serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn effect_intent_is_persisted_in_the_activation_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = LocalConfig::new(
+            directory.path(),
+            graphreact_persistence::DeploymentId::new(),
+            graphreact_persistence::DeploymentDigest::of(b"effect-deployment"),
+        );
+        let definition = NodeDefinition::new("Agent", |_ctx: &NodeContext| {
+            let effect = graphreact_core::use_durable_effect();
+            use_message("start", move |_| {
+                effect(graphreact_core::DurableEffectRequest {
+                    key: "tool-call".into(),
+                    adapter: "deterministic".into(),
+                    operation: "record".into(),
+                    input: serde_json::json!({"value": 42}),
+                    result_type: "tool_result".into(),
+                    error_type: "tool_error".into(),
+                    replay_policy: graphreact_core::DurableReplayPolicy::Idempotent,
+                })
+                .unwrap();
+            });
+            PermissionManifest::new(vec!["start"], Vec::<String>::new())
+        });
+        let mut graph = CommunicationGraph::new();
+        graph.add_node("agent", Attrs::new());
+        let mut scheduler = Scheduler::new(graph);
+        scheduler
+            .register_node(definition, "agent", Attrs::new(), 0)
+            .unwrap();
+        let engine = install_local(&mut scheduler, config).unwrap();
+        scheduler.start().unwrap();
+        enqueue_durable_message(
+            &scheduler,
+            engine.as_ref(),
+            1,
+            "agent",
+            "start",
+            serde_json::Value::Null,
+            RunId::new(),
+            AttemptId::new(),
+            CorrelationId::new(),
+        )
+        .unwrap();
+        scheduler.process_batch().unwrap();
+
+        let records = futures::executor::block_on(engine.replay(0)).unwrap();
+        let commit = records
+            .iter()
+            .find_map(|record| match record {
+                RuntimeRecordV1::ActivationCommitted(commit) => Some(commit),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(commit.effect_intents.len(), 1);
+        assert_eq!(commit.effect_intents[0].key, "tool-call");
+        assert_eq!(
+            commit.effect_intents[0].replay_policy,
+            ReplayPolicy::Idempotent
         );
     }
 }

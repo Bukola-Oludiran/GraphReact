@@ -25,7 +25,8 @@ use crate::runtime::node_instance::{
 };
 use crate::runtime::sources::EventSource;
 use crate::runtime::types::{
-    EmitOptions, IncomingMessage, MessageHandler, TopologyFilterOptions, TopologyHandler,
+    DurableEffectRequest, EmitOptions, IncomingMessage, MessageHandler, TopologyFilterOptions,
+    TopologyHandler,
 };
 
 // --- Thread-local context populated by the lifecycle ---
@@ -45,6 +46,8 @@ pub struct HookCtx {
     pub(crate) enqueue_self: std::rc::Rc<dyn Fn()>,
     /// Send a message from the active node.
     pub(crate) emit: std::rc::Rc<dyn Fn(&str, Value, EmitOptions)>,
+    pub(crate) enqueue_durable_effect:
+        std::rc::Rc<dyn Fn(DurableEffectRequest) -> Result<String, crate::RuntimeError>>,
     /// Register a new event source under the active node.
     pub(crate) register_source: std::rc::Rc<dyn Fn(std::sync::Arc<dyn EventSource>)>,
     /// Unregister an event source by ID.
@@ -278,6 +281,13 @@ where
         cell,
         _marker: std::marker::PhantomData,
     }
+}
+
+/// Return a callback that buffers an effect intent in the active durable
+/// message-handler activation. Dispatch happens only after host commit.
+pub fn use_durable_effect(
+) -> std::rc::Rc<dyn Fn(DurableEffectRequest) -> Result<String, crate::RuntimeError>> {
+    with_ctx(|ctx| std::rc::Rc::clone(&ctx.enqueue_durable_effect))
 }
 
 /// Node-local JSON state with a stable recovery key.

@@ -1,6 +1,7 @@
 use graphreact_core::{
-    use_durable_state, use_emit, use_message, Attrs, CommunicationGraph, EmitOptions, NodeContext,
-    NodeDefinition, PermissionManifest, Scheduler,
+    use_durable_effect, use_durable_state, use_emit, use_message, Attrs, CommunicationGraph,
+    DurableEffectRequest, DurableReplayPolicy, EmitOptions, NodeContext, NodeDefinition,
+    PermissionManifest, Scheduler,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -337,4 +338,51 @@ fn failed_commit_rolls_back_state_and_retries_input() {
         scheduler.snapshot_durable_state().nodes["sender"]["count"],
         serde_json::json!(1)
     );
+}
+
+#[test]
+fn durable_effect_intent_is_part_of_activation_commit() {
+    let definition = NodeDefinition::new("Agent", |_ctx: &NodeContext| {
+        let effect = use_durable_effect();
+        use_message("start", move |_| {
+            effect(DurableEffectRequest {
+                key: "tool-call".into(),
+                adapter: "deterministic".into(),
+                operation: "record".into(),
+                input: serde_json::json!({"value": 42}),
+                result_type: "tool_result".into(),
+                error_type: "tool_error".into(),
+                replay_policy: DurableReplayPolicy::Idempotent,
+            })
+            .unwrap();
+        });
+        PermissionManifest::new(vec!["start"], Vec::<String>::new())
+    });
+    let mut graph = CommunicationGraph::new();
+    graph.add_node("agent", Attrs::new());
+    let mut scheduler = Scheduler::new(graph);
+    scheduler
+        .register_node(definition, "agent", Attrs::new(), 0)
+        .unwrap();
+    scheduler.install_durable_activation_committer(Rc::new(|activation| {
+        assert_eq!(activation.effect_intents.len(), 1);
+        let intent = &activation.effect_intents[0];
+        assert_eq!(intent.key, "tool-call");
+        assert_eq!(intent.adapter, "deterministic");
+        assert_eq!(intent.replay_policy, DurableReplayPolicy::Idempotent);
+        assert_eq!(
+            uuid::Uuid::parse_str(&intent.id).unwrap().get_version_num(),
+            7
+        );
+        Ok(())
+    }));
+    scheduler.start().unwrap();
+    scheduler.send_durable(
+        "agent",
+        "start",
+        serde_json::Value::Null,
+        "run-1",
+        "attempt-1",
+    );
+    scheduler.process_batch().unwrap();
 }

@@ -42,8 +42,9 @@ use crate::runtime::supervision::{
     RestartPolicy, Supervisor, SupervisorError, SYSTEM_DOWN, SYSTEM_EXIT,
 };
 use crate::runtime::types::{
-    ComposeChildSpec, DurableActivation, DurableStateSnapshot, EmitOptions, IncomingMessage,
-    Message, NodeContext, PermissionManifest, TopologyEventKind,
+    ComposeChildSpec, DurableActivation, DurableEffectIntent, DurableEffectRequest,
+    DurableStateSnapshot, EmitOptions, IncomingMessage, Message, NodeContext, PermissionManifest,
+    TopologyEventKind,
 };
 
 new_key_type! {
@@ -80,6 +81,13 @@ struct CallContext {
 struct DurableRunContext {
     run_id: String,
     attempt_id: String,
+}
+
+#[derive(Default)]
+struct DurableActivationBuffer {
+    emitted_messages: Vec<Message>,
+    effect_intents: Vec<DurableEffectIntent>,
+    effect_keys: std::collections::BTreeSet<String>,
 }
 
 /// Reactive scheduler. Owns nodes, the message queue, and the dirty queue.
@@ -153,7 +161,7 @@ pub struct Scheduler {
     durable_activation_committer: Option<DurableActivationCommitter>,
     /// Local output messages produced by the active durable handler. `None`
     /// means the compatibility path should enqueue directly.
-    durable_output_buffer: Rc<RefCell<Option<Vec<Message>>>>,
+    durable_output_buffer: Rc<RefCell<Option<DurableActivationBuffer>>>,
 
     /// Active monitors. Drained per-target on `unmount` to deliver
     /// `__DOWN__` system messages.
@@ -2512,7 +2520,7 @@ impl Scheduler {
             && self.durable_activation_committer.is_some();
         let state_before = is_durable_activation.then(|| self.snapshot_durable_state());
         if is_durable_activation {
-            *self.durable_output_buffer.borrow_mut() = Some(Vec::new());
+            *self.durable_output_buffer.borrow_mut() = Some(DurableActivationBuffer::default());
         }
 
         let handlers: Vec<crate::runtime::types::MessageHandler> = target_rc
@@ -2582,7 +2590,7 @@ impl Scheduler {
         *self.current_durable_run_context.borrow_mut() = prev_run_context;
 
         if let Some(state_before) = state_before {
-            let emitted_messages = self
+            let buffer = self
                 .durable_output_buffer
                 .borrow_mut()
                 .take()
@@ -2591,7 +2599,8 @@ impl Scheduler {
                 input: msg.clone(),
                 state_before: state_before.clone(),
                 state_after: self.snapshot_durable_state(),
-                emitted_messages,
+                emitted_messages: buffer.emitted_messages,
+                effect_intents: buffer.effect_intents,
             };
             let commit_result = self
                 .durable_activation_committer
@@ -2634,6 +2643,7 @@ impl Scheduler {
             neighbors,
             enqueue_self: self.make_enqueue_self(key),
             emit: self.make_emit(node_id.clone()),
+            enqueue_durable_effect: self.make_enqueue_durable_effect(node_id.clone()),
             register_source: self.make_register_source(key, node_id.clone()),
             unregister_source: self.make_unregister_source(),
             register_monitor: self.make_register_monitor(key, node_id.clone()),
@@ -2824,7 +2834,7 @@ impl Scheduler {
                         msg.attempt_id = Some(context.attempt_id.clone());
                     }
                     if let Some(buffer) = durable_output_buffer.borrow_mut().as_mut() {
-                        buffer.push(msg);
+                        buffer.emitted_messages.push(msg);
                     } else {
                         messages.borrow_mut().push_back(msg);
                     }
@@ -2866,6 +2876,43 @@ impl Scheduler {
                 // else: bare local target not in id_to_key → drop
                 // (today's behavior, unchanged).
             }
+        })
+    }
+
+    fn make_enqueue_durable_effect(
+        &self,
+        node_id: String,
+    ) -> Rc<dyn Fn(DurableEffectRequest) -> Result<String, RuntimeError>> {
+        let run_context = Rc::clone(&self.current_durable_run_context);
+        let activation_buffer = Rc::clone(&self.durable_output_buffer);
+        Rc::new(move |request: DurableEffectRequest| {
+            if request.key.trim().is_empty() {
+                return Err(RuntimeError::EmptyDurableEffectKey);
+            }
+            let context = run_context
+                .borrow()
+                .clone()
+                .ok_or(RuntimeError::DurableEffectOutsideRun)?;
+            let mut slot = activation_buffer.borrow_mut();
+            let buffer = slot.as_mut().ok_or(RuntimeError::DurableEffectOutsideRun)?;
+            if !buffer.effect_keys.insert(request.key.clone()) {
+                return Err(RuntimeError::DuplicateDurableEffectKey { key: request.key });
+            }
+            let id = uuid::Uuid::now_v7().to_string();
+            buffer.effect_intents.push(DurableEffectIntent {
+                id: id.clone(),
+                key: request.key,
+                run_id: context.run_id,
+                attempt_id: context.attempt_id,
+                node_id: node_id.clone(),
+                adapter: request.adapter,
+                operation: request.operation,
+                input: request.input,
+                result_type: request.result_type,
+                error_type: request.error_type,
+                replay_policy: request.replay_policy,
+            });
+            Ok(id)
         })
     }
 

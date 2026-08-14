@@ -64,6 +64,15 @@ pub enum RuntimeError {
     #[error("durable activation commit failed: {message}")]
     DurableCommit { message: String },
 
+    #[error("durable effect requires an active durable run")]
+    DurableEffectOutsideRun,
+
+    #[error("durable effect key must be non-empty")]
+    EmptyDurableEffectKey,
+
+    #[error("duplicate durable effect key `{key}` in one activation")]
+    DuplicateDurableEffectKey { key: String },
+
     /// Wrapper around a graph-layer error.
     #[error(transparent)]
     Graph(#[from] GraphError),
