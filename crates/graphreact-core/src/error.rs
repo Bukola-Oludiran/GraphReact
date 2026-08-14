@@ -73,6 +73,18 @@ pub enum RuntimeError {
     #[error("duplicate durable effect key `{key}` in one activation")]
     DuplicateDurableEffectKey { key: String },
 
+    #[error("durable timer requires an active durable run")]
+    DurableTimerOutsideRun,
+
+    #[error("durable timer key must be non-empty")]
+    EmptyDurableTimerKey,
+
+    #[error("duplicate durable timer key `{key}` in one activation")]
+    DuplicateDurableTimerKey { key: String },
+
+    #[error("invalid durable timer id `{id}`")]
+    InvalidDurableTimerId { id: String },
+
     /// Wrapper around a graph-layer error.
     #[error(transparent)]
     Graph(#[from] GraphError),

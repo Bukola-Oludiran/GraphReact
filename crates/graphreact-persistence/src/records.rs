@@ -163,6 +163,7 @@ pub struct TimerIntent {
     pub id: TimerId,
     pub key: String,
     pub run_id: RunId,
+    pub attempt_id: AttemptId,
     pub node_id: String,
     pub deadline_unix_ms: u64,
     pub message_type: String,
@@ -250,6 +251,7 @@ pub enum RuntimeRecordV1 {
     },
     TimerFired {
         timer_id: TimerId,
+        result_message: DurableMessage,
         fired_at_ms: u64,
     },
     TimerCancelled {

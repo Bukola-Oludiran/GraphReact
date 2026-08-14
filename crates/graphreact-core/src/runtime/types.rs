@@ -42,6 +42,8 @@ pub struct DurableActivation {
     pub state_after: DurableStateSnapshot,
     pub emitted_messages: Vec<Message>,
     pub effect_intents: Vec<DurableEffectIntent>,
+    pub timers_scheduled: Vec<DurableTimerIntent>,
+    pub timers_cancelled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +76,32 @@ pub struct DurableEffectIntent {
     pub result_type: String,
     pub error_type: String,
     pub replay_policy: DurableReplayPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct DurableTimerRequest {
+    pub key: String,
+    pub deadline_unix_ms: u64,
+    pub message_type: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub enum DurableTimerCommand {
+    Schedule(DurableTimerRequest),
+    Cancel { timer_id: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct DurableTimerIntent {
+    pub id: String,
+    pub key: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub node_id: String,
+    pub deadline_unix_ms: u64,
+    pub message_type: String,
+    pub payload: serde_json::Value,
 }
 
 /// Wire-level message — what flows through the scheduler's queue.

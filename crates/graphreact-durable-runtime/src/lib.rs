@@ -2,11 +2,13 @@
 //! and the versioned persistence records.
 
 mod effects;
+mod timers;
 
 pub use effects::{
     dispatch_pending_effects, AdapterFuture, DeterministicIdempotentAdapter, DurableEffectAdapter,
     EffectAdapterError, EffectAdapterRegistry, EffectDispatchSummary,
 };
+pub use timers::{fire_due_timers, TimerDispatchSummary};
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -16,7 +18,7 @@ use graphreact_core::{DurableActivation, RuntimeError, Scheduler};
 use graphreact_persistence::{
     ActivationCommit, AttemptId, CorrelationId, DurableMessage, DurableStateWrite, EffectId,
     EffectIntent, LocalConfig, LocalPersistence, MessageId, PersistenceEngine, ReplayPolicy, RunId,
-    RunStatus, RuntimeRecordV1,
+    RunStatus, RuntimeRecordV1, TimerId, TimerIntent,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -160,6 +162,9 @@ pub async fn recover(
                 result_message: Some(message),
                 ..
             } => upsert_message(&mut inbox, message.clone()),
+            RuntimeRecordV1::TimerFired { result_message, .. } => {
+                upsert_message(&mut inbox, result_message.clone());
+            }
             RuntimeRecordV1::CancellationRequested { run_id, .. } => {
                 cancelled_runs.insert(run_id.clone());
             }
@@ -253,6 +258,16 @@ fn activation_record(activation: &DurableActivation) -> Result<RuntimeRecordV1, 
         .iter()
         .map(durable_effect_intent)
         .collect::<Result<Vec<_>, _>>()?;
+    let timers_scheduled = activation
+        .timers_scheduled
+        .iter()
+        .map(durable_timer_intent)
+        .collect::<Result<Vec<_>, _>>()?;
+    let timers_cancelled = activation
+        .timers_cancelled
+        .iter()
+        .map(|id| TimerId::parse(id.clone()).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(RuntimeRecordV1::ActivationCommitted(ActivationCommit {
         run_id,
@@ -260,12 +275,30 @@ fn activation_record(activation: &DurableActivation) -> Result<RuntimeRecordV1, 
         input_message_id,
         state_writes,
         emitted_messages,
-        timers_scheduled: Vec::new(),
-        timers_cancelled: Vec::new(),
+        timers_scheduled,
+        timers_cancelled,
         effect_intents,
         artifacts: Vec::new(),
         resulting_status: RunStatus::Running,
     }))
+}
+
+fn durable_timer_intent(
+    intent: &graphreact_core::DurableTimerIntent,
+) -> Result<TimerIntent, String> {
+    Ok(TimerIntent {
+        id: TimerId::parse(intent.id.clone())
+            .map_err(|error| format!("invalid durable timer id: {error}"))?,
+        key: intent.key.clone(),
+        run_id: RunId::parse(intent.run_id.clone())
+            .map_err(|error| format!("invalid durable timer run id: {error}"))?,
+        attempt_id: AttemptId::parse(intent.attempt_id.clone())
+            .map_err(|error| format!("invalid durable timer attempt id: {error}"))?,
+        node_id: intent.node_id.clone(),
+        deadline_unix_ms: intent.deadline_unix_ms,
+        message_type: intent.message_type.clone(),
+        payload: intent.payload.clone(),
+    })
 }
 
 fn durable_effect_intent(
@@ -603,5 +636,75 @@ mod tests {
             recovered.snapshot_durable_state().nodes["counter"]["count"],
             serde_json::json!(0)
         );
+    }
+
+    #[test]
+    fn durable_timer_fires_once_at_or_after_absolute_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = LocalConfig::new(
+            directory.path(),
+            graphreact_persistence::DeploymentId::new(),
+            graphreact_persistence::DeploymentDigest::of(b"timer-deployment"),
+        );
+        let definition = NodeDefinition::new("TimerNode", |_ctx: &NodeContext| {
+            let fired = use_durable_state("fired", serde_json::json!(0));
+            let timer = graphreact_core::use_durable_timer();
+            use_message("start", move |_| {
+                timer(graphreact_core::DurableTimerCommand::Schedule(
+                    graphreact_core::DurableTimerRequest {
+                        key: "wake-up".into(),
+                        deadline_unix_ms: 100,
+                        message_type: "wake".into(),
+                        payload: serde_json::json!({"ready": true}),
+                    },
+                ))
+                .unwrap();
+            });
+            use_message("wake", move |_| {
+                fired.update(|value| serde_json::json!(value.as_u64().unwrap_or_default() + 1));
+            });
+            PermissionManifest::new(vec!["start", "wake"], Vec::<String>::new())
+        });
+        let mut graph = CommunicationGraph::new();
+        graph.add_node("timer", Attrs::new());
+        let mut scheduler = Scheduler::new(graph);
+        scheduler
+            .register_node(definition, "timer", Attrs::new(), 0)
+            .unwrap();
+        let engine = install_local(&mut scheduler, config).unwrap();
+        scheduler.start().unwrap();
+        enqueue_durable_message(
+            &scheduler,
+            engine.as_ref(),
+            1,
+            "timer",
+            "start",
+            serde_json::Value::Null,
+            RunId::new(),
+            AttemptId::new(),
+            CorrelationId::new(),
+        )
+        .unwrap();
+        scheduler.process_batch().unwrap();
+
+        let early =
+            futures::executor::block_on(fire_due_timers(&scheduler, engine.as_ref(), 1, 99))
+                .unwrap();
+        assert_eq!(early.pending, 1);
+        assert_eq!(early.fired, 0);
+
+        let due = futures::executor::block_on(fire_due_timers(&scheduler, engine.as_ref(), 1, 100))
+            .unwrap();
+        assert_eq!(due.fired, 1);
+        scheduler.process_batch().unwrap();
+        assert_eq!(
+            scheduler.snapshot_durable_state().nodes["timer"]["fired"],
+            serde_json::json!(1)
+        );
+
+        let repeated =
+            futures::executor::block_on(fire_due_timers(&scheduler, engine.as_ref(), 1, 1_000))
+                .unwrap();
+        assert_eq!(repeated.fired, 0);
     }
 }

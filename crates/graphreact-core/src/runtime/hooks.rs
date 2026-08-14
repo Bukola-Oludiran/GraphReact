@@ -25,8 +25,8 @@ use crate::runtime::node_instance::{
 };
 use crate::runtime::sources::EventSource;
 use crate::runtime::types::{
-    DurableEffectRequest, EmitOptions, IncomingMessage, MessageHandler, TopologyFilterOptions,
-    TopologyHandler,
+    DurableEffectRequest, DurableTimerCommand, EmitOptions, IncomingMessage, MessageHandler,
+    TopologyFilterOptions, TopologyHandler,
 };
 
 // --- Thread-local context populated by the lifecycle ---
@@ -48,6 +48,8 @@ pub struct HookCtx {
     pub(crate) emit: std::rc::Rc<dyn Fn(&str, Value, EmitOptions)>,
     pub(crate) enqueue_durable_effect:
         std::rc::Rc<dyn Fn(DurableEffectRequest) -> Result<String, crate::RuntimeError>>,
+    pub(crate) durable_timer:
+        std::rc::Rc<dyn Fn(DurableTimerCommand) -> Result<Option<String>, crate::RuntimeError>>,
     /// Register a new event source under the active node.
     pub(crate) register_source: std::rc::Rc<dyn Fn(std::sync::Arc<dyn EventSource>)>,
     /// Unregister an event source by ID.
@@ -288,6 +290,13 @@ where
 pub fn use_durable_effect(
 ) -> std::rc::Rc<dyn Fn(DurableEffectRequest) -> Result<String, crate::RuntimeError>> {
     with_ctx(|ctx| std::rc::Rc::clone(&ctx.enqueue_durable_effect))
+}
+
+/// Return the command surface for scheduling and cancelling durable timers.
+/// Scheduling returns the stable timer id; cancellation returns `None`.
+pub fn use_durable_timer(
+) -> std::rc::Rc<dyn Fn(DurableTimerCommand) -> Result<Option<String>, crate::RuntimeError>> {
+    with_ctx(|ctx| std::rc::Rc::clone(&ctx.durable_timer))
 }
 
 /// Node-local JSON state with a stable recovery key.

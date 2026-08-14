@@ -43,8 +43,8 @@ use crate::runtime::supervision::{
 };
 use crate::runtime::types::{
     ComposeChildSpec, DurableActivation, DurableEffectIntent, DurableEffectRequest,
-    DurableStateSnapshot, EmitOptions, IncomingMessage, Message, NodeContext, PermissionManifest,
-    TopologyEventKind,
+    DurableStateSnapshot, DurableTimerCommand, DurableTimerIntent, EmitOptions, IncomingMessage,
+    Message, NodeContext, PermissionManifest, TopologyEventKind,
 };
 
 new_key_type! {
@@ -88,6 +88,9 @@ struct DurableActivationBuffer {
     emitted_messages: Vec<Message>,
     effect_intents: Vec<DurableEffectIntent>,
     effect_keys: std::collections::BTreeSet<String>,
+    timers_scheduled: Vec<DurableTimerIntent>,
+    timers_cancelled: Vec<String>,
+    timer_keys: std::collections::BTreeSet<String>,
 }
 
 /// Reactive scheduler. Owns nodes, the message queue, and the dirty queue.
@@ -2623,6 +2626,8 @@ impl Scheduler {
                 state_after: self.snapshot_durable_state(),
                 emitted_messages: buffer.emitted_messages,
                 effect_intents: buffer.effect_intents,
+                timers_scheduled: buffer.timers_scheduled,
+                timers_cancelled: buffer.timers_cancelled,
             };
             let commit_result = self
                 .durable_activation_committer
@@ -2666,6 +2671,7 @@ impl Scheduler {
             enqueue_self: self.make_enqueue_self(key),
             emit: self.make_emit(node_id.clone()),
             enqueue_durable_effect: self.make_enqueue_durable_effect(node_id.clone()),
+            durable_timer: self.make_durable_timer(node_id.clone()),
             register_source: self.make_register_source(key, node_id.clone()),
             unregister_source: self.make_unregister_source(),
             register_monitor: self.make_register_monitor(key, node_id.clone()),
@@ -2935,6 +2941,51 @@ impl Scheduler {
                 replay_policy: request.replay_policy,
             });
             Ok(id)
+        })
+    }
+
+    fn make_durable_timer(
+        &self,
+        node_id: String,
+    ) -> Rc<dyn Fn(DurableTimerCommand) -> Result<Option<String>, RuntimeError>> {
+        let run_context = Rc::clone(&self.current_durable_run_context);
+        let activation_buffer = Rc::clone(&self.durable_output_buffer);
+        Rc::new(move |command| {
+            let context = run_context
+                .borrow()
+                .clone()
+                .ok_or(RuntimeError::DurableTimerOutsideRun)?;
+            let mut slot = activation_buffer.borrow_mut();
+            let buffer = slot.as_mut().ok_or(RuntimeError::DurableTimerOutsideRun)?;
+            match command {
+                DurableTimerCommand::Schedule(request) => {
+                    if request.key.trim().is_empty() {
+                        return Err(RuntimeError::EmptyDurableTimerKey);
+                    }
+                    if !buffer.timer_keys.insert(request.key.clone()) {
+                        return Err(RuntimeError::DuplicateDurableTimerKey { key: request.key });
+                    }
+                    let id = uuid::Uuid::now_v7().to_string();
+                    buffer.timers_scheduled.push(DurableTimerIntent {
+                        id: id.clone(),
+                        key: request.key,
+                        run_id: context.run_id,
+                        attempt_id: context.attempt_id,
+                        node_id: node_id.clone(),
+                        deadline_unix_ms: request.deadline_unix_ms,
+                        message_type: request.message_type,
+                        payload: request.payload,
+                    });
+                    Ok(Some(id))
+                }
+                DurableTimerCommand::Cancel { timer_id } => {
+                    if uuid::Uuid::parse_str(&timer_id).is_err() {
+                        return Err(RuntimeError::InvalidDurableTimerId { id: timer_id });
+                    }
+                    buffer.timers_cancelled.push(timer_id);
+                    Ok(None)
+                }
+            }
         })
     }
 
