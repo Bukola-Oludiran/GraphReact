@@ -1,10 +1,14 @@
 //! Bridge between the storage-agnostic core activation boundary
 //! and the versioned persistence records.
 
+mod config;
 mod deployment;
 mod effects;
 mod timers;
 
+pub use config::{
+    ClusterObjectStoreConfig, DurabilityConfigError, RawDurabilityConfig, ValidatedDurabilityConfig,
+};
 pub use deployment::{
     build_deployment_bundle, install_deployment_bundle, require_deployment_bundle, BundleInputs,
 };
