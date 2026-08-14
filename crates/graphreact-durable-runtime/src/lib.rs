@@ -11,6 +11,24 @@ use graphreact_persistence::{
     LocalPersistence, MessageId, PersistenceEngine, RunId, RunStatus, RuntimeRecordV1,
 };
 
+#[derive(Debug, thiserror::Error)]
+pub enum DurableRuntimeError {
+    #[error(transparent)]
+    Persistence(#[from] graphreact_persistence::PersistenceError),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    #[error("invalid persisted durable message: {0}")]
+    InvalidMessage(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoverySummary {
+    pub snapshot_sequence: Option<u64>,
+    pub replayed_records: usize,
+    pub pending_messages: usize,
+    pub postponed_messages: usize,
+}
+
 /// Open a locked local backend and install its fsync-before-ack activation
 /// committer on the scheduler. The returned engine must remain alive for the
 /// lifetime of the scheduler and is also used for replay/snapshot operations.
@@ -43,6 +61,124 @@ pub fn install_engine(
                 message: error.to_string(),
             })
     }));
+}
+
+/// Persist an initial durable inbox message before making it visible to the
+/// scheduler. Recovery reconstructs it if the process exits before delivery.
+#[allow(clippy::too_many_arguments)]
+pub fn enqueue_durable_message(
+    scheduler: &Scheduler,
+    engine: &dyn PersistenceEngine,
+    fencing_token: u64,
+    target: impl Into<String>,
+    message_type: impl Into<String>,
+    payload: serde_json::Value,
+    run_id: RunId,
+    attempt_id: AttemptId,
+    correlation_id: CorrelationId,
+) -> Result<MessageId, DurableRuntimeError> {
+    let mut message =
+        graphreact_core::create_message(message_type, "__external__", target, payload, None);
+    let message_id = MessageId::new();
+    message.id = message_id.to_string();
+    message.run_id = Some(run_id.to_string());
+    message.attempt_id = Some(attempt_id.to_string());
+    message.correlation_id = Some(correlation_id.to_string());
+    let durable = durable_message(&message).map_err(DurableRuntimeError::InvalidMessage)?;
+    futures::executor::block_on(
+        engine.commit(fencing_token, &[RuntimeRecordV1::MessageEnqueued(durable)]),
+    )?;
+    scheduler.enqueue_recovered_message(message);
+    Ok(message_id)
+}
+
+/// Rebuild named state and pending work from a verified snapshot plus log.
+/// Inputs consumed by a later activation commit are removed, while committed
+/// outputs not yet consumed are re-enqueued without rerunning their producer.
+pub async fn recover(
+    scheduler: &Scheduler,
+    engine: &dyn PersistenceEngine,
+) -> Result<RecoverySummary, DurableRuntimeError> {
+    let snapshot = engine.read_snapshot().await?;
+    let snapshot_sequence = snapshot.as_ref().map(|value| value.through_sequence);
+    let replay_from = snapshot_sequence.map_or(0, |sequence| sequence.saturating_add(1));
+    let mut state = BTreeMap::<String, BTreeMap<String, serde_json::Value>>::new();
+    let mut inbox = Vec::<DurableMessage>::new();
+    let mut postponed = Vec::<DurableMessage>::new();
+    if let Some(snapshot) = snapshot {
+        apply_state_writes(&mut state, &snapshot.durable_state);
+        inbox = snapshot.inbox;
+        postponed = snapshot.postponed;
+    }
+
+    let records = engine.replay(replay_from).await?;
+    for record in &records {
+        match record {
+            RuntimeRecordV1::MessageEnqueued(message) => {
+                upsert_message(&mut inbox, message.clone());
+            }
+            RuntimeRecordV1::ActivationCommitted(commit) => {
+                inbox.retain(|message| message.id != commit.input_message_id);
+                postponed.retain(|message| message.id != commit.input_message_id);
+                apply_state_writes(&mut state, &commit.state_writes);
+                for message in &commit.emitted_messages {
+                    upsert_message(&mut inbox, message.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    scheduler.restore_durable_state(graphreact_core::DurableStateSnapshot { nodes: state })?;
+    let pending_messages = inbox.len();
+    for message in inbox {
+        scheduler.enqueue_recovered_message(core_message(message));
+    }
+    let postponed_messages = postponed.len();
+    scheduler.restore_postponed_messages(postponed.into_iter().map(core_message))?;
+    Ok(RecoverySummary {
+        snapshot_sequence,
+        replayed_records: records.len(),
+        pending_messages,
+        postponed_messages,
+    })
+}
+
+fn apply_state_writes(
+    state: &mut BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    writes: &[DurableStateWrite],
+) {
+    for write in writes {
+        state
+            .entry(write.node_id.clone())
+            .or_default()
+            .insert(write.key.clone(), write.value.clone());
+    }
+}
+
+fn upsert_message(messages: &mut Vec<DurableMessage>, message: DurableMessage) {
+    if let Some(existing) = messages.iter_mut().find(|value| value.id == message.id) {
+        *existing = message;
+    } else {
+        messages.push(message);
+    }
+}
+
+fn core_message(message: DurableMessage) -> graphreact_core::Message {
+    graphreact_core::Message {
+        id: message.id.to_string(),
+        r#type: message.message_type,
+        from: message.from,
+        to: message.to,
+        payload: message.payload,
+        ttl: message.ttl,
+        timestamp: message.created_at_ms,
+        direct: message.direct,
+        trace_context: None,
+        correlation_id: Some(message.correlation_id.to_string()),
+        run_id: Some(message.run_id.to_string()),
+        attempt_id: Some(message.attempt_id.to_string()),
+    }
 }
 
 fn activation_record(activation: &DurableActivation) -> Result<RuntimeRecordV1, String> {
@@ -140,6 +276,7 @@ fn durable_message(message: &graphreact_core::Message) -> Result<DurableMessage,
         payload: message.payload.clone(),
         ttl: message.ttl,
         created_at_ms: message.timestamp,
+        direct: message.direct,
     })
 }
 
@@ -151,13 +288,7 @@ mod tests {
         PermissionManifest,
     };
 
-    #[test]
-    fn local_committer_persists_activation_before_ack() {
-        let directory = tempfile::tempdir().unwrap();
-        let deployment_id = graphreact_persistence::DeploymentId::new();
-        let digest = graphreact_persistence::DeploymentDigest::of(b"test-deployment");
-        let config = LocalConfig::new(directory.path(), deployment_id, digest);
-
+    fn counter_scheduler() -> Scheduler {
         let definition = NodeDefinition::new("Counter", |_ctx: &NodeContext| {
             let count = use_durable_state("count", serde_json::json!(0));
             use_message("increment", move |_| {
@@ -171,23 +302,120 @@ mod tests {
         scheduler
             .register_node(definition, "counter", Attrs::new(), 0)
             .unwrap();
+        scheduler
+    }
+
+    #[test]
+    fn local_committer_persists_activation_before_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let deployment_id = graphreact_persistence::DeploymentId::new();
+        let digest = graphreact_persistence::DeploymentDigest::of(b"test-deployment");
+        let config = LocalConfig::new(directory.path(), deployment_id, digest);
+
+        let mut scheduler = counter_scheduler();
         let engine = install_local(&mut scheduler, config).unwrap();
         scheduler.start().unwrap();
-        scheduler.send_durable(
+        enqueue_durable_message(
+            &scheduler,
+            engine.as_ref(),
+            1,
             "counter",
             "increment",
             serde_json::Value::Null,
-            RunId::new().to_string(),
-            AttemptId::new().to_string(),
-        );
+            RunId::new(),
+            AttemptId::new(),
+            CorrelationId::new(),
+        )
+        .unwrap();
         scheduler.process_batch().unwrap();
 
         let replayed = futures::executor::block_on(engine.replay(0)).unwrap();
-        let RuntimeRecordV1::ActivationCommitted(commit) = &replayed[0] else {
-            panic!("expected activation commit");
-        };
+        let commit = replayed
+            .iter()
+            .find_map(|record| match record {
+                RuntimeRecordV1::ActivationCommitted(commit) => Some(commit),
+                _ => None,
+            })
+            .expect("expected activation commit");
         assert_eq!(commit.state_writes.len(), 1);
         assert_eq!(commit.state_writes[0].key, "count");
         assert_eq!(commit.state_writes[0].value, serde_json::json!(1));
+    }
+
+    #[test]
+    fn recovery_retries_uncommitted_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = LocalConfig::new(
+            directory.path(),
+            graphreact_persistence::DeploymentId::new(),
+            graphreact_persistence::DeploymentDigest::of(b"recovery-deployment"),
+        );
+        let mut first = counter_scheduler();
+        let first_engine = install_local(&mut first, config.clone()).unwrap();
+        first.start().unwrap();
+        enqueue_durable_message(
+            &first,
+            first_engine.as_ref(),
+            1,
+            "counter",
+            "increment",
+            serde_json::Value::Null,
+            RunId::new(),
+            AttemptId::new(),
+            CorrelationId::new(),
+        )
+        .unwrap();
+        drop(first);
+        drop(first_engine);
+
+        let mut recovered = counter_scheduler();
+        let recovered_engine = install_local(&mut recovered, config).unwrap();
+        let summary =
+            futures::executor::block_on(recover(&recovered, recovered_engine.as_ref())).unwrap();
+        assert_eq!(summary.pending_messages, 1);
+        recovered.start().unwrap();
+        assert_eq!(
+            recovered.snapshot_durable_state().nodes["counter"]["count"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_rerun_committed_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = LocalConfig::new(
+            directory.path(),
+            graphreact_persistence::DeploymentId::new(),
+            graphreact_persistence::DeploymentDigest::of(b"committed-deployment"),
+        );
+        let mut first = counter_scheduler();
+        let first_engine = install_local(&mut first, config.clone()).unwrap();
+        first.start().unwrap();
+        enqueue_durable_message(
+            &first,
+            first_engine.as_ref(),
+            1,
+            "counter",
+            "increment",
+            serde_json::Value::Null,
+            RunId::new(),
+            AttemptId::new(),
+            CorrelationId::new(),
+        )
+        .unwrap();
+        first.process_batch().unwrap();
+        drop(first);
+        drop(first_engine);
+
+        let mut recovered = counter_scheduler();
+        let recovered_engine = install_local(&mut recovered, config).unwrap();
+        let summary =
+            futures::executor::block_on(recover(&recovered, recovered_engine.as_ref())).unwrap();
+        assert_eq!(summary.pending_messages, 0);
+        recovered.start().unwrap();
+        assert_eq!(
+            recovered.snapshot_durable_state().nodes["counter"]["count"],
+            serde_json::json!(1)
+        );
     }
 }

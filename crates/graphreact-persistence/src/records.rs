@@ -147,6 +147,7 @@ pub struct DurableMessage {
     pub payload: serde_json::Value,
     pub ttl: u32,
     pub created_at_ms: u64,
+    pub direct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

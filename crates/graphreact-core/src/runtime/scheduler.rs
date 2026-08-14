@@ -1126,6 +1126,33 @@ impl Scheduler {
         self.notify.notify_one();
     }
 
+    /// Enqueue a fully formed local message without changing its durable
+    /// identity or timestamp. Used by recovery after storage replay.
+    pub fn enqueue_recovered_message(&self, message: Message) {
+        self.messages.borrow_mut().push_back(message);
+        self.notify.notify_one();
+    }
+
+    /// Restore messages parked at a committed snapshot boundary.
+    pub fn restore_postponed_messages(
+        &self,
+        messages: impl IntoIterator<Item = Message>,
+    ) -> Result<(), RuntimeError> {
+        for message in messages {
+            let key = self.id_to_key.get(&message.to).copied().ok_or_else(|| {
+                RuntimeError::NodeNotRegistered {
+                    id: message.to.clone(),
+                }
+            })?;
+            self.postponed
+                .borrow_mut()
+                .entry(key)
+                .or_default()
+                .push(message);
+        }
+        Ok(())
+    }
+
     /// Inject a message belonging to a durable run. Downstream local emits
     /// inherit the same run and attempt identifiers.
     pub fn send_durable(
