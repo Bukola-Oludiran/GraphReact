@@ -433,6 +433,20 @@ pub enum ClusterOp {
         /// runs an empty cluster, useful as a relay or for tests.
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Durable execution backend. Off preserves the existing ephemeral
+        /// scheduler behavior. Cluster storage is validated but remains
+        /// unavailable until the Phase A Postgres/S3 backend lands.
+        #[arg(long, value_enum, default_value_t = DurabilityArg::Off)]
+        durability: DurabilityArg,
+        /// Stable UUID identifying this immutable durable deployment.
+        #[arg(long, requires = "durability")]
+        deployment_id: Option<String>,
+        /// Root directory for local logs, snapshots, bundles, and artifacts.
+        #[arg(long, requires = "durability")]
+        durability_dir: Option<PathBuf>,
+        /// Stable replica identity used for clustered lease ownership.
+        #[arg(long, requires = "durability")]
+        replica_id: Option<String>,
         /// Start a single-node, loopback-only development daemon with an
         /// ephemeral cookie and in-memory mTLS identity. Defaults the cluster
         /// listener to `127.0.0.1:0` and observer to `127.0.0.1:9090`.
@@ -759,6 +773,25 @@ pub enum RuntimeArg {
     Mixed,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum DurabilityArg {
+    #[default]
+    Off,
+    Local,
+    Cluster,
+}
+
+impl From<DurabilityArg> for graphreact_core::DurabilityMode {
+    fn from(value: DurabilityArg) -> Self {
+        match value {
+            DurabilityArg::Off => Self::Off,
+            DurabilityArg::Local => Self::Local,
+            DurabilityArg::Cluster => Self::Cluster,
+        }
+    }
+}
+
 impl std::fmt::Display for RuntimeArg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -774,7 +807,7 @@ impl std::fmt::Display for RuntimeArg {
 
 #[cfg(test)]
 mod greenhouse_dev_tests {
-    use super::{Cli, ClusterOp, Command};
+    use super::{Cli, ClusterOp, Command, DurabilityArg};
     use clap::Parser;
 
     #[test]
@@ -803,5 +836,47 @@ mod greenhouse_dev_tests {
         let rendered = error.to_string();
         assert!(rendered.contains("--node-id"));
         assert!(rendered.contains("--cert"));
+    }
+
+    #[test]
+    fn daemon_durability_defaults_off() {
+        let cli = Cli::try_parse_from(["grx", "cluster", "daemon", "--dev-loopback"])
+            .expect("ephemeral daemon parses");
+        assert!(matches!(
+            cli.command,
+            Command::Cluster { op }
+                if matches!(*op, ClusterOp::Daemon { durability: DurabilityArg::Off, .. })
+        ));
+    }
+
+    #[test]
+    fn daemon_accepts_local_durability_identity_and_directory() {
+        let deployment_id = "018f1f7c-5322-7d72-8e65-44f741d52b62";
+        let cli = Cli::try_parse_from([
+            "grx",
+            "cluster",
+            "daemon",
+            "--dev-loopback",
+            "--durability",
+            "local",
+            "--deployment-id",
+            deployment_id,
+            "--durability-dir",
+            ".grx-durable",
+        ])
+        .expect("local durability flags parse");
+        assert!(matches!(
+            cli.command,
+            Command::Cluster { op }
+                if matches!(
+                    *op,
+                    ClusterOp::Daemon {
+                        durability: DurabilityArg::Local,
+                        deployment_id: Some(ref id),
+                        durability_dir: Some(_),
+                        ..
+                    } if id == deployment_id
+                )
+        ));
     }
 }

@@ -1350,6 +1350,7 @@ pub fn dev_loopback_cluster_material(
 /// [`start_daemon`].
 pub struct DaemonOptions {
     pub path: Option<std::path::PathBuf>,
+    pub durability: graphreact_durable_runtime::RawDurabilityConfig,
     pub node_id: NodeId,
     pub listen: SocketAddr,
     pub cookie: SecretCookie,
@@ -2455,6 +2456,41 @@ fn validate_tls_paths_absolute(paths: Option<&TlsPaths>) {
 /// [`DaemonHandle`]. Async because `Cluster::start` + `Cluster::connect`
 /// are async.
 pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandError> {
+    let durability = opts
+        .durability
+        .clone()
+        .with_environment()
+        .validate(false)
+        .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+    let local_durability = match durability {
+        graphreact_durable_runtime::ValidatedDurabilityConfig::Off => None,
+        graphreact_durable_runtime::ValidatedDurabilityConfig::Local {
+            deployment_id,
+            directory,
+        } => {
+            let path = opts.path.as_deref().ok_or_else(|| {
+                CommandError::ClusterArg(
+                    "--durability local requires --path for an immutable deployment bundle".into(),
+                )
+            })?;
+            let ir = build_ir_for_path(path)?;
+            let bundle = graphreact_durable_runtime::build_deployment_bundle(
+                deployment_id.clone(),
+                &ir,
+                &graphreact_durable_runtime::BundleInputs::default(),
+            )
+            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+            let config =
+                graphreact_persistence::LocalConfig::new(directory, deployment_id, bundle.digest);
+            Some((config, bundle))
+        }
+        graphreact_durable_runtime::ValidatedDurabilityConfig::Cluster { .. } => {
+            return Err(CommandError::ClusterArg(
+                "cluster durability is not available until the Phase A Postgres/S3 backend lands"
+                    .into(),
+            ));
+        }
+    };
     let runtime_secrets = opts
         .path
         .as_ref()
@@ -2466,6 +2502,19 @@ pub async fn start_daemon(opts: DaemonOptions) -> Result<DaemonHandle, CommandEr
         runtime_secrets.clone(),
         &opts.go_build,
     )?;
+    if let Some((config, bundle)) = local_durability {
+        let engine = graphreact_durable_runtime::install_local(host.scheduler_mut(), config)
+            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+        graphreact_durable_runtime::install_deployment_bundle(engine.as_ref(), &bundle)
+            .await
+            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+        graphreact_durable_runtime::require_deployment_bundle(engine.as_ref())
+            .await
+            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+        graphreact_durable_runtime::recover(host.scheduler_mut(), engine.as_ref())
+            .await
+            .map_err(|error| CommandError::ClusterArg(error.to_string()))?;
+    }
     // **M16-Backend P8.** Install debugpy on the freshly-mounted
     // CPython isolate (if `--debug=cpython:<port>` was passed).
     // build_scheduler_host (above) already mounted via the

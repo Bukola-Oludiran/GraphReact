@@ -77,6 +77,7 @@ async fn daemon_accepts_peer_with_matching_cookie() {
 
     let alice_opts = DaemonOptions {
         path: None,
+        durability: Default::default(),
         node_id: parse_id("alice@127.0.0.1"),
         listen: ephemeral_loopback(),
         cookie: SecretCookie::from_bytes(cookie_bytes.clone()).unwrap(),
@@ -108,6 +109,7 @@ async fn daemon_accepts_peer_with_matching_cookie() {
     // dials alice during the boot phase.
     let bob_opts = DaemonOptions {
         path: None,
+        durability: Default::default(),
         node_id: parse_id("bob@127.0.0.1"),
         listen: ephemeral_loopback(),
         cookie: SecretCookie::from_bytes(cookie_bytes).unwrap(),
@@ -162,6 +164,7 @@ async fn daemon_rejects_peer_with_cookie_mismatch() {
 
     let alice_opts = DaemonOptions {
         path: None,
+        durability: Default::default(),
         node_id: parse_id("alice@127.0.0.1"),
         listen: ephemeral_loopback(),
         cookie: SecretCookie::from_bytes(b"alice-secret".to_vec()).unwrap(),
@@ -191,6 +194,7 @@ async fn daemon_rejects_peer_with_cookie_mismatch() {
 
     let bob_opts = DaemonOptions {
         path: None,
+        durability: Default::default(),
         node_id: parse_id("bob@127.0.0.1"),
         listen: ephemeral_loopback(),
         cookie: SecretCookie::from_bytes(b"bob-different-secret".to_vec()).unwrap(),

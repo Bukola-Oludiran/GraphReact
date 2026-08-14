@@ -163,6 +163,7 @@ async fn boot_tls_daemon(initial: &TestCert) -> TlsBooted {
 
     let opts = DaemonOptions {
         path: None,
+        durability: Default::default(),
         node_id: parse_id("sighup-test@127.0.0.1"),
         listen: ephemeral_loopback(),
         cookie,

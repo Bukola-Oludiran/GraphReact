@@ -79,6 +79,7 @@ async fn boot_daemon(with_observer: bool) -> graphreact_cli::commands::DaemonHan
 
     let opts = DaemonOptions {
         path: None,
+        durability: Default::default(),
         node_id: parse_id("drain-test@127.0.0.1"),
         listen: ephemeral_loopback(),
         cookie: SecretCookie::from_bytes(cookie_bytes).unwrap(),

@@ -19,6 +19,7 @@ path = "src/bin/grx.rs"
 graphreact-algorithms = { path = "../graphreact-algorithms" }
 graphreact-core = { path = "../graphreact-core" }
 graphreact-dist = { path = "../graphreact-dist" }
+graphreact-durable-runtime = { path = "../graphreact-durable-runtime" }
 graphreact-codegen-go = { path = "../graphreact-codegen-go" }
 graphreact-engine-cpython = { path = "../graphreact-engine-cpython" }
 graphreact-engine-echo = { path = "../graphreact-engine-echo" }
@@ -29,6 +30,7 @@ graphreact-engine-zig = { path = "../graphreact-engine-zig" }
 graphreact-grx-parser = { path = "../graphreact-grx-parser" }
 graphreact-hotreload = { path = "../graphreact-hotreload" }
 graphreact-observer = { path = "../graphreact-observer" }
+graphreact-persistence = { path = "../graphreact-persistence" }
 graphreact-secrets = { path = "../graphreact-secrets" }
 clap.workspace = true
 clap_complete.workspace = true

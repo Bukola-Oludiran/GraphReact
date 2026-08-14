@@ -154,6 +154,10 @@ fn dispatch_cluster(runtime: &tokio::runtime::Runtime, op: ClusterOp) -> Result<
     match op {
         ClusterOp::Daemon {
             path,
+            durability,
+            deployment_id,
+            durability_dir,
+            replica_id,
             dev_loopback,
             node_id,
             listen,
@@ -305,6 +309,13 @@ fn dispatch_cluster(runtime: &tokio::runtime::Runtime, op: ClusterOp) -> Result<
             };
             let opts = DaemonOptions {
                 path,
+                durability: graphreact_durable_runtime::RawDurabilityConfig {
+                    mode: durability.into(),
+                    deployment_id,
+                    durability_dir,
+                    replica_id,
+                    ..Default::default()
+                },
                 node_id,
                 listen,
                 cookie,

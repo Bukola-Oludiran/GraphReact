@@ -89,6 +89,7 @@ async fn pubsub_demo_two_daemons_jsc_grx_broadcast_fans_out() {
     // when Cluster::start runs the install.
     let alice_opts = DaemonOptions {
         path: Some(fixture("alice.grx")),
+        durability: Default::default(),
         node_id: parse_id("alice@127.0.0.1"),
         listen: "127.0.0.1:0".parse().unwrap(),
         cookie: SecretCookie::from_bytes(cookie_bytes.clone()).unwrap(),
@@ -121,6 +122,7 @@ async fn pubsub_demo_two_daemons_jsc_grx_broadcast_fans_out() {
     // alice during boot.
     let bob_opts = DaemonOptions {
         path: Some(fixture("bob.grx")),
+        durability: Default::default(),
         node_id: parse_id("bob@127.0.0.1"),
         listen: "127.0.0.1:0".parse().unwrap(),
         cookie: SecretCookie::from_bytes(cookie_bytes).unwrap(),
