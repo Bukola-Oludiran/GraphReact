@@ -626,18 +626,19 @@ use serde_json::Value;
 use graphreact_core::{
     delay_source as core_delay_source, timer_source as core_timer_source,
     use_accept_edge as core_use_accept_edge, use_compose as core_use_compose,
-    use_demonitor as core_use_demonitor, use_edge_accept_handler as core_use_edge_accept_handler,
-    use_effect as core_use_effect, use_effect_async as core_use_effect_async,
-    use_emit as core_use_emit, use_group_join as core_use_group_join,
-    use_group_leave as core_use_group_leave, use_link as core_use_link, use_memo as core_use_memo,
-    use_message as core_use_message, use_monitor as core_use_monitor,
-    use_neighbors as core_use_neighbors, use_source as core_use_source,
-    use_spawn_child as core_use_spawn_child, use_state as core_use_state,
-    use_topology as core_use_topology, use_unlink as core_use_unlink,
+    use_demonitor as core_use_demonitor, use_durable_state as core_use_durable_state,
+    use_edge_accept_handler as core_use_edge_accept_handler, use_effect as core_use_effect,
+    use_effect_async as core_use_effect_async, use_emit as core_use_emit,
+    use_group_join as core_use_group_join, use_group_leave as core_use_group_leave,
+    use_link as core_use_link, use_memo as core_use_memo, use_message as core_use_message,
+    use_monitor as core_use_monitor, use_neighbors as core_use_neighbors,
+    use_source as core_use_source, use_spawn_child as core_use_spawn_child,
+    use_state as core_use_state, use_topology as core_use_topology, use_unlink as core_use_unlink,
     use_unmount_self as core_use_unmount_self, AsyncEffectCleanup, Attrs, CommunicationGraph,
-    ComposeChildSpec, EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource, GraphDirectory,
-    IncomingMessage, MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest,
-    Scheduler, Signal, Subscription, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
+    ComposeChildSpec, DurableSignal, EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource,
+    GraphDirectory, IncomingMessage, MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition,
+    PermissionManifest, Scheduler, Signal, Subscription, TopologyEvent, TopologyEventKind,
+    TopologyFilterOptions,
 };
 use graphreact_engine_cpython::{invoke_global_static, CPythonEngine};
 use graphreact_engine_zig::{
@@ -676,6 +677,12 @@ thread_local! {
 
     /// Monotonic id source for [`SIGNAL_REGISTRY`].
     static NEXT_SIGNAL_ID: Cell<u64> = const { Cell::new(1) };
+
+    static DURABLE_SIGNAL_REGISTRY: RefCell<FxHashMap<u64, DurableSignal>> =
+        RefCell::new(FxHashMap::default());
+    static DURABLE_SIGNAL_BY_KEY: RefCell<FxHashMap<(String, String), u64>> =
+        RefCell::new(FxHashMap::default());
+    static NEXT_DURABLE_SIGNAL_ID: Cell<u64> = const { Cell::new(1) };
 
     /// Phase 3d-α memo cache. Keyed by `(node_id, hook_pos)`. Holds
     /// the actual cached value (or token, for `use_callback`); core's
@@ -1068,6 +1075,28 @@ def use_state(initial):
     def setter(new_val):
         host_state_set(sid, new_val)
     return val, setter
+
+def use_durable_state(key, initial):
+    pair = host_durable_state(key, initial)
+    sid = pair['id']
+    val = pair['value']
+    def setter(new_val):
+        host_durable_state_set(sid, new_val)
+    return val, setter
+
+def use_durable_effect():
+    def enqueue(request):
+        return host_durable_effect(request)
+    return enqueue
+
+class _DurableTimer:
+    def schedule(self, request):
+        return host_durable_timer_schedule(request)
+    def cancel(self, timer_id):
+        host_durable_timer_cancel(timer_id)
+
+def use_durable_timer():
+    return _DurableTimer()
 
 def use_effect(fn, deps=None):
     if deps is None:
@@ -1545,6 +1574,9 @@ _builtins.__release_callback = __release_callback
 _builtins.__release_tokens = __release_tokens
 _builtins.__augment_ctx = __augment_ctx
 _builtins.use_state = use_state
+_builtins.use_durable_state = use_durable_state
+_builtins.use_durable_effect = use_durable_effect
+_builtins.use_durable_timer = use_durable_timer
 _builtins.use_effect = use_effect
 _builtins.use_effect_async = use_effect_async
 _builtins.use_emit = use_emit
@@ -1690,6 +1722,79 @@ fn build_host_state_set_callback() -> BoxCallback {
                     "host_state_set: no signal registered for id {id}"
                 )));
             };
+            signal.set(value);
+            Ok(HostValue::Null)
+        })
+    })
+}
+
+fn build_host_durable_state_callback() -> BoxCallback {
+    Box::new(|args| {
+        let key = match args.first() {
+            Some(HostValue::String(key)) => key.clone(),
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_durable_state: expected String key, got {other:?}"
+                )))
+            }
+        };
+        let initial = args
+            .get(1)
+            .cloned()
+            .map(HostValue::into_json)
+            .unwrap_or(Value::Null);
+        let node_id = current_node_id()
+            .ok_or_else(|| EngineError::Internal("host_durable_state: no active node".into()))?;
+        let signal = core_use_durable_state(key.clone(), initial.clone());
+        let registry_key = (node_id, key);
+        let id = DURABLE_SIGNAL_BY_KEY.with(|map| {
+            if let Some(&id) = map.borrow().get(&registry_key) {
+                DURABLE_SIGNAL_REGISTRY.with(|registry| registry.borrow_mut().insert(id, signal));
+                return id;
+            }
+            let id = NEXT_DURABLE_SIGNAL_ID.with(|next| {
+                let id = next.get();
+                next.set(id + 1);
+                id
+            });
+            DURABLE_SIGNAL_REGISTRY.with(|registry| registry.borrow_mut().insert(id, signal));
+            map.borrow_mut().insert(registry_key, id);
+            id
+        });
+        let value = DURABLE_SIGNAL_REGISTRY
+            .with(|registry| registry.borrow().get(&id).map(DurableSignal::get))
+            .unwrap_or(initial);
+        #[allow(clippy::cast_precision_loss)]
+        Ok(HostValue::Object(vec![
+            ("id".into(), HostValue::Number(id as f64)),
+            ("value".into(), HostValue::from_json(value)),
+        ]))
+    })
+}
+
+fn build_host_durable_state_set_callback() -> BoxCallback {
+    Box::new(|args| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let id = match args.first() {
+            Some(HostValue::Number(id)) => *id as u64,
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_durable_state_set: expected Number id, got {other:?}"
+                )))
+            }
+        };
+        let value = args
+            .get(1)
+            .cloned()
+            .map(HostValue::into_json)
+            .unwrap_or(Value::Null);
+        DURABLE_SIGNAL_REGISTRY.with(|registry| {
+            let registry = registry.borrow();
+            let signal = registry.get(&id).ok_or_else(|| {
+                EngineError::Internal(format!(
+                    "host_durable_state_set: no signal registered for id {id}"
+                ))
+            })?;
             signal.set(value);
             Ok(HostValue::Null)
         })
@@ -4889,6 +4994,31 @@ fn install_hook_prelude(
     }
     engine.register_callback(iso, "host_state", build_host_state_callback())?;
     engine.register_callback(iso, "host_state_set", build_host_state_set_callback())?;
+    engine.register_callback(
+        iso,
+        "host_durable_state",
+        build_host_durable_state_callback(),
+    )?;
+    engine.register_callback(
+        iso,
+        "host_durable_state_set",
+        build_host_durable_state_set_callback(),
+    )?;
+    engine.register_callback(
+        iso,
+        "host_durable_effect",
+        crate::durable_host::build_effect_callback(),
+    )?;
+    engine.register_callback(
+        iso,
+        "host_durable_timer_schedule",
+        crate::durable_host::build_timer_schedule_callback(),
+    )?;
+    engine.register_callback(
+        iso,
+        "host_durable_timer_cancel",
+        crate::durable_host::build_timer_cancel_callback(),
+    )?;
     engine.register_callback(iso, "host_effect", build_host_effect_callback())?;
     // Phase 3g — useEffectAsync via asyncio bridge. host_effect_async
     // parks a oneshot Sender + invokes the Python invoker (which
@@ -5876,6 +6006,9 @@ pub(crate) fn reset_global_state() {
     SIGNAL_REGISTRY.with(|r| r.borrow_mut().clear());
     SIGNAL_BY_HOOK_POS.with(|m| m.borrow_mut().clear());
     NEXT_SIGNAL_ID.with(|c| c.set(1));
+    DURABLE_SIGNAL_REGISTRY.with(|registry| registry.borrow_mut().clear());
+    DURABLE_SIGNAL_BY_KEY.with(|map| map.borrow_mut().clear());
+    NEXT_DURABLE_SIGNAL_ID.with(|next| next.set(1));
     MEMO_REGISTRY.with(|r| r.borrow_mut().clear());
     PENDING_MEMO_KEY.with(|p| *p.borrow_mut() = None);
     CURRENT_NODE_ID.with(|n| *n.borrow_mut() = None);
@@ -6814,7 +6947,7 @@ def body(ctx):
                 "probe",
                 "def probe():\n    \
                      import builtins\n    \
-                     names = ('use_state', 'use_effect', 'use_effect_async', 'use_emit', 'use_message', 'use_memo', 'use_callback', 'use_reducer', 'use_neighbors', 'use_topology', 'use_accept_edge', 'use_edge_accept_handler', 'use_graph_query', 'use_spawn_child', 'use_unmount_self', 'use_compose', 'use_monitor', 'use_demonitor', 'use_link', 'use_unlink', 'use_group_join', 'use_group_leave', 'use_source', 'timer_source', 'delay_source', 'http_source', 'watch_source', '__register_callback', '__invoke_callback', '__augment_ctx')\n    \
+                     names = ('use_state', 'use_durable_state', 'use_durable_effect', 'use_durable_timer', 'use_effect', 'use_effect_async', 'use_emit', 'use_message', 'use_memo', 'use_callback', 'use_reducer', 'use_neighbors', 'use_topology', 'use_accept_edge', 'use_edge_accept_handler', 'use_graph_query', 'use_spawn_child', 'use_unmount_self', 'use_compose', 'use_monitor', 'use_demonitor', 'use_link', 'use_unlink', 'use_group_join', 'use_group_leave', 'use_source', 'timer_source', 'delay_source', 'http_source', 'watch_source', '__register_callback', '__invoke_callback', '__augment_ctx')\n    \
                      return [n for n in names if hasattr(builtins, n)]\n",
             )
             .expect("eval");
@@ -6834,6 +6967,9 @@ def body(ctx):
                     .collect();
                 for required in &[
                     "use_state",
+                    "use_durable_state",
+                    "use_durable_effect",
+                    "use_durable_timer",
                     "use_effect",
                     "use_effect_async",
                     "use_emit",

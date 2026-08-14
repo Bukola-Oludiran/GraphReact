@@ -511,6 +511,12 @@ mod tests {
         // the state survives-a-message acceptance gate.
         for sym in [
             "func UseState(",
+            "func UseDurableState(",
+            "func UseDurableEffect(",
+            "func ScheduleDurableTimer(",
+            "func CancelDurableTimer(",
+            "type DurableEffectRequest",
+            "type DurableTimerRequest",
             "func UseEffect(",
             "type StateResult",
             "callbackRegistry",

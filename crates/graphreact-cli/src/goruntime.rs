@@ -44,17 +44,18 @@ use graphreact_codegen_go::{BuildArtifact, Codegen};
 use graphreact_core::{
     delay_source as core_delay_source, timer_source as core_timer_source,
     use_accept_edge as core_use_accept_edge, use_compose as core_use_compose,
-    use_demonitor as core_use_demonitor, use_edge_accept_handler as core_use_edge_accept_handler,
-    use_effect as core_use_effect, use_emit as core_use_emit,
-    use_group_join as core_use_group_join, use_group_leave as core_use_group_leave,
-    use_link as core_use_link, use_memo as core_use_memo, use_message as core_use_message,
-    use_monitor as core_use_monitor, use_neighbors as core_use_neighbors,
-    use_source as core_use_source, use_spawn_child as core_use_spawn_child,
-    use_state as core_use_state, use_topology as core_use_topology, use_unlink as core_use_unlink,
+    use_demonitor as core_use_demonitor, use_durable_state as core_use_durable_state,
+    use_edge_accept_handler as core_use_edge_accept_handler, use_effect as core_use_effect,
+    use_emit as core_use_emit, use_group_join as core_use_group_join,
+    use_group_leave as core_use_group_leave, use_link as core_use_link, use_memo as core_use_memo,
+    use_message as core_use_message, use_monitor as core_use_monitor,
+    use_neighbors as core_use_neighbors, use_source as core_use_source,
+    use_spawn_child as core_use_spawn_child, use_state as core_use_state,
+    use_topology as core_use_topology, use_unlink as core_use_unlink,
     use_unmount_self as core_use_unmount_self, Attrs, CommunicationGraph, ComposeChildSpec,
-    EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource, GraphDirectory, IncomingMessage,
-    MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest, Scheduler,
-    Signal, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
+    DurableSignal, EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource, GraphDirectory,
+    IncomingMessage, MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest,
+    Scheduler, Signal, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
 };
 use std::sync::Arc;
 
@@ -111,6 +112,12 @@ thread_local! {
     /// Monotonic id source for [`SIGNAL_REGISTRY`]. Mirrors
     /// `pyruntime::NEXT_SIGNAL_ID`.
     static NEXT_SIGNAL_ID: Cell<u64> = const { Cell::new(1) };
+
+    static DURABLE_SIGNAL_REGISTRY: RefCell<FxHashMap<u64, DurableSignal>> =
+        RefCell::new(FxHashMap::default());
+    static DURABLE_SIGNAL_BY_KEY: RefCell<FxHashMap<(String, String), u64>> =
+        RefCell::new(FxHashMap::default());
+    static NEXT_DURABLE_SIGNAL_ID: Cell<u64> = const { Cell::new(1) };
 
     /// Active node id while a body is rendering. Set by
     /// [`ComponentEvalGuard::new`]; cleared on drop. Read by
@@ -299,6 +306,9 @@ fn reset_global_state() {
     SIGNAL_REGISTRY.with(|r| r.borrow_mut().clear());
     SIGNAL_BY_HOOK_POS.with(|m| m.borrow_mut().clear());
     NEXT_SIGNAL_ID.with(|c| c.set(1));
+    DURABLE_SIGNAL_REGISTRY.with(|registry| registry.borrow_mut().clear());
+    DURABLE_SIGNAL_BY_KEY.with(|map| map.borrow_mut().clear());
+    NEXT_DURABLE_SIGNAL_ID.with(|next| next.set(1));
     CURRENT_NODE_ID.with(|n| *n.borrow_mut() = None);
     GO_HOOK_INDEX.with(|i| i.set(0));
     MEMO_REGISTRY.with(|r| r.borrow_mut().clear());
@@ -548,6 +558,79 @@ fn build_host_state_set_callback() -> BoxCallback {
                     "host_state_set: no signal registered for id {id}"
                 )));
             };
+            signal.set(value);
+            Ok(HostValue::Null)
+        })
+    })
+}
+
+fn build_host_durable_state_callback() -> BoxCallback {
+    Box::new(|args| {
+        let key = match args.first() {
+            Some(HostValue::String(key)) => key.clone(),
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_durable_state: expected String key, got {other:?}"
+                )))
+            }
+        };
+        let initial = args
+            .get(1)
+            .cloned()
+            .map(HostValue::into_json)
+            .unwrap_or(Value::Null);
+        let node_id = current_node_id()
+            .ok_or_else(|| EngineError::Internal("host_durable_state: no active node".into()))?;
+        let signal = core_use_durable_state(key.clone(), initial.clone());
+        let registry_key = (node_id, key);
+        let id = DURABLE_SIGNAL_BY_KEY.with(|map| {
+            if let Some(&id) = map.borrow().get(&registry_key) {
+                DURABLE_SIGNAL_REGISTRY.with(|registry| registry.borrow_mut().insert(id, signal));
+                return id;
+            }
+            let id = NEXT_DURABLE_SIGNAL_ID.with(|next| {
+                let id = next.get();
+                next.set(id + 1);
+                id
+            });
+            DURABLE_SIGNAL_REGISTRY.with(|registry| registry.borrow_mut().insert(id, signal));
+            map.borrow_mut().insert(registry_key, id);
+            id
+        });
+        let value = DURABLE_SIGNAL_REGISTRY
+            .with(|registry| registry.borrow().get(&id).map(DurableSignal::get))
+            .unwrap_or(initial);
+        #[allow(clippy::cast_precision_loss)]
+        Ok(HostValue::Object(vec![
+            ("id".into(), HostValue::Number(id as f64)),
+            ("value".into(), HostValue::from_json(value)),
+        ]))
+    })
+}
+
+fn build_host_durable_state_set_callback() -> BoxCallback {
+    Box::new(|args| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let id = match args.first() {
+            Some(HostValue::Number(id)) => *id as u64,
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_durable_state_set: expected Number id, got {other:?}"
+                )))
+            }
+        };
+        let value = args
+            .get(1)
+            .cloned()
+            .map(HostValue::into_json)
+            .unwrap_or(Value::Null);
+        DURABLE_SIGNAL_REGISTRY.with(|registry| {
+            let registry = registry.borrow();
+            let signal = registry.get(&id).ok_or_else(|| {
+                EngineError::Internal(format!(
+                    "host_durable_state_set: no signal registered for id {id}"
+                ))
+            })?;
             signal.set(value);
             Ok(HostValue::Null)
         })
@@ -3434,6 +3517,36 @@ pub fn mount_with_scheduler_and_options(
             .map_err(RuntimeError::Engine)?;
         e.register_callback(iso, "host_state_set", build_host_state_set_callback())
             .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_durable_state",
+            build_host_durable_state_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_durable_state_set",
+            build_host_durable_state_set_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_durable_effect",
+            crate::durable_host::build_effect_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_durable_timer_schedule",
+            crate::durable_host::build_timer_schedule_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
+        e.register_callback(
+            iso,
+            "host_durable_timer_cancel",
+            crate::durable_host::build_timer_cancel_callback(),
+        )
+        .map_err(RuntimeError::Engine)?;
         e.register_callback(iso, "host_effect", build_host_effect_callback())
             .map_err(RuntimeError::Engine)?;
         // M17 phase 3d-α: memo + callback split-cache substrate.

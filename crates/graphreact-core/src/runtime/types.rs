@@ -52,20 +52,26 @@ pub struct DurableActivation {
     pub timers_cancelled: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DurableReplayPolicy {
     Idempotent,
+    #[serde(alias = "nonReplayable")]
     NonReplayable,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DurableEffectRequest {
     pub key: String,
     pub adapter: String,
     pub operation: String,
     pub input: serde_json::Value,
+    #[serde(alias = "result_type")]
     pub result_type: String,
+    #[serde(alias = "error_type")]
     pub error_type: String,
+    #[serde(alias = "replay_policy")]
     pub replay_policy: DurableReplayPolicy,
 }
 
@@ -84,10 +90,13 @@ pub struct DurableEffectIntent {
     pub replay_policy: DurableReplayPolicy,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DurableTimerRequest {
     pub key: String,
+    #[serde(alias = "deadline_unix_ms")]
     pub deadline_unix_ms: u64,
+    #[serde(alias = "message_type")]
     pub message_type: String,
     pub payload: serde_json::Value,
 }
@@ -108,6 +117,59 @@ pub struct DurableTimerIntent {
     pub deadline_unix_ms: u64,
     pub message_type: String,
     pub payload: serde_json::Value,
+}
+
+#[cfg(test)]
+mod durable_wire_tests {
+    use super::{DurableEffectRequest, DurableReplayPolicy, DurableTimerRequest};
+    use serde_json::json;
+
+    #[test]
+    fn durable_requests_use_the_language_host_wire_shape() {
+        let effect: DurableEffectRequest = serde_json::from_value(json!({
+            "key": "lookup",
+            "adapter": "test",
+            "operation": "record",
+            "input": {"value": 7},
+            "resultType": "effect.ok",
+            "errorType": "effect.error",
+            "replayPolicy": "idempotent"
+        }))
+        .expect("effect request");
+        assert_eq!(effect.replay_policy, DurableReplayPolicy::Idempotent);
+        assert_eq!(
+            serde_json::to_value(&effect).expect("serialize")["resultType"],
+            "effect.ok"
+        );
+
+        let timer: DurableTimerRequest = serde_json::from_value(json!({
+            "key": "wake",
+            "deadlineUnixMs": 42,
+            "messageType": "timer.fired",
+            "payload": null
+        }))
+        .expect("timer request");
+        assert_eq!(timer.deadline_unix_ms, 42);
+        assert_eq!(
+            serde_json::to_value(&timer).expect("serialize")["messageType"],
+            "timer.fired"
+        );
+
+        let python_effect: DurableEffectRequest = serde_json::from_value(json!({
+            "key": "lookup",
+            "adapter": "test",
+            "operation": "record",
+            "input": null,
+            "result_type": "effect.ok",
+            "error_type": "effect.error",
+            "replay_policy": "non_replayable"
+        }))
+        .expect("snake-case effect request");
+        assert_eq!(
+            python_effect.replay_policy,
+            DurableReplayPolicy::NonReplayable
+        );
+    }
 }
 
 /// Wire-level message — what flows through the scheduler's queue.

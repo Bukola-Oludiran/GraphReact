@@ -64,18 +64,18 @@ use serde_json::Value;
 use graphreact_core::{
     delay_source as core_delay_source, timer_source as core_timer_source,
     use_accept_edge as core_use_accept_edge, use_compose as core_use_compose,
-    use_demonitor as core_use_demonitor, use_edge_accept_handler as core_use_edge_accept_handler,
-    use_effect as core_use_effect, use_effect_async as core_use_effect_async,
-    use_emit as core_use_emit, use_group_join as core_use_group_join,
-    use_group_leave as core_use_group_leave, use_link as core_use_link, use_memo as core_use_memo,
-    use_message as core_use_message, use_monitor as core_use_monitor,
-    use_neighbors as core_use_neighbors, use_source as core_use_source,
-    use_spawn_child as core_use_spawn_child, use_state as core_use_state,
-    use_topology as core_use_topology, use_unlink as core_use_unlink,
+    use_demonitor as core_use_demonitor, use_durable_state as core_use_durable_state,
+    use_edge_accept_handler as core_use_edge_accept_handler, use_effect as core_use_effect,
+    use_effect_async as core_use_effect_async, use_emit as core_use_emit,
+    use_group_join as core_use_group_join, use_group_leave as core_use_group_leave,
+    use_link as core_use_link, use_memo as core_use_memo, use_message as core_use_message,
+    use_monitor as core_use_monitor, use_neighbors as core_use_neighbors,
+    use_source as core_use_source, use_spawn_child as core_use_spawn_child,
+    use_state as core_use_state, use_topology as core_use_topology, use_unlink as core_use_unlink,
     use_unmount_self as core_use_unmount_self, Attrs, CommunicationGraph, ComposeChildSpec,
-    EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource, GraphDirectory, IncomingMessage,
-    MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest, Scheduler,
-    Signal, Subscription, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
+    DurableSignal, EdgeAcceptPredicate, EffectCleanup, EmitOptions, EventSource, GraphDirectory,
+    IncomingMessage, MonitorRef as CoreMonitorRef, NodeContext, NodeDefinition, PermissionManifest,
+    Scheduler, Signal, Subscription, TopologyEvent, TopologyEventKind, TopologyFilterOptions,
 };
 use graphreact_engine_jsc::{drain_microtasks_static, invoke_global_static, JscEngine};
 use graphreact_engine_zig::{
@@ -124,6 +124,12 @@ thread_local! {
     /// fresh mount on this thread doesn't reuse a stale id from a
     /// previous run.
     static NEXT_SIGNAL_ID: Cell<u64> = const { Cell::new(1) };
+
+    static DURABLE_SIGNAL_REGISTRY: RefCell<FxHashMap<u64, DurableSignal>> =
+        RefCell::new(FxHashMap::default());
+    static DURABLE_SIGNAL_BY_KEY: RefCell<FxHashMap<(String, String), u64>> =
+        RefCell::new(FxHashMap::default());
+    static NEXT_DURABLE_SIGNAL_ID: Cell<u64> = const { Cell::new(1) };
 
     /// useMemo / useCallback cached values, keyed by `(node_id,
     /// hook_pos)`. Stores `serde_json::Value` (which can hold either a
@@ -560,6 +566,7 @@ pub(crate) fn build_host_state_callback() -> BoxCallback {
             .with(|reg| reg.borrow().get(&id).map(Signal::get))
             .unwrap_or(initial);
 
+        #[allow(clippy::cast_precision_loss)]
         Ok(HostValue::Object(vec![
             ("id".into(), HostValue::Number(id as f64)),
             ("value".into(), HostValue::from_json(current_value)),
@@ -594,6 +601,78 @@ pub(crate) fn build_host_state_set_callback() -> BoxCallback {
                     "host_state_set: no signal registered for id {id}"
                 )));
             };
+            signal.set(value);
+            Ok(HostValue::Null)
+        })
+    })
+}
+
+pub(crate) fn build_host_durable_state_callback() -> BoxCallback {
+    Box::new(|args| {
+        let key = match args.first() {
+            Some(HostValue::String(key)) => key.clone(),
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_durable_state: expected String key, got {other:?}"
+                )))
+            }
+        };
+        let initial = args
+            .get(1)
+            .cloned()
+            .map(HostValue::into_json)
+            .unwrap_or(Value::Null);
+        let node_id = current_node_id()
+            .ok_or_else(|| EngineError::Internal("host_durable_state: no active node".into()))?;
+        let signal = core_use_durable_state(key.clone(), initial.clone());
+        let registry_key = (node_id, key);
+        let id = DURABLE_SIGNAL_BY_KEY.with(|map| {
+            if let Some(&id) = map.borrow().get(&registry_key) {
+                DURABLE_SIGNAL_REGISTRY.with(|registry| registry.borrow_mut().insert(id, signal));
+                return id;
+            }
+            let id = NEXT_DURABLE_SIGNAL_ID.with(|next| {
+                let id = next.get();
+                next.set(id + 1);
+                id
+            });
+            DURABLE_SIGNAL_REGISTRY.with(|registry| registry.borrow_mut().insert(id, signal));
+            map.borrow_mut().insert(registry_key, id);
+            id
+        });
+        let value = DURABLE_SIGNAL_REGISTRY
+            .with(|registry| registry.borrow().get(&id).map(DurableSignal::get))
+            .unwrap_or(initial);
+        Ok(HostValue::Object(vec![
+            ("id".into(), HostValue::Number(id as f64)),
+            ("value".into(), HostValue::from_json(value)),
+        ]))
+    })
+}
+
+pub(crate) fn build_host_durable_state_set_callback() -> BoxCallback {
+    Box::new(|args| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let id = match args.first() {
+            Some(HostValue::Number(id)) => *id as u64,
+            other => {
+                return Err(EngineError::Internal(format!(
+                    "host_durable_state_set: expected Number id, got {other:?}"
+                )))
+            }
+        };
+        let value = args
+            .get(1)
+            .cloned()
+            .map(HostValue::into_json)
+            .unwrap_or(Value::Null);
+        DURABLE_SIGNAL_REGISTRY.with(|registry| {
+            let registry = registry.borrow();
+            let signal = registry.get(&id).ok_or_else(|| {
+                EngineError::Internal(format!(
+                    "host_durable_state_set: no signal registered for id {id}"
+                ))
+            })?;
             signal.set(value);
             Ok(HostValue::Null)
         })
@@ -4088,6 +4167,24 @@ pub(crate) fn clear_node_local_state(node_id: &str) {
             r.remove(id);
         }
     });
+    let durable_ids: Vec<u64> = DURABLE_SIGNAL_BY_KEY.with(|map| {
+        let mut map = map.borrow_mut();
+        let ids = map
+            .iter()
+            .filter(|((id, _), _)| id == node_id)
+            .map(|(key, id)| (key.clone(), *id))
+            .collect::<Vec<_>>();
+        for (key, _) in &ids {
+            map.remove(key);
+        }
+        ids.into_iter().map(|(_, id)| id).collect()
+    });
+    DURABLE_SIGNAL_REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        for id in durable_ids {
+            registry.remove(&id);
+        }
+    });
     MEMO_REGISTRY.with(|reg| {
         reg.borrow_mut().retain(|(id, _), _| id != node_id);
     });
@@ -4122,6 +4219,9 @@ pub(crate) fn reset_global_state() {
     SIGNAL_REGISTRY.with(|reg| reg.borrow_mut().clear());
     SIGNAL_BY_HOOK_POS.with(|map| map.borrow_mut().clear());
     NEXT_SIGNAL_ID.with(|c| c.set(1));
+    DURABLE_SIGNAL_REGISTRY.with(|registry| registry.borrow_mut().clear());
+    DURABLE_SIGNAL_BY_KEY.with(|map| map.borrow_mut().clear());
+    NEXT_DURABLE_SIGNAL_ID.with(|next| next.set(1));
     MEMO_REGISTRY.with(|reg| reg.borrow_mut().clear());
     PENDING_MEMO_KEY.with(|p| *p.borrow_mut() = None);
     NODE_TOKENS.with(|m| m.borrow_mut().clear());
@@ -4685,6 +4785,31 @@ pub fn mount_with_scheduler_and_secrets(
         }
         e.register_callback(iso, "host_state", build_host_state_callback())?;
         e.register_callback(iso, "host_state_set", build_host_state_set_callback())?;
+        e.register_callback(
+            iso,
+            "host_durable_state",
+            build_host_durable_state_callback(),
+        )?;
+        e.register_callback(
+            iso,
+            "host_durable_state_set",
+            build_host_durable_state_set_callback(),
+        )?;
+        e.register_callback(
+            iso,
+            "host_durable_effect",
+            crate::durable_host::build_effect_callback(),
+        )?;
+        e.register_callback(
+            iso,
+            "host_durable_timer_schedule",
+            crate::durable_host::build_timer_schedule_callback(),
+        )?;
+        e.register_callback(
+            iso,
+            "host_durable_timer_cancel",
+            crate::durable_host::build_timer_cancel_callback(),
+        )?;
         e.register_callback(iso, "host_effect", build_host_effect_callback())?;
         // M12.3b-phase1: useEffectAsync — real impl via JS Promise →
         // Rust Future bridge (oneshot channel keyed by completion id).
@@ -5051,6 +5176,34 @@ mod tests {
     /// same mutex.
     fn engine_lock() -> MutexGuard<'static, ()> {
         super::engine_lock()
+    }
+
+    #[test]
+    fn durable_hook_prelude_is_visible_to_javascript_bodies() {
+        let _g = engine_lock();
+        reset_global_state();
+        let mut engine = JscEngine::new();
+        engine.initialize().expect("init");
+        let iso = engine
+            .create_isolate(IsolateOptions::default())
+            .expect("isolate");
+        let body = engine
+            .eval_component(
+                iso,
+                "durable-hook-probe",
+                "function body() {\n\
+                   if (typeof useDurableState !== 'function') throw new Error('state');\n\
+                   if (typeof useDurableEffect !== 'function') throw new Error('effect');\n\
+                   if (typeof useDurableTimer !== 'function') throw new Error('timer');\n\
+                   return { accepts: [], emits: [] };\n\
+                 }",
+            )
+            .expect("component");
+        engine
+            .call_function(iso, body, &[HostValue::Object(Vec::new())])
+            .expect("durable hooks available");
+        engine.dispose_isolate(iso).expect("dispose");
+        engine.shutdown().expect("shutdown");
     }
 
     /// PCBPnR Phase 5-D follow-on item #2 — external `.js` body

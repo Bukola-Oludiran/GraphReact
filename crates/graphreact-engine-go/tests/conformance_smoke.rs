@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use graphreact_engine_go::{__test_callback_registry_contains, GoEngine};
+use graphreact_engine_go::{GoEngine, __test_callback_registry_contains};
 use graphreact_engine_zig::{
     BoxCallback, Engine, EngineError, EngineResult, FunctionHandle, HostValue, IsolateHandle,
     IsolateOptions, ModuleHandle,

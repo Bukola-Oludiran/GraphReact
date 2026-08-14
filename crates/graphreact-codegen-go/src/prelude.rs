@@ -567,6 +567,72 @@ func UseState(initial interface{{}}) (interface{{}}, func(interface{{}})) {{
     }}
 }}
 
+// UseDurableState is the named, JSON-compatible state surface restored
+// across durable-run recovery. Keys must be non-empty and unique per node.
+func UseDurableState(key string, initial interface{{}}) (interface{{}}, func(interface{{}})) {{
+    raw, status := Invoke("host_durable_state", key, initial)
+    if status != GR_OK {{
+        return initial, func(interface{{}}) {{}}
+    }}
+    var sr StateResult
+    if err := json.Unmarshal(raw, &sr); err != nil {{
+        return initial, func(interface{{}}) {{}}
+    }}
+    id := uint64(sr.ID)
+    return sr.Value, func(newVal interface{{}}) {{
+        _, _ = Invoke("host_durable_state_set", id, newVal)
+    }}
+}}
+
+type DurableEffectRequest struct {{
+    Key          string      `json:"key"`
+    Adapter      string      `json:"adapter"`
+    Operation    string      `json:"operation"`
+    Input        interface{{}} `json:"input"`
+    ResultType   string      `json:"resultType"`
+    ErrorType    string      `json:"errorType"`
+    ReplayPolicy string      `json:"replayPolicy"`
+}}
+
+func UseDurableEffect(request DurableEffectRequest) (string, error) {{
+    raw, status := Invoke("host_durable_effect", request)
+    if status != GR_OK {{
+        return "", fmt.Errorf("durable effect enqueue failed with status %d", status)
+    }}
+    var effectID string
+    if err := json.Unmarshal(raw, &effectID); err != nil {{
+        return "", err
+    }}
+    return effectID, nil
+}}
+
+type DurableTimerRequest struct {{
+    Key            string      `json:"key"`
+    DeadlineUnixMs uint64      `json:"deadlineUnixMs"`
+    MessageType    string      `json:"messageType"`
+    Payload        interface{{}} `json:"payload"`
+}}
+
+func ScheduleDurableTimer(request DurableTimerRequest) (string, error) {{
+    raw, status := Invoke("host_durable_timer_schedule", request)
+    if status != GR_OK {{
+        return "", fmt.Errorf("durable timer schedule failed with status %d", status)
+    }}
+    var timerID string
+    if err := json.Unmarshal(raw, &timerID); err != nil {{
+        return "", err
+    }}
+    return timerID, nil
+}}
+
+func CancelDurableTimer(timerID string) error {{
+    _, status := Invoke("host_durable_timer_cancel", timerID)
+    if status != GR_OK {{
+        return fmt.Errorf("durable timer cancellation failed with status %d", status)
+    }}
+    return nil
+}}
+
 // MemoCheckResult is the JSON shape host_memo_check returns. Mirrors
 // pyruntime's envelope: `cached` (deps-unchanged hit), optional
 // `value` (the cached value, present only on hit), optional

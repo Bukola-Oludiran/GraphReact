@@ -33,6 +33,7 @@ pub mod cli;
 pub mod commands;
 pub mod debug;
 pub mod dist_reload_bridge;
+mod durable_host;
 pub mod engine_select;
 pub mod fmt;
 /// Go body runtime — **M17 phase 3a skeleton**. Mirrors `pyruntime`

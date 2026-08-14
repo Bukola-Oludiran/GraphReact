@@ -467,6 +467,29 @@ const HOOK_PRELUDE: []const u8 =
     \\  var r = host_state(initial);
     \\  return [r.value, function(v) { host_state_set(r.id, v); }];
     \\};
+    \\globalThis.useDurableState = function(key, initial) {
+    \\  if (typeof host_durable_state === 'undefined') return [initial, function() {}];
+    \\  var r = host_durable_state(key, initial);
+    \\  return [r.value, function(v) { host_durable_state_set(r.id, v); }];
+    \\};
+    \\globalThis.useDurableEffect = function() {
+    \\  return function(request) {
+    \\    if (typeof host_durable_effect === 'undefined') return null;
+    \\    return host_durable_effect(request);
+    \\  };
+    \\};
+    \\globalThis.useDurableTimer = function() {
+    \\  return {
+    \\    schedule: function(request) {
+    \\      if (typeof host_durable_timer_schedule === 'undefined') return null;
+    \\      return host_durable_timer_schedule(request);
+    \\    },
+    \\    cancel: function(timerId) {
+    \\      if (typeof host_durable_timer_cancel === 'undefined') return;
+    \\      host_durable_timer_cancel(timerId);
+    \\    }
+    \\  };
+    \\};
     \\globalThis.useEmit = function() {
     \\  return function(type, payload, opts) {
     \\    if (typeof host_emit === 'undefined') return;
