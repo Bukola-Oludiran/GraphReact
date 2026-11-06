@@ -218,7 +218,3 @@ On macOS, `cargo test --workspace` may fail to link the JavaScriptCore and CPyth
 ## Acknowledgements
 
 GraphReact's design draws on [Erlang/OTP](https://www.erlang.org) (supervision), [Leptos](https://leptos.dev) (reactive propagation), [Dioxus](https://dioxuslabs.com) (signals), [faer](https://github.com/sarah-quinones/faer-rs) (linear algebra), and [graspologic](https://github.com/graspologic-org/graspologic) (graph statistics).
-
-## License
-
-This project doesn't have a license file yet, and its licensing terms are not finalized.
