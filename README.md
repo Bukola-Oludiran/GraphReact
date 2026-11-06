@@ -221,4 +221,4 @@ GraphReact's design draws on [Erlang/OTP](https://www.erlang.org) (supervision),
 
 ## License
 
-MIT, as declared in [`Cargo.toml`](Cargo.toml).
+This project doesn't have a license file yet, and its licensing terms are not finalized.
